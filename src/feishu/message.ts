@@ -7,6 +7,7 @@ import { loadConfig } from "../config/config.js";
 import { logVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { getChildLogger } from "../logging.js";
+import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { isSenderAllowed, normalizeAllowFromWithStore, resolveSenderAllowMatch } from "./access.js";
 import {
   resolveFeishuConfig,
@@ -299,12 +300,23 @@ export async function processFeishuMessage(
   let streamingStarted = false;
   let lastPartialText = "";
 
+  const route = resolveAgentRoute({
+    cfg,
+    channel: "feishu",
+    accountId,
+    peer: {
+      kind: isGroup ? "group" : "dm",
+      id: isGroup ? chatId : senderId,
+    },
+  });
+
   // Context construction
   const ctx = {
     Body: bodyText,
     RawBody: text || media?.placeholder || "",
     From: senderId,
     To: chatId,
+    SessionKey: route.sessionKey,
     SenderId: senderId,
     SenderName: senderName,
     ChatType: isGroup ? "group" : "dm",
@@ -312,7 +324,7 @@ export async function processFeishuMessage(
     Surface: "feishu",
     Timestamp: Number(message.create_time),
     MessageSid: message.message_id,
-    AccountId: accountId,
+    AccountId: route.accountId,
     OriginatingChannel: "feishu",
     OriginatingTo: chatId,
     // Media fields (similar to Telegram)
