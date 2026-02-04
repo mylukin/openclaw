@@ -1,6 +1,8 @@
 import type { Client } from "@larksuiteoapi/node-sdk";
 import type { OpenClawConfig } from "../config/config.js";
+import { hasControlCommand } from "../auto-reply/command-detection.js";
 import { dispatchReplyWithBufferedBlockDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
+import { resolveControlCommandGate } from "../channels/command-gating.js";
 import { loadConfig } from "../config/config.js";
 import { logVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -104,6 +106,12 @@ export async function processFeishuMessage(
 
   // Load allowlist from store
   const storeAllowFrom = await readFeishuAllowFromStore().catch(() => []);
+  const effectiveDmAllow = normalizeAllowFromWithStore({
+    allowFrom: feishuCfg.allowFrom,
+    storeAllowFrom,
+  });
+  let effectiveGroupAllow = effectiveDmAllow;
+  let groupConfig: ReturnType<typeof resolveFeishuGroupConfig>["groupConfig"] | undefined;
 
   // ===== Access Control =====
 
@@ -115,15 +123,19 @@ export async function processFeishuMessage(
       return;
     }
 
-    const { groupConfig } = resolveFeishuGroupConfig({ cfg, accountId, chatId });
+    const resolved = resolveFeishuGroupConfig({ cfg, accountId, chatId });
+    groupConfig = resolved.groupConfig;
+    const groupAllowOverride = groupConfig?.allowFrom;
+    effectiveGroupAllow = normalizeAllowFromWithStore({
+      allowFrom:
+        groupAllowOverride ??
+        (feishuCfg.groupAllowFrom.length > 0 ? feishuCfg.groupAllowFrom : feishuCfg.allowFrom),
+      storeAllowFrom,
+    });
 
     // Check group-level allowFrom override
-    if (groupConfig?.allowFrom) {
-      const groupAllow = normalizeAllowFromWithStore({
-        allowFrom: groupConfig.allowFrom,
-        storeAllowFrom,
-      });
-      if (!isSenderAllowed({ allow: groupAllow, senderId })) {
+    if (groupAllowOverride) {
+      if (!isSenderAllowed({ allow: effectiveGroupAllow, senderId })) {
         logVerbose(`Blocked feishu group sender ${senderId} (group allowFrom override)`);
         return;
       }
@@ -137,16 +149,11 @@ export async function processFeishuMessage(
     }
 
     if (groupPolicy === "allowlist") {
-      const groupAllow = normalizeAllowFromWithStore({
-        allowFrom:
-          feishuCfg.groupAllowFrom.length > 0 ? feishuCfg.groupAllowFrom : feishuCfg.allowFrom,
-        storeAllowFrom,
-      });
-      if (!groupAllow.hasEntries) {
+      if (!effectiveGroupAllow.hasEntries) {
         logVerbose(`Blocked feishu group message (groupPolicy: allowlist, no entries)`);
         return;
       }
-      if (!isSenderAllowed({ allow: groupAllow, senderId })) {
+      if (!isSenderAllowed({ allow: effectiveGroupAllow, senderId })) {
         logVerbose(`Blocked feishu group sender ${senderId} (groupPolicy: allowlist)`);
         return;
       }
@@ -163,12 +170,9 @@ export async function processFeishuMessage(
     }
 
     if (dmPolicy !== "open") {
-      const dmAllow = normalizeAllowFromWithStore({
-        allowFrom: feishuCfg.allowFrom,
-        storeAllowFrom,
-      });
-      const allowMatch = resolveSenderAllowMatch({ allow: dmAllow, senderId });
-      const allowed = dmAllow.hasWildcard || (dmAllow.hasEntries && allowMatch.allowed);
+      const allowMatch = resolveSenderAllowMatch({ allow: effectiveDmAllow, senderId });
+      const allowed =
+        effectiveDmAllow.hasWildcard || (effectiveDmAllow.hasEntries && allowMatch.allowed);
 
       if (!allowed) {
         if (dmPolicy === "pairing") {
@@ -218,7 +222,6 @@ export async function processFeishuMessage(
 
   // In group chat, check requireMention setting
   if (isGroup) {
-    const { groupConfig } = resolveFeishuGroupConfig({ cfg, accountId, chatId });
     const requireMention = groupConfig?.requireMention ?? true;
     if (requireMention && !wasMentioned) {
       logger.debug(`Ignoring group message without @mention (requireMention: true)`);
@@ -245,6 +248,23 @@ export async function processFeishuMessage(
       text = text.replace(mention.key, "").trim();
     }
   }
+
+  const allowForCommands = isGroup ? effectiveGroupAllow : effectiveDmAllow;
+  const senderAllowedForCommands = isSenderAllowed({ allow: allowForCommands, senderId });
+  const useAccessGroups = cfg.commands?.useAccessGroups !== false;
+  const hasControlCommandInMessage = hasControlCommand(text, cfg);
+  const commandGate = resolveControlCommandGate({
+    useAccessGroups,
+    authorizers: [
+      {
+        configured: allowForCommands.hasEntries || allowForCommands.hasWildcard,
+        allowed: senderAllowedForCommands,
+      },
+    ],
+    allowTextCommands: true,
+    hasControlCommand: hasControlCommandInMessage,
+  });
+  const commandAuthorized = commandGate.commandAuthorized;
 
   // Resolve media if present
   let media: FeishuMediaRef | null = null;
@@ -300,6 +320,7 @@ export async function processFeishuMessage(
     MediaType: media?.contentType,
     MediaUrl: media?.path,
     WasMentioned: isGroup ? wasMentioned : undefined,
+    CommandAuthorized: commandAuthorized,
   };
 
   await dispatchReplyWithBufferedBlockDispatcher({
