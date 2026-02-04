@@ -2,6 +2,7 @@ import type { Client } from "@larksuiteoapi/node-sdk";
 import { formatErrorMessage } from "../infra/errors.js";
 import { getChildLogger } from "../logging.js";
 import { mediaKindFromMime } from "../media/constants.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { loadWebMedia } from "../web/media.js";
 import { containsMarkdown, markdownToFeishuPost } from "./format.js";
 
@@ -43,6 +44,8 @@ export type FeishuSendOpts = {
   maxBytes?: number;
   /** Whether to auto-convert Markdown to rich text (post). Default: true */
   autoRichText?: boolean;
+  /** Optional thread/root message id for routing metadata */
+  threadId?: string | null;
 };
 
 export type FeishuSendResult = {
@@ -352,8 +355,56 @@ export async function sendMessageFeishu(
       logger.error(`Feishu send failed: ${res.code} - ${res.msg}`);
       throw new Error(`Feishu API Error: ${res.msg}`);
     }
+    const hookRunner = getGlobalHookRunner();
+    if (hookRunner) {
+      const contentText =
+        typeof finalContent === "object" && finalContent !== null && "text" in finalContent
+          ? (finalContent as { text?: string }).text
+          : undefined;
+      const threadId = typeof opts.threadId === "string" ? opts.threadId : undefined;
+      void hookRunner.runMessageSent(
+        {
+          to: receiveId,
+          content: contentText ?? contentStr,
+          success: true,
+          metadata: {
+            channelId: "feishu",
+            msgType,
+            messageId: res.data?.message_id ?? undefined,
+            receiveIdType,
+            threadId,
+          },
+        },
+        {
+          channelId: "feishu",
+          conversationId: receiveIdType === "chat_id" ? receiveId : undefined,
+        },
+      );
+    }
     return res.data ?? null;
   } catch (err) {
+    const hookRunner = getGlobalHookRunner();
+    if (hookRunner) {
+      const threadId = typeof opts.threadId === "string" ? opts.threadId : undefined;
+      void hookRunner.runMessageSent(
+        {
+          to: receiveId,
+          content: contentStr,
+          success: false,
+          error: formatErrorMessage(err),
+          metadata: {
+            channelId: "feishu",
+            msgType,
+            receiveIdType,
+            threadId,
+          },
+        },
+        {
+          channelId: "feishu",
+          conversationId: receiveIdType === "chat_id" ? receiveId : undefined,
+        },
+      );
+    }
     logger.error(`Feishu send error: ${formatErrorMessage(err)}`);
     throw err;
   }

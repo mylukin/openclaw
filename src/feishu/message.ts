@@ -7,6 +7,7 @@ import { loadConfig } from "../config/config.js";
 import { logVerbose } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { getChildLogger } from "../logging.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { isSenderAllowed, normalizeAllowFromWithStore, resolveSenderAllowMatch } from "./access.js";
 import {
@@ -183,6 +184,8 @@ type FeishuMessage = {
   mentions?: FeishuMention[];
   create_time?: string | number;
   message_id?: string;
+  root_id?: string;
+  parent_id?: string;
 };
 
 type FeishuEventPayload = {
@@ -456,6 +459,7 @@ export async function processFeishuMessage(
   }
 
   const senderName = sender?.sender_id?.user_id || "unknown";
+  const threadId = message.root_id || message.parent_id || undefined;
 
   // Streaming mode support
   const streamingEnabled = (feishuCfg.streaming ?? true) && Boolean(options.credentials);
@@ -464,6 +468,7 @@ export async function processFeishuMessage(
       ? new FeishuStreamingSession(client, options.credentials)
       : null;
   let streamingStarted = false;
+  let streamingHookSent = false;
   let lastPartialText = "";
 
   const route = resolveAgentRoute({
@@ -543,6 +548,31 @@ export async function processFeishuMessage(
           if (canStream) {
             const streamingText = normalizeMentionTextForCard(payload.text);
             await streamingSession?.close(streamingText);
+            const hookRunner = getGlobalHookRunner();
+            if (hookRunner && !streamingHookSent) {
+              const messageId = streamingSession?.getMessageId();
+              if (messageId) {
+                streamingHookSent = true;
+                void hookRunner.runMessageSent(
+                  {
+                    to: chatId,
+                    content: payload.text,
+                    success: true,
+                    metadata: {
+                      channelId: "feishu",
+                      msgType: "interactive",
+                      messageId,
+                      receiveIdType: "chat_id",
+                      threadId,
+                    },
+                  },
+                  {
+                    channelId: "feishu",
+                    conversationId: chatId,
+                  },
+                );
+              }
+            }
             return; // Card already contains the final text
           }
         }
@@ -571,6 +601,7 @@ export async function processFeishuMessage(
               {
                 mediaUrl,
                 receiveIdType: "chat_id",
+                threadId,
               },
             );
           }
@@ -584,6 +615,7 @@ export async function processFeishuMessage(
               {
                 msgType: "text",
                 receiveIdType: "chat_id",
+                threadId,
               },
             );
           }
