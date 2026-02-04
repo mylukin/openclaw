@@ -44,6 +44,12 @@ type FeishuMention = {
 };
 
 const MENTION_ALL_ID = "all";
+const MENTION_ALL_DISPLAY = "@所有人";
+const MENTION_ALL_TEXT_REGEX = /@_?all\b/gi;
+const MENTION_EVERYONE_TEXT_REGEX = /@everyone\b/gi;
+const MENTION_ALL_CN_TEXT_REGEX = /@所有人/g;
+const MENTION_ALL_TAG_REGEX = /<at\s+user_id=("|')all\1>[^<]*<\/at>/gi;
+const MENTION_ALL_CARD_TAG_REGEX = /<at\s+id=("|')?all\1?\s*>\s*<\/at>/gi;
 
 function normalizeMentionId(value?: string): string | null {
   if (!value) {
@@ -61,6 +67,20 @@ function parseMessageContent(rawContent: string | undefined): unknown {
   } catch {
     return undefined;
   }
+}
+
+function normalizeMentionTextForCard(text: string): string {
+  if (!text) {
+    return text;
+  }
+
+  let updated = text;
+  updated = updated.replace(MENTION_ALL_TAG_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_CARD_TAG_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_EVERYONE_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_CN_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  return updated;
 }
 
 function isMentionAllId(mention: FeishuMention): boolean {
@@ -81,6 +101,9 @@ function isMentionAllId(mention: FeishuMention): boolean {
 function hasMentionAllTag(text: string): boolean {
   if (!text) {
     return false;
+  }
+  if (/@_all\b/.test(text)) {
+    return true;
   }
   return (
     text.includes('<at user_id="all">') ||
@@ -207,6 +230,11 @@ export async function processFeishuMessage(
     logger.warn(`Received event without message field`);
     return;
   }
+
+  logger.debug(
+    { content: message.content, mentions: message.mentions ?? payload.mentions ?? [] },
+    "feishu inbound content/mentions",
+  );
 
   const chatId = message.chat_id;
   if (!chatId) {
@@ -483,18 +511,40 @@ export async function processFeishuMessage(
           return;
         }
 
+        const ensureStreamingSession = async () => {
+          if (!streamingSession || streamingStarted) {
+            return Boolean(streamingSession?.isActive());
+          }
+          try {
+            await streamingSession.start(chatId, "chat_id", options.botName);
+            streamingStarted = true;
+            logger.debug(`Started streaming card for chat ${chatId}`);
+          } catch (err) {
+            logger.warn(`Failed to start streaming card: ${formatErrorMessage(err)}`);
+          }
+          return Boolean(streamingSession?.isActive());
+        };
+
         // Handle block replies - update streaming card with partial text
-        if (streamingSession?.isActive() && info?.kind === "block" && payload.text) {
-          logger.debug(`Updating streaming card with block text: ${payload.text.length} chars`);
-          await streamingSession.update(payload.text);
+        if (info?.kind === "block" && payload.text) {
+          const canStream = await ensureStreamingSession();
+          if (!canStream) {
+            return;
+          }
+          const streamingText = normalizeMentionTextForCard(payload.text);
+          logger.debug(`Updating streaming card with block text: ${streamingText.length} chars`);
+          await streamingSession?.update(streamingText);
           return;
         }
 
         // If streaming was active, close it with the final text
-        if (streamingSession?.isActive() && info?.kind === "final") {
-          await streamingSession.close(payload.text);
-          streamingStarted = false;
-          return; // Card already contains the final text
+        if (info?.kind === "final" && payload.text) {
+          const canStream = await ensureStreamingSession();
+          if (canStream) {
+            const streamingText = normalizeMentionTextForCard(payload.text);
+            await streamingSession?.close(streamingText);
+            return; // Card already contains the final text
+          }
         }
 
         // Handle media URLs
@@ -546,19 +596,7 @@ export async function processFeishuMessage(
           streamingSession.close().catch(() => {});
         }
       },
-      onReplyStart: async () => {
-        // Start streaming card when reply generation begins
-        if (streamingSession && !streamingStarted) {
-          try {
-            await streamingSession.start(chatId, "chat_id", options.botName);
-            streamingStarted = true;
-            logger.debug(`Started streaming card for chat ${chatId}`);
-          } catch (err) {
-            logger.warn(`Failed to start streaming card: ${formatErrorMessage(err)}`);
-            // Continue without streaming
-          }
-        }
-      },
+      onReplyStart: undefined,
     },
     replyOptions: {
       disableBlockStreaming: !feishuCfg.blockStreaming,
@@ -567,11 +605,12 @@ export async function processFeishuMessage(
             if (!streamingSession.isActive() || !payload.text) {
               return;
             }
-            if (payload.text === lastPartialText) {
+            const streamingText = normalizeMentionTextForCard(payload.text);
+            if (streamingText === lastPartialText) {
               return;
             }
-            lastPartialText = payload.text;
-            await streamingSession.update(payload.text);
+            lastPartialText = streamingText;
+            await streamingSession.update(streamingText);
           }
         : undefined,
       onReasoningStream: streamingSession
@@ -580,11 +619,12 @@ export async function processFeishuMessage(
             if (!streamingSession.isActive() || !payload.text) {
               return;
             }
-            if (payload.text === lastPartialText) {
+            const streamingText = normalizeMentionTextForCard(payload.text);
+            if (streamingText === lastPartialText) {
               return;
             }
-            lastPartialText = payload.text;
-            await streamingSession.update(payload.text);
+            lastPartialText = streamingText;
+            await streamingSession.update(streamingText);
           }
         : undefined,
     },
