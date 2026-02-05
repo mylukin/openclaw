@@ -358,7 +358,11 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
-    if (text === this.state.currentText) {
+    const mergedText = this.mergeText(text);
+    if (!mergedText) {
+      return;
+    }
+    if (mergedText === this.state.currentText) {
       return;
     }
 
@@ -367,11 +371,11 @@ export class FeishuStreamingSession {
     if (elapsed >= STREAM_UPDATE_INTERVAL_MS) {
       this.clearPendingUpdate();
       this.lastUpdateAt = now;
-      await this.queueUpdate(text);
+      await this.queueUpdate(mergedText);
       return;
     }
 
-    this.pendingText = text;
+    this.pendingText = mergedText;
     if (!this.pendingTimer) {
       const delay = Math.max(0, STREAM_UPDATE_INTERVAL_MS - elapsed);
       this.pendingTimer = setTimeout(() => {
@@ -423,6 +427,20 @@ export class FeishuStreamingSession {
     return this.updateQueue;
   }
 
+  private mergeText(next: string): string {
+    if (!this.state) {
+      return next;
+    }
+    const prev = this.state.currentText;
+    if (!prev) {
+      return next;
+    }
+    if (next.startsWith(prev)) {
+      return next;
+    }
+    return prev + next;
+  }
+
   /**
    * Finalize and close the streaming session
    */
@@ -439,7 +457,8 @@ export class FeishuStreamingSession {
     // Wait for pending updates
     await this.updateQueue;
 
-    const text = finalText ?? pendingText ?? this.state.currentText;
+    const mergedFinal = typeof finalText === "string" ? this.mergeText(finalText) : undefined;
+    const text = mergedFinal ?? pendingText ?? this.state.currentText;
     this.state.sequence += 1;
 
     try {
