@@ -32,7 +32,140 @@ type FeishuSender = {
 
 type FeishuMention = {
   key?: string;
+  id?:
+    | {
+        open_id?: string;
+        user_id?: string;
+        union_id?: string;
+      }
+    | string;
+  id_type?: string;
+  name?: string;
 };
+
+const MENTION_ALL_ID = "all";
+const MENTION_ALL_TEXT_REGEX = /@_?all\b/i;
+const MENTION_EVERYONE_TEXT_REGEX = /@everyone\b/i;
+const MENTION_ALL_CN_TEXT_REGEX = /@所有人/;
+const MENTION_ALL_TAG_REGEX = /<at\s+user_id=("|')all\1>[^<]*<\/at>/i;
+const MENTION_ALL_CARD_TAG_REGEX = /<at\s+id=("|')?all\1?\s*>\s*<\/at>/i;
+
+function normalizeMentionId(value?: string): string | null {
+  if (!value) {
+    return null;
+  }
+  return value.trim().toLowerCase();
+}
+
+function parseMessageContent(rawContent: unknown): unknown {
+  if (!rawContent) {
+    return undefined;
+  }
+  if (typeof rawContent === "string") {
+    try {
+      return JSON.parse(rawContent);
+    } catch {
+      return { text: rawContent };
+    }
+  }
+  if (typeof rawContent === "object") {
+    return rawContent;
+  }
+  return undefined;
+}
+
+function extractContentText(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.text === "string") {
+    return record.text;
+  }
+  return undefined;
+}
+
+function isMentionAllId(mention: FeishuMention): boolean {
+  if (!mention) {
+    return false;
+  }
+  if (typeof mention.id === "string") {
+    return normalizeMentionId(mention.id) === MENTION_ALL_ID;
+  }
+  if (mention.id) {
+    const openId = normalizeMentionId(mention.id.open_id);
+    const userId = normalizeMentionId(mention.id.user_id);
+    return openId === MENTION_ALL_ID || userId === MENTION_ALL_ID;
+  }
+  return false;
+}
+
+function hasMentionAllTag(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  if (MENTION_ALL_TEXT_REGEX.test(text)) {
+    return true;
+  }
+  if (MENTION_EVERYONE_TEXT_REGEX.test(text)) {
+    return true;
+  }
+  if (MENTION_ALL_CN_TEXT_REGEX.test(text)) {
+    return true;
+  }
+  return MENTION_ALL_TAG_REGEX.test(text) || MENTION_ALL_CARD_TAG_REGEX.test(text);
+}
+
+function hasMentionAllNode(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasMentionAllNode(entry));
+  }
+
+  const record = value as Record<string, unknown>;
+  const tag = typeof record.tag === "string" ? record.tag : undefined;
+  if (tag === "at") {
+    const userId = normalizeMentionId(record.user_id as string | undefined);
+    const id = normalizeMentionId(record.id as string | undefined);
+    if (userId === MENTION_ALL_ID || id === MENTION_ALL_ID) {
+      return true;
+    }
+  }
+
+  for (const entry of Object.values(record)) {
+    if (hasMentionAllNode(entry)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isMentionAll(mentions: FeishuMention[], parsedContent: unknown): boolean {
+  if (mentions.some((mention) => isMentionAllId(mention))) {
+    return true;
+  }
+
+  const text = extractContentText(parsedContent);
+  if (text && hasMentionAllTag(text)) {
+    return true;
+  }
+
+  return hasMentionAllNode(parsedContent);
+}
+
+function isBotMentioned(mention: FeishuMention, botOpenId: string): boolean {
+  if (!mention || !botOpenId) {
+    return false;
+  }
+  if (typeof mention.id === "string") {
+    return mention.id === botOpenId;
+  }
+  return mention.id?.open_id === botOpenId;
+}
 
 type FeishuMessage = {
   chat_id?: string;
@@ -42,6 +175,7 @@ type FeishuMessage = {
   mentions?: FeishuMention[];
   create_time?: string | number;
   message_id?: string;
+  is_at_all?: boolean;
 };
 
 type FeishuEventPayload = {
@@ -49,9 +183,11 @@ type FeishuEventPayload = {
   event?: {
     message?: FeishuMessage;
     sender?: FeishuSender;
+    is_at_all?: boolean;
   };
   sender?: FeishuSender;
   mentions?: FeishuMention[];
+  is_at_all?: boolean;
 };
 
 // Supported message types for processing
@@ -65,6 +201,8 @@ export type ProcessFeishuMessageOptions = {
   credentials?: { appId: string; appSecret: string; domain?: string };
   /** Bot name for streaming card title (optional, defaults to no title) */
   botName?: string;
+  /** Bot open_id for mention filtering (cached at startup) */
+  botOpenId?: string;
 };
 
 export async function processFeishuMessage(
@@ -219,12 +357,45 @@ export async function processFeishuMessage(
 
   // Handle @mentions for group chats
   const mentions = message.mentions ?? payload.mentions ?? [];
-  const wasMentioned = mentions.length > 0;
+  const botOpenId = options.botOpenId?.trim();
+  const parsedContent = parseMessageContent(message.content);
+  const contentText = extractContentText(parsedContent);
+  const mentionsAllFlag =
+    message.is_at_all === true || payload.event?.is_at_all === true || payload.is_at_all === true;
+  const mentionsAll = mentionsAllFlag || isMentionAll(mentions, parsedContent);
+
+  logger.debug(
+    {
+      chatId,
+      messageId: message.message_id,
+      msgType,
+      senderId,
+      senderUnionId,
+      botOpenId,
+      mentions,
+      rawContent: message.content,
+      contentText,
+      isAtAll: mentionsAllFlag,
+    },
+    "feishu inbound message payload",
+  );
+
+  // Check if this bot was specifically mentioned (by open_id match)
+  const wasMentioned = botOpenId
+    ? mentions.some((mention) => isBotMentioned(mention, botOpenId))
+    : mentions.length > 0;
+  const allowGroupMention = wasMentioned || mentionsAll;
+
+  if (mentions.length > 0 && !botOpenId) {
+    logger.warn(
+      "Feishu mentions detected but botOpenId not available - cannot verify bot-specific mention",
+    );
+  }
 
   // In group chat, check requireMention setting
   if (isGroup) {
     const requireMention = groupConfig?.requireMention ?? true;
-    if (requireMention && !wasMentioned) {
+    if (requireMention && !allowGroupMention) {
       logger.debug(`Ignoring group message without @mention (requireMention: true)`);
       return;
     }
@@ -233,13 +404,15 @@ export async function processFeishuMessage(
   // Extract text content (for text messages or captions)
   let text = "";
   if (msgType === "text") {
-    try {
-      if (message.content) {
+    if (contentText) {
+      text = contentText;
+    } else if (typeof message.content === "string") {
+      try {
         const content = JSON.parse(message.content);
         text = content.text || "";
+      } catch (err) {
+        logger.error(`Failed to parse text message content: ${formatErrorMessage(err)}`);
       }
-    } catch (err) {
-      logger.error(`Failed to parse text message content: ${formatErrorMessage(err)}`);
     }
   }
 
@@ -331,7 +504,7 @@ export async function processFeishuMessage(
     MediaPath: media?.path,
     MediaType: media?.contentType,
     MediaUrl: media?.path,
-    WasMentioned: isGroup ? wasMentioned : undefined,
+    WasMentioned: isGroup ? allowGroupMention : undefined,
     CommandAuthorized: commandAuthorized,
   };
 
