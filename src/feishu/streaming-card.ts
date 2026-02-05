@@ -17,6 +17,26 @@ import { resolveFeishuApiBase, resolveFeishuDomain } from "./domain.js";
 
 const logger = getChildLogger({ module: "feishu-streaming" });
 
+const MENTION_ALL_TEXT_REGEX = /@_?all\b/gi;
+const MENTION_EVERYONE_TEXT_REGEX = /@everyone\b/gi;
+const MENTION_ALL_CN_TEXT_REGEX = /@所有人/g;
+const MENTION_ALL_TAG_REGEX = /<at\s+user_id=("|')all\1>[^<]*<\/at>/gi;
+const MENTION_ALL_CARD_TAG_REGEX = /<at\s+id=("|')?all\1?\s*>\s*<\/at>/gi;
+const MENTION_ALL_DISPLAY = "@所有人";
+
+function normalizeStreamingCardText(text: string): string {
+  if (!text) {
+    return text;
+  }
+  let updated = text;
+  updated = updated.replace(MENTION_ALL_TAG_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_CARD_TAG_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_EVERYONE_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  updated = updated.replace(MENTION_ALL_CN_TEXT_REGEX, MENTION_ALL_DISPLAY);
+  return updated;
+}
+
 export type FeishuStreamingCredentials = {
   appId: string;
   appSecret: string;
@@ -186,6 +206,7 @@ export async function updateStreamingCardText(
   text: string,
   sequence: number,
 ): Promise<void> {
+  const normalizedText = normalizeStreamingCardText(text);
   const apiBase = resolveFeishuApiBase(credentials.domain);
   const response = await fetch(
     `${apiBase}/cardkit/v1/cards/${cardId}/elements/${elementId}/content`,
@@ -196,7 +217,7 @@ export async function updateStreamingCardText(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        content: text,
+        content: normalizedText,
         sequence,
         uuid: `stream_${cardId}_${sequence}`,
       }),
@@ -220,10 +241,11 @@ export async function closeStreamingMode(
   sequence: number,
   finalSummary?: string,
 ): Promise<void> {
+  const normalizedSummary = normalizeStreamingCardText(finalSummary || "");
   // Build config object - summary must be set to clear "[Generating...]"
   const configObj: Record<string, unknown> = {
     streaming_mode: false,
-    summary: { content: finalSummary || "" },
+    summary: { content: normalizedSummary },
   };
 
   const settings = { config: configObj };

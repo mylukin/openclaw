@@ -7,6 +7,43 @@ import { containsMarkdown, markdownToFeishuPost } from "./format.js";
 
 const logger = getChildLogger({ module: "feishu-send" });
 
+const MENTION_ALL_REGEX = /@_?all\b/gi;
+const MENTION_EVERYONE_REGEX = /@everyone\b/gi;
+const MENTION_ALL_CN_REGEX = /@所有人/g;
+const MENTION_ALL_TAG = '<at user_id="all">Everyone</at>';
+const MENTION_ALL_DISPLAY = "@所有人";
+
+type MentionNormalizeMode = "tag" | "readable";
+
+function normalizeFeishuMentions(text: string, mode: MentionNormalizeMode): string {
+  if (!text) {
+    return text;
+  }
+  const replacement = mode === "tag" ? MENTION_ALL_TAG : MENTION_ALL_DISPLAY;
+  let updated = text.replace(MENTION_ALL_REGEX, replacement);
+  updated = updated.replace(MENTION_EVERYONE_REGEX, replacement);
+  updated = updated.replace(MENTION_ALL_CN_REGEX, replacement);
+  return updated;
+}
+
+function normalizeFeishuOutgoingValue(value: unknown, mode: MentionNormalizeMode): unknown {
+  if (typeof value === "string") {
+    return normalizeFeishuMentions(value, mode);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeFeishuOutgoingValue(entry, mode));
+  }
+  const record = value as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    normalized[key] = normalizeFeishuOutgoingValue(entry, mode);
+  }
+  return normalized;
+}
+
 export type FeishuMsgType = "text" | "image" | "file" | "audio" | "media" | "post" | "interactive";
 
 export type FeishuSendOpts = {
@@ -168,11 +205,15 @@ export async function sendMessageFeishu(
 ): Promise<FeishuSendResult | null> {
   const receiveIdType = opts.receiveIdType || "chat_id";
   let msgType = opts.msgType || "text";
-  let finalContent = content;
-  const contentText =
-    typeof content === "object" && content !== null && "text" in content
-      ? (content as { text?: string }).text
-      : undefined;
+  const rawContentText =
+    typeof content === "string"
+      ? content
+      : typeof content === "object" && content !== null && "text" in content
+        ? (content as { text?: string }).text
+        : undefined;
+  let finalContent = normalizeFeishuOutgoingValue(content, "tag") as FeishuMessageContent;
+  const normalizedContentText =
+    typeof rawContentText === "string" ? normalizeFeishuMentions(rawContentText, "tag") : undefined;
 
   // Handle media URL - upload first, then send
   if (opts.mediaUrl) {
@@ -228,7 +269,8 @@ export async function sendMessageFeishu(
 
       // If there's text alongside media, we need to send two messages
       // First send the media, then send text as a follow-up
-      if (typeof contentText === "string" && contentText.trim()) {
+      const followupText = normalizedContentText ?? rawContentText;
+      if (typeof followupText === "string" && followupText.trim()) {
         // Send media first
         const mediaRes = await client.im.message.create({
           params: { receive_id_type: receiveIdType },
@@ -250,7 +292,7 @@ export async function sendMessageFeishu(
           data: {
             receive_id: receiveId,
             msg_type: "text",
-            content: JSON.stringify({ text: contentText }),
+            content: JSON.stringify({ text: followupText }),
           },
         });
 
@@ -272,21 +314,25 @@ export async function sendMessageFeishu(
   // Auto-convert Markdown to rich text if enabled and content is text with Markdown
   const autoRichText = opts.autoRichText !== false;
   const finalText =
-    typeof finalContent === "object" && finalContent !== null && "text" in finalContent
-      ? (finalContent as { text?: string }).text
+    typeof finalContent === "string"
+      ? finalContent
+      : typeof finalContent === "object" && finalContent !== null && "text" in finalContent
+        ? (finalContent as { text?: string }).text
+        : undefined;
+  const readableText =
+    typeof rawContentText === "string"
+      ? normalizeFeishuMentions(rawContentText, "readable")
       : undefined;
 
-  if (
-    autoRichText &&
-    msgType === "text" &&
-    typeof finalText === "string" &&
-    containsMarkdown(finalText)
-  ) {
+  const textForMarkdown = readableText ?? finalText;
+  if (autoRichText && msgType === "text" && typeof textForMarkdown === "string") {
     try {
-      const postContent = markdownToFeishuPost(finalText);
-      msgType = "post";
-      finalContent = postContent;
-      logger.debug(`Converted Markdown to Feishu post format`);
+      if (containsMarkdown(textForMarkdown)) {
+        const postContent = markdownToFeishuPost(textForMarkdown);
+        msgType = "post";
+        finalContent = postContent;
+        logger.debug(`Converted Markdown to Feishu post format`);
+      }
     } catch (err) {
       logger.warn(
         `Failed to convert Markdown to post, falling back to text: ${formatErrorMessage(err)}`,
@@ -295,6 +341,8 @@ export async function sendMessageFeishu(
     }
   }
 
+  const normalizeMode: MentionNormalizeMode = msgType === "post" ? "readable" : "tag";
+  finalContent = normalizeFeishuOutgoingValue(finalContent, normalizeMode) as FeishuMessageContent;
   const contentStr = typeof finalContent === "string" ? finalContent : JSON.stringify(finalContent);
 
   try {
