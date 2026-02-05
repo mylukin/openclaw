@@ -1,4 +1,10 @@
-import type { DmPolicy, GroupPolicy, MarkdownConfig, OutboundRetryConfig } from "./types.base.js";
+import type {
+  DmPolicy,
+  GroupPolicy,
+  MarkdownConfig,
+  OutboundRetryConfig,
+  ReplyToMode,
+} from "./types.base.js";
 import type { ChannelHeartbeatVisibilityConfig } from "./types.channels.js";
 import type { DmConfig, ProviderCommandsConfig } from "./types.messages.js";
 import type { GroupToolPolicyBySenderConfig, GroupToolPolicyConfig } from "./types.tools.js";
@@ -84,6 +90,8 @@ export type FeishuAccountConfig = {
   retry?: OutboundRetryConfig;
   /** Heartbeat visibility settings for this channel. */
   heartbeat?: ChannelHeartbeatVisibilityConfig;
+  /** Reply threading mode for group chats: "off" | "first" | "all". Default: "off". */
+  replyToMode?: ReplyToMode;
 };
 
 export type FeishuConfig = {

@@ -49,7 +49,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
       if (!account.config.appId || !account.config.appSecret) {
         throw new Error("Feishu app credentials not configured");
       }
-      await feishuOutbound.sendText({ cfg, to: id, text: PAIRING_APPROVED_MESSAGE });
+      await feishuOutbound.sendText!({ cfg, to: id, text: PAIRING_APPROVED_MESSAGE });
     },
   },
   capabilities: {
@@ -144,6 +144,17 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
       });
     },
   },
+  threading: {
+    resolveReplyToMode: ({ cfg }) => cfg.channels?.feishu?.replyToMode ?? "off",
+    buildToolContext: ({ context, hasRepliedRef }) => {
+      const threadId = context.MessageThreadId ?? context.ReplyToId;
+      return {
+        currentChannelId: context.To?.trim() || undefined,
+        currentThreadTs: threadId != null ? String(threadId) : undefined,
+        hasRepliedRef,
+      };
+    },
+  },
   directory: {
     self: async () => null,
     listPeers: async ({ cfg, accountId, query, limit }) => {
@@ -201,7 +212,12 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
       lastProbeAt: snapshot.lastProbeAt ?? null,
     }),
     probeAccount: async ({ account, timeoutMs }) =>
-      probeFeishu(account.config.appId, account.config.appSecret, timeoutMs, account.config.domain),
+      probeFeishu(
+        account.config.appId ?? "",
+        account.config.appSecret ?? "",
+        timeoutMs,
+        account.config.domain,
+      ),
     buildAccountSnapshot: ({ account, runtime, probe }) => {
       const configured = account.tokenSource !== "none";
       return {

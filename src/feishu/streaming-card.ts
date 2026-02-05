@@ -165,28 +165,50 @@ export async function createStreamingCard(
   return { cardId: result.data.card_id };
 }
 
-/**
- * Send a streaming card as a message
- */
+export type SendStreamingCardOpts = {
+  receiveIdType?: "open_id" | "user_id" | "union_id" | "email" | "chat_id";
+  replyToId?: string | null;
+  isGroup?: boolean;
+  threadId?: string | null;
+};
+
 export async function sendStreamingCard(
   client: Client,
   receiveId: string,
   cardId: string,
-  receiveIdType: "open_id" | "user_id" | "union_id" | "email" | "chat_id" = "chat_id",
+  opts: SendStreamingCardOpts = {},
 ): Promise<{ messageId: string }> {
+  const receiveIdType = opts.receiveIdType ?? "chat_id";
   const content = JSON.stringify({
     type: "card",
     data: { card_id: cardId },
   });
 
-  const res = await client.im.message.create({
-    params: { receive_id_type: receiveIdType },
-    data: {
-      receive_id: receiveId,
-      msg_type: "interactive",
-      content,
-    },
-  });
+  const shouldReply =
+    opts.isGroup === true && typeof opts.replyToId === "string" && opts.replyToId.trim().length > 0;
+  const replyMessageId = shouldReply ? opts.replyToId!.trim() : undefined;
+  const replyInThread = Boolean(opts.threadId);
+
+  let res;
+  if (replyMessageId) {
+    res = await client.im.message.reply({
+      path: { message_id: replyMessageId },
+      data: {
+        content,
+        msg_type: "interactive",
+        reply_in_thread: replyInThread,
+      },
+    });
+  } else {
+    res = await client.im.message.create({
+      params: { receive_id_type: receiveIdType },
+      data: {
+        receive_id: receiveId,
+        msg_type: "interactive",
+        content,
+      },
+    });
+  }
 
   if (res.code !== 0 || !res.data?.message_id) {
     throw new Error(`Failed to send streaming card: ${res.msg}`);
@@ -289,13 +311,11 @@ export class FeishuStreamingSession {
     this.credentials = credentials;
   }
 
-  /**
-   * Start a streaming session - creates and sends a streaming card
-   */
   async start(
     receiveId: string,
     receiveIdType: "open_id" | "user_id" | "union_id" | "email" | "chat_id" = "chat_id",
     title?: string,
+    opts?: { replyToId?: string | null; isGroup?: boolean; threadId?: string | null },
   ): Promise<void> {
     if (this.state) {
       logger.warn("Streaming session already started");
@@ -304,7 +324,12 @@ export class FeishuStreamingSession {
 
     try {
       const { cardId } = await createStreamingCard(this.credentials, title);
-      const { messageId } = await sendStreamingCard(this.client, receiveId, cardId, receiveIdType);
+      const { messageId } = await sendStreamingCard(this.client, receiveId, cardId, {
+        receiveIdType,
+        replyToId: opts?.replyToId,
+        isGroup: opts?.isGroup,
+        threadId: opts?.threadId,
+      });
 
       this.state = {
         cardId,

@@ -58,6 +58,10 @@ export type FeishuSendOpts = {
   autoRichText?: boolean;
   /** Optional thread/root message id for routing metadata */
   threadId?: string | null;
+  /** Message ID to reply to (for quote replies in groups) */
+  replyToId?: string | null;
+  /** Whether this is a group chat (enables quote reply behavior) */
+  isGroup?: boolean;
 };
 
 export type FeishuSendResult = {
@@ -249,6 +253,32 @@ export async function sendMessageFeishu(
   const normalizedContentText =
     typeof rawContentText === "string" ? normalizeFeishuMentions(rawContentText, "tag") : undefined;
 
+  const shouldReply =
+    opts.isGroup === true && typeof opts.replyToId === "string" && opts.replyToId.trim().length > 0;
+  const replyMessageId = shouldReply ? opts.replyToId!.trim() : undefined;
+  const replyInThread = Boolean(opts.threadId);
+
+  const sendFeishuMessage = async (params: { msgType: FeishuMsgType; content: string }) => {
+    if (replyMessageId) {
+      return client.im.message.reply({
+        path: { message_id: replyMessageId },
+        data: {
+          content: params.content,
+          msg_type: params.msgType,
+          reply_in_thread: replyInThread,
+        },
+      });
+    }
+    return client.im.message.create({
+      params: { receive_id_type: receiveIdType },
+      data: {
+        receive_id: receiveId,
+        msg_type: params.msgType,
+        content: params.content,
+      },
+    });
+  };
+
   // Handle media URL - upload first, then send
   if (opts.mediaUrl) {
     try {
@@ -306,13 +336,9 @@ export async function sendMessageFeishu(
       const followupText = normalizedContentText ?? rawContentText;
       if (typeof followupText === "string" && followupText.trim()) {
         // Send media first
-        const mediaRes = await client.im.message.create({
-          params: { receive_id_type: receiveIdType },
-          data: {
-            receive_id: receiveId,
-            msg_type: msgType,
-            content: JSON.stringify(finalContent),
-          },
+        const mediaRes = await sendFeishuMessage({
+          msgType,
+          content: JSON.stringify(finalContent),
         });
 
         if (mediaRes.code !== 0) {
@@ -321,13 +347,9 @@ export async function sendMessageFeishu(
         }
 
         // Then send text
-        const textRes = await client.im.message.create({
-          params: { receive_id_type: receiveIdType },
-          data: {
-            receive_id: receiveId,
-            msg_type: "text",
-            content: JSON.stringify({ text: followupText }),
-          },
+        const textRes = await sendFeishuMessage({
+          msgType: "text",
+          content: JSON.stringify({ text: followupText }),
         });
         emitMessageSent({
           success: true,
@@ -389,14 +411,7 @@ export async function sendMessageFeishu(
       : contentStr;
 
   try {
-    const res = await client.im.message.create({
-      params: { receive_id_type: receiveIdType },
-      data: {
-        receive_id: receiveId,
-        msg_type: msgType,
-        content: contentStr,
-      },
-    });
+    const res = await sendFeishuMessage({ msgType, content: contentStr });
 
     if (res.code !== 0) {
       logger.error(`Feishu send failed: ${res.code} - ${res.msg}`);

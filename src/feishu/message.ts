@@ -467,6 +467,7 @@ export async function processFeishuMessage(
 
   const senderName = sender?.sender_id?.user_id || "unknown";
   const threadId = message.root_id || message.parent_id || undefined;
+  const replyToId = isGroup ? threadId || message.message_id : undefined;
   const hookRunner = getGlobalHookRunner();
 
   // Streaming mode support
@@ -587,6 +588,8 @@ export async function processFeishuMessage(
                 mediaUrl,
                 receiveIdType: "chat_id",
                 threadId,
+                replyToId,
+                isGroup,
               },
             );
           }
@@ -601,6 +604,8 @@ export async function processFeishuMessage(
                 msgType: "text",
                 receiveIdType: "chat_id",
                 threadId,
+                replyToId,
+                isGroup,
               },
             );
           }
@@ -617,7 +622,11 @@ export async function processFeishuMessage(
         // Start streaming card when reply generation begins
         if (streamingSession && !streamingStarted) {
           try {
-            await streamingSession.start(chatId, "chat_id", options.botName);
+            await streamingSession.start(chatId, "chat_id", options.botName, {
+              replyToId,
+              isGroup,
+              threadId,
+            });
             streamingStarted = true;
             logger.debug(`Started streaming card for chat ${chatId}`);
           } catch (err) {
