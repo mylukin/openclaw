@@ -366,6 +366,7 @@ export async function processFeishuMessage(
   const mentionsAllFlag =
     message.is_at_all === true || payload.event?.is_at_all === true || payload.is_at_all === true;
   const mentionsAll = mentionsAllFlag || isMentionAll(mentions, parsedContent);
+  const hookRunner = getGlobalHookRunner();
 
   logger.debug(
     {
@@ -382,6 +383,35 @@ export async function processFeishuMessage(
     },
     "feishu inbound message payload",
   );
+
+  if (hookRunner?.hasHooks("message_received")) {
+    void hookRunner.runMessageReceived(
+      {
+        from: senderId,
+        content: contentText ?? "",
+        timestamp: Number(message.create_time),
+        metadata: {
+          chatId,
+          messageId: message.message_id,
+          threadId: message.root_id ?? message.parent_id ?? undefined,
+          msgType,
+          senderId,
+          senderUnionId,
+          botOpenId,
+          mentions,
+          rawContent: message.content,
+          contentText,
+          isAtAll: mentionsAllFlag,
+          rawEvent: payload,
+        },
+      },
+      {
+        channelId: "feishu",
+        accountId,
+        conversationId: chatId,
+      },
+    );
+  }
 
   // Check if this bot was specifically mentioned (by open_id match)
   const wasMentioned = botOpenId
@@ -468,7 +498,6 @@ export async function processFeishuMessage(
   const senderName = sender?.sender_id?.user_id || "unknown";
   const threadId = message.root_id || message.parent_id || undefined;
   const replyToId = isGroup ? threadId || message.message_id : undefined;
-  const hookRunner = getGlobalHookRunner();
 
   // Streaming mode support
   const streamingEnabled = (feishuCfg.streaming ?? true) && Boolean(options.credentials);
