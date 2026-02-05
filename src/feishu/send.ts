@@ -2,6 +2,7 @@ import type { Client } from "@larksuiteoapi/node-sdk";
 import { formatErrorMessage } from "../infra/errors.js";
 import { getChildLogger } from "../logging.js";
 import { mediaKindFromMime } from "../media/constants.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { loadWebMedia } from "../web/media.js";
 import { containsMarkdown, markdownToFeishuPost } from "./format.js";
 
@@ -55,6 +56,8 @@ export type FeishuSendOpts = {
   maxBytes?: number;
   /** Whether to auto-convert Markdown to rich text (post). Default: true */
   autoRichText?: boolean;
+  /** Optional thread/root message id for routing metadata */
+  threadId?: string | null;
 };
 
 export type FeishuSendResult = {
@@ -212,6 +215,37 @@ export async function sendMessageFeishu(
         ? (content as { text?: string }).text
         : undefined;
   let finalContent = normalizeFeishuOutgoingValue(content, "tag") as FeishuMessageContent;
+  const hookRunner = getGlobalHookRunner();
+  const emitMessageSent = (params: {
+    success: boolean;
+    content: string;
+    messageId?: string;
+    error?: string;
+  }) => {
+    if (!hookRunner) {
+      return;
+    }
+    const threadId = typeof opts.threadId === "string" ? opts.threadId : undefined;
+    void hookRunner.runMessageSent(
+      {
+        to: receiveId,
+        content: params.content,
+        success: params.success,
+        error: params.error,
+        metadata: {
+          channelId: "feishu",
+          msgType,
+          messageId: params.messageId,
+          receiveIdType,
+          threadId,
+        },
+      },
+      {
+        channelId: "feishu",
+        conversationId: receiveIdType === "chat_id" ? receiveId : undefined,
+      },
+    );
+  };
   const normalizedContentText =
     typeof rawContentText === "string" ? normalizeFeishuMentions(rawContentText, "tag") : undefined;
 
@@ -295,6 +329,11 @@ export async function sendMessageFeishu(
             content: JSON.stringify({ text: followupText }),
           },
         });
+        emitMessageSent({
+          success: true,
+          content: followupText,
+          messageId: textRes.data?.message_id,
+        });
 
         return textRes.data ?? null;
       }
@@ -344,6 +383,10 @@ export async function sendMessageFeishu(
   const normalizeMode: MentionNormalizeMode = msgType === "post" ? "readable" : "tag";
   finalContent = normalizeFeishuOutgoingValue(finalContent, normalizeMode) as FeishuMessageContent;
   const contentStr = typeof finalContent === "string" ? finalContent : JSON.stringify(finalContent);
+  const hookContent =
+    typeof finalContent === "object" && finalContent !== null && "text" in finalContent
+      ? ((finalContent as { text?: string }).text ?? contentStr)
+      : contentStr;
 
   try {
     const res = await client.im.message.create({
@@ -359,8 +402,18 @@ export async function sendMessageFeishu(
       logger.error(`Feishu send failed: ${res.code} - ${res.msg}`);
       throw new Error(`Feishu API Error: ${res.msg}`);
     }
+    emitMessageSent({
+      success: true,
+      content: hookContent,
+      messageId: res.data?.message_id ?? undefined,
+    });
     return res.data ?? null;
   } catch (err) {
+    emitMessageSent({
+      success: false,
+      content: hookContent,
+      error: formatErrorMessage(err),
+    });
     logger.error(`Feishu send error: ${formatErrorMessage(err)}`);
     throw err;
   }
