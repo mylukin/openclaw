@@ -17,6 +17,8 @@ import { resolveFeishuApiBase, resolveFeishuDomain } from "./domain.js";
 
 const logger = getChildLogger({ module: "feishu-streaming" });
 
+const STREAM_UPDATE_INTERVAL_MS = 500;
+
 const MENTION_ALL_TEXT_REGEX = /@_?all\b/gi;
 const MENTION_EVERYONE_TEXT_REGEX = /@everyone\b/gi;
 const MENTION_ALL_CN_TEXT_REGEX = /@所有人/g;
@@ -305,6 +307,9 @@ export class FeishuStreamingSession {
   private state: FeishuStreamingCardState | null = null;
   private updateQueue: Promise<void> = Promise.resolve();
   private closed = false;
+  private lastUpdateAt = 0;
+  private pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingText: string | null = null;
 
   constructor(client: Client, credentials: FeishuStreamingCredentials) {
     this.client = client;
@@ -353,6 +358,46 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
+    if (text === this.state.currentText) {
+      return;
+    }
+
+    const now = Date.now();
+    const elapsed = now - this.lastUpdateAt;
+    if (elapsed >= STREAM_UPDATE_INTERVAL_MS) {
+      this.clearPendingUpdate();
+      this.lastUpdateAt = now;
+      await this.queueUpdate(text);
+      return;
+    }
+
+    this.pendingText = text;
+    if (!this.pendingTimer) {
+      const delay = Math.max(0, STREAM_UPDATE_INTERVAL_MS - elapsed);
+      this.pendingTimer = setTimeout(() => {
+        this.pendingTimer = null;
+        const nextText = this.pendingText;
+        this.pendingText = null;
+        if (!nextText || this.closed) {
+          return;
+        }
+        this.lastUpdateAt = Date.now();
+        void this.queueUpdate(nextText);
+      }, delay);
+    }
+  }
+
+  private clearPendingUpdate(): void {
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+  }
+
+  private queueUpdate(text: string): Promise<void> {
+    if (!this.state || this.closed) {
+      return this.updateQueue;
+    }
 
     // Queue updates to ensure order
     this.updateQueue = this.updateQueue.then(async () => {
@@ -375,8 +420,7 @@ export class FeishuStreamingSession {
         logger.debug(`Streaming update failed (will retry): ${String(err)}`);
       }
     });
-
-    await this.updateQueue;
+    return this.updateQueue;
   }
 
   /**
@@ -388,10 +432,14 @@ export class FeishuStreamingSession {
     }
     this.closed = true;
 
+    const pendingText = this.pendingText;
+    this.pendingText = null;
+    this.clearPendingUpdate();
+
     // Wait for pending updates
     await this.updateQueue;
 
-    const text = finalText ?? this.state.currentText;
+    const text = finalText ?? pendingText ?? this.state.currentText;
     this.state.sequence += 1;
 
     try {
