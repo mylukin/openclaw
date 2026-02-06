@@ -2,7 +2,7 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import fs from "node:fs";
 import { loadConfig } from "../config/config.js";
 import { getChildLogger } from "../logging.js";
-import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
+import { resolveDefaultFeishuAccountId } from "./accounts.js";
 import { normalizeFeishuDomain } from "./domain.js";
 
 const logger = getChildLogger({ module: "feishu-client" });
@@ -39,7 +39,7 @@ export function getFeishuClient(accountIdOrAppId?: string, explicitAppSecret?: s
 
   // Determine if we received an accountId or an appId
   const isAppId = accountIdOrAppId?.startsWith("cli_");
-  const accountId = isAppId ? undefined : accountIdOrAppId || DEFAULT_ACCOUNT_ID;
+  const accountId = isAppId ? undefined : accountIdOrAppId || resolveDefaultFeishuAccountId(cfg);
 
   if (!appSecret && feishuCfg?.accounts) {
     if (isAppId) {
