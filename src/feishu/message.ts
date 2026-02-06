@@ -544,159 +544,193 @@ export async function processFeishuMessage(
     CommandAuthorized: commandAuthorized,
   };
 
-  await dispatchReplyWithBufferedBlockDispatcher({
-    ctx,
-    cfg,
-    dispatcherOptions: {
-      deliver: async (payload, info) => {
-        const hasMedia = payload.mediaUrl || (payload.mediaUrls && payload.mediaUrls.length > 0);
-        if (!payload.text && !hasMedia) {
-          return;
-        }
+  try {
+    await dispatchReplyWithBufferedBlockDispatcher({
+      ctx,
+      cfg,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          const hasMedia = payload.mediaUrl || (payload.mediaUrls && payload.mediaUrls.length > 0);
+          if (!payload.text && !hasMedia) {
+            return;
+          }
 
-        // Handle block replies - update streaming card with partial text
-        if (streamingSession?.isActive() && info?.kind === "block" && payload.text) {
-          logger.debug(`Updating streaming card with block text: ${payload.text.length} chars`);
-          await streamingSession.update(payload.text);
-          return;
-        }
+          // Handle block replies - update streaming card with partial text
+          if (streamingSession?.isActive() && info?.kind === "block" && payload.text) {
+            logger.debug(`Updating streaming card with block text: ${payload.text.length} chars`);
+            await streamingSession.update(payload.text);
+            return;
+          }
 
-        // If streaming was active, close it with the final text
-        if (streamingSession?.isActive() && info?.kind === "final") {
-          await streamingSession.close(payload.text);
-          streamingStarted = false;
-          if (hookRunner && !streamingHookSent) {
-            const messageId = streamingSession.getMessageId();
-            if (messageId) {
-              streamingHookSent = true;
-              void hookRunner.runMessageSent(
-                {
-                  to: chatId,
-                  content: payload.text ?? "",
-                  success: true,
-                  metadata: {
-                    channelId: "feishu",
-                    msgType: "interactive",
-                    messageId,
-                    receiveIdType: "chat_id",
-                    threadId,
+          // If streaming was active, close it with the final text
+          if (streamingSession?.isActive() && info?.kind === "final") {
+            await streamingSession.close(payload.text);
+            streamingStarted = false;
+            if (hookRunner && !streamingHookSent) {
+              const messageId = streamingSession.getMessageId();
+              if (messageId) {
+                streamingHookSent = true;
+                void hookRunner.runMessageSent(
+                  {
+                    to: chatId,
+                    content: payload.text ?? "",
+                    success: true,
+                    metadata: {
+                      channelId: "feishu",
+                      msgType: "interactive",
+                      messageId,
+                      receiveIdType: "chat_id",
+                      threadId,
+                    },
                   },
-                },
+                  {
+                    channelId: "feishu",
+                    conversationId: chatId,
+                  },
+                );
+              }
+            }
+            return; // Card already contains the final text
+          }
+
+          // Handle media URLs
+          const mediaUrls = payload.mediaUrls?.length
+            ? payload.mediaUrls
+            : payload.mediaUrl
+              ? [payload.mediaUrl]
+              : [];
+
+          if (mediaUrls.length > 0) {
+            // Close streaming session before sending media
+            if (streamingSession?.isActive()) {
+              await streamingSession.close();
+              streamingStarted = false;
+            }
+            // Send each media item
+            for (let i = 0; i < mediaUrls.length; i++) {
+              const mediaUrl = mediaUrls[i];
+              const caption = i === 0 ? payload.text || "" : "";
+              await sendMessageFeishu(
+                client,
+                chatId,
+                { text: caption },
                 {
-                  channelId: "feishu",
-                  conversationId: chatId,
+                  mediaUrl,
+                  receiveIdType: "chat_id",
+                  threadId,
+                  replyToId,
+                  isGroup,
+                },
+              );
+            }
+          } else if (payload.text) {
+            // If streaming wasn't used, send as regular message
+            if (!streamingSession?.isActive()) {
+              await sendMessageFeishu(
+                client,
+                chatId,
+                { text: payload.text },
+                {
+                  msgType: "text",
+                  receiveIdType: "chat_id",
+                  threadId,
+                  replyToId,
+                  isGroup,
                 },
               );
             }
           }
-          return; // Card already contains the final text
-        }
-
-        // Handle media URLs
-        const mediaUrls = payload.mediaUrls?.length
-          ? payload.mediaUrls
-          : payload.mediaUrl
-            ? [payload.mediaUrl]
-            : [];
-
-        if (mediaUrls.length > 0) {
-          // Close streaming session before sending media
+        },
+        onError: (err) => {
+          logger.error(`Reply error: ${formatErrorMessage(err)}`);
+          // Clean up streaming session on error
           if (streamingSession?.isActive()) {
-            await streamingSession.close();
-            streamingStarted = false;
+            streamingSession.close().catch(() => {});
           }
-          // Send each media item
-          for (let i = 0; i < mediaUrls.length; i++) {
-            const mediaUrl = mediaUrls[i];
-            const caption = i === 0 ? payload.text || "" : "";
-            await sendMessageFeishu(
-              client,
-              chatId,
-              { text: caption },
-              {
-                mediaUrl,
-                receiveIdType: "chat_id",
-                threadId,
+        },
+        onReplyStart: async () => {
+          // Start streaming card when reply generation begins
+          if (streamingSession && !streamingStarted) {
+            try {
+              await streamingSession.start(chatId, "chat_id", options.botName, {
                 replyToId,
                 isGroup,
-              },
-            );
-          }
-        } else if (payload.text) {
-          // If streaming wasn't used, send as regular message
-          if (!streamingSession?.isActive()) {
-            await sendMessageFeishu(
-              client,
-              chatId,
-              { text: payload.text },
-              {
-                msgType: "text",
-                receiveIdType: "chat_id",
                 threadId,
-                replyToId,
-                isGroup,
-              },
-            );
+              });
+              streamingStarted = true;
+              logger.debug(`Started streaming card for chat ${chatId}`);
+            } catch (err) {
+              logger.warn(`Failed to start streaming card: ${formatErrorMessage(err)}`);
+              // Continue without streaming
+            }
           }
-        }
+        },
       },
-      onError: (err) => {
-        logger.error(`Reply error: ${formatErrorMessage(err)}`);
-        // Clean up streaming session on error
-        if (streamingSession?.isActive()) {
-          streamingSession.close().catch(() => {});
-        }
+      replyOptions: {
+        disableBlockStreaming: !feishuCfg.blockStreaming,
+        onPartialReply: streamingSession
+          ? async (payload) => {
+              if (!streamingSession.isActive() || !payload.text) {
+                return;
+              }
+              if (payload.text === lastPartialText) {
+                return;
+              }
+              lastPartialText = payload.text;
+              await streamingSession.update(payload.text);
+            }
+          : undefined,
+        onReasoningStream: streamingSession
+          ? async (payload) => {
+              // Also update on reasoning stream for extended thinking models
+              if (!streamingSession.isActive() || !payload.text) {
+                return;
+              }
+              if (payload.text === lastPartialText) {
+                return;
+              }
+              lastPartialText = payload.text;
+              await streamingSession.update(payload.text);
+            }
+          : undefined,
       },
-      onReplyStart: async () => {
-        // Start streaming card when reply generation begins
-        if (streamingSession && !streamingStarted) {
-          try {
-            await streamingSession.start(chatId, "chat_id", options.botName, {
-              replyToId,
-              isGroup,
-              threadId,
-            });
-            streamingStarted = true;
-            logger.debug(`Started streaming card for chat ${chatId}`);
-          } catch (err) {
-            logger.warn(`Failed to start streaming card: ${formatErrorMessage(err)}`);
-            // Continue without streaming
-          }
-        }
-      },
-    },
-    replyOptions: {
-      disableBlockStreaming: !feishuCfg.blockStreaming,
-      onPartialReply: streamingSession
-        ? async (payload) => {
-            if (!streamingSession.isActive() || !payload.text) {
-              return;
-            }
-            if (payload.text === lastPartialText) {
-              return;
-            }
-            lastPartialText = payload.text;
-            await streamingSession.update(payload.text);
-          }
-        : undefined,
-      onReasoningStream: streamingSession
-        ? async (payload) => {
-            // Also update on reasoning stream for extended thinking models
-            if (!streamingSession.isActive() || !payload.text) {
-              return;
-            }
-            if (payload.text === lastPartialText) {
-              return;
-            }
-            lastPartialText = payload.text;
-            await streamingSession.update(payload.text);
-          }
-        : undefined,
-    },
-  });
+    });
+  } finally {
+    // Ensure streaming session is closed on completion.
+    // Note: Some failure modes never deliver a kind="final" payload. We still want
+    // to close the card and emit message_sent once we have a stable messageId+text.
+    if (streamingSession?.isActive()) {
+      await streamingSession.close();
+    }
 
-  // Ensure streaming session is closed on completion
-  if (streamingSession?.isActive()) {
-    await streamingSession.close();
+    // Fallback: if we used a streaming card and never emitted message_sent in the
+    // deliver(kind="final") path, emit it after close().
+    if (hookRunner && streamingSession && !streamingHookSent) {
+      const messageId = streamingSession.getMessageId();
+      if (messageId) {
+        const text = streamingSession.getCurrentText();
+        const content = text.trim().length > 0 ? text : "[card message]";
+        streamingHookSent = true;
+        void hookRunner.runMessageSent(
+          {
+            to: chatId,
+            content,
+            success: true,
+            metadata: {
+              channelId: "feishu",
+              msgType: "interactive",
+              messageId,
+              receiveIdType: "chat_id",
+              threadId,
+            },
+          },
+          {
+            channelId: "feishu",
+            accountId,
+            conversationId: chatId,
+          },
+        );
+      }
+    }
   }
 }

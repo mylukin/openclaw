@@ -459,6 +459,10 @@ export class FeishuStreamingSession {
 
     const mergedFinal = typeof finalText === "string" ? this.mergeText(finalText) : undefined;
     const text = mergedFinal ?? pendingText ?? this.state.currentText;
+
+    // Persist the final merged text so callers can reliably read it after close()
+    // (even when we never receive a dispatcher deliver(kind="final") callback).
+    this.state.currentText = text ?? "";
     this.state.sequence += 1;
 
     try {
@@ -500,6 +504,14 @@ export class FeishuStreamingSession {
    */
   getMessageId(): string | null {
     return this.state?.messageId ?? null;
+  }
+
+  /**
+   * Return the latest text we attempted to render into the card.
+   * Useful for emitting hooks after a close() that happened outside a "final" deliver.
+   */
+  getCurrentText(): string {
+    return this.state?.currentText ?? "";
   }
 }
 
