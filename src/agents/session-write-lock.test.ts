@@ -72,6 +72,25 @@ describe("acquireSessionWriteLock", () => {
     }
   });
 
+  it("reclaims orphan lock files owned by current pid", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-lock-"));
+    try {
+      const sessionFile = path.join(root, "sessions.json");
+      const lockPath = `${sessionFile}.lock`;
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+        "utf8",
+      );
+
+      const lock = await acquireSessionWriteLock({ sessionFile, timeoutMs: 500 });
+      await lock.release();
+      await expect(fs.access(lockPath)).rejects.toThrow();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("removes held locks on termination signals", async () => {
     const signals = ["SIGINT", "SIGTERM", "SIGQUIT", "SIGABRT"] as const;
     for (const signal of signals) {
