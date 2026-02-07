@@ -3,9 +3,45 @@ import type { MentionTarget } from "./mention.js";
 import type { FeishuSendResult } from "./types.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
-import { buildMentionedMessage, buildMentionedCardContent } from "./mention.js";
+import {
+  buildMentionedMessage,
+  buildMentionedCardContent,
+  normalizeMentionAllForText,
+  normalizeMentionAllForCard,
+} from "./mention.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { resolveReceiveIdType, normalizeFeishuTarget } from "./targets.js";
+
+function emitMessageSent(params: {
+  to: string;
+  content: string;
+  success: boolean;
+  messageId?: string;
+  error?: string;
+  accountId?: string;
+  threadId?: string;
+}): void {
+  getFeishuRuntime()
+    .hooks.runMessageSent(
+      {
+        to: params.to,
+        content: params.content,
+        success: params.success,
+        error: params.error,
+        metadata: {
+          channelId: "feishu",
+          messageId: params.messageId,
+          threadId: params.threadId,
+        },
+      },
+      {
+        channelId: "feishu",
+        accountId: params.accountId,
+        conversationId: params.to,
+      },
+    )
+    .catch(() => {});
+}
 
 export type FeishuMessageInfo = {
   messageId: string;
@@ -144,11 +180,11 @@ export async function sendMessageFeishu(
     channel: "feishu",
   });
 
-  // Build message content (with @mention support)
   let rawText = text ?? "";
   if (mentions && mentions.length > 0) {
     rawText = buildMentionedMessage(mentions, rawText);
   }
+  rawText = normalizeMentionAllForText(rawText);
   const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(rawText, tableMode);
 
   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
@@ -163,13 +199,27 @@ export async function sendMessageFeishu(
     });
 
     if (response.code !== 0) {
+      emitMessageSent({
+        to: receiveId,
+        content: rawText,
+        success: false,
+        error: response.msg || `code ${response.code}`,
+        accountId: account.accountId,
+        threadId: replyToMessageId,
+      });
       throw new Error(`Feishu reply failed: ${response.msg || `code ${response.code}`}`);
     }
 
-    return {
-      messageId: response.data?.message_id ?? "unknown",
-      chatId: receiveId,
-    };
+    const resultMessageId = response.data?.message_id ?? "unknown";
+    emitMessageSent({
+      to: receiveId,
+      content: rawText,
+      success: true,
+      messageId: resultMessageId,
+      accountId: account.accountId,
+      threadId: replyToMessageId,
+    });
+    return { messageId: resultMessageId, chatId: receiveId };
   }
 
   const response = await client.im.message.create({
@@ -182,13 +232,25 @@ export async function sendMessageFeishu(
   });
 
   if (response.code !== 0) {
+    emitMessageSent({
+      to: receiveId,
+      content: rawText,
+      success: false,
+      error: response.msg || `code ${response.code}`,
+      accountId: account.accountId,
+    });
     throw new Error(`Feishu send failed: ${response.msg || `code ${response.code}`}`);
   }
 
-  return {
-    messageId: response.data?.message_id ?? "unknown",
-    chatId: receiveId,
-  };
+  const resultMessageId = response.data?.message_id ?? "unknown";
+  emitMessageSent({
+    to: receiveId,
+    content: rawText,
+    success: true,
+    messageId: resultMessageId,
+    accountId: account.accountId,
+  });
+  return { messageId: resultMessageId, chatId: receiveId };
 }
 
 export type SendFeishuCardParams = {
@@ -310,11 +372,11 @@ export async function sendMarkdownCardFeishu(params: {
   accountId?: string;
 }): Promise<FeishuSendResult> {
   const { cfg, to, text, replyToMessageId, mentions, accountId } = params;
-  // Build message content (with @mention support)
   let cardText = text;
   if (mentions && mentions.length > 0) {
     cardText = buildMentionedCardContent(mentions, text);
   }
+  cardText = normalizeMentionAllForCard(cardText);
   const card = buildMarkdownCard(cardText);
   return sendCardFeishu({ cfg, to, card, replyToMessageId, accountId });
 }
