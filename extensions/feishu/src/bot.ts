@@ -935,6 +935,12 @@ export async function handleFeishuMessage(params: {
           }))
         : undefined;
 
+    // Serialize raw Feishu mentions for downstream plugins (e.g. bot-company journal).
+    const mentionsForCtx = (event.message.mentions ?? []).map((m) => ({
+      user_id: m.id.open_id ?? m.id.user_id ?? "",
+      name: m.name,
+    }));
+
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: combinedBody,
       BodyForAgent: ctx.content,
@@ -958,6 +964,10 @@ export async function handleFeishuMessage(params: {
       CommandAuthorized: true,
       OriginatingChannel: "feishu" as const,
       OriginatingTo: feishuTo,
+      RootId: ctx.rootId,
+      ParentId: ctx.parentId,
+      MsgType: ctx.contentType,
+      MentionsJson: JSON.stringify(mentionsForCtx),
       ...mediaPayload,
     });
 
