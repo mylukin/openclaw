@@ -220,6 +220,37 @@ function checkBotMentioned(event: FeishuMessageEvent, botOpenId?: string): boole
   return mentions.some((m) => m.id.open_id === botOpenId);
 }
 
+function checkAtAllMentioned(event: FeishuMessageEvent): boolean {
+  const mentions = event.message.mentions ?? [];
+  for (const mention of mentions) {
+    const idCandidates = [mention.id.user_id, mention.id.open_id, mention.id.union_id]
+      .map((value) => value?.toLowerCase())
+      .filter(Boolean);
+    if (idCandidates.includes("all")) {
+      return true;
+    }
+
+    const mentionKey = mention.key.toLowerCase();
+    if (mentionKey.includes('user_id="all"') || mentionKey.includes("id=all")) {
+      return true;
+    }
+
+    const mentionName = mention.name.trim().toLowerCase();
+    if (mentionName === "all" || mentionName === "everyone" || mentionName === "所有人") {
+      return true;
+    }
+  }
+
+  const parsedText = parseMessageContent(event.message.content, event.message.message_type);
+
+  // Feishu sends @all as literal "@_all" in text (no mentions array, no XML tags)
+  if (/(?:^|\s)@_all(?:\s|$)/i.test(parsedText)) {
+    return true;
+  }
+
+  return /<at\b[^>]*\b(?:user_id|id)\s*=\s*["']?all["']?[^>]*>/i.test(parsedText);
+}
+
 function stripBotMention(
   text: string,
   mentions?: FeishuMessageEvent["message"]["mentions"],
@@ -490,6 +521,7 @@ export function parseFeishuMessageEvent(
 ): FeishuMessageContext {
   const rawContent = parseMessageContent(event.message.content, event.message.message_type);
   const mentionedBot = checkBotMentioned(event, botOpenId);
+  const mentionedAll = event.message.chat_type === "group" ? checkAtAllMentioned(event) : false;
   const content = stripBotMention(rawContent, event.message.mentions);
 
   const ctx: FeishuMessageContext = {
@@ -499,6 +531,7 @@ export function parseFeishuMessageEvent(
     senderOpenId: event.sender.sender_id.open_id || "",
     chatType: event.message.chat_type,
     mentionedBot,
+    mentionedAll,
     rootId: event.message.root_id || undefined,
     parentId: event.message.parent_id || undefined,
     content,
@@ -547,6 +580,11 @@ export async function handleFeishuMessage(params: {
 
   let ctx = parseFeishuMessageEvent(event, botOpenId);
   const isGroup = ctx.chatType === "group";
+
+  if (event.sender.sender_type === "bot" || (botOpenId && ctx.senderOpenId === botOpenId)) {
+    log(`feishu[${account.accountId}]: ignoring bot-origin message in ${ctx.chatId}`);
+    return;
+  }
 
   // Resolve sender display name (best-effort) so the agent can attribute messages correctly.
   const senderResult = await resolveFeishuSenderName({
@@ -618,30 +656,36 @@ export async function handleFeishuMessage(params: {
       }
     }
 
-    const { requireMention } = resolveFeishuReplyPolicy({
+    const { requireMention, replyOnAtAll } = resolveFeishuReplyPolicy({
       isDirectMessage: false,
       globalConfig: feishuCfg,
       groupConfig,
     });
 
     if (requireMention && !ctx.mentionedBot) {
-      log(
-        `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
-      );
-      if (chatHistories) {
-        recordPendingHistoryEntryIfEnabled({
-          historyMap: chatHistories,
-          historyKey: ctx.chatId,
-          limit: historyLimit,
-          entry: {
-            sender: ctx.senderOpenId,
-            body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
-            timestamp: Date.now(),
-            messageId: ctx.messageId,
-          },
-        });
+      if (replyOnAtAll && ctx.mentionedAll) {
+        log(
+          `feishu[${account.accountId}]: group ${ctx.chatId} triggered by @all mention (replyOnAtAll=true)`,
+        );
+      } else {
+        log(
+          `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
+        );
+        if (chatHistories) {
+          recordPendingHistoryEntryIfEnabled({
+            historyMap: chatHistories,
+            historyKey: ctx.chatId,
+            limit: historyLimit,
+            entry: {
+              sender: ctx.senderOpenId,
+              body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
+              timestamp: Date.now(),
+              messageId: ctx.messageId,
+            },
+          });
+        }
+        return;
       }
-      return;
     }
   } else {
     const dmPolicy = feishuCfg?.dmPolicy ?? "pairing";
@@ -839,14 +883,18 @@ export async function handleFeishuMessage(params: {
 
       log(`feishu[${account.accountId}]: dispatching permission error notification to agent`);
 
-      await core.channel.reply.dispatchReplyFromConfig({
-        ctx: permissionCtx,
-        cfg,
-        dispatcher: permDispatcher,
-        replyOptions: permReplyOptions,
-      });
-
-      markPermIdle();
+      await (async () => {
+        try {
+          await core.channel.reply.dispatchReplyFromConfig({
+            ctx: permissionCtx,
+            cfg,
+            dispatcher: permDispatcher,
+            replyOptions: permReplyOptions,
+          });
+        } finally {
+          markPermIdle();
+        }
+      })();
     }
 
     const body = core.channel.reply.formatAgentEnvelope({
