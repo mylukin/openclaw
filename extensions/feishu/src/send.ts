@@ -356,3 +356,146 @@ export async function editMessageFeishu(params: {
     throw new Error(`Feishu message edit failed: ${response.msg || `code ${response.code}`}`);
   }
 }
+
+export const STREAMING_ELEMENT_ID = "streaming_md";
+
+export type CreateCardEntityResult = {
+  cardId: string;
+};
+
+export function buildStreamingCardData(initialContent: string): string {
+  return JSON.stringify({
+    schema: "2.0",
+    config: {
+      update_multi: true,
+      streaming_mode: true,
+      streaming_config: {
+        print_step: { default: 1 },
+        print_frequency_ms: { default: 70 },
+        print_strategy: "fast",
+      },
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: initialContent,
+          element_id: STREAMING_ELEMENT_ID,
+        },
+      ],
+    },
+  });
+}
+
+export async function createCardEntityFeishu(params: {
+  cfg: ClawdbotConfig;
+  initialContent?: string;
+  accountId?: string;
+}): Promise<CreateCardEntityResult> {
+  const { cfg, initialContent = "", accountId } = params;
+  const account = resolveFeishuAccount({ cfg, accountId });
+  if (!account.configured) {
+    throw new Error(`Feishu account "${account.accountId}" not configured`);
+  }
+
+  const client = createFeishuClient(account);
+
+  const response = (await client.cardkit.v1.card.create({
+    data: {
+      type: "card_json",
+      data: buildStreamingCardData(initialContent),
+    },
+  })) as { code?: number; msg?: string; data?: { card_id?: string } };
+
+  if (response.code !== 0 || !response.data?.card_id) {
+    throw new Error(`Feishu CardKit create failed: ${response.msg || `code ${response.code}`}`);
+  }
+
+  return { cardId: response.data.card_id };
+}
+
+export async function sendCardByCardIdFeishu(params: {
+  cfg: ClawdbotConfig;
+  to: string;
+  cardId: string;
+  replyToMessageId?: string;
+  accountId?: string;
+}): Promise<FeishuSendResult> {
+  const { cfg, to, cardId, replyToMessageId, accountId } = params;
+  const account = resolveFeishuAccount({ cfg, accountId });
+  if (!account.configured) {
+    throw new Error(`Feishu account "${account.accountId}" not configured`);
+  }
+
+  const client = createFeishuClient(account);
+  const receiveId = normalizeFeishuTarget(to);
+  if (!receiveId) {
+    throw new Error(`Invalid Feishu target: ${to}`);
+  }
+
+  const receiveIdType = resolveReceiveIdType(receiveId);
+  const content = JSON.stringify({ card_id: cardId });
+
+  if (replyToMessageId) {
+    const response = await client.im.message.reply({
+      path: { message_id: replyToMessageId },
+      data: { content, msg_type: "interactive" },
+    });
+
+    if (response.code !== 0) {
+      throw new Error(`Feishu card-id reply failed: ${response.msg || `code ${response.code}`}`);
+    }
+
+    return {
+      messageId: response.data?.message_id ?? "unknown",
+      chatId: receiveId,
+    };
+  }
+
+  const response = await client.im.message.create({
+    params: { receive_id_type: receiveIdType },
+    data: {
+      receive_id: receiveId,
+      content,
+      msg_type: "interactive",
+    },
+  });
+
+  if (response.code !== 0) {
+    throw new Error(`Feishu card-id send failed: ${response.msg || `code ${response.code}`}`);
+  }
+
+  return {
+    messageId: response.data?.message_id ?? "unknown",
+    chatId: receiveId,
+  };
+}
+
+/** @param sequence Strictly increasing per card (1, 2, 3, …). */
+export async function updateCardElementContentFeishu(params: {
+  cfg: ClawdbotConfig;
+  cardId: string;
+  content: string;
+  sequence: number;
+  elementId?: string;
+  accountId?: string;
+}): Promise<void> {
+  const { cfg, cardId, content, sequence, elementId = STREAMING_ELEMENT_ID, accountId } = params;
+  const account = resolveFeishuAccount({ cfg, accountId });
+  if (!account.configured) {
+    throw new Error(`Feishu account "${account.accountId}" not configured`);
+  }
+
+  const client = createFeishuClient(account);
+
+  const response = (await client.cardkit.v1.cardElement.content({
+    path: { card_id: cardId, element_id: elementId },
+    data: { content, sequence },
+  })) as { code?: number; msg?: string };
+
+  if (response.code !== 0) {
+    throw new Error(
+      `Feishu CardKit element update failed: ${response.msg || `code ${response.code}`}`,
+    );
+  }
+}

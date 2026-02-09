@@ -1,4 +1,4 @@
-import type { ClawdbotConfig, RuntimeEnv } from "openclaw/plugin-sdk";
+import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
 import {
   buildPendingHistoryContextFromMap,
   recordPendingHistoryEntryIfEnabled,
@@ -322,7 +322,7 @@ function inferPlaceholder(messageType: string): string {
  * Similar to Discord's resolveMediaList().
  */
 async function resolveFeishuMediaList(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   messageId: string;
   messageType: string;
   content: string;
@@ -507,7 +507,7 @@ export function parseFeishuMessageEvent(
 }
 
 export async function handleFeishuMessage(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   event: FeishuMessageEvent;
   botOpenId?: string;
   runtime?: RuntimeEnv;
@@ -849,7 +849,12 @@ export async function handleFeishuMessage(params: {
       ctx: ctxPayload,
       cfg,
       dispatcher,
-      replyOptions,
+      replyOptions: {
+        ...replyOptions,
+        disableBlockStreaming:
+          replyOptions.disableBlockStreaming ??
+          (typeof feishuCfg?.blockStreaming === "boolean" ? !feishuCfg.blockStreaming : undefined),
+      },
     });
 
     markDispatchIdle();
