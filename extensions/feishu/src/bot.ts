@@ -219,8 +219,11 @@ function parseMessageContent(content: string, messageType: string): string {
 function checkBotMentioned(event: FeishuMessageEvent, botOpenId?: string): boolean {
   const mentions = event.message.mentions ?? [];
   if (mentions.length === 0) return false;
-  if (!botOpenId) return false;
-  return mentions.some((m) => m.id.open_id === botOpenId);
+  // Compatibility fallback: if bot identity is unavailable, treat any explicit mention as addressed.
+  if (!botOpenId) return mentions.length > 0;
+  return mentions.some(
+    (m) => m.id.open_id === botOpenId || m.id.user_id === botOpenId || m.id.union_id === botOpenId,
+  );
 }
 
 function checkAtAllMentioned(event: FeishuMessageEvent): boolean {
