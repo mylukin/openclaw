@@ -711,6 +711,7 @@ export async function handleFeishuMessage(params: {
               msgType: ctx.contentType,
               mentionsJson: JSON.stringify(mentionsForHook),
               eventId: event.message.message_id,
+              hookSource: "feishu_extension_ingress",
             },
           },
           {
