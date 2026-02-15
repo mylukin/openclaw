@@ -18,6 +18,9 @@ const STREAM_UPDATE_MAX_RETRIES = 3;
 const STREAM_SEQUENCE_MAX_RETRIES = 8;
 const STREAM_PREFIX_SIMILARITY_MIN = 0.85;
 const STREAM_MIN_LENGTH_RATIO = 0.85;
+const STREAM_DIVERGENCE_CONFIRMATION_COUNT = 2;
+const STREAM_ROTATION_MIN_LENGTH = 32;
+const STREAM_NOISE_TOKEN_MAX_LENGTH = 6;
 
 type StreamingBackend = "none" | "cardkit" | "raw" | "stopped";
 
@@ -103,6 +106,7 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
   let streamSegmentRotationRequested = false;
   let streamRotationNextText: string | null = null;
   let streamSegmentAccumulatedText = "";
+  let streamDivergenceStreak = 0;
   let streamFinalizing = false;
   let streamNextCardCreateCause: "stream_start" | "segment_rotation" = "stream_start";
 
@@ -185,6 +189,20 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
       : buildMentionedMessage(mentionTargets, text);
   };
 
+  const normalizeComparisonText = (text: string): string => {
+    const trimmed = text.replace(/\s+$/g, "");
+    const withoutTrailingMarkdownControl = trimmed.replace(/[\s*_`~|#>\-:.()]+$/g, "");
+    return withoutTrailingMarkdownControl.replace(/\s+$/g, "");
+  };
+
+  const isShortMarkdownNoiseToken = (text: string): boolean => {
+    const candidate = text.trim();
+    if (!candidate || candidate.length > STREAM_NOISE_TOKEN_MAX_LENGTH) {
+      return false;
+    }
+    return /^[*_`~|#>\-:.()]+$/.test(candidate);
+  };
+
   const isNonRegressiveStreamUpdate = (previous: string, current: string): boolean => {
     if (!previous) {
       return true;
@@ -192,30 +210,33 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
     if (current.startsWith(previous)) {
       return true;
     }
-    const prevTrimmed = previous.replace(/\s+$/g, "");
-    const nextTrimmed = current.replace(/\s+$/g, "");
-    if (!prevTrimmed) {
+    const previousNormalized = normalizeComparisonText(previous);
+    const currentNormalized = normalizeComparisonText(current);
+    if (!previousNormalized) {
       return true;
     }
-    if (nextTrimmed.startsWith(prevTrimmed)) {
+    if (currentNormalized.startsWith(previousNormalized)) {
       return true;
     }
 
-    const lengthRatio = nextTrimmed.length / prevTrimmed.length;
+    const lengthRatio = currentNormalized.length / previousNormalized.length;
     if (lengthRatio < STREAM_MIN_LENGTH_RATIO) {
       return false;
     }
 
-    const compareLen = Math.min(prevTrimmed.length, nextTrimmed.length);
+    const compareLen = Math.min(previousNormalized.length, currentNormalized.length);
     let commonPrefixLen = 0;
     while (commonPrefixLen < compareLen) {
-      if (prevTrimmed.charCodeAt(commonPrefixLen) !== nextTrimmed.charCodeAt(commonPrefixLen)) {
+      if (
+        previousNormalized.charCodeAt(commonPrefixLen) !==
+        currentNormalized.charCodeAt(commonPrefixLen)
+      ) {
         break;
       }
       commonPrefixLen += 1;
     }
 
-    const preservedPrefixRatio = commonPrefixLen / prevTrimmed.length;
+    const preservedPrefixRatio = commonPrefixLen / previousNormalized.length;
     return preservedPrefixRatio >= STREAM_PREFIX_SIMILARITY_MIN;
   };
 
@@ -349,6 +370,7 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
     try {
       if (streamSegmentRotationRequested) {
         streamSegmentRotationRequested = false;
+        streamDivergenceStreak = 0;
         const nextSegmentText = streamRotationNextText;
         streamRotationNextText = null;
         const previousSegmentMessageId = streamMessageId;
@@ -575,19 +597,39 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
       lastPartialQueued = text;
       return;
     }
+
+    if (isShortMarkdownNoiseToken(text)) {
+      runtime.log?.(
+        `feishu[${accountLabel}] stream partial skipped (cause=noise_token, len=${text.length})`,
+      );
+      lastPartialQueued = text;
+      return;
+    }
+
     if (!isNonRegressiveStreamUpdate(streamLastAcceptedPartial, text)) {
       const hasActiveSegment = Boolean(streamMessageId || streamCardKitId);
+      const normalizedLen = normalizeComparisonText(text).length;
+      streamDivergenceStreak += 1;
+      streamRotationNextText = text;
       if (hasActiveSegment) {
-        if (!streamSegmentRotationRequested) {
+        const reachedConfirmation =
+          streamDivergenceStreak >= STREAM_DIVERGENCE_CONFIRMATION_COUNT &&
+          normalizedLen >= STREAM_ROTATION_MIN_LENGTH;
+        if (reachedConfirmation) {
+          if (!streamSegmentRotationRequested) {
+            runtime.log?.(
+              `feishu[${accountLabel}] stream partial diverged (cause=segment_rotation_trigger, streak=${streamDivergenceStreak}, prev=${streamLastAcceptedPartial.length}, next=${text.length}, normalizedNext=${normalizedLen}), rotating to new card segment`,
+            );
+          }
+          streamSegmentRotationRequested = true;
+        } else {
           runtime.log?.(
-            `feishu[${accountLabel}] stream partial diverged (cause=segment_rotation_trigger, prev=${streamLastAcceptedPartial.length}, next=${text.length}), rotating to new card segment`,
+            `feishu[${accountLabel}] stream partial diverged (cause=segment_rotation_deferred, streak=${streamDivergenceStreak}, prev=${streamLastAcceptedPartial.length}, next=${text.length}, normalizedNext=${normalizedLen})`,
           );
         }
-        streamSegmentRotationRequested = true;
-        streamRotationNextText = text;
       }
       lastPartialQueued = text;
-      if (!streamTimer) {
+      if (streamSegmentRotationRequested && !streamTimer) {
         streamTimer = setTimeout(() => {
           void flushStream();
         }, STREAM_THROTTLE_MS);
@@ -597,6 +639,7 @@ export function createFeishuStreamingController(params: FeishuStreamingControlle
 
     streamLastAcceptedPartial = text;
     streamSegmentAccumulatedText = text;
+    streamDivergenceStreak = 0;
     lastPartialQueued = text;
     streamPartialCount += 1;
     streamPendingText = text;
