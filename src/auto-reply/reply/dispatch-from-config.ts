@@ -242,6 +242,7 @@ export async function dispatchReplyFromConfig(params: {
           channelId,
           accountId: ctx.AccountId,
           conversationId,
+          chatType: ctx.ChatType,
         },
       )
       .catch((err) => {

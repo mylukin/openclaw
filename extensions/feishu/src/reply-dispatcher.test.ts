@@ -135,6 +135,7 @@ describe("createFeishuReplyDispatcher message_sent hooks", () => {
       agentId: "agent-main",
       runtime: { log: () => {}, error: () => {} } as never,
       chatId: "oc_chat",
+      chatType: "p2p",
     });
 
     dispatcher.sendFinalReply({ text: "hello world" });
@@ -153,6 +154,7 @@ describe("createFeishuReplyDispatcher message_sent hooks", () => {
         channelId: "feishu",
         accountId: "default",
         conversationId: "oc_chat",
+        chatType: "p2p",
       },
     );
   });

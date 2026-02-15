@@ -44,6 +44,7 @@ export type CreateFeishuReplyDispatcherParams = {
   agentId: string;
   runtime: RuntimeEnv;
   chatId: string;
+  chatType?: "p2p" | "group";
   replyToMessageId?: string;
   mentionTargets?: MentionTarget[];
   accountId?: string;
@@ -142,10 +143,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     messageId?: string,
     metadata?: { msgType?: "text" | "post" | "interactive" },
   ): void => {
-    emitMessageSent(
-      { to: chatId, content, success: true, messageId, metadata },
-      { channelId: "feishu", accountId: account.accountId, conversationId: chatId },
-    );
+    const hookCtx = {
+      channelId: "feishu",
+      accountId: account.accountId,
+      conversationId: chatId,
+      ...(params.chatType ? { chatType: params.chatType } : {}),
+    };
+    emitMessageSent({ to: chatId, content, success: true, messageId, metadata }, hookCtx);
   };
 
   const { dispatcher, replyOptions, markDispatchIdle } =

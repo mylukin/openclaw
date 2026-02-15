@@ -789,6 +789,7 @@ export async function handleFeishuMessage(params: {
             channelId: "feishu",
             accountId: account.accountId,
             conversationId: `chat:${ctx.chatId}`,
+            chatType: ctx.chatType,
           },
         );
 
@@ -1071,6 +1072,7 @@ export async function handleFeishuMessage(params: {
         agentId: route.agentId,
         runtime: runtime as RuntimeEnv,
         chatId: ctx.chatId,
+        chatType: ctx.chatType,
         replyToMessageId: ctx.messageId,
         accountId: account.accountId,
         disableBlockStreaming: disableBlockStreamingFromConfig,
@@ -1173,6 +1175,7 @@ export async function handleFeishuMessage(params: {
         agentId: route.agentId,
         runtime: runtime as RuntimeEnv,
         chatId: ctx.chatId,
+        chatType: ctx.chatType,
         replyToMessageId: ctx.messageId,
         mentionTargets: ctx.mentionTargets,
         accountId: account.accountId,
