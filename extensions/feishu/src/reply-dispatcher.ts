@@ -136,6 +136,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     blockStreamingEnabled,
     thinkingCardEnabled,
     summarize: firstSentence,
+    onSegmentFinalized: ({ messageId, content, cause }) => {
+      params.runtime.log?.(
+        `feishu[${account.accountId}] message_sent hook for segment card (cause=${cause}, messageId=${messageId}, len=${content.length})`,
+      );
+      notifyMessageSent(content, messageId, { msgType: "interactive" });
+    },
   });
 
   const notifyMessageSent = (

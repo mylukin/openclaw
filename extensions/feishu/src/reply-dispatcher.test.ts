@@ -287,3 +287,173 @@ describe("createFeishuReplyDispatcher summary sanitization", () => {
     expect(summaryPayload.summaryText).toBe("Emma 开始吧。");
   });
 });
+
+describe("createFeishuReplyDispatcher partial streaming guard", () => {
+  it("keeps updating the same card when prefix similarity stays above threshold", async () => {
+    vi.useFakeTimers();
+    try {
+      setFeishuRuntime(createRuntime() as never);
+      createCardEntityFeishu.mockResolvedValue({ cardId: "card_stream_1" });
+      sendCardByCardIdFeishu.mockResolvedValue({ messageId: "om_stream_1", chatId: "oc_chat" });
+      updateCardElementContentFeishu.mockResolvedValue(undefined);
+
+      const { replyOptions } = createFeishuReplyDispatcher({
+        cfg: {
+          channels: {
+            feishu: {
+              appId: "app",
+              appSecret: "secret",
+              renderMode: "card",
+              streaming: true,
+              blockStreaming: false,
+            },
+          },
+        } as never,
+        agentId: "agent-main",
+        runtime: { log: () => {}, error: () => {} } as never,
+        chatId: "oc_chat",
+      });
+
+      const first = `${"A".repeat(95)}${"B".repeat(15)}`;
+      const second = `${"A".repeat(95)}X${"B".repeat(14)}-extended`;
+
+      replyOptions.onPartialReply?.({ text: first } as never);
+      await vi.advanceTimersByTimeAsync(600);
+      replyOptions.onPartialReply?.({ text: second } as never);
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(createCardEntityFeishu).toHaveBeenCalledTimes(1);
+      expect(sendCardByCardIdFeishu).toHaveBeenCalledTimes(1);
+      expect(updateCardElementContentFeishu).toHaveBeenCalledTimes(1);
+      expect(closeStreamingModeFeishu).toHaveBeenCalledTimes(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rotates to a new card segment and keeps final updates on the latest card", async () => {
+    vi.useFakeTimers();
+    try {
+      setFeishuRuntime(createRuntime() as never);
+      createCardEntityFeishu
+        .mockResolvedValueOnce({ cardId: "card_stream_1" })
+        .mockResolvedValueOnce({ cardId: "card_stream_2" });
+      sendCardByCardIdFeishu
+        .mockResolvedValueOnce({ messageId: "om_stream_1", chatId: "oc_chat" })
+        .mockResolvedValueOnce({ messageId: "om_stream_2", chatId: "oc_chat" });
+      updateCardElementContentFeishu.mockResolvedValue(undefined);
+      updateCardSummaryFeishu.mockResolvedValue(undefined);
+      closeStreamingModeFeishu.mockResolvedValue(undefined);
+
+      const { dispatcher, replyOptions } = createFeishuReplyDispatcher({
+        cfg: {
+          channels: {
+            feishu: {
+              appId: "app",
+              appSecret: "secret",
+              renderMode: "card",
+              streaming: true,
+              blockStreaming: false,
+            },
+          },
+        } as never,
+        agentId: "agent-main",
+        runtime: { log: () => {}, error: () => {} } as never,
+        chatId: "oc_chat",
+      });
+
+      replyOptions.onPartialReply?.({ text: "hello world" } as never);
+      await vi.advanceTimersByTimeAsync(600);
+
+      replyOptions.onPartialReply?.({ text: "hello" } as never);
+      await vi.advanceTimersByTimeAsync(600);
+
+      dispatcher.sendFinalReply({ text: "hello final answer" });
+      await dispatcher.waitForIdle();
+
+      expect(createCardEntityFeishu).toHaveBeenCalledTimes(2);
+      expect(sendCardByCardIdFeishu).toHaveBeenCalledTimes(2);
+      expect(closeStreamingModeFeishu).toHaveBeenCalledTimes(2);
+
+      expect(updateCardElementContentFeishu).toHaveBeenCalledTimes(1);
+      const updatedCardIds = updateCardElementContentFeishu.mock.calls.map(
+        (args) => (args[0] as { cardId: string }).cardId,
+      );
+      expect(updatedCardIds).toEqual(["card_stream_2"]);
+
+      const summaryCardIds = updateCardSummaryFeishu.mock.calls.map(
+        (args) => (args[0] as { cardId: string }).cardId,
+      );
+      expect(summaryCardIds).toEqual(["card_stream_2"]);
+
+      const closedCardIds = closeStreamingModeFeishu.mock.calls.map(
+        (args) => (args[0] as { cardId: string }).cardId,
+      );
+      expect(closedCardIds).toEqual(["card_stream_1", "card_stream_2"]);
+
+      expect(emitMessageSent).toHaveBeenCalledTimes(2);
+      const sentMessageIds = emitMessageSent.mock.calls.map(
+        (args) => (args[0] as { messageId?: string }).messageId,
+      );
+      expect(sentMessageIds).toEqual(["om_stream_1", "om_stream_2"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses latest segment accumulated text when final snapshot regresses", async () => {
+    vi.useFakeTimers();
+    try {
+      setFeishuRuntime(createRuntime() as never);
+      createCardEntityFeishu
+        .mockResolvedValueOnce({ cardId: "card_stream_1" })
+        .mockResolvedValueOnce({ cardId: "card_stream_2" });
+      sendCardByCardIdFeishu
+        .mockResolvedValueOnce({ messageId: "om_stream_1", chatId: "oc_chat" })
+        .mockResolvedValueOnce({ messageId: "om_stream_2", chatId: "oc_chat" });
+      updateCardElementContentFeishu.mockResolvedValue(undefined);
+      updateCardSummaryFeishu.mockResolvedValue(undefined);
+      closeStreamingModeFeishu.mockResolvedValue(undefined);
+
+      const { dispatcher, replyOptions } = createFeishuReplyDispatcher({
+        cfg: {
+          channels: {
+            feishu: {
+              appId: "app",
+              appSecret: "secret",
+              renderMode: "card",
+              streaming: true,
+              blockStreaming: false,
+            },
+          },
+        } as never,
+        agentId: "agent-main",
+        runtime: { log: () => {}, error: () => {} } as never,
+        chatId: "oc_chat",
+      });
+
+      replyOptions.onPartialReply?.({ text: "first segment text" } as never);
+      await vi.advanceTimersByTimeAsync(600);
+
+      replyOptions.onPartialReply?.({ text: "second segment text" } as never);
+      await vi.advanceTimersByTimeAsync(600);
+
+      dispatcher.sendFinalReply({ text: "first segment text" });
+      await dispatcher.waitForIdle();
+
+      expect(createCardEntityFeishu).toHaveBeenCalledTimes(2);
+      expect(updateCardElementContentFeishu).toHaveBeenCalledTimes(0);
+
+      const summaryPayload = updateCardSummaryFeishu.mock.calls[0]?.[0] as {
+        cardId: string;
+        content: string;
+        summaryText: string;
+      };
+      expect(summaryPayload.cardId).toBe("card_stream_2");
+      expect(summaryPayload.content).toContain("second segment text");
+      expect(summaryPayload.summaryText).toContain("second segment text");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
