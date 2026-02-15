@@ -216,6 +216,45 @@ describe("initSessionState RawBody", () => {
     expect(result.triggerBodyNormalized).toBe("/status");
   });
 
+  it("retargets previousSessionEntry.sessionFile to archived transcript on explicit /new", async () => {
+    const root = await makeCaseDir("openclaw-reset-archive-hook-");
+    const storePath = path.join(root, "sessions.json");
+    const sessionKey = "agent:main:whatsapp:dm:s-reset";
+    const oldSessionId = "session-old";
+    const oldSessionFile = path.join(root, "session-old.jsonl");
+
+    await fs.writeFile(oldSessionFile, '{"type":"message"}\n', "utf-8");
+    await saveSessionStore(storePath, {
+      [sessionKey]: {
+        sessionId: oldSessionId,
+        sessionFile: oldSessionFile,
+        updatedAt: Date.now(),
+      },
+    });
+
+    const cfg = { session: { store: storePath } } as OpenClawConfig;
+    const result = await initSessionState({
+      ctx: {
+        RawBody: "/new",
+        ChatType: "direct",
+        SessionKey: sessionKey,
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.resetTriggered).toBe(true);
+    const archivedSessionFile = result.previousSessionEntry?.sessionFile;
+    expect(archivedSessionFile).toBeDefined();
+    expect(archivedSessionFile).not.toBe(oldSessionFile);
+    expect(archivedSessionFile?.startsWith(`${oldSessionFile}.reset.`)).toBe(true);
+    if (!archivedSessionFile) {
+      throw new Error("Expected archived session file path");
+    }
+    await expect(fs.access(oldSessionFile)).rejects.toThrow();
+    await expect(fs.access(archivedSessionFile)).resolves.toBeUndefined();
+  });
+
   it("uses the default per-agent sessions store when config store is unset", async () => {
     const root = await makeCaseDir("openclaw-session-store-default-");
     const stateDir = path.join(root, ".openclaw");

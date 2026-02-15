@@ -399,13 +399,24 @@ export async function initSessionState(params: {
 
   // Archive old transcript so it doesn't accumulate on disk (#14869).
   if (previousSessionEntry?.sessionId) {
-    archiveSessionTranscripts({
+    const archivedTranscripts = archiveSessionTranscripts({
       sessionId: previousSessionEntry.sessionId,
       storePath,
       sessionFile: previousSessionEntry.sessionFile,
       agentId,
       reason: "reset",
     });
+
+    // Explicit /new hooks run after initSessionState; keep previousSessionEntry
+    // pointed at a readable transcript so session-memory can still summarize.
+    const archivedSessionFile = previousSessionEntry.sessionFile
+      ? archivedTranscripts.find((candidate) =>
+          candidate.startsWith(`${previousSessionEntry.sessionFile}.reset.`),
+        )
+      : archivedTranscripts[0];
+    if (archivedSessionFile) {
+      previousSessionEntry.sessionFile = archivedSessionFile;
+    }
   }
 
   const sessionCtx: TemplateContext = {
