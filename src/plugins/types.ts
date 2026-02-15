@@ -376,6 +376,8 @@ export type PluginHookMessageContext = {
   channelId: string;
   accountId?: string;
   conversationId?: string;
+  /** Channel-specific chat type (e.g. p2p/group/direct/channel). */
+  chatType?: string;
 };
 
 // message_received hook
