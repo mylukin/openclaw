@@ -353,6 +353,52 @@ describe("handleFeishuMessage command authorization", () => {
     );
   });
 
+  it("keeps DM auto reply path when dispatchMode=plugin", async () => {
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          dispatchMode: "plugin",
+          dmPolicy: "open",
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-dm-user",
+        },
+      },
+      message: {
+        message_id: "msg-plugin-dm",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello in dm" }),
+      },
+    };
+
+    await handleFeishuMessage({
+      cfg,
+      event,
+      runtime: {
+        log: vi.fn(),
+        error: vi.fn(),
+        exit: vi.fn((code: number): never => {
+          throw new Error(`exit ${code}`);
+        }),
+      } as RuntimeEnv,
+    });
+
+    expect(mockCreateReplyDispatcherWithTyping).not.toHaveBeenCalled();
+    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledTimes(1);
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    const dispatchArgs = mockDispatchReplyFromConfig.mock.calls[0]?.[0] as
+      | { replyResolver?: unknown }
+      | undefined;
+    expect(dispatchArgs?.replyResolver).toBeUndefined();
+  });
+
   it("always marks dispatch idle in plugin mode even when dispatch throws", async () => {
     const markDispatchIdle = vi.fn();
     mockCreateReplyDispatcherWithTyping.mockReturnValueOnce({
