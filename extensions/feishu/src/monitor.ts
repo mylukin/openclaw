@@ -26,6 +26,11 @@ const botOpenIds = new Map<string, string>();
 const FEISHU_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
 const FEISHU_WEBHOOK_BODY_TIMEOUT_MS = 30_000;
 
+export function getBotOpenId(accountId: string): string | undefined {
+  const value = botOpenIds.get(accountId)?.trim();
+  return value ? value : undefined;
+}
+
 async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
   try {
     const result = await probeFeishu(account);
