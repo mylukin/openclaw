@@ -962,7 +962,7 @@ export async function handleFeishuMessage(params: {
           cfg: effectiveCfg,
           dispatcher,
           replyOptions,
-          replyResolver: async () => null,
+          replyResolver: async () => undefined,
         });
       } finally {
         markDispatchIdle();
