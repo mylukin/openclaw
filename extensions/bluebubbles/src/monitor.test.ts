@@ -90,6 +90,9 @@ const mockResolveChunkMode = vi.fn(() => "length");
 function createMockRuntime(): PluginRuntime {
   return {
     version: "1.0.0",
+    agents: {
+      runEmbeddedPiAgent: vi.fn() as unknown as PluginRuntime["agents"]["runEmbeddedPiAgent"],
+    },
     config: {
       loadConfig: vi.fn(() => ({})) as unknown as PluginRuntime["config"]["loadConfig"],
       writeConfigFile: vi.fn() as unknown as PluginRuntime["config"]["writeConfigFile"],
