@@ -407,6 +407,12 @@ describe("dispatchReplyFromConfig", () => {
       SenderUsername: "alice",
       SenderE164: "+15555550123",
       AccountId: "acc-1",
+      ChannelData: {
+        feishu: {
+          messageId: "om_123",
+          chatId: "oc_456",
+        },
+      },
     });
 
     const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
@@ -421,6 +427,12 @@ describe("dispatchReplyFromConfig", () => {
           originatingChannel: "Telegram",
           originatingTo: "telegram:999",
           messageId: "sid-full",
+          channelData: {
+            feishu: {
+              messageId: "om_123",
+              chatId: "oc_456",
+            },
+          },
           senderId: "user-1",
           senderName: "Alice",
           senderUsername: "alice",
