@@ -107,6 +107,20 @@ export type SendFeishuMessageParams = {
   accountId?: string;
 };
 
+function buildMentionMeta(
+  mentions?: MentionTarget[],
+): { mentions: Array<{ id: string; name?: string }> } | undefined {
+  if (!mentions || mentions.length === 0) {
+    return undefined;
+  }
+  return {
+    mentions: mentions.map((mention) => ({
+      id: mention.openId,
+      name: mention.name,
+    })),
+  };
+}
+
 function buildMentionDisplayNameMap(
   mentions?: MentionTarget[],
 ): Record<string, string> | undefined {
@@ -195,7 +209,10 @@ export async function sendMessageFeishu(
       },
     });
     assertFeishuMessageApiSuccess(response, "Feishu reply failed");
-    return toFeishuSendResult(response, receiveId);
+    return {
+      ...toFeishuSendResult(response, receiveId),
+      ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+    };
   }
 
   const response = await client.im.message.create({
@@ -207,7 +224,10 @@ export async function sendMessageFeishu(
     },
   });
   assertFeishuMessageApiSuccess(response, "Feishu send failed");
-  return toFeishuSendResult(response, receiveId);
+  return {
+    ...toFeishuSendResult(response, receiveId),
+    ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+  };
 }
 
 export type SendFeishuCardParams = {
@@ -215,6 +235,7 @@ export type SendFeishuCardParams = {
   to: string;
   card: Record<string, unknown>;
   replyToMessageId?: string;
+  mentions?: MentionTarget[];
   accountId?: string;
 };
 
@@ -232,7 +253,10 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
       },
     });
     assertFeishuMessageApiSuccess(response, "Feishu card reply failed");
-    return toFeishuSendResult(response, receiveId);
+    return {
+      ...toFeishuSendResult(response, receiveId),
+      ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+    };
   }
 
   const response = await client.im.message.create({
@@ -244,7 +268,10 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
     },
   });
   assertFeishuMessageApiSuccess(response, "Feishu card send failed");
-  return toFeishuSendResult(response, receiveId);
+  return {
+    ...toFeishuSendResult(response, receiveId),
+    ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+  };
 }
 
 export async function updateCardFeishu(params: {
@@ -315,7 +342,7 @@ export async function sendMarkdownCardFeishu(params: {
   }
   cardText = normalizeMentionTagsForCard(cardText);
   const card = buildMarkdownCard(cardText);
-  return sendCardFeishu({ cfg, to, card, replyToMessageId, accountId });
+  return sendCardFeishu({ cfg, to, card, replyToMessageId, mentions, accountId });
 }
 
 /**
