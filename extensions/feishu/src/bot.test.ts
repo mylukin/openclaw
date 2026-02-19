@@ -146,6 +146,7 @@ describe("handleFeishuMessage command authorization", () => {
           finalizeInboundContext: mockFinalizeInboundContext,
           dispatchReplyFromConfig: mockDispatchReplyFromConfig,
           withReplyDispatcher: mockWithReplyDispatcher,
+          createReplyDispatcherWithTyping: mockCreateReplyDispatcherWithTyping,
         },
         commands: {
           shouldComputeCommandAuthorized: mockShouldComputeCommandAuthorized,
