@@ -2,7 +2,12 @@ import type { ClawdbotConfig } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import type { MentionTarget } from "./mention.js";
-import { buildMentionedMessage, buildMentionedCardContent } from "./mention.js";
+import {
+  buildMentionedMessage,
+  buildMentionedCardContent,
+  normalizeMentionTagsForCard,
+  normalizeMentionTagsForText,
+} from "./mention.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { assertFeishuMessageApiSuccess, toFeishuSendResult } from "./send-result.js";
 import { resolveFeishuSendTarget } from "./send-target.js";
@@ -102,6 +107,43 @@ export type SendFeishuMessageParams = {
   accountId?: string;
 };
 
+function buildMentionDisplayNameMap(
+  mentions?: MentionTarget[],
+): Record<string, string> | undefined {
+  if (!mentions || mentions.length === 0) {
+    return undefined;
+  }
+  const map: Record<string, string> = {};
+  for (const mention of mentions) {
+    const openId = mention.openId?.trim();
+    if (!openId) {
+      continue;
+    }
+    const name = mention.name?.trim();
+    if (name) {
+      map[openId] = name;
+    }
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
+function normalizeCardMentionTags(value: unknown): unknown {
+  if (typeof value === "string") {
+    return normalizeMentionTagsForCard(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeCardMentionTags(item));
+  }
+  if (value && typeof value === "object") {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      normalized[key] = normalizeCardMentionTags(item);
+    }
+    return normalized;
+  }
+  return value;
+}
+
 function buildFeishuPostMessagePayload(params: { messageText: string }): {
   content: string;
   msgType: string;
@@ -139,6 +181,7 @@ export async function sendMessageFeishu(
   if (mentions && mentions.length > 0) {
     rawText = buildMentionedMessage(mentions, rawText);
   }
+  rawText = normalizeMentionTagsForText(rawText, buildMentionDisplayNameMap(mentions));
   const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(rawText, tableMode);
 
   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
@@ -217,7 +260,7 @@ export async function updateCardFeishu(params: {
   }
 
   const client = createFeishuClient(account);
-  const content = JSON.stringify(card);
+  const content = JSON.stringify(normalizeCardMentionTags(card));
 
   const response = await client.im.message.patch({
     path: { message_id: messageId },
@@ -270,6 +313,7 @@ export async function sendMarkdownCardFeishu(params: {
   if (mentions && mentions.length > 0) {
     cardText = buildMentionedCardContent(mentions, text);
   }
+  cardText = normalizeMentionTagsForCard(cardText);
   const card = buildMarkdownCard(cardText);
   return sendCardFeishu({ cfg, to, card, replyToMessageId, accountId });
 }
@@ -295,7 +339,11 @@ export async function editMessageFeishu(params: {
     cfg,
     channel: "feishu",
   });
-  const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(text ?? "", tableMode);
+  const normalizedText = normalizeMentionTagsForText(text ?? "");
+  const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(
+    normalizedText,
+    tableMode,
+  );
 
   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
 
