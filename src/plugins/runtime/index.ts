@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { resolveEffectiveMessagesConfig, resolveHumanDelayConfig } from "../../agents/identity.js";
+import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import { createMemoryGetTool, createMemorySearchTool } from "../../agents/tools/memory-tool.js";
 import { handleSlackAction } from "../../agents/tools/slack-actions.js";
 import {
@@ -239,6 +240,9 @@ function loadWhatsAppActions() {
 export function createPluginRuntime(): PluginRuntime {
   return {
     version: resolveVersion(),
+    agents: {
+      runEmbeddedPiAgent,
+    },
     config: createRuntimeConfig(),
     system: createRuntimeSystem(),
     media: createRuntimeMedia(),
