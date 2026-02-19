@@ -335,11 +335,14 @@ async function deliverOutboundPayloadsCore(
   const sendTextChunks = async (
     text: string,
     overrides?: { replyToId?: string | null; threadId?: string | number | null },
-  ) => {
+  ): Promise<OutboundDeliveryResult[]> => {
+    const sentResults: OutboundDeliveryResult[] = [];
     throwIfAborted(abortSignal);
     if (!handler.chunker || textLimit === undefined) {
-      results.push(await handler.sendText(text, overrides));
-      return;
+      const sent = await handler.sendText(text, overrides);
+      results.push(sent);
+      sentResults.push(sent);
+      return sentResults;
     }
     if (chunkMode === "newline") {
       const mode = handler.chunkerMode ?? "text";
@@ -358,16 +361,21 @@ async function deliverOutboundPayloadsCore(
         }
         for (const chunk of chunks) {
           throwIfAborted(abortSignal);
-          results.push(await handler.sendText(chunk, overrides));
+          const sent = await handler.sendText(chunk, overrides);
+          results.push(sent);
+          sentResults.push(sent);
         }
       }
-      return;
+      return sentResults;
     }
     const chunks = handler.chunker(text, textLimit);
     for (const chunk of chunks) {
       throwIfAborted(abortSignal);
-      results.push(await handler.sendText(chunk, overrides));
+      const sent = await handler.sendText(chunk, overrides);
+      results.push(sent);
+      sentResults.push(sent);
     }
+    return sentResults;
   };
 
   const sendSignalText = async (text: string, styles: SignalTextStyleRange[]) => {
@@ -383,7 +391,8 @@ async function deliverOutboundPayloadsCore(
     };
   };
 
-  const sendSignalTextChunks = async (text: string) => {
+  const sendSignalTextChunks = async (text: string): Promise<OutboundDeliveryResult[]> => {
+    const sentResults: OutboundDeliveryResult[] = [];
     throwIfAborted(abortSignal);
     let signalChunks =
       textLimit === undefined
@@ -396,8 +405,11 @@ async function deliverOutboundPayloadsCore(
     }
     for (const chunk of signalChunks) {
       throwIfAborted(abortSignal);
-      results.push(await sendSignalText(chunk.text, chunk.styles));
+      const sent = await sendSignalText(chunk.text, chunk.styles);
+      results.push(sent);
+      sentResults.push(sent);
     }
+    return sentResults;
   };
 
   const sendSignalMedia = async (caption: string, mediaUrl: string) => {
@@ -453,20 +465,24 @@ async function deliverOutboundPayloadsCore(
       mediaUrls: payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []),
       channelData: payload.channelData,
     };
-    const emitMessageSent = (params: {
+    const emitMessageSent = (event: {
       success: boolean;
       content: string;
       error?: string;
-      messageId?: string;
+      result?: OutboundDeliveryResult;
     }) => {
       if (hookRunner?.hasHooks("message_sent")) {
         void hookRunner
           .runMessageSent(
             {
               to,
-              content: params.content,
-              success: params.success,
-              ...(params.error ? { error: params.error } : {}),
+              content: event.content,
+              success: event.success,
+              ...(event.result?.messageId ? { messageId: event.result.messageId } : {}),
+              ...(event.result?.meta && Object.keys(event.result.meta).length > 0
+                ? { metadata: event.result.meta }
+                : {}),
+              ...(event.error ? { error: event.error } : {}),
             },
             {
               channelId: channel,
@@ -482,16 +498,17 @@ async function deliverOutboundPayloadsCore(
       void triggerInternalHook(
         createInternalHookEvent("message", "sent", sessionKeyForInternalHooks, {
           to,
-          content: params.content,
-          success: params.success,
-          ...(params.error ? { error: params.error } : {}),
+          content: event.content,
+          success: event.success,
+          ...(event.error ? { error: event.error } : {}),
           channelId: channel,
           accountId: accountId ?? undefined,
           conversationId: to,
-          messageId: params.messageId,
+          messageId: event.result?.messageId,
         }),
       ).catch(() => {});
     };
+
     try {
       throwIfAborted(abortSignal);
 
@@ -528,51 +545,48 @@ async function deliverOutboundPayloadsCore(
         threadId: params.threadId ?? undefined,
       };
       if (handler.sendPayload && effectivePayload.channelData) {
-        const delivery = await handler.sendPayload(effectivePayload, sendOverrides);
-        results.push(delivery);
+        const sent = await handler.sendPayload(effectivePayload, sendOverrides);
+        results.push(sent);
         emitMessageSent({
           success: true,
           content: payloadSummary.text,
-          messageId: delivery.messageId,
+          result: sent,
         });
         continue;
       }
+
       if (payloadSummary.mediaUrls.length === 0) {
-        const beforeCount = results.length;
-        if (isSignalChannel) {
-          await sendSignalTextChunks(payloadSummary.text);
-        } else {
-          await sendTextChunks(payloadSummary.text, sendOverrides);
-        }
-        const messageId = results.at(-1)?.messageId;
+        const sentResults = isSignalChannel
+          ? await sendSignalTextChunks(payloadSummary.text)
+          : await sendTextChunks(payloadSummary.text, sendOverrides);
         emitMessageSent({
-          success: results.length > beforeCount,
+          success: sentResults.length > 0,
           content: payloadSummary.text,
-          messageId,
+          result: pickMessageSentResult(sentResults),
         });
         continue;
       }
 
       let first = true;
-      let lastMessageId: string | undefined;
+      const sentResults: OutboundDeliveryResult[] = [];
       for (const url of payloadSummary.mediaUrls) {
         throwIfAborted(abortSignal);
         const caption = first ? payloadSummary.text : "";
         first = false;
         if (isSignalChannel) {
-          const delivery = await sendSignalMedia(caption, url);
-          results.push(delivery);
-          lastMessageId = delivery.messageId;
+          const sent = await sendSignalMedia(caption, url);
+          results.push(sent);
+          sentResults.push(sent);
         } else {
-          const delivery = await handler.sendMedia(caption, url, sendOverrides);
-          results.push(delivery);
-          lastMessageId = delivery.messageId;
+          const sent = await handler.sendMedia(caption, url, sendOverrides);
+          results.push(sent);
+          sentResults.push(sent);
         }
       }
       emitMessageSent({
-        success: true,
+        success: sentResults.length > 0,
         content: payloadSummary.text,
-        messageId: lastMessageId,
+        result: pickMessageSentResult(sentResults),
       });
     } catch (err) {
       emitMessageSent({
