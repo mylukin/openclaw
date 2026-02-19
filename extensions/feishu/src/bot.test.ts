@@ -90,6 +90,7 @@ describe("handleFeishuMessage command authorization", () => {
           formatAgentEnvelope: vi.fn((params: { body: string }) => params.body),
           finalizeInboundContext: mockFinalizeInboundContext,
           dispatchReplyFromConfig: mockDispatchReplyFromConfig,
+          createReplyDispatcherWithTyping: mockCreateReplyDispatcherWithTyping,
         },
         commands: {
           shouldComputeCommandAuthorized: mockShouldComputeCommandAuthorized,
