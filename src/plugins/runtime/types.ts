@@ -177,6 +177,7 @@ type CreateQuickReplyItems = typeof import("../../line/send.js").createQuickRepl
 type BuildTemplateMessageFromPayload =
   typeof import("../../line/template-messages.js").buildTemplateMessageFromPayload;
 type MonitorLineProvider = typeof import("../../line/monitor.js").monitorLineProvider;
+type RunEmbeddedPiAgent = typeof import("../../agents/pi-embedded.js").runEmbeddedPiAgent;
 
 export type RuntimeLogger = {
   debug?: (message: string, meta?: Record<string, unknown>) => void;
@@ -187,6 +188,9 @@ export type RuntimeLogger = {
 
 export type PluginRuntime = {
   version: string;
+  agents: {
+    runEmbeddedPiAgent: RunEmbeddedPiAgent;
+  };
   config: {
     loadConfig: LoadConfig;
     writeConfigFile: WriteConfigFile;
