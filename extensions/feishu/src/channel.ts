@@ -40,6 +40,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
   id: "feishu",
   meta: {
     ...meta,
+    preferSessionLookupForAnnounceTarget: true,
   },
   pairing: {
     idLabel: "feishuUserId",
