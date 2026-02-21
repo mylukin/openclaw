@@ -497,6 +497,7 @@ export async function handleFeishuMessage(params: {
   cfg: ClawdbotConfig;
   event: FeishuMessageEvent;
   botOpenId?: string;
+  botOpenIdsByAccount?: Record<string, string | undefined>;
   runtime?: RuntimeEnv;
   chatHistories?: Map<string, HistoryEntry[]>;
   accountId?: string;
@@ -555,6 +556,7 @@ export async function handleFeishuMessage(params: {
     0,
     feishuCfg?.historyLimit ?? cfg.messages?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT,
   );
+  const dispatchMode = feishuCfg?.dispatchMode ?? "auto";
   const groupConfig = isGroup
     ? resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: ctx.chatId })
     : undefined;
@@ -601,7 +603,7 @@ export async function handleFeishuMessage(params: {
       groupConfig,
     });
 
-    if (requireMention && !ctx.mentionedBot) {
+    if (dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot) {
       log(
         `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
       );
@@ -935,8 +937,57 @@ export async function handleFeishuMessage(params: {
       CommandAuthorized: commandAuthorized,
       OriginatingChannel: "feishu" as const,
       OriginatingTo: feishuTo,
+      ChannelData: {
+        messageId: ctx.messageId,
+        chatId: ctx.chatId,
+        chatType: ctx.chatType,
+        accountId: account.accountId,
+        accountBotOpenId: botOpenId,
+        botOpenIdsByAccount: params.botOpenIdsByAccount,
+        messageType: event.message.message_type,
+        rootId: ctx.rootId,
+        parentId: ctx.parentId,
+        mentions: event.message.mentions ?? [],
+        senderType: event.sender.sender_type,
+        senderOpenId: ctx.senderOpenId,
+        senderUnionId: event.sender.sender_id.union_id,
+      },
       ...mediaPayload,
     });
+
+    if (isGroup && dispatchMode === "plugin") {
+      // Group-only plugin mode: emit message_received hook via dispatchReplyFromConfig,
+      // but skip full reply generation by providing a null reply resolver.
+      const { dispatcher, replyOptions, markDispatchIdle } =
+        core.channel.reply.createReplyDispatcherWithTyping({
+          deliver: async () => {},
+          onIdle: () => {},
+          onError: () => {},
+        });
+
+      log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
+
+      try {
+        await core.channel.reply.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg: effectiveCfg,
+          dispatcher,
+          replyOptions,
+          replyResolver: async () => undefined,
+        });
+      } finally {
+        markDispatchIdle();
+      }
+
+      if (isGroup && historyKey && chatHistories) {
+        clearHistoryEntriesIfEnabled({
+          historyMap: chatHistories,
+          historyKey,
+          limit: historyLimit,
+        });
+      }
+      return;
+    }
 
     const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
       cfg,

@@ -182,6 +182,7 @@ export async function dispatchReplyFromConfig(params: {
             originatingChannel: ctx.OriginatingChannel,
             originatingTo: ctx.OriginatingTo,
             messageId: messageIdForHook,
+            channelData: ctx.ChannelData,
             senderId: ctx.SenderId,
             senderName: ctx.SenderName,
             senderUsername: ctx.SenderUsername,

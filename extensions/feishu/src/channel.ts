@@ -40,6 +40,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
   id: "feishu",
   meta: {
     ...meta,
+    preferSessionLookupForAnnounceTarget: true,
   },
   pairing: {
     idLabel: "feishuUserId",
@@ -88,6 +89,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
           ],
         },
         connectionMode: { type: "string", enum: ["websocket", "webhook"] },
+        dispatchMode: { type: "string", enum: ["auto", "plugin"] },
         webhookPath: { type: "string" },
         webhookHost: { type: "string" },
         webhookPort: { type: "integer", minimum: 1 },
@@ -122,6 +124,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
               webhookHost: { type: "string" },
               webhookPath: { type: "string" },
               webhookPort: { type: "integer", minimum: 1 },
+              dispatchMode: { type: "string", enum: ["auto", "plugin"] },
             },
           },
         },
