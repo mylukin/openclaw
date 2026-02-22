@@ -508,6 +508,7 @@ async function deliverOutboundPayloadsCore(
           accountId: accountId ?? undefined,
           conversationId: to,
           messageId: event.result?.messageId,
+          ...(event.result?.meta ? { metadata: event.result.meta } : {}),
         }),
       ).catch(() => {});
     };
