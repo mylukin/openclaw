@@ -482,3 +482,7 @@ export type { ProcessedLineMessage } from "../line/markdown-to-line.js";
 
 // Media utilities
 export { loadWebMedia, type WebMediaResult } from "../web/media.js";
+
+// Plugin hooks
+export type { HookRunner } from "../plugins/hooks.js";
+export { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
