@@ -11,8 +11,14 @@ const {
   mockDownloadMessageResourceFeishu,
   mockCreateFeishuClient,
   mockResolveAgentRoute,
+  mockCreateReplyDispatcherWithTyping,
 } = vi.hoisted(() => ({
   mockCreateFeishuReplyDispatcher: vi.fn(() => ({
+    dispatcher: vi.fn(),
+    replyOptions: {},
+    markDispatchIdle: vi.fn(),
+  })),
+  mockCreateReplyDispatcherWithTyping: vi.fn(() => ({
     dispatcher: vi.fn(),
     replyOptions: {},
     markDispatchIdle: vi.fn(),
