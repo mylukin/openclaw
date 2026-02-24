@@ -146,7 +146,11 @@ describe("feishuOutbound renderMode routing", () => {
       config: { renderMode: "card" },
     });
 
-    await feishuOutbound.sendText({
+    const sendText = feishuOutbound.sendText;
+    if (!sendText) {
+      throw new Error("feishuOutbound.sendText is not configured");
+    }
+    await sendText({
       cfg: {} as never,
       to: "chat:oc_xxx",
       text: "plain text",
@@ -169,7 +173,11 @@ describe("feishuOutbound renderMode routing", () => {
       config: { renderMode: "raw" },
     });
 
-    await feishuOutbound.sendText({
+    const sendText = feishuOutbound.sendText;
+    if (!sendText) {
+      throw new Error("feishuOutbound.sendText is not configured");
+    }
+    await sendText({
       cfg: {} as never,
       to: "chat:oc_xxx",
       text: "plain text",
@@ -185,7 +193,11 @@ describe("feishuOutbound renderMode routing", () => {
       config: { renderMode: "auto" },
     });
 
-    await feishuOutbound.sendText({
+    const sendText = feishuOutbound.sendText;
+    if (!sendText) {
+      throw new Error("feishuOutbound.sendText is not configured");
+    }
+    await sendText({
       cfg: {} as never,
       to: "chat:oc_xxx",
       text: "```ts\nconst x = 1\n```",
@@ -202,7 +214,11 @@ describe("feishuOutbound renderMode routing", () => {
       .mockReturnValueOnce({ config: { renderMode: "card" } });
     sendMediaFeishuMock.mockRejectedValueOnce(new Error("upload failed"));
 
-    await feishuOutbound.sendMedia({
+    const sendMedia = feishuOutbound.sendMedia;
+    if (!sendMedia) {
+      throw new Error("feishuOutbound.sendMedia is not configured");
+    }
+    await sendMedia({
       cfg: {} as never,
       to: "chat:oc_xxx",
       text: "",
