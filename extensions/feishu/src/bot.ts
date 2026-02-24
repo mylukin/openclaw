@@ -975,12 +975,21 @@ export async function handleFeishuMessage(params: {
         accountBotOpenId: botOpenId,
         botOpenIdsByAccount: params.botOpenIdsByAccount,
         messageType: event.message.message_type,
+        rawContent: event.message.content,
         rootId: ctx.rootId,
         parentId: ctx.parentId,
         mentions: event.message.mentions ?? [],
         senderType: event.sender.sender_type,
         senderOpenId: ctx.senderOpenId,
         senderUnionId: event.sender.sender_id.union_id,
+        ...(mediaList.length > 0
+          ? {
+              mediaPath: mediaList[0].path,
+              mediaType: mediaList[0].contentType,
+              mediaPaths: mediaList.map((m) => m.path),
+              mediaTypes: mediaList.filter((m) => m.contentType).map((m) => m.contentType!),
+            }
+          : {}),
       },
       ...mediaPayload,
     });
