@@ -85,6 +85,7 @@ function registerEventHandlers(
       try {
         const event = data as unknown as FeishuBotAddedEvent;
         log(`feishu[${accountId}]: bot added to chat ${event.chat_id}`);
+        if (!event.chat_id) return;
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_bot_added")) {
           void hookRunner.runChatMemberBotAdded(
@@ -100,6 +101,7 @@ function registerEventHandlers(
       try {
         const event = data as unknown as { chat_id: string };
         log(`feishu[${accountId}]: bot removed from chat ${event.chat_id}`);
+        if (!event.chat_id) return;
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_bot_deleted")) {
           void hookRunner.runChatMemberBotDeleted(
@@ -121,15 +123,18 @@ function registerEventHandlers(
           }>;
         };
         log(`feishu[${accountId}]: users added to chat ${event.chat_id}`);
+        if (!event.chat_id) return;
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_user_added")) {
-          const users = (event.users ?? []).map((u) => ({
-            openId: u.user_id?.open_id ?? "",
-            unionId: u.user_id?.union_id,
-            name: u.name,
-          }));
+          const users = (event.users ?? [])
+            .filter((u) => !!u.user_id?.open_id)
+            .map((u) => ({
+              openId: u.user_id!.open_id!,
+              unionId: u.user_id?.union_id,
+              name: u.name,
+            }));
           void hookRunner.runChatMemberUserAdded(
-            { chatId: event.chat_id ?? "", users },
+            { chatId: event.chat_id, users },
             { channelId: "feishu", accountId },
           );
         }
@@ -147,15 +152,18 @@ function registerEventHandlers(
           }>;
         };
         log(`feishu[${accountId}]: users deleted from chat ${event.chat_id}`);
+        if (!event.chat_id) return;
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_user_deleted")) {
-          const users = (event.users ?? []).map((u) => ({
-            openId: u.user_id?.open_id ?? "",
-            unionId: u.user_id?.union_id,
-            name: u.name,
-          }));
+          const users = (event.users ?? [])
+            .filter((u) => !!u.user_id?.open_id)
+            .map((u) => ({
+              openId: u.user_id!.open_id!,
+              unionId: u.user_id?.union_id,
+              name: u.name,
+            }));
           void hookRunner.runChatMemberUserDeleted(
-            { chatId: event.chat_id ?? "", users },
+            { chatId: event.chat_id, users },
             { channelId: "feishu", accountId },
           );
         }
@@ -173,15 +181,18 @@ function registerEventHandlers(
           }>;
         };
         log(`feishu[${accountId}]: users withdrawn from chat ${event.chat_id}`);
+        if (!event.chat_id) return;
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_user_withdrawn")) {
-          const users = (event.users ?? []).map((u) => ({
-            openId: u.user_id?.open_id ?? "",
-            unionId: u.user_id?.union_id,
-            name: u.name,
-          }));
+          const users = (event.users ?? [])
+            .filter((u) => !!u.user_id?.open_id)
+            .map((u) => ({
+              openId: u.user_id!.open_id!,
+              unionId: u.user_id?.union_id,
+              name: u.name,
+            }));
           void hookRunner.runChatMemberUserWithdrawn(
-            { chatId: event.chat_id ?? "", users },
+            { chatId: event.chat_id, users },
             { channelId: "feishu", accountId },
           );
         }
