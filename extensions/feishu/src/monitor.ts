@@ -5,9 +5,9 @@ import {
   type ClawdbotConfig,
   type RuntimeEnv,
   type HistoryEntry,
-  getGlobalHookRunner,
   installRequestBodyLimitGuard,
 } from "openclaw/plugin-sdk";
+import { getGlobalHookRunner } from "../../../src/plugins/hook-runner-global.js";
 import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
 import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
