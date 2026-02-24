@@ -308,6 +308,11 @@ export type PluginHookName =
   | "message_received"
   | "message_sending"
   | "message_sent"
+  | "chat_member_user_added"
+  | "chat_member_user_deleted"
+  | "chat_member_user_withdrawn"
+  | "chat_member_bot_added"
+  | "chat_member_bot_deleted"
   | "before_tool_call"
   | "after_tool_call"
   | "tool_result_persist"
@@ -464,6 +469,17 @@ export type PluginHookMessageSentEvent = {
   error?: string;
 };
 
+// chat_member_user_added / chat_member_user_deleted / chat_member_user_withdrawn hook
+export type PluginHookChatMemberUserEvent = {
+  chatId: string;
+  users: Array<{ openId: string; unionId?: string; name?: string }>;
+};
+
+// chat_member_bot_added / chat_member_bot_deleted hook
+export type PluginHookChatMemberBotEvent = {
+  chatId: string;
+};
+
 // Tool context
 export type PluginHookToolContext = {
   agentId?: string;
@@ -607,6 +623,26 @@ export type PluginHookHandlerMap = {
   ) => Promise<PluginHookMessageSendingResult | void> | PluginHookMessageSendingResult | void;
   message_sent: (
     event: PluginHookMessageSentEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_added: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_deleted: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_withdrawn: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_bot_added: (
+    event: PluginHookChatMemberBotEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_bot_deleted: (
+    event: PluginHookChatMemberBotEvent,
     ctx: PluginHookMessageContext,
   ) => Promise<void> | void;
   before_tool_call: (
