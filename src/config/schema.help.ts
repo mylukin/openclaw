@@ -319,6 +319,10 @@ export const FIELD_HELP: Record<string, string> = {
     "Extra node.invoke commands to allow beyond the gateway defaults (array of command strings). Enabling dangerous commands here is a security-sensitive override and is flagged by `openclaw security audit`.",
   "gateway.nodes.denyCommands":
     "Commands to block even if present in node claims or default allowlist.",
+  "gateway.nodes.overrides":
+    "Per-node command policy overrides, keyed by node displayName, nodeId, or nodeId prefix. " +
+    "Each entry may specify allowCommands and denyCommands that merge with the global lists. " +
+    "Match precedence is nodeId exact, then displayName exact, then longest nodeId prefix.",
   nodeHost:
     "Node host controls for features exposed from this gateway node to other nodes or clients. Keep defaults unless you intentionally proxy local capabilities across your node network.",
   "nodeHost.browserProxy":
