@@ -192,6 +192,10 @@ function createChannelOutboundContextBase(
 
 const isAbortError = (err: unknown): boolean => err instanceof Error && err.name === "AbortError";
 
+const pickMessageSentResult = (
+  sentResults: OutboundDeliveryResult[],
+): OutboundDeliveryResult | undefined => sentResults.at(-1);
+
 type DeliverOutboundPayloadsCoreParams = {
   cfg: OpenClawConfig;
   channel: Exclude<OutboundChannel, "none">;
