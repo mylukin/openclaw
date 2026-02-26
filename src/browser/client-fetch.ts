@@ -1,5 +1,6 @@
 import { formatCliCommand } from "../cli/command-format.js";
 import { loadConfig } from "../config/config.js";
+import { isLoopbackHost } from "../gateway/net.js";
 import { getBridgeAuthForPort } from "./bridge-auth-registry.js";
 import { resolveBrowserControlAuth } from "./control-auth.js";
 import {
@@ -20,8 +21,7 @@ function isAbsoluteHttp(url: string): boolean {
 
 function isLoopbackHttpUrl(url: string): boolean {
   try {
-    const host = new URL(url).hostname.trim().toLowerCase();
-    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+    return isLoopbackHost(new URL(url).hostname);
   } catch {
     return false;
   }

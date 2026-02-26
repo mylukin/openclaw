@@ -1,3 +1,4 @@
+import type { AcpConfig } from "./types.acp.js";
 import type { AgentBinding, AgentsConfig } from "./types.agents.js";
 import type { ApprovalsConfig } from "./types.approvals.js";
 import type { AuthConfig } from "./types.auth.js";
@@ -33,6 +34,7 @@ export type OpenClawConfig = {
     lastTouchedAt?: string;
   };
   auth?: AuthConfig;
+  acp?: AcpConfig;
   env?: {
     /** Opt-in: import missing secrets from a login shell environment (exec `$SHELL -l -c 'env -0'`). */
     shellEnv?: {
@@ -63,6 +65,17 @@ export type OpenClawConfig = {
     channel?: "stable" | "beta" | "dev";
     /** Check for updates on gateway start (npm installs only). */
     checkOnStart?: boolean;
+    /** Core auto-update policy for package installs. */
+    auto?: {
+      /** Enable background auto-update checks and apply logic. Default: false. */
+      enabled?: boolean;
+      /** Stable channel minimum delay before auto-apply. Default: 6. */
+      stableDelayHours?: number;
+      /** Additional stable-channel jitter window. Default: 12. */
+      stableJitterHours?: number;
+      /** Beta channel check cadence. Default: 1 hour. */
+      betaCheckIntervalHours?: number;
+    };
   };
   browser?: BrowserConfig;
   ui?: {
