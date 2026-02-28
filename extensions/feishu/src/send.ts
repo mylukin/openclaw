@@ -192,6 +192,7 @@ export async function sendMessageFeishu(
   params: SendFeishuMessageParams,
 ): Promise<FeishuSendResult> {
   const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId } = params;
+  const mentionMeta = buildMentionMeta(mentions);
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
     cfg,
@@ -225,7 +226,7 @@ export async function sendMessageFeishu(
     assertFeishuMessageApiSuccess(response, "Feishu reply failed");
     return {
       ...toFeishuSendResult(response, receiveId),
-      ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+      ...(mentionMeta ? { meta: mentionMeta } : {}),
     };
   }
 
@@ -245,7 +246,7 @@ export async function sendMessageFeishu(
   assertFeishuMessageApiSuccess(response, "Feishu send failed");
   return {
     ...toFeishuSendResult(response, receiveId),
-    ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+    ...(mentionMeta ? { meta: mentionMeta } : {}),
   };
 }
 
@@ -262,6 +263,7 @@ export type SendFeishuCardParams = {
 
 export async function sendCardFeishu(params: SendFeishuCardParams): Promise<FeishuSendResult> {
   const { cfg, to, card, replyToMessageId, replyInThread, mentions, accountId } = params;
+  const mentionMeta = buildMentionMeta(mentions);
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
   const content = JSON.stringify(card);
 
@@ -282,7 +284,7 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
     assertFeishuMessageApiSuccess(response, "Feishu card reply failed");
     return {
       ...toFeishuSendResult(response, receiveId),
-      ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+      ...(mentionMeta ? { meta: mentionMeta } : {}),
     };
   }
 
@@ -302,7 +304,7 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
   assertFeishuMessageApiSuccess(response, "Feishu card send failed");
   return {
     ...toFeishuSendResult(response, receiveId),
-    ...(buildMentionMeta(mentions) ? { meta: buildMentionMeta(mentions) } : {}),
+    ...(mentionMeta ? { meta: mentionMeta } : {}),
   };
 }
 
