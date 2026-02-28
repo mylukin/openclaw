@@ -1324,12 +1324,14 @@ export async function runEmbeddedAttempt(
               // Pre-analyze images with imageModel, then pass text analysis to main model
               log.debug(`Image pre-analysis: using configured imageModel for image analysis`);
               try {
-                const preAnalysis = await analyzeImagesWithImageModel({
-                  images: imageResult.images,
-                  config: params.config,
-                  agentDir: params.agentDir ?? "",
-                  userPrompt: effectivePrompt,
-                });
+                const preAnalysis = await abortable(
+                  analyzeImagesWithImageModel({
+                    images: imageResult.images,
+                    config: params.config,
+                    agentDir: params.agentDir ?? "",
+                    userPrompt: effectivePrompt,
+                  }),
+                );
                 if (preAnalysis.successfulImageCount > 0 && preAnalysis.analysisText) {
                   log.debug(
                     `Image pre-analysis: analyzed ${preAnalysis.imageCount} image(s) with ${preAnalysis.provider}/${preAnalysis.model}`,
