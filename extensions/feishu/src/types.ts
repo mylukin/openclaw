@@ -13,6 +13,7 @@ export type FeishuAccountConfig = z.infer<typeof FeishuAccountConfigSchema>;
 
 export type FeishuDomain = "feishu" | "lark" | (string & {});
 export type FeishuConnectionMode = "websocket" | "webhook";
+export type FeishuDispatchMode = "auto" | "plugin";
 
 export type ResolvedFeishuAccount = {
   accountId: string;
@@ -51,6 +52,7 @@ export type FeishuMessageContext = {
 export type FeishuSendResult = {
   messageId: string;
   chatId: string;
+  meta?: Record<string, unknown>;
 };
 
 export type FeishuProbeResult = BaseProbeResult<string> & {

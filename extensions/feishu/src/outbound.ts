@@ -1,9 +1,46 @@
 import fs from "fs";
 import path from "path";
-import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk";
+import type { ChannelOutboundAdapter, ClawdbotConfig } from "openclaw/plugin-sdk";
+import { resolveFeishuAccount } from "./accounts.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
-import { sendMessageFeishu } from "./send.js";
+import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
+
+function shouldUseCard(text: string): boolean {
+  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+}
+
+function resolveUseCard(params: {
+  cfg: ClawdbotConfig;
+  accountId?: string;
+  text: string;
+}): boolean {
+  const account = resolveFeishuAccount({ cfg: params.cfg, accountId: params.accountId });
+  const renderMode = account.config?.renderMode ?? "auto";
+  return renderMode === "card" || (renderMode === "auto" && shouldUseCard(params.text));
+}
+
+async function sendTextByRenderMode(params: {
+  cfg: ClawdbotConfig;
+  to: string;
+  text: string;
+  accountId?: string;
+}) {
+  if (resolveUseCard(params)) {
+    return sendMarkdownCardFeishu({
+      cfg: params.cfg,
+      to: params.to,
+      text: params.text,
+      accountId: params.accountId,
+    });
+  }
+  return sendMessageFeishu({
+    cfg: params.cfg,
+    to: params.to,
+    text: params.text,
+    accountId: params.accountId,
+  });
+}
 
 function normalizePossibleLocalImagePath(text: string | undefined): string | null {
   const raw = text?.trim();
@@ -63,13 +100,23 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       }
     }
 
-    const result = await sendMessageFeishu({ cfg, to, text, accountId: accountId ?? undefined });
+    const result = await sendTextByRenderMode({
+      cfg,
+      to,
+      text,
+      accountId: accountId ?? undefined,
+    });
     return { channel: "feishu", ...result };
   },
   sendMedia: async ({ cfg, to, text, mediaUrl, accountId, mediaLocalRoots }) => {
     // Send text first if provided
     if (text?.trim()) {
-      await sendMessageFeishu({ cfg, to, text, accountId: accountId ?? undefined });
+      await sendTextByRenderMode({
+        cfg,
+        to,
+        text,
+        accountId: accountId ?? undefined,
+      });
     }
 
     // Upload and send media if URL or local path provided
@@ -88,7 +135,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         console.error(`[feishu] sendMediaFeishu failed:`, err);
         // Fallback to URL link if upload fails
         const fallbackText = `📎 ${mediaUrl}`;
-        const result = await sendMessageFeishu({
+        const result = await sendTextByRenderMode({
           cfg,
           to,
           text: fallbackText,
@@ -99,7 +146,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
     }
 
     // No media URL, just return text result
-    const result = await sendMessageFeishu({
+    const result = await sendTextByRenderMode({
       cfg,
       to,
       text: text ?? "",

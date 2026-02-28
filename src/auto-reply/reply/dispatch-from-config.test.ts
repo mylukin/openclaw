@@ -1368,6 +1368,12 @@ describe("dispatchReplyFromConfig", () => {
       AccountId: "acc-1",
       GroupSpace: "guild-123",
       GroupChannel: "alerts",
+      ChannelData: {
+        feishu: {
+          messageId: "om_123",
+          chatId: "oc_456",
+        },
+      },
     });
 
     const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
@@ -1382,6 +1388,12 @@ describe("dispatchReplyFromConfig", () => {
           originatingChannel: "Telegram",
           originatingTo: "telegram:999",
           messageId: "sid-full",
+          channelData: {
+            feishu: {
+              messageId: "om_123",
+              chatId: "oc_456",
+            },
+          },
           senderId: "user-1",
           senderName: "Alice",
           senderUsername: "alice",

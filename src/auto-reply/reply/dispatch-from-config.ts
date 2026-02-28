@@ -2,14 +2,12 @@ import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { loadSessionStore, resolveStorePath, type SessionEntry } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
-import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import { isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import {
   logMessageProcessed,
   logMessageQueued,
   logSessionStateChange,
 } from "../../logging/diagnostic.js";
-import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { maybeApplyTtsToPayload, normalizeTtsAutoMode, resolveTtsConfig } from "../../tts/tts.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
@@ -19,6 +17,7 @@ import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { formatAbortReplyText, tryFastAbortFromMessage } from "./abort.js";
 import { shouldBypassAcpDispatchForCommand, tryDispatchAcpReply } from "./dispatch-acp.js";
 import { shouldSkipDuplicateInbound } from "./inbound-dedupe.js";
+import { emitMessageReceivedHooks } from "./message-received-hooks.js";
 import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
 import { shouldSuppressReasoningPayload } from "./reply-payloads.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
@@ -160,87 +159,7 @@ export async function dispatchReplyFromConfig(params: {
   const sessionStoreEntry = resolveSessionStoreEntry(ctx, cfg);
   const inboundAudio = isInboundAudioContext(ctx);
   const sessionTtsAuto = normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto);
-  const hookRunner = getGlobalHookRunner();
-
-  // Extract message context for hooks (plugin and internal)
-  const timestamp =
-    typeof ctx.Timestamp === "number" && Number.isFinite(ctx.Timestamp) ? ctx.Timestamp : undefined;
-  const messageIdForHook =
-    ctx.MessageSidFull ?? ctx.MessageSid ?? ctx.MessageSidFirst ?? ctx.MessageSidLast;
-  const content =
-    typeof ctx.BodyForCommands === "string"
-      ? ctx.BodyForCommands
-      : typeof ctx.RawBody === "string"
-        ? ctx.RawBody
-        : typeof ctx.Body === "string"
-          ? ctx.Body
-          : "";
-  const channelId = (ctx.OriginatingChannel ?? ctx.Surface ?? ctx.Provider ?? "").toLowerCase();
-  const conversationId = ctx.OriginatingTo ?? ctx.To ?? ctx.From ?? undefined;
-
-  // Trigger plugin hooks (fire-and-forget)
-  if (hookRunner?.hasHooks("message_received")) {
-    void hookRunner
-      .runMessageReceived(
-        {
-          from: ctx.From ?? "",
-          content,
-          timestamp,
-          metadata: {
-            to: ctx.To,
-            provider: ctx.Provider,
-            surface: ctx.Surface,
-            threadId: ctx.MessageThreadId,
-            originatingChannel: ctx.OriginatingChannel,
-            originatingTo: ctx.OriginatingTo,
-            messageId: messageIdForHook,
-            senderId: ctx.SenderId,
-            senderName: ctx.SenderName,
-            senderUsername: ctx.SenderUsername,
-            senderE164: ctx.SenderE164,
-            guildId: ctx.GroupSpace,
-            channelName: ctx.GroupChannel,
-          },
-        },
-        {
-          channelId,
-          accountId: ctx.AccountId,
-          conversationId,
-        },
-      )
-      .catch((err) => {
-        logVerbose(`dispatch-from-config: message_received plugin hook failed: ${String(err)}`);
-      });
-  }
-
-  // Bridge to internal hooks (HOOK.md discovery system) - refs #8807
-  if (sessionKey) {
-    void triggerInternalHook(
-      createInternalHookEvent("message", "received", sessionKey, {
-        from: ctx.From ?? "",
-        content,
-        timestamp,
-        channelId,
-        accountId: ctx.AccountId,
-        conversationId,
-        messageId: messageIdForHook,
-        metadata: {
-          to: ctx.To,
-          provider: ctx.Provider,
-          surface: ctx.Surface,
-          threadId: ctx.MessageThreadId,
-          senderId: ctx.SenderId,
-          senderName: ctx.SenderName,
-          senderUsername: ctx.SenderUsername,
-          senderE164: ctx.SenderE164,
-          guildId: ctx.GroupSpace,
-          channelName: ctx.GroupChannel,
-        },
-      }),
-    ).catch((err) => {
-      logVerbose(`dispatch-from-config: message_received internal hook failed: ${String(err)}`);
-    });
-  }
+  emitMessageReceivedHooks({ ctx });
 
   // Check if we should route replies to originating channel instead of dispatcher.
   // Only route when the originating channel is DIFFERENT from the current surface.
