@@ -1217,17 +1217,20 @@ export async function handleFeishuMessage(params: {
 
       log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
 
-      try {
-        await core.channel.reply.dispatchReplyFromConfig({
-          ctx: ctxPayload,
-          cfg: effectiveCfg,
-          dispatcher,
-          replyOptions,
-          replyResolver: async () => undefined,
-        });
-      } finally {
-        markDispatchIdle();
-      }
+      await core.channel.reply.withReplyDispatcher({
+        dispatcher,
+        onSettled: () => {
+          markDispatchIdle();
+        },
+        run: () =>
+          core.channel.reply.dispatchReplyFromConfig({
+            ctx: ctxPayload,
+            cfg: effectiveCfg,
+            dispatcher,
+            replyOptions,
+            replyResolver: async () => undefined,
+          }),
+      });
 
       if (isGroup && historyKey && chatHistories) {
         clearHistoryEntriesIfEnabled({
