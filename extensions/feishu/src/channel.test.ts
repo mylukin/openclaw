@@ -46,3 +46,50 @@ describe("feishuPlugin.status.probeAccount", () => {
     expect(result).toMatchObject({ ok: true, appId: "cli_main" });
   });
 });
+
+describe("feishuPlugin.configSchema", () => {
+  it("exposes account-level dispatchMode in channel schema", () => {
+    const schema = feishuPlugin.configSchema?.schema as
+      | {
+          properties?: {
+            accounts?: {
+              additionalProperties?: {
+                properties?: Record<string, unknown>;
+              };
+            };
+          };
+        }
+      | undefined;
+
+    const dispatchMode = schema?.properties?.accounts?.additionalProperties?.properties
+      ?.dispatchMode as { enum?: string[] } | undefined;
+
+    expect(dispatchMode?.enum).toEqual(["auto", "plugin"]);
+  });
+
+  it("exposes account-level pluginMode.forwardControlCommands in channel schema", () => {
+    const schema = feishuPlugin.configSchema?.schema as
+      | {
+          properties?: {
+            accounts?: {
+              additionalProperties?: {
+                properties?: Record<string, unknown>;
+              };
+            };
+          };
+        }
+      | undefined;
+
+    const pluginMode = schema?.properties?.accounts?.additionalProperties?.properties?.pluginMode as
+      | {
+          properties?: Record<string, unknown>;
+        }
+      | undefined;
+
+    const forwardControlCommands = pluginMode?.properties?.forwardControlCommands as
+      | { type?: string }
+      | undefined;
+
+    expect(forwardControlCommands?.type).toBe("boolean");
+  });
+});
