@@ -778,6 +778,7 @@ export async function handleFeishuMessage(params: {
     0,
     feishuCfg?.historyLimit ?? cfg.messages?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT,
   );
+  const dispatchMode = feishuCfg?.dispatchMode ?? "auto";
   const groupConfig = isGroup
     ? resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: ctx.chatId })
     : undefined;
@@ -845,7 +846,7 @@ export async function handleFeishuMessage(params: {
       groupConfig,
     });
 
-    if (requireMention && !ctx.mentionedBot) {
+    if (dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot) {
       log(
         `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
       );
@@ -1185,6 +1186,58 @@ export async function handleFeishuMessage(params: {
       },
       ...mediaPayload,
     });
+
+    if (isGroup && dispatchMode === "plugin") {
+      const shouldForwardControlCommands = feishuCfg?.pluginMode?.forwardControlCommands ?? true;
+      if (
+        !shouldForwardControlCommands &&
+        core.channel.commands.isControlCommandMessage(ctx.content, effectiveCfg)
+      ) {
+        log(
+          `feishu[${account.accountId}]: skipping control command relay in plugin mode (message=${ctx.messageId})`,
+        );
+        if (isGroup && historyKey && chatHistories) {
+          clearHistoryEntriesIfEnabled({
+            historyMap: chatHistories,
+            historyKey,
+            limit: historyLimit,
+          });
+        }
+        return;
+      }
+
+      // Group-only plugin mode: still run dispatch-from-config so message_received/internal hooks
+      // execute through the standard pipeline, but suppress actual reply generation.
+      const { dispatcher, replyOptions, markDispatchIdle } =
+        core.channel.reply.createReplyDispatcherWithTyping({
+          deliver: async () => {},
+          onIdle: () => {},
+          onError: () => {},
+        });
+
+      log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
+
+      try {
+        await core.channel.reply.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg: effectiveCfg,
+          dispatcher,
+          replyOptions,
+          replyResolver: async () => undefined,
+        });
+      } finally {
+        markDispatchIdle();
+      }
+
+      if (isGroup && historyKey && chatHistories) {
+        clearHistoryEntriesIfEnabled({
+          historyMap: chatHistories,
+          historyKey,
+          limit: historyLimit,
+        });
+      }
+      return;
+    }
 
     const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
       cfg,
