@@ -192,5 +192,62 @@ describe("FeishuConfigSchema defaultAccount", () => {
         true,
       );
     }
+describe("FeishuConfigSchema dispatchMode", () => {
+  it("accepts dispatchMode at account level", () => {
+    const parsed = FeishuConfigSchema.parse({
+      enabled: true,
+      accounts: {
+        alpha: {
+          appId: "app",
+          appSecret: "secret",
+          dispatchMode: "plugin",
+        },
+      },
+    });
+
+    expect(parsed.accounts?.alpha?.dispatchMode).toBe("plugin");
+  });
+
+  it("rejects invalid dispatchMode values", () => {
+    expect(() =>
+      FeishuConfigSchema.parse({
+        accounts: {
+          alpha: {
+            appId: "app",
+            appSecret: "secret",
+            // oxlint-disable-next-line typescript/no-explicit-any
+            dispatchMode: "invalid" as any,
+          },
+        },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("FeishuConfigSchema pluginMode", () => {
+  it("accepts pluginMode.forwardControlCommands at top level", () => {
+    const parsed = FeishuConfigSchema.parse({
+      pluginMode: {
+        forwardControlCommands: false,
+      },
+    });
+
+    expect(parsed.pluginMode?.forwardControlCommands).toBe(false);
+  });
+
+  it("accepts pluginMode.forwardControlCommands at account level", () => {
+    const parsed = FeishuConfigSchema.parse({
+      accounts: {
+        alpha: {
+          appId: "app",
+          appSecret: "secret",
+          pluginMode: {
+            forwardControlCommands: false,
+          },
+        },
+      },
+    });
+
+    expect(parsed.accounts?.alpha?.pluginMode?.forwardControlCommands).toBe(false);
   });
 });

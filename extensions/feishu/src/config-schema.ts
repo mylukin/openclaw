@@ -13,6 +13,7 @@ const FeishuDomainSchema = z.union([
   z.string().url().startsWith("https://"),
 ]);
 const FeishuConnectionModeSchema = z.enum(["websocket", "webhook"]);
+const DispatchModeSchema = z.enum(["auto", "plugin"]);
 
 const ToolPolicySchema = z
   .object({
@@ -58,6 +59,13 @@ const ChannelHeartbeatVisibilitySchema = z
   .object({
     visibility: z.enum(["visible", "hidden"]).optional(),
     intervalMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+const PluginModeConfigSchema = z
+  .object({
+    forwardControlCommands: z.boolean().optional(),
   })
   .strict()
   .optional();
@@ -167,6 +175,7 @@ const FeishuSharedConfigShape = {
   mediaMaxMb: z.number().positive().optional(),
   httpTimeoutMs: z.number().int().positive().max(300_000).optional(),
   heartbeat: ChannelHeartbeatVisibilitySchema,
+  pluginMode: PluginModeConfigSchema,
   renderMode: RenderModeSchema,
   streaming: StreamingModeSchema,
   tools: FeishuToolsConfigSchema,
@@ -190,6 +199,7 @@ export const FeishuAccountConfigSchema = z
     verificationToken: buildSecretInputSchema().optional(),
     domain: FeishuDomainSchema.optional(),
     connectionMode: FeishuConnectionModeSchema.optional(),
+    dispatchMode: DispatchModeSchema.optional(),
     webhookPath: z.string().optional(),
     ...FeishuSharedConfigShape,
     groupSessionScope: GroupSessionScopeSchema,
@@ -208,6 +218,7 @@ export const FeishuConfigSchema = z
     verificationToken: buildSecretInputSchema().optional(),
     domain: FeishuDomainSchema.optional().default("feishu"),
     connectionMode: FeishuConnectionModeSchema.optional().default("websocket"),
+    dispatchMode: DispatchModeSchema.optional().default("auto"),
     webhookPath: z.string().optional().default("/feishu/events"),
     ...FeishuSharedConfigShape,
     dmPolicy: DmPolicySchema.optional().default("pairing"),

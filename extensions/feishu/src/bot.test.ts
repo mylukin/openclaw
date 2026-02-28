@@ -18,8 +18,14 @@ const {
   mockDownloadMessageResourceFeishu,
   mockCreateFeishuClient,
   mockResolveAgentRoute,
+  mockCreateReplyDispatcherWithTyping,
 } = vi.hoisted(() => ({
   mockCreateFeishuReplyDispatcher: vi.fn(() => ({
+    dispatcher: vi.fn(),
+    replyOptions: {},
+    markDispatchIdle: vi.fn(),
+  })),
+  mockCreateReplyDispatcherWithTyping: vi.fn(() => ({
     dispatcher: vi.fn(),
     replyOptions: {},
     markDispatchIdle: vi.fn(),
@@ -125,6 +131,7 @@ describe("handleFeishuMessage command authorization", () => {
     },
   );
   const mockResolveCommandAuthorizedFromAuthorizers = vi.fn(() => false);
+  const mockIsControlCommandMessage = vi.fn(() => false);
   const mockShouldComputeCommandAuthorized = vi.fn(() => true);
   const mockReadAllowFromStore = vi.fn().mockResolvedValue([]);
   const mockUpsertPairingRequest = vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false });
@@ -140,6 +147,7 @@ describe("handleFeishuMessage command authorization", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockShouldComputeCommandAuthorized.mockReset().mockReturnValue(true);
+    mockIsControlCommandMessage.mockReturnValue(false);
     mockResolveAgentRoute.mockReturnValue({
       agentId: "main",
       channel: "feishu",
@@ -190,6 +198,18 @@ describe("handleFeishuMessage command authorization", () => {
             upsertPairingRequest: mockUpsertPairingRequest,
             buildPairingReply: mockBuildPairingReply,
           },
+        reply: {
+          resolveEnvelopeFormatOptions: vi.fn(() => ({ template: "channel+name+time" })),
+          formatAgentEnvelope: vi.fn((params: { body: string }) => params.body),
+          finalizeInboundContext: mockFinalizeInboundContext,
+          dispatchReplyFromConfig: mockDispatchReplyFromConfig,
+          withReplyDispatcher: mockWithReplyDispatcher,
+          createReplyDispatcherWithTyping: mockCreateReplyDispatcherWithTyping,
+        },
+        commands: {
+          shouldComputeCommandAuthorized: mockShouldComputeCommandAuthorized,
+          isControlCommandMessage: mockIsControlCommandMessage,
+          resolveCommandAuthorizedFromAuthorizers: mockResolveCommandAuthorizedFromAuthorizers,
         },
         media: {
           detectMime: vi.fn(async () => "application/octet-stream"),
@@ -757,6 +777,139 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
   });
 
+  it("plugin dispatch mode runs dispatch pipeline with reply generation disabled", async () => {
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          dispatchMode: "plugin",
+          groupPolicy: "open",
+          groups: {
+            "oc-group": {
+              requireMention: false,
+            },
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-plugin",
+        },
+      },
+      message: {
+        message_id: "msg-plugin-dispatch-only",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello from plugin mode" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cfg,
+        replyResolver: expect.any(Function),
+        ctx: expect.objectContaining({
+          ChatType: "group",
+          MessageSid: "msg-plugin-dispatch-only",
+          SessionKey: expect.any(String),
+        }),
+      }),
+    );
+    const call = mockDispatchReplyFromConfig.mock.calls[0]?.[0] as
+      | {
+          replyResolver?: (() => Promise<unknown>) | undefined;
+        }
+      | undefined;
+    await expect(call?.replyResolver?.()).resolves.toBeUndefined();
+    expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
+  });
+
+  it("plugin dispatch mode still forwards control commands by default", async () => {
+    mockIsControlCommandMessage.mockReturnValue(true);
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          dispatchMode: "plugin",
+          groupPolicy: "open",
+          groups: {
+            "oc-group": {
+              requireMention: false,
+            },
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-plugin",
+        },
+      },
+      message: {
+        message_id: "msg-plugin-control-default",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockIsControlCommandMessage).not.toHaveBeenCalled();
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
+  });
+
+  it("plugin dispatch mode can skip forwarding control commands", async () => {
+    mockIsControlCommandMessage.mockReturnValue(true);
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          dispatchMode: "plugin",
+          groupPolicy: "open",
+          pluginMode: {
+            forwardControlCommands: false,
+          },
+          groups: {
+            "oc-group": {
+              requireMention: false,
+            },
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-plugin",
+        },
+      },
+      message: {
+        message_id: "msg-plugin-control-skip",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockIsControlCommandMessage).toHaveBeenCalledWith("/stop", cfg);
+    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
+    expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
+  });
   it("uses video file_key (not thumbnail image_key) for inbound video download", async () => {
     mockShouldComputeCommandAuthorized.mockReturnValue(false);
 

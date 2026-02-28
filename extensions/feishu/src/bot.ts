@@ -965,6 +965,7 @@ export async function handleFeishuMessage(params: {
     0,
     feishuCfg?.historyLimit ?? cfg.messages?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT,
   );
+  const dispatchMode = feishuCfg?.dispatchMode ?? "auto";
   const groupConfig = isGroup
     ? resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: ctx.chatId })
     : undefined;
@@ -1049,13 +1050,11 @@ export async function handleFeishuMessage(params: {
       groupConfig,
     }));
 
-    if (requireMention && !ctx.mentionedBot) {
-      log(`feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot`);
-      // Record to pending history for non-broadcast groups only. For broadcast groups,
-      // the mentioned handler's broadcast dispatch writes the turn directly into all
-      // agent sessions — buffering here would cause duplicate replay when this account
-      // later becomes active via buildPendingHistoryContextFromMap.
-      if (!broadcastAgents && chatHistories && groupHistoryKey) {
+    if (dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot) {
+      log(
+        `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
+      );
+      if (chatHistories) {
         recordPendingHistoryEntryIfEnabled({
           historyMap: chatHistories,
           historyKey: groupHistoryKey,
