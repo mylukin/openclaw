@@ -1247,12 +1247,15 @@ export async function runEmbeddedAttempt(
             activeSession.agent.replaceMessages(activeSession.messages);
           }
 
-          // Detect and load images referenced in the prompt for vision-capable models.
-          // Images are prompt-local only (pi-like behavior).
+          const mainModelSupportsImages = modelSupportsImages(params.model);
+          const usePreAnalysis = shouldUseImagePreAnalysis({ config: params.config });
+
+          // Detect and load images referenced in the prompt.
+          // When pre-analysis is enabled, we still need image payloads even if the main model is text-only.
           const imageResult = await detectAndLoadPromptImages({
             prompt: effectivePrompt,
             workspaceDir: effectiveWorkspace,
-            model: params.model,
+            model: usePreAnalysis ? { input: ["image"] } : params.model,
             existingImages: params.images,
             maxBytes: MAX_IMAGE_BYTES,
             maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
@@ -1317,9 +1320,6 @@ export async function runEmbeddedAttempt(
           // Only pass images option if there are actually images to pass
           // This avoids potential issues with models that don't expect the images parameter
           if (imageResult.images.length > 0) {
-            const mainModelSupportsImages = modelSupportsImages(params.model);
-            const usePreAnalysis = shouldUseImagePreAnalysis({ config: params.config });
-
             if (usePreAnalysis) {
               // Pre-analyze images with imageModel, then pass text analysis to main model
               log.debug(`Image pre-analysis: using configured imageModel for image analysis`);
