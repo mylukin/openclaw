@@ -5,7 +5,6 @@ import {
   clearHistoryEntriesIfEnabled,
   createScopedPairingAccess,
   DEFAULT_GROUP_HISTORY_LIMIT,
-  emitMessageReceivedHooks,
   type HistoryEntry,
   recordPendingHistoryEntryIfEnabled,
   resolveOpenProviderRuntimeGroupPolicy,
@@ -1207,10 +1206,28 @@ export async function handleFeishuMessage(params: {
         return;
       }
 
-      log(
-        `feishu[${account.accountId}]: group plugin dispatch mode enabled, emitting message_received hook only`,
-      );
-      emitMessageReceivedHooks({ ctx: ctxPayload });
+      // Group-only plugin mode: still run dispatch-from-config so message_received/internal hooks
+      // execute through the standard pipeline, but suppress actual reply generation.
+      const { dispatcher, replyOptions, markDispatchIdle } =
+        core.channel.reply.createReplyDispatcherWithTyping({
+          deliver: async () => {},
+          onIdle: () => {},
+          onError: () => {},
+        });
+
+      log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
+
+      try {
+        await core.channel.reply.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg: effectiveCfg,
+          dispatcher,
+          replyOptions,
+          replyResolver: async () => undefined,
+        });
+      } finally {
+        markDispatchIdle();
+      }
 
       if (isGroup && historyKey && chatHistories) {
         clearHistoryEntriesIfEnabled({

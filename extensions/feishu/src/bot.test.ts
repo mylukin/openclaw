@@ -12,7 +12,6 @@ const {
   mockCreateFeishuClient,
   mockResolveAgentRoute,
   mockCreateReplyDispatcherWithTyping,
-  mockEmitMessageReceivedHooks,
 } = vi.hoisted(() => ({
   mockCreateFeishuReplyDispatcher: vi.fn(() => ({
     dispatcher: vi.fn(),
@@ -38,16 +37,7 @@ const {
     sessionKey: "agent:main:feishu:dm:ou-attacker",
     matchedBy: "default",
   })),
-  mockEmitMessageReceivedHooks: vi.fn(),
 }));
-
-vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk")>();
-  return {
-    ...actual,
-    emitMessageReceivedHooks: mockEmitMessageReceivedHooks,
-  };
-});
 
 vi.mock("./reply-dispatcher.js", () => ({
   createFeishuReplyDispatcher: mockCreateFeishuReplyDispatcher,
@@ -606,7 +596,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
   });
 
-  it("plugin dispatch mode emits message_received hooks without running reply pipeline", async () => {
+  it("plugin dispatch mode runs dispatch pipeline with reply generation disabled", async () => {
     const cfg: ClawdbotConfig = {
       channels: {
         feishu: {
@@ -638,15 +628,24 @@ describe("handleFeishuMessage command authorization", () => {
 
     await dispatchMessage({ cfg, event });
 
-    expect(mockEmitMessageReceivedHooks).toHaveBeenCalledTimes(1);
-    expect(mockEmitMessageReceivedHooks).toHaveBeenCalledWith({
-      ctx: expect.objectContaining({
-        ChatType: "group",
-        MessageSid: "msg-plugin-dispatch-only",
-        SessionKey: expect.any(String),
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cfg,
+        replyResolver: expect.any(Function),
+        ctx: expect.objectContaining({
+          ChatType: "group",
+          MessageSid: "msg-plugin-dispatch-only",
+          SessionKey: expect.any(String),
+        }),
       }),
-    });
-    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
+    );
+    const call = mockDispatchReplyFromConfig.mock.calls[0]?.[0] as
+      | {
+          replyResolver?: (() => Promise<unknown>) | undefined;
+        }
+      | undefined;
+    await expect(call?.replyResolver?.()).resolves.toBeUndefined();
     expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
   });
 
@@ -685,8 +684,8 @@ describe("handleFeishuMessage command authorization", () => {
     await dispatchMessage({ cfg, event });
 
     expect(mockIsControlCommandMessage).not.toHaveBeenCalled();
-    expect(mockEmitMessageReceivedHooks).toHaveBeenCalledTimes(1);
-    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
   });
 
   it("plugin dispatch mode can skip forwarding control commands", async () => {
@@ -727,7 +726,6 @@ describe("handleFeishuMessage command authorization", () => {
     await dispatchMessage({ cfg, event });
 
     expect(mockIsControlCommandMessage).toHaveBeenCalledWith("/stop", cfg);
-    expect(mockEmitMessageReceivedHooks).not.toHaveBeenCalled();
     expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
     expect(mockWithReplyDispatcher).not.toHaveBeenCalled();
   });
