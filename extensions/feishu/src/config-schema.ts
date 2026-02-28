@@ -58,6 +58,13 @@ const ChannelHeartbeatVisibilitySchema = z
   .strict()
   .optional();
 
+const PluginModeConfigSchema = z
+  .object({
+    forwardControlCommands: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
 /**
  * Dynamic agent creation configuration.
  * When enabled, a new agent is created for each unique DM user.
@@ -158,6 +165,7 @@ const FeishuSharedConfigShape = {
   blockStreamingCoalesce: BlockStreamingCoalesceSchema,
   mediaMaxMb: z.number().positive().optional(),
   heartbeat: ChannelHeartbeatVisibilitySchema,
+  pluginMode: PluginModeConfigSchema,
   renderMode: RenderModeSchema,
   streaming: StreamingModeSchema,
   tools: FeishuToolsConfigSchema,
