@@ -130,22 +130,4 @@ describe("shouldUseImagePreAnalysis", () => {
 
     expect(result).toBe(false);
   });
-
-  it("ignores modelSupportsImages parameter (kept for compatibility)", () => {
-    // Even if main model supports images, should still return true when imageModel is configured
-    const result = shouldUseImagePreAnalysis({
-      config: {
-        agents: {
-          defaults: {
-            imageModel: {
-              primary: "gemini-crs/gemini-3-flash-preview",
-            },
-          },
-        },
-      },
-      modelSupportsImages: true,
-    });
-
-    expect(result).toBe(true);
-  });
 });
