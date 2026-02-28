@@ -155,10 +155,14 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     stopReason: "stop",
     timestamp: Date.now(),
   });
-  // Restore leafId so delivery-mirror doesn't affect the main chain
-  // The message still exists in the JSONL file for audit purposes
+  // Restore leafId so delivery-mirror doesn't affect the main chain.
+  // branch() only updates in-memory leafId; on next SessionManager.open(),
+  // _buildIndex() would set leafId to the delivery-mirror entry (last in JSONL).
+  // branchWithSummary() persists a branch_summary entry to JSONL, so _buildIndex()
+  // picks it up as leafId. buildSessionContext() walks from its parentId (savedLeafId),
+  // skipping delivery-mirror. Empty summary is filtered by the "entry.summary" guard.
   if (savedLeafId !== null) {
-    sessionManager.branch(savedLeafId);
+    sessionManager.branchWithSummary(savedLeafId, "", undefined, false);
   }
 
   emitSessionTranscriptUpdate(sessionFile);
