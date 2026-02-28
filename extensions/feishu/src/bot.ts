@@ -5,6 +5,7 @@ import {
   clearHistoryEntriesIfEnabled,
   createScopedPairingAccess,
   DEFAULT_GROUP_HISTORY_LIMIT,
+  emitMessageReceivedHooks,
   type HistoryEntry,
   recordPendingHistoryEntryIfEnabled,
   resolveOpenProviderRuntimeGroupPolicy,
@@ -1217,28 +1218,28 @@ export async function handleFeishuMessage(params: {
     });
 
     if (isGroup && dispatchMode === "plugin") {
-      // Group-only plugin mode: emit message_received hook via dispatchReplyFromConfig,
-      // but skip full reply generation by providing a null reply resolver.
-      const { dispatcher, replyOptions, markDispatchIdle } =
-        core.channel.reply.createReplyDispatcherWithTyping({
-          deliver: async () => {},
-          onIdle: () => {},
-          onError: () => {},
-        });
-
-      log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
-
-      try {
-        await core.channel.reply.dispatchReplyFromConfig({
-          ctx: ctxPayload,
-          cfg: effectiveCfg,
-          dispatcher,
-          replyOptions,
-          replyResolver: async () => undefined,
-        });
-      } finally {
-        markDispatchIdle();
+      const shouldForwardControlCommands = feishuCfg?.pluginMode?.forwardControlCommands ?? true;
+      if (
+        !shouldForwardControlCommands &&
+        core.channel.commands.isControlCommandMessage(ctx.content, effectiveCfg)
+      ) {
+        log(
+          `feishu[${account.accountId}]: skipping control command relay in plugin mode (message=${ctx.messageId})`,
+        );
+        if (isGroup && historyKey && chatHistories) {
+          clearHistoryEntriesIfEnabled({
+            historyMap: chatHistories,
+            historyKey,
+            limit: historyLimit,
+          });
+        }
+        return;
       }
+
+      log(
+        `feishu[${account.accountId}]: group plugin dispatch mode enabled, emitting message_received hook only`,
+      );
+      emitMessageReceivedHooks({ ctx: ctxPayload });
 
       if (isGroup && historyKey && chatHistories) {
         clearHistoryEntriesIfEnabled({

@@ -170,3 +170,31 @@ describe("FeishuConfigSchema dispatchMode", () => {
     ).toThrow();
   });
 });
+
+describe("FeishuConfigSchema pluginMode", () => {
+  it("accepts pluginMode.forwardControlCommands at top level", () => {
+    const parsed = FeishuConfigSchema.parse({
+      pluginMode: {
+        forwardControlCommands: false,
+      },
+    });
+
+    expect(parsed.pluginMode?.forwardControlCommands).toBe(false);
+  });
+
+  it("accepts pluginMode.forwardControlCommands at account level", () => {
+    const parsed = FeishuConfigSchema.parse({
+      accounts: {
+        alpha: {
+          appId: "app",
+          appSecret: "secret",
+          pluginMode: {
+            forwardControlCommands: false,
+          },
+        },
+      },
+    });
+
+    expect(parsed.accounts?.alpha?.pluginMode?.forwardControlCommands).toBe(false);
+  });
+});

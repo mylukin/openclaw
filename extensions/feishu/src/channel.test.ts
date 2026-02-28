@@ -66,4 +66,30 @@ describe("feishuPlugin.configSchema", () => {
 
     expect(dispatchMode?.enum).toEqual(["auto", "plugin"]);
   });
+
+  it("exposes account-level pluginMode.forwardControlCommands in channel schema", () => {
+    const schema = feishuPlugin.configSchema?.schema as
+      | {
+          properties?: {
+            accounts?: {
+              additionalProperties?: {
+                properties?: Record<string, unknown>;
+              };
+            };
+          };
+        }
+      | undefined;
+
+    const pluginMode = schema?.properties?.accounts?.additionalProperties?.properties?.pluginMode as
+      | {
+          properties?: Record<string, unknown>;
+        }
+      | undefined;
+
+    const forwardControlCommands = pluginMode?.properties?.forwardControlCommands as
+      | { type?: string }
+      | undefined;
+
+    expect(forwardControlCommands?.type).toBe("boolean");
+  });
 });
