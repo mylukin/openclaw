@@ -270,6 +270,9 @@ function registerEventHandlers(
           cfg,
           event,
           botOpenId: botOpenIds.get(accountId),
+          botOpenIdsByAccount: Object.fromEntries(
+            Array.from(botOpenIds.entries()).map(([id, openId]) => [id, openId || undefined]),
+          ),
           runtime,
           chatHistories,
           accountId,

@@ -145,6 +145,8 @@ export type MsgContext = {
    * The chat/channel/user ID where the reply should be sent.
    */
   OriginatingTo?: string;
+  /** Provider-specific inbound payload (structured raw event data). */
+  ChannelData?: Record<string, unknown>;
   /**
    * Messages from hooks to be included in the response.
    * Used for hook confirmation messages like "Session context saved to memory".

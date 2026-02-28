@@ -679,6 +679,7 @@ export async function handleFeishuMessage(params: {
   cfg: ClawdbotConfig;
   event: FeishuMessageEvent;
   botOpenId?: string;
+  botOpenIdsByAccount?: Record<string, string | undefined>;
   runtime?: RuntimeEnv;
   chatHistories?: Map<string, HistoryEntry[]>;
   accountId?: string;
@@ -1154,6 +1155,30 @@ export async function handleFeishuMessage(params: {
       CommandAuthorized: commandAuthorized,
       OriginatingChannel: "feishu" as const,
       OriginatingTo: feishuTo,
+      ChannelData: {
+        messageId: ctx.messageId,
+        chatId: ctx.chatId,
+        chatType: ctx.chatType,
+        accountId: account.accountId,
+        accountBotOpenId: botOpenId,
+        botOpenIdsByAccount: params.botOpenIdsByAccount,
+        messageType: event.message.message_type,
+        rawContent: event.message.content,
+        rootId: ctx.rootId,
+        parentId: ctx.parentId,
+        mentions: event.message.mentions ?? [],
+        senderType: event.sender.sender_type,
+        senderOpenId: ctx.senderOpenId,
+        senderUnionId: event.sender.sender_id.union_id,
+        ...(mediaList.length > 0
+          ? {
+              mediaPath: mediaList[0].path,
+              mediaType: mediaList[0].contentType,
+              mediaPaths: mediaList.map((m) => m.path),
+              mediaTypes: mediaList.filter((m) => m.contentType).map((m) => m.contentType!),
+            }
+          : {}),
+      },
       ...mediaPayload,
     });
 
