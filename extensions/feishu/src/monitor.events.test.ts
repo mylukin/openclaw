@@ -22,9 +22,13 @@ vi.mock("./client.js", () => ({
   createEventDispatcher: createEventDispatcherMock,
 }));
 
-vi.mock("../../../src/plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: () => hookRunnerMocks,
-}));
+vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk")>();
+  return {
+    ...actual,
+    getGlobalHookRunner: () => hookRunnerMocks,
+  };
+});
 
 import { monitorFeishuProvider, stopFeishuMonitor } from "./monitor.js";
 
