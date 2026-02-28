@@ -1352,6 +1352,9 @@ export async function runEmbeddedAttempt(
                   }
                 }
               } catch (preAnalysisErr) {
+                if (isRunnerAbortError(preAnalysisErr)) {
+                  throw preAnalysisErr;
+                }
                 log.warn(
                   `Image pre-analysis failed: ${preAnalysisErr instanceof Error ? preAnalysisErr.message : String(preAnalysisErr)}`,
                 );
