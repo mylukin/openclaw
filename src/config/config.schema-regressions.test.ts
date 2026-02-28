@@ -130,4 +130,23 @@ describe("config schema regressions", () => {
       expect(res.issues[0]?.path).toBe("channels.imessage.attachmentRoots.0");
     }
   });
+
+  it("rejects displayName-like gateway.nodes.overrides keys", () => {
+    const res = validateConfigObject({
+      gateway: {
+        nodes: {
+          overrides: {
+            "My MacBook": {
+              denyCommands: ["system.run"],
+            },
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.issues[0]?.path).toBe("gateway.nodes.overrides.My MacBook");
+    }
+  });
 });
