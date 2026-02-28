@@ -129,6 +129,9 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   await ensureSessionHeader({ sessionFile, sessionId: entry.sessionId });
 
   const sessionManager = SessionManager.open(sessionFile);
+  // Save current leafId before appending delivery-mirror
+  // This prevents delivery-mirror from affecting the main chain (leafId)
+  const savedLeafId = sessionManager.getLeafId();
   sessionManager.appendMessage({
     role: "assistant",
     content: [{ type: "text", text: mirrorText }],
@@ -152,6 +155,11 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     stopReason: "stop",
     timestamp: Date.now(),
   });
+  // Restore leafId so delivery-mirror doesn't affect the main chain
+  // The message still exists in the JSONL file for audit purposes
+  if (savedLeafId !== null) {
+    sessionManager.branch(savedLeafId);
+  }
 
   emitSessionTranscriptUpdate(sessionFile);
   return { ok: true, sessionFile };
