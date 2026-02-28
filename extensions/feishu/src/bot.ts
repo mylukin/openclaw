@@ -354,10 +354,14 @@ function checkBotMentioned(event: FeishuMessageEvent, botOpenId?: string): boole
 export function stripBotMention(
   text: string,
   mentions?: FeishuMessageEvent["message"]["mentions"],
+  botOpenId?: string,
 ): string {
-  if (!mentions || mentions.length === 0) return text;
+  if (!mentions || mentions.length === 0 || !botOpenId) return text;
   let result = text;
   for (const mention of mentions) {
+    if (mention.id.open_id !== botOpenId) {
+      continue;
+    }
     result = result.replace(new RegExp(`@${escapeRegExp(mention.name)}\\s*`, "g"), "");
     result = result.replace(new RegExp(escapeRegExp(mention.key), "g"), "");
   }
@@ -607,7 +611,7 @@ export function parseFeishuMessageEvent(
 ): FeishuMessageContext {
   const rawContent = parseMessageContent(event.message.content, event.message.message_type);
   const mentionedBot = checkBotMentioned(event, botOpenId);
-  const content = stripBotMention(rawContent, event.message.mentions);
+  const content = stripBotMention(rawContent, event.message.mentions, botOpenId);
   const senderOpenId = event.sender.sender_id.open_id?.trim();
   const senderUserId = event.sender.sender_id.user_id?.trim();
   const senderFallbackId = senderOpenId || senderUserId || "";
