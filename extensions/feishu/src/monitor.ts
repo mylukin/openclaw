@@ -10,6 +10,7 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
+import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
 import { createFeishuWSClient, createEventDispatcher } from "./client.js";
 import { probeFeishu } from "./probe.js";
 import { getMessageFeishu } from "./send.js";
@@ -461,6 +462,27 @@ function registerEventHandlers(
     },
     "im.message.reaction.deleted_v1": async () => {
       // Ignore reaction removals
+    },
+    "card.action.trigger": async (data) => {
+      try {
+        const event = data as unknown as FeishuCardActionEvent;
+        const promise = handleFeishuCardAction({
+          cfg,
+          event,
+          botOpenId: botOpenIds.get(accountId),
+          runtime,
+          accountId,
+        });
+        if (fireAndForget) {
+          promise.catch((err) => {
+            error(`feishu[${accountId}]: error handling card action: ${String(err)}`);
+          });
+        } else {
+          await promise;
+        }
+      } catch (err) {
+        error(`feishu[${accountId}]: error handling card action: ${String(err)}`);
+      }
     },
   });
 }
