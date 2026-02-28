@@ -28,10 +28,7 @@ const DEFAULT_IMAGE_ANALYSIS_PROMPT =
  * When imageModel is explicitly configured, it takes priority over the main model's
  * image capabilities. The main model's vision capability serves as a fallback only.
  */
-export function shouldUseImagePreAnalysis(params: {
-  config?: OpenClawConfig;
-  modelSupportsImages?: boolean; // kept for compatibility but no longer used
-}): boolean {
+export function shouldUseImagePreAnalysis(params: { config?: OpenClawConfig }): boolean {
   const imageModelConfig = coerceImageModelConfig(params.config);
   const hasImageModel =
     Boolean(imageModelConfig.primary?.trim()) || (imageModelConfig.fallbacks?.length ?? 0) > 0;
