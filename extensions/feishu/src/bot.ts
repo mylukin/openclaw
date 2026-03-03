@@ -1300,7 +1300,6 @@ export async function handleFeishuMessage(params: {
           }))
         : undefined;
 
-<<<<<<< HEAD
     // --- Shared context builder for dispatch ---
     const buildCtxPayloadForAgent = (
       agentSessionKey: string,
