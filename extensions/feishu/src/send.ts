@@ -202,6 +202,11 @@ export async function getMessageFeishu(params: {
           id_type?: string;
           sender_type?: string;
         };
+        mentions?: Array<{
+          key?: string;
+          name?: string;
+          id?: { open_id?: string; user_id?: string; union_id?: string };
+        }>;
         create_time?: string;
       };
     };
@@ -223,7 +228,10 @@ export async function getMessageFeishu(params: {
 
     const msgType = item.msg_type ?? "text";
     const rawContent = item.body?.content ?? "";
-    const content = parseQuotedMessageContent(rawContent, msgType);
+    const content = enrichMentionPlaceholders(
+      parseQuotedMessageContent(rawContent, msgType),
+      item.mentions,
+    );
 
     return {
       messageId: item.message_id ?? messageId,
