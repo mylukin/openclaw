@@ -12,7 +12,7 @@ import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
 import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
 import { createFeishuWSClient, createEventDispatcher } from "./client.js";
-import { probeFeishu } from "./probe.js";
+import { fetchBotOpenIdForMonitor } from "./monitor.startup.js";
 import { getMessageFeishu } from "./send.js";
 import type { ResolvedFeishuAccount } from "./types.js";
 
@@ -240,10 +240,12 @@ export function getBotOpenId(accountId: string): string | undefined {
   return value ? value : undefined;
 }
 
-async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
+async function fetchBotOpenId(
+  account: ResolvedFeishuAccount,
+  options: { runtime?: RuntimeEnv; abortSignal?: AbortSignal } = {},
+): Promise<string | undefined> {
   try {
-    const result = await probeFeishu(account);
-    return result.ok ? result.botOpenId : undefined;
+    return await fetchBotOpenIdForMonitor(account, options);
   } catch {
     return undefined;
   }
@@ -492,6 +494,7 @@ type MonitorAccountParams = {
   account: ResolvedFeishuAccount;
   runtime?: RuntimeEnv;
   abortSignal?: AbortSignal;
+  botOpenIdSource?: { kind: "prefetched"; botOpenId?: string } | { kind: "fetch" };
 };
 
 /**
@@ -502,8 +505,11 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
   const { accountId } = account;
   const log = runtime?.log ?? console.log;
 
-  // Fetch bot open_id
-  const botOpenId = await fetchBotOpenId(account);
+  const botOpenIdSource = params.botOpenIdSource ?? { kind: "fetch" as const };
+  const botOpenId =
+    botOpenIdSource.kind === "prefetched"
+      ? botOpenIdSource.botOpenId
+      : await fetchBotOpenIdForMonitor(account, { runtime, abortSignal });
   botOpenIds.set(accountId, botOpenId ?? "");
   log(`feishu[${accountId}]: bot open_id resolved: ${botOpenId ?? "unknown"}`);
 
@@ -703,7 +709,23 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
     `feishu: starting ${accounts.length} account(s): ${accounts.map((a) => a.accountId).join(", ")}`,
   );
 
-  // Start all accounts in parallel
+  // Probe bot info sequentially so startup does not burst requests across accounts.
+  const prefetchedBotOpenIds = new Map<string, string | undefined>();
+  for (const account of accounts) {
+    if (opts.abortSignal?.aborted) {
+      break;
+    }
+    prefetchedBotOpenIds.set(
+      account.accountId,
+      await fetchBotOpenId(account, { runtime: opts.runtime, abortSignal: opts.abortSignal }),
+    );
+  }
+
+  if (opts.abortSignal?.aborted) {
+    return;
+  }
+
+  // Start account monitors in parallel after preflight completes.
   await Promise.all(
     accounts.map((account) =>
       monitorSingleAccount({
@@ -711,6 +733,10 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
         account,
         runtime: opts.runtime,
         abortSignal: opts.abortSignal,
+        botOpenIdSource: {
+          kind: "prefetched",
+          botOpenId: prefetchedBotOpenIds.get(account.accountId),
+        },
       }),
     ),
   );
