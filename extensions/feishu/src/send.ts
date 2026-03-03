@@ -29,6 +29,32 @@ export type FeishuMessageInfo = {
 };
 
 /**
+ * Replace `@_user_N` placeholders with `@name` using the mentions array
+ * returned by the Feishu message API.
+ */
+export function enrichMentionPlaceholders(
+  content: string,
+  mentions?: Array<{ key?: string; name?: string }>,
+): string {
+  if (!mentions || mentions.length === 0) return content;
+
+  const entries: Array<[string, string]> = [];
+  for (const m of mentions) {
+    const key = m.key?.trim();
+    const name = m.name?.trim();
+    if (key && name) entries.push([key, `@${name}`]);
+  }
+  if (entries.length === 0) return content;
+
+  // Sort by key length descending to prevent @_user_1 matching @_user_10
+  entries.sort((a, b) => b[0].length - a[0].length);
+
+  const pattern = entries.map(([k]) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const map = new Map(entries);
+  return content.replace(new RegExp(pattern, "g"), (match) => map.get(match) ?? match);
+}
+
+/**
  * Get a message by its ID.
  * Useful for fetching quoted/replied message content.
  */
@@ -62,6 +88,11 @@ export async function getMessageFeishu(params: {
             id_type?: string;
             sender_type?: string;
           };
+          mentions?: Array<{
+            key?: string;
+            name?: string;
+            id?: { open_id?: string; user_id?: string; union_id?: string };
+          }>;
           create_time?: string;
         }>;
       };
@@ -86,6 +117,8 @@ export async function getMessageFeishu(params: {
     } catch {
       // Keep raw content if parsing fails
     }
+
+    content = enrichMentionPlaceholders(content, item.mentions);
 
     return {
       messageId: item.message_id ?? messageId,
