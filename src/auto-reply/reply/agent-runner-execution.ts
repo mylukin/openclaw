@@ -226,9 +226,13 @@ export async function runAgentTurnWithFallback(params: {
                   timeoutMs: params.followupRun.run.timeoutMs,
                   runId,
                   extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                  skillsSnapshot: params.followupRun.run.skillsSnapshot,
                   ownerNumbers: params.followupRun.run.ownerNumbers,
                   cliSessionId,
                   images: params.opts?.images,
+                  abortSignal: params.opts?.abortSignal,
+                  trigger: params.isHeartbeat ? "heartbeat" : "user",
+                  messageChannel: params.followupRun.run.messageProvider,
                   onAssistantTurn: (text) => {
                     emitAgentEvent({
                       runId,

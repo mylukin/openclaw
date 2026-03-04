@@ -195,9 +195,13 @@ function runAgentAttempt(params: {
         timeoutMs: params.timeoutMs,
         runId: params.runId,
         extraSystemPrompt: params.opts.extraSystemPrompt,
+        skillsSnapshot: params.skillsSnapshot,
         cliSessionId: nextCliSessionId,
         images: params.isFallbackRetry ? undefined : params.opts.images,
         streamParams: params.opts.streamParams,
+        abortSignal: params.opts.abortSignal,
+        trigger: "user",
+        messageChannel: params.messageChannel,
       });
     return runCliWithSession(cliSessionId).catch(async (err) => {
       // Handle CLI session expired error
