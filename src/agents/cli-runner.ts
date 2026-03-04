@@ -15,7 +15,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import type { PluginHookAgentContext } from "../plugins/types.js";
 import { getProcessSupervisor } from "../process/supervisor/index.js";
-import { resolveUserPath } from "../utils.js";
+import { sliceUtf16Safe, resolveUserPath } from "../utils.js";
 import { resolveSessionAgentIds } from "./agent-scope.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
@@ -54,6 +54,29 @@ type McpServers = Record<string, unknown>;
 const MERGED_MCP_CONFIG_BASENAME_RE = /^mcp\.cli-merged\.[a-f0-9]{16}\.json$/;
 const MERGED_MCP_CONFIG_MAX_FILES = 20;
 const MERGED_MCP_CONFIG_MIN_AGE_MS = 60 * 60 * 1000;
+const CLI_OUTPUT_LOG_HEAD_CHARS = 240;
+const CLI_OUTPUT_LOG_TAIL_CHARS = 160;
+const CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS = CLI_OUTPUT_LOG_HEAD_CHARS + CLI_OUTPUT_LOG_TAIL_CHARS;
+
+function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): string {
+  if (!text) {
+    return `cli ${channel}: <empty>`;
+  }
+  const totalChars = text.length;
+  if (totalChars <= CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS) {
+    return `cli ${channel} (${totalChars} chars):\n${text}`;
+  }
+  const head = sliceUtf16Safe(text, 0, CLI_OUTPUT_LOG_HEAD_CHARS);
+  const tailStart = Math.max(0, totalChars - CLI_OUTPUT_LOG_TAIL_CHARS);
+  const tail = sliceUtf16Safe(text, tailStart);
+  const truncatedChars = Math.max(0, totalChars - head.length - tail.length);
+  return [
+    `cli ${channel} (${totalChars} chars):`,
+    head,
+    `[truncated ${truncatedChars} chars]`,
+    tail,
+  ].join("\n");
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -362,6 +385,9 @@ export async function runCliAgent(params: {
   images?: ImageContent[];
   onAssistantTurn?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
+  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
@@ -659,6 +685,9 @@ export async function runCliAgent(params: {
             ? createStreamJsonProcessor(backend, {
                 onAssistantTurn: params.onAssistantTurn,
                 onToolUse: params.onToolUse,
+                onThinkingTurn: params.onThinkingTurn,
+                onToolUseEvent: params.onToolUseEvent,
+                onToolResult: params.onToolResult,
               })
             : undefined;
 
@@ -700,18 +729,18 @@ export async function runCliAgent(params: {
         const stderr = result.stderr.trim();
         if (logOutputText) {
           if (stdout) {
-            log.info(`cli stdout:\n${stdout}`);
+            log.info(formatCliOutputForLog("stdout", stdout));
           }
           if (stderr) {
-            log.info(`cli stderr:\n${stderr}`);
+            log.info(formatCliOutputForLog("stderr", stderr));
           }
         }
         if (shouldLogVerbose()) {
           if (stdout) {
-            log.debug(`cli stdout:\n${stdout}`);
+            log.debug(formatCliOutputForLog("stdout", stdout));
           }
           if (stderr) {
-            log.debug(`cli stderr:\n${stderr}`);
+            log.debug(formatCliOutputForLog("stderr", stderr));
           }
         }
 
@@ -901,6 +930,9 @@ export async function runClaudeCliAgent(params: {
   images?: ImageContent[];
   onAssistantTurn?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
+  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
@@ -925,6 +957,9 @@ export async function runClaudeCliAgent(params: {
     images: params.images,
     onAssistantTurn: params.onAssistantTurn,
     onToolUse: params.onToolUse,
+    onThinkingTurn: params.onThinkingTurn,
+    onToolUseEvent: params.onToolUseEvent,
+    onToolResult: params.onToolResult,
     abortSignal: params.abortSignal,
     trigger: params.trigger,
     messageChannel: params.messageChannel,
