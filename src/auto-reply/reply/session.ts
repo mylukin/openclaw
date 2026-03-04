@@ -186,7 +186,7 @@ export async function initSessionState(params: {
     sessionStore[retiredLegacyMainDelivery.key] = retiredLegacyMainDelivery.entry;
   }
   const entry = sessionStore[sessionKey];
-  const previousSessionEntry = resetTriggered && entry ? { ...entry } : undefined;
+  let previousSessionEntry: SessionEntry | undefined;
   const now = Date.now();
   const isThread = resolveThreadFlag({
     sessionKey,
@@ -241,6 +241,9 @@ export async function initSessionState(params: {
       persistedProviderOverride = entry.providerOverride;
       persistedLabel = entry.label;
     }
+  }
+  if (isNewSession && entry?.sessionId) {
+    previousSessionEntry = { ...entry };
   }
 
   const baseEntry = !isNewSession && freshEntry ? entry : undefined;

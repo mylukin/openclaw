@@ -58,12 +58,13 @@ function createManagedRun(exit: MockRunExit, pid = 1234) {
 }
 
 describe("runCliAgent with process supervisor", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     supervisorSpawnMock.mockClear();
     ensureMcpConfigFileMock.mockClear();
     ensureMcpConfigFileMock.mockReturnValue("/tmp/openclaw-mcp.json");
     getGlobalHookRunnerMock.mockReset();
     getGlobalHookRunnerMock.mockReturnValue(null);
+    await fs.rm("/tmp/session.jsonl", { force: true }).catch(() => undefined);
   });
 
   it("runs CLI through supervisor and returns payload", async () => {
@@ -109,6 +110,49 @@ describe("runCliAgent with process supervisor", () => {
     expect(input.replaceExistingScope).toBe(true);
     expect(input.scopeKey).toContain("thread-123");
     expect(ensureMcpConfigFileMock).not.toHaveBeenCalled();
+  });
+
+  it("writes prompt and assistant reply into the OpenClaw session transcript", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-transcript-"));
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: "CLI answer",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    try {
+      await runCliAgent({
+        sessionId: "s-transcript",
+        sessionFile,
+        workspaceDir: tempDir,
+        prompt: "What changed today?",
+        provider: "codex-cli",
+        model: "gpt-5.2-codex",
+        timeoutMs: 1_000,
+        runId: "run-cli-transcript",
+      });
+      const lines = (await fs.readFile(sessionFile, "utf-8")).trim().split("\n");
+      const entries = lines.map((line) => JSON.parse(line));
+      const messages = entries.filter((entry) => entry.type === "message");
+      expect(messages.length).toBe(2);
+      const userLine = messages[0];
+      const assistantLine = messages[1];
+      expect(userLine.message.role).toBe("user");
+      expect(userLine.message.content[0].text).toBe("What changed today?");
+      expect(assistantLine.message.role).toBe("assistant");
+      expect(assistantLine.message.content[0].text).toBe("CLI answer");
+      expect(assistantLine.message.provider).toBe("codex-cli");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("does not apply skill env overrides for non-claude CLI backends", async () => {

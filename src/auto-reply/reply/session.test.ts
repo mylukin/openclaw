@@ -530,6 +530,7 @@ describe("initSessionState reset policy", () => {
 
     expect(result.isNewSession).toBe(true);
     expect(result.sessionId).not.toBe(existingSessionId);
+    expect(result.previousSessionEntry?.sessionId).toBe(existingSessionId);
   });
 
   it("treats sessions as stale before the daily reset when updated before yesterday's boundary", async () => {

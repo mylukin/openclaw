@@ -6,6 +6,7 @@ import type { ImageContent } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { appendCliTurnToSessionTranscript } from "../config/sessions.js";
 import type { CliBackendConfig } from "../config/types.js";
 import { MCP_PORT_OFFSET, ensureMcpConfigFile } from "../gateway/mcp-http.js";
 import { shouldLogVerbose } from "../globals.js";
@@ -768,6 +769,22 @@ export async function runCliAgent(params: {
         } else {
           const parsed = parseCliJson(stdout, backend);
           output = parsed ?? { text: stdout };
+        }
+        try {
+          const appendResult = await appendCliTurnToSessionTranscript({
+            sessionFile: params.sessionFile,
+            sessionId: params.sessionId,
+            userText: params.prompt,
+            assistantText: output.text,
+            provider: params.provider,
+            model: normalizedModel,
+            usage: output.usage,
+          });
+          if (!appendResult.ok) {
+            log.debug(`cli transcript append skipped: ${appendResult.reason}`);
+          }
+        } catch (err) {
+          log.warn(`cli transcript append failed: ${String(err)}`);
         }
         emitCliLlmOutputHook({
           hookRunner,
