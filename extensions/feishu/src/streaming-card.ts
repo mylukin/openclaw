@@ -289,12 +289,21 @@ export class FeishuStreamingSession {
     this.closed = true;
     await this.queue;
 
+    const hasExplicitFinalText = finalText !== undefined;
     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
+    const text = hasExplicitFinalText
+      ? finalText.length > 0
+        ? mergeStreamingText(pendingMerged, finalText)
+        : finalText
+      : pendingMerged;
     const apiBase = resolveApiBase(this.creds.domain);
 
-    // Only send final update if content differs from what's already displayed
-    if (text && text !== this.state.currentText) {
+    // Explicit finalText (even empty) must win over transient status lines.
+    if (
+      hasExplicitFinalText
+        ? text !== this.state.currentText
+        : Boolean(text && text !== this.state.currentText)
+    ) {
       await this.updateCardContent(text);
       this.state.currentText = text;
     }

@@ -1007,7 +1007,7 @@ describe("runCliAgent with process supervisor", () => {
     );
   });
 
-  it("does not resend system prompt on resumed claude sessions", async () => {
+  it("resends system prompt on resumed claude sessions by default", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-"));
     const skillDir = path.join(tempDir, "skills", "resume-skill");
     await fs.mkdir(skillDir, { recursive: true });
@@ -1056,22 +1056,27 @@ describe("runCliAgent with process supervisor", () => {
     const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
     expect(input.argv).toContain("--resume");
     expect(input.argv).toContain("existing-claude-session");
-    expect(input.argv).not.toContain("--append-system-prompt");
+    expect(input.argv).toContain("--append-system-prompt");
+    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
+    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
+    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
+    expect(systemPrompt).toContain("<available_skills>");
+    expect(systemPrompt).toContain("resume-skill");
   });
 
-  it("resends system prompt on resumed claude sessions when configured", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-always-"));
-    const skillDir = path.join(tempDir, "skills", "resume-skill-always");
+  it("skips system prompt on resumed claude sessions when configured with first", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-first-"));
+    const skillDir = path.join(tempDir, "skills", "resume-skill-first");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(
       path.join(skillDir, "SKILL.md"),
       [
         "---",
-        "name: resume-skill-always",
-        "description: Resume-skill description for always mode",
+        "name: resume-skill-first",
+        "description: Resume-skill description for first mode",
         "---",
         "",
-        "Use this skill after resume in always mode.",
+        "Use this skill only on first run.",
       ].join("\n"),
       "utf-8",
     );
@@ -1095,7 +1100,7 @@ describe("runCliAgent with process supervisor", () => {
           cliBackends: {
             "claude-cli": {
               command: "claude",
-              systemPromptWhen: "always",
+              systemPromptWhen: "first",
             },
           },
         },
@@ -1111,7 +1116,7 @@ describe("runCliAgent with process supervisor", () => {
         provider: "claude-cli",
         model: "sonnet",
         timeoutMs: 1_000,
-        runId: "run-claude-resume-always",
+        runId: "run-claude-resume-first",
         cliSessionId: "existing-claude-session",
         config: cfg,
       });
@@ -1122,12 +1127,7 @@ describe("runCliAgent with process supervisor", () => {
     const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
     expect(input.argv).toContain("--resume");
     expect(input.argv).toContain("existing-claude-session");
-    expect(input.argv).toContain("--append-system-prompt");
-    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
-    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
-    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
-    expect(systemPrompt).toContain("<available_skills>");
-    expect(systemPrompt).toContain("resume-skill-always");
+    expect(input.argv).not.toContain("--append-system-prompt");
   });
 
   it("fails with timeout when no-output watchdog trips", async () => {

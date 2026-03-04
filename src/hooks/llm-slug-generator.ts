@@ -12,7 +12,11 @@ import {
   resolveAgentEffectiveModelPrimary,
 } from "../agents/agent-scope.js";
 import { DEFAULT_PROVIDER, DEFAULT_MODEL } from "../agents/defaults.js";
-import { buildModelAliasIndex, resolveModelRefFromString } from "../agents/model-selection.js";
+import {
+  buildModelAliasIndex,
+  isCliProvider,
+  resolveModelRefFromString,
+} from "../agents/model-selection.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -77,8 +81,12 @@ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design", 
     const resolved = modelRef
       ? resolveModelRefFromString({ raw: modelRef, defaultProvider: DEFAULT_PROVIDER, aliasIndex })
       : null;
-    const provider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
-    const model = resolved?.ref.model ?? DEFAULT_MODEL;
+    const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
+    const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
+    // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
+    // Fall back to default embedded provider when the agent's primary model is a CLI backend.
+    const provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
+    const model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
     const timeoutMs = resolveSlugTimeoutMs(params.cfg);
 
     const result = await runEmbeddedPiAgent({

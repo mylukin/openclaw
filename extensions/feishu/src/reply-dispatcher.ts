@@ -146,8 +146,48 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
   let lastPartial = "";
+  let lastRenderedStreamContent = "";
+  let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
+  let toolUseCount = 0;
+  let lastToolName: string | undefined;
   let partialUpdateQueue: Promise<void> = Promise.resolve();
   let streamingStartPromise: Promise<void> | null = null;
+
+  const normalizeToolName = (name: string | undefined): string | undefined => {
+    const trimmed = name?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    return trimmed.replace(/\s+/g, " ");
+  };
+
+  const resolveStatusLine = (): string | undefined => {
+    if (streamPhase === "thinking") {
+      return "💭 思考中...";
+    }
+    if (streamPhase === "tool") {
+      if (toolUseCount >= 2) {
+        return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
+      }
+      return `🔧 正在使用 ${lastToolName ?? "工具"}...`;
+    }
+    return undefined;
+  };
+
+  const composeStreamingContent = (mode: "live" | "final" = "live"): string => {
+    const assistantText = streamText;
+    if (mode === "final") {
+      return assistantText;
+    }
+    const statusLine = resolveStatusLine();
+    if (!statusLine) {
+      return assistantText;
+    }
+    if (!assistantText) {
+      return statusLine;
+    }
+    return `${statusLine}\n---\n${assistantText}`;
+  };
 
   const mergeStreamingText = (nextText: string) => {
     if (!streamText) {
@@ -165,6 +205,26 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamText += nextText;
   };
 
+  const queueStreamingRender = () => {
+    partialUpdateQueue = partialUpdateQueue.then(async () => {
+      if (streamingStartPromise) {
+        await streamingStartPromise;
+      }
+      if (!streaming?.isActive()) {
+        return;
+      }
+      const rendered = composeStreamingContent("live");
+      if (!rendered || rendered === lastRenderedStreamContent) {
+        return;
+      }
+      lastRenderedStreamContent = rendered;
+      await streaming.update(rendered);
+    });
+  };
+
+  const shouldRenderStreamingStatus = (): boolean =>
+    renderMode === "card" || Boolean(streamingStartPromise) || Boolean(streaming?.isActive());
+
   const queueStreamingUpdate = (
     nextText: string,
     options?: {
@@ -181,14 +241,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       lastPartial = nextText;
     }
     mergeStreamingText(nextText);
-    partialUpdateQueue = partialUpdateQueue.then(async () => {
-      if (streamingStartPromise) {
-        await streamingStartPromise;
-      }
-      if (streaming?.isActive()) {
-        await streaming.update(streamText);
-      }
-    });
+    streamPhase = "streaming";
+    queueStreamingRender();
   };
 
   const startStreaming = () => {
@@ -226,7 +280,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
     await partialUpdateQueue;
     if (streaming?.isActive()) {
-      let text = streamText;
+      let text = composeStreamingContent("final");
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
       }
@@ -236,6 +290,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamingStartPromise = null;
     streamText = "";
     lastPartial = "";
+    lastRenderedStreamContent = "";
+    streamPhase = "idle";
+    toolUseCount = 0;
+    lastToolName = undefined;
   };
 
   const { dispatcher, replyOptions, markDispatchIdle } =
@@ -385,6 +443,43 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     replyOptions: {
       ...replyOptions,
       onModelSelected: prefixContext.onModelSelected,
+      onReasoningStream: streamingEnabled
+        ? () => {
+            streamPhase = "thinking";
+            if (!shouldRenderStreamingStatus()) {
+              return;
+            }
+            startStreaming();
+            queueStreamingRender();
+          }
+        : undefined,
+      onReasoningEnd: streamingEnabled
+        ? () => {
+            if (streamPhase !== "thinking") {
+              return;
+            }
+            streamPhase = streamText ? "streaming" : "idle";
+            if (!shouldRenderStreamingStatus()) {
+              return;
+            }
+            queueStreamingRender();
+          }
+        : undefined,
+      onToolStart: streamingEnabled
+        ? (payload) => {
+            const isStartPhase = !payload?.phase || payload.phase === "start";
+            if (isStartPhase) {
+              toolUseCount += 1;
+              lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
+            }
+            streamPhase = "tool";
+            if (!shouldRenderStreamingStatus()) {
+              return;
+            }
+            startStreaming();
+            queueStreamingRender();
+          }
+        : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
             if (!payload.text) {

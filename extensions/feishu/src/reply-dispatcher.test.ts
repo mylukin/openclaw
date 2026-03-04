@@ -45,6 +45,12 @@ vi.mock("./streaming-card.js", () => ({
 
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 
+async function flushAsyncTasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 describe("createFeishuReplyDispatcher streaming behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -202,6 +208,29 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(sendMediaFeishuMock).not.toHaveBeenCalled();
   });
 
+  it("does not force streaming in auto mode for reasoning/tool events without card content", async () => {
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await dispatcher.replyOptions.onReasoningStream?.({ text: "reasoning...", isReasoning: true });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(0);
+
+    await options.deliver({ text: "plain text" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(0);
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+  });
+
   it("uses streaming session for auto mode markdown payloads", async () => {
     createFeishuReplyDispatcher({
       cfg: {} as never,
@@ -242,6 +271,57 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances[0].start).toHaveBeenCalledTimes(1);
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
     expect(streamingInstances[0].close).toHaveBeenCalledWith("```md\npartial answer\n```");
+  });
+
+  it("renders thinking/tool status lines and keeps final close content text-only", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await dispatcher.replyOptions.onReasoningStream?.({
+      text: "Reasoning:\n_step_",
+      isReasoning: true,
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("💭 思考中...");
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("🔧 正在使用 Read...");
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案");
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith(
+      "🔧 已使用 2 个工具，正在处理...\n---\n第一段答案",
+    );
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案\n第二段答案" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案\n第二段答案");
+
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n第二段答案");
   });
 
   it("sends media-only payloads as attachments", async () => {
