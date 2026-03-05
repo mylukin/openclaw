@@ -663,6 +663,7 @@ export async function runCliAgent(params: {
             next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
             next.OPENCLAW_MCP_ACCOUNT_ID = "";
             next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
+            next.OPENCLAW_MCP_MESSAGE_CHANNEL = params.messageChannel ?? "";
           }
           return next;
         })();
