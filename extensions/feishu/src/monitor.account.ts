@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
 import * as Lark from "@larksuiteoapi/node-sdk";
-import type { ClawdbotConfig, RuntimeEnv, HistoryEntry } from "openclaw/plugin-sdk";
-import { getGlobalHookRunner } from "openclaw/plugin-sdk";
+import type { ClawdbotConfig, RuntimeEnv, HistoryEntry } from "openclaw/plugin-sdk/compat";
+import { getGlobalHookRunner } from "openclaw/plugin-sdk/compat";
 import { resolveFeishuAccount } from "./accounts.js";
 import { raceWithTimeoutAndAbort } from "./async.js";
 import {

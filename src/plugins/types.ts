@@ -331,7 +331,12 @@ export type PluginHookName =
   | "subagent_spawned"
   | "subagent_ended"
   | "gateway_start"
-  | "gateway_stop";
+  | "gateway_stop"
+  | "chat_member_bot_added"
+  | "chat_member_bot_deleted"
+  | "chat_member_user_added"
+  | "chat_member_user_deleted"
+  | "chat_member_user_withdrawn";
 
 export const PLUGIN_HOOK_NAMES = [
   "before_model_resolve",
@@ -763,6 +768,16 @@ export type PluginHookGatewayContext = {
 };
 
 // gateway_start hook
+// chat_member hooks
+export type PluginHookChatMemberBotEvent = {
+  chatId: string;
+};
+
+export type PluginHookChatMemberUserEvent = {
+  chatId: string;
+  users: Array<{ openId: string; unionId?: string; name?: string }>;
+};
+
 export type PluginHookGatewayStartEvent = {
   port: number;
 };
@@ -869,6 +884,26 @@ export type PluginHookHandlerMap = {
   gateway_stop: (
     event: PluginHookGatewayStopEvent,
     ctx: PluginHookGatewayContext,
+  ) => Promise<void> | void;
+  chat_member_bot_added: (
+    event: PluginHookChatMemberBotEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_bot_deleted: (
+    event: PluginHookChatMemberBotEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_added: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_deleted: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ) => Promise<void> | void;
+  chat_member_user_withdrawn: (
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
   ) => Promise<void> | void;
 };
 
