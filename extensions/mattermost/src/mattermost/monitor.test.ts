@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/compat";
 import { describe, expect, it, vi } from "vitest";
 import { resolveMattermostAccount } from "./accounts.js";
 import {
