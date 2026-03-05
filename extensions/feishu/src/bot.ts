@@ -304,8 +304,7 @@ function resolveFeishuGroupSession(params: {
   const normalizedRootId = rootId?.trim();
   const threadReply = Boolean(normalizedThreadId || normalizedRootId);
   const replyInThread =
-    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled" ||
-    threadReply;
+    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
   const streamingInThread =
     (groupConfig?.streamingInThread ?? feishuCfg?.streamingInThread ?? "disabled") === "enabled";
 
@@ -543,9 +542,13 @@ function normalizeMentions(
 
   const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const escapeName = (value: string) => value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  let result = text;
+  const replacementByKey = new Map<string, string>();
 
   for (const mention of mentions) {
+    const key = mention.key?.trim();
+    if (!key || replacementByKey.has(key)) {
+      continue;
+    }
     const mentionId = mention.id.open_id;
     const replacement =
       botStripId && mentionId === botStripId
@@ -553,11 +556,18 @@ function normalizeMentions(
         : mentionId
           ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
           : `@${mention.name}`;
-
-    result = result.replace(new RegExp(escaped(mention.key), "g"), () => replacement).trim();
+    replacementByKey.set(key, replacement);
   }
 
-  return result;
+  if (replacementByKey.size === 0) {
+    return text;
+  }
+
+  // One-pass replacement avoids recursive/cascading rewrites when keys overlap,
+  // e.g. "@_user_1" and "@_user_10".
+  const sortedKeys = [...replacementByKey.keys()].sort((left, right) => right.length - left.length);
+  const keyPattern = new RegExp(sortedKeys.map((key) => escaped(key)).join("|"), "g");
+  return text.replace(keyPattern, (matched) => replacementByKey.get(matched) ?? matched).trim();
 }
 
 /**
@@ -1476,8 +1486,8 @@ export async function handleFeishuMessage(params: {
             skipReplyToInMessages: !isGroup,
             replyInThread,
             streamingInThread,
-            rootId: ctx.rootId,
-            threadReply,
+            rootId: replyInThread ? ctx.rootId : undefined,
+            threadReply: replyInThread && threadReply,
             mentionTargets: ctx.mentionTargets,
             accountId: account.accountId,
             botOpenId,
@@ -1629,8 +1639,8 @@ export async function handleFeishuMessage(params: {
         skipReplyToInMessages: !isGroup,
         replyInThread,
         streamingInThread,
-        rootId: ctx.rootId,
-        threadReply,
+        rootId: replyInThread ? ctx.rootId : undefined,
+        threadReply: replyInThread && threadReply,
         mentionTargets: ctx.mentionTargets,
         accountId: account.accountId,
         botOpenId,
