@@ -79,6 +79,130 @@ async function ensureSessionHeader(params: {
   });
 }
 
+type CliTurnUsage = {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  total?: number;
+};
+
+const ZERO_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: 0,
+  },
+};
+
+function normalizeNonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const normalized = Math.max(0, Math.floor(value));
+  return normalized;
+}
+
+function buildCliUsage(usage?: CliTurnUsage): {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+} | null {
+  if (!usage) {
+    return null;
+  }
+  const input = normalizeNonNegativeNumber(usage.input) ?? 0;
+  const output = normalizeNonNegativeNumber(usage.output) ?? 0;
+  const cacheRead = normalizeNonNegativeNumber(usage.cacheRead) ?? 0;
+  const cacheWrite = normalizeNonNegativeNumber(usage.cacheWrite) ?? 0;
+  const totalTokens =
+    normalizeNonNegativeNumber(usage.total) ?? input + output + cacheRead + cacheWrite;
+  const hasUsage = totalTokens > 0 || input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0;
+  if (!hasUsage) {
+    return null;
+  }
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+}
+
+export async function appendCliTurnToSessionTranscript(params: {
+  sessionFile: string;
+  sessionId: string;
+  userText?: string;
+  assistantText?: string;
+  provider: string;
+  model: string;
+  usage?: CliTurnUsage;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const sessionFile = params.sessionFile.trim();
+  if (!sessionFile) {
+    return { ok: false, reason: "missing sessionFile" };
+  }
+  const sessionId = params.sessionId.trim();
+  if (!sessionId) {
+    return { ok: false, reason: "missing sessionId" };
+  }
+  const userText = params.userText?.trim() ?? "";
+  const assistantText = params.assistantText?.trim() ?? "";
+  if (!userText && !assistantText) {
+    return { ok: false, reason: "empty turn" };
+  }
+
+  await ensureSessionHeader({ sessionFile, sessionId });
+
+  const sessionManager = SessionManager.open(sessionFile);
+  if (userText) {
+    sessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: userText }],
+      timestamp: Date.now(),
+    });
+  }
+  if (assistantText) {
+    const usage = buildCliUsage(params.usage) ?? ZERO_USAGE;
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: assistantText }],
+      api: "cli",
+      provider: params.provider,
+      model: params.model,
+      usage,
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+  }
+  emitSessionTranscriptUpdate(sessionFile);
+  return { ok: true };
+}
+
 export async function appendAssistantMessageToSessionTranscript(params: {
   agentId?: string;
   sessionKey: string;
@@ -129,6 +253,9 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   await ensureSessionHeader({ sessionFile, sessionId: entry.sessionId });
 
   const sessionManager = SessionManager.open(sessionFile);
+  // Save current leafId before appending delivery-mirror
+  // This prevents delivery-mirror from affecting the main chain (leafId)
+  const savedLeafId = sessionManager.getLeafId();
   sessionManager.appendMessage({
     role: "assistant",
     content: [{ type: "text", text: mirrorText }],
@@ -152,6 +279,15 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     stopReason: "stop",
     timestamp: Date.now(),
   });
+  // Restore leafId so delivery-mirror doesn't affect the main chain.
+  // branch() only updates in-memory leafId; on next SessionManager.open(),
+  // _buildIndex() would set leafId to the delivery-mirror entry (last in JSONL).
+  // branchWithSummary() persists a branch_summary entry to JSONL, so _buildIndex()
+  // picks it up as leafId. buildSessionContext() walks from its parentId (savedLeafId),
+  // skipping delivery-mirror. Empty summary is filtered by the "entry.summary" guard.
+  if (savedLeafId !== null) {
+    sessionManager.branchWithSummary(savedLeafId, "", undefined, false);
+  }
 
   emitSessionTranscriptUpdate(sessionFile);
   return { ok: true, sessionFile };

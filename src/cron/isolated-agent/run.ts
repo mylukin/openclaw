@@ -483,7 +483,11 @@ export async function runCronIsolatedAgentTurn(params: {
             thinkLevel,
             timeoutMs,
             runId: cronSession.sessionEntry.sessionId,
+            skillsSnapshot,
             cliSessionId,
+            abortSignal,
+            trigger: "cron",
+            messageChannel,
           });
         }
         return runEmbeddedPiAgent({

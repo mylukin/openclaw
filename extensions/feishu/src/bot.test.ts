@@ -1155,6 +1155,110 @@ describe("handleFeishuMessage command authorization", () => {
     );
   });
 
+  it("backs off sender name lookup per sender when Feishu returns no user authority", async () => {
+    mockShouldComputeCommandAuthorized.mockReturnValue(false);
+    const mockGetUser = vi.fn().mockRejectedValue({
+      response: {
+        data: {
+          code: 41050,
+          msg: "no user authority error",
+        },
+      },
+    });
+    mockCreateFeishuClient.mockReturnValue({
+      contact: {
+        user: {
+          get: mockGetUser,
+        },
+      },
+    });
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          appId: "cli_noauth",
+          appSecret: "sec_noauth",
+          groups: {
+            "oc-group": {
+              requireMention: false,
+            },
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const eventA: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-noauth-a",
+        },
+      },
+      message: {
+        message_id: "msg-noauth-1",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello group A" }),
+      },
+    };
+    const eventARepeat: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-noauth-a",
+        },
+      },
+      message: {
+        message_id: "msg-noauth-2",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello group A repeat" }),
+      },
+    };
+    const eventB: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-noauth-b",
+        },
+      },
+      message: {
+        message_id: "msg-noauth-3",
+        chat_id: "oc-group",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello group B" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event: eventA });
+    await dispatchMessage({ cfg, event: eventARepeat });
+    await dispatchMessage({ cfg, event: eventB });
+
+    expect(mockGetUser).toHaveBeenCalledTimes(2);
+    expect(mockCreateFeishuClient).toHaveBeenCalledTimes(2);
+    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(3);
+
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: expect.stringContaining("ou-noauth-a: hello group A"),
+      }),
+    );
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: expect.stringContaining("ou-noauth-a: hello group A repeat"),
+      }),
+    );
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: expect.stringContaining("ou-noauth-b: hello group B"),
+      }),
+    );
+    for (const [arg] of mockFinalizeInboundContext.mock.calls) {
+      const body = (arg as { BodyForAgent?: string }).BodyForAgent ?? "";
+      expect(body).not.toContain("Permission grant URL");
+    }
+  });
+
   it("routes group sessions by sender when groupSessionScope=group_sender", async () => {
     mockShouldComputeCommandAuthorized.mockReturnValue(false);
 
@@ -1517,7 +1621,7 @@ describe("handleFeishuMessage command authorization", () => {
     );
   });
 
-  it("forces thread replies when inbound message contains thread_id", async () => {
+  it("respects replyInThread=disabled even when thread_id is present", async () => {
     mockShouldComputeCommandAuthorized.mockReturnValue(false);
 
     const cfg: ClawdbotConfig = {
@@ -1550,8 +1654,50 @@ describe("handleFeishuMessage command authorization", () => {
 
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
-        replyInThread: true,
-        threadReply: true,
+        replyInThread: false,
+        streamingInThread: false,
+        threadReply: false,
+      }),
+    );
+  });
+
+  it("gates threadReply and rootId when replyInThread is disabled", async () => {
+    mockShouldComputeCommandAuthorized.mockReturnValue(false);
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          groups: {
+            "oc-group": {
+              requireMention: false,
+              groupSessionScope: "group",
+              replyInThread: "disabled",
+              streamingInThread: "disabled",
+            },
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: { sender_id: { open_id: "ou-thread-stream-off" } },
+      message: {
+        message_id: "msg-thread-stream-off",
+        chat_id: "oc-group",
+        chat_type: "group",
+        thread_id: "omt_topic_stream_off",
+        message_type: "text",
+        content: JSON.stringify({ text: "thread content" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyInThread: false,
+        streamingInThread: false,
+        threadReply: false,
       }),
     );
   });
