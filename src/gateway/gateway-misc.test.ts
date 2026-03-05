@@ -543,7 +543,6 @@ describe("resolveNodeCommandAllowlist", () => {
     // "node-lukin-" is the longest prefix → only browser.proxy denied
     expect(allow.has("browser.proxy")).toBe(false);
     expect(allow.has("system.run")).toBe(true);
-
   });
 });
 

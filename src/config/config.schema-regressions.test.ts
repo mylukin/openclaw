@@ -179,6 +179,12 @@ describe("config schema regressions", () => {
     const res = validateConfigObject({
       browser: {
         extraArgs: "--proxy-server=http://127.0.0.1:7890" as unknown,
+      },
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
   it("rejects displayName-like gateway.nodes.overrides keys", () => {
     const res = validateConfigObject({
       gateway: {
