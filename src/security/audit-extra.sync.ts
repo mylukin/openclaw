@@ -1075,7 +1075,7 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
   }
 
   const patternLike: string[] = [];
-  const unknownExact: string[] = [];
+  const unknownExact: { label: string; command: string }[] = [];
   for (const entry of denyEntries) {
     const knownCommands = new Set(baseKnownCommands);
     for (const value of globalAllowCommands) {
@@ -1099,7 +1099,7 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
         continue;
       }
       if (!knownCommands.has(value)) {
-        unknownExact.push(`${entry.path}: ${value}`);
+        unknownExact.push({ label: `${entry.path}: ${value}`, command: value });
       }
     }
   }
@@ -1116,11 +1116,11 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
   if (unknownExact.length > 0) {
     const unknownDetails = unknownExact
       .map((entry) => {
-        const suggestions = suggestKnownNodeCommands(entry, baseKnownCommands);
+        const suggestions = suggestKnownNodeCommands(entry.command, baseKnownCommands);
         if (suggestions.length === 0) {
-          return entry;
+          return entry.label;
         }
-        return `${entry} (did you mean: ${suggestions.join(", ")})`;
+        return `${entry.label} (did you mean: ${suggestions.join(", ")})`;
       })
       .join(", ");
 
