@@ -1116,7 +1116,7 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
   if (unknownExact.length > 0) {
     const unknownDetails = unknownExact
       .map((entry) => {
-        const suggestions = suggestKnownNodeCommands(entry, knownCommands);
+        const suggestions = suggestKnownNodeCommands(entry, baseKnownCommands);
         if (suggestions.length === 0) {
           return entry;
         }
