@@ -264,8 +264,6 @@ export async function getMessageFeishu(params: {
       item.mentions,
     );
 
-    content = enrichMentionPlaceholders(content, item.mentions);
-
     return {
       messageId: item.message_id ?? messageId,
       chatId: item.chat_id ?? "",
