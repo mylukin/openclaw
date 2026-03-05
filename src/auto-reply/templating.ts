@@ -135,6 +135,8 @@ export type MsgContext = {
   CommandTargetSessionKey?: string;
   /** Gateway client scopes when the message originates from the gateway. */
   GatewayClientScopes?: string[];
+  /** Channel-specific payload data forwarded to hook consumers (e.g. Feishu message/chat IDs). */
+  ChannelData?: Record<string, unknown>;
   /** Thread identifier (Telegram topic id or Matrix thread event id). */
   MessageThreadId?: string | number;
   /** Telegram forum supergroup marker. */

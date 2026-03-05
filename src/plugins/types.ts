@@ -482,6 +482,10 @@ export type PluginHookMessageSentEvent = {
   content: string;
   success: boolean;
   error?: string;
+  /** Provider-assigned message ID for the sent message. */
+  messageId?: string;
+  /** Delivery metadata (e.g. mentions, channel-specific data). */
+  metadata?: Record<string, unknown>;
 };
 
 // Tool context
