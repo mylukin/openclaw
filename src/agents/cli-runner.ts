@@ -392,6 +392,9 @@ export async function runCliAgent(params: {
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
+  messageAccountId?: string;
+  messageTo?: string;
+  messageThreadId?: string | number;
 }): Promise<EmbeddedPiRunResult> {
   const started = Date.now();
   const workspaceResolution = resolveRunWorkspaceDir({
@@ -661,9 +664,12 @@ export async function runCliAgent(params: {
           }
           if (mcpConfigPath) {
             next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
-            next.OPENCLAW_MCP_ACCOUNT_ID = "";
+            next.OPENCLAW_MCP_ACCOUNT_ID = params.messageAccountId ?? "";
             next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
             next.OPENCLAW_MCP_MESSAGE_CHANNEL = params.messageChannel ?? "";
+            next.OPENCLAW_MCP_TO = params.messageTo ?? "";
+            next.OPENCLAW_MCP_THREAD_ID =
+              params.messageThreadId != null ? String(params.messageThreadId) : "";
           }
           return next;
         })();
@@ -940,6 +946,9 @@ export async function runClaudeCliAgent(params: {
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
+  messageAccountId?: string;
+  messageTo?: string;
+  messageThreadId?: string | number;
 }): Promise<EmbeddedPiRunResult> {
   return runCliAgent({
     sessionId: params.sessionId,
@@ -968,5 +977,8 @@ export async function runClaudeCliAgent(params: {
     abortSignal: params.abortSignal,
     trigger: params.trigger,
     messageChannel: params.messageChannel,
+    messageAccountId: params.messageAccountId,
+    messageTo: params.messageTo,
+    messageThreadId: params.messageThreadId,
   });
 }

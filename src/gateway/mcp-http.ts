@@ -49,6 +49,8 @@ function resolveFilteredTools(params: {
   sessionKey: string;
   messageProvider?: string;
   accountId?: string;
+  messageTo?: string;
+  messageThreadId?: string;
 }) {
   const {
     agentId,
@@ -83,6 +85,8 @@ function resolveFilteredTools(params: {
     agentSessionKey: params.sessionKey,
     agentChannel: resolveGatewayMessageChannel(params.messageProvider),
     agentAccountId: params.accountId,
+    agentTo: params.messageTo,
+    agentThreadId: params.messageThreadId,
     config: params.cfg,
     pluginToolAllowlist: collectExplicitAllowlist([
       profilePolicy,
@@ -318,6 +322,8 @@ export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): strin
           "x-openclaw-agent-id": "${OPENCLAW_MCP_AGENT_ID}",
           "x-openclaw-account-id": "${OPENCLAW_MCP_ACCOUNT_ID}",
           "x-openclaw-message-channel": "${OPENCLAW_MCP_MESSAGE_CHANNEL}",
+          "x-openclaw-message-to": "${OPENCLAW_MCP_TO}",
+          "x-openclaw-thread-id": "${OPENCLAW_MCP_THREAD_ID}",
         },
       },
     },
@@ -368,14 +374,20 @@ export async function startMcpLoopbackServer(port: number): Promise<{
     sessionKey: string;
     messageProvider?: string;
     accountId?: string;
+    messageTo?: string;
+    messageThreadId?: string;
   }) {
     if (toolCacheConfigRef && toolCacheConfigRef !== params.cfg) {
       toolCache.clear();
     }
     toolCacheConfigRef = params.cfg;
-    const cacheKey = [params.sessionKey, params.messageProvider ?? "", params.accountId ?? ""].join(
-      "\u0000",
-    );
+    const cacheKey = [
+      params.sessionKey,
+      params.messageProvider ?? "",
+      params.accountId ?? "",
+      params.messageTo ?? "",
+      params.messageThreadId ?? "",
+    ].join("\u0000");
     const now = Date.now();
     const cached = toolCache.get(cacheKey);
     if (cached && now - cached.time < TOOL_CACHE_TTL_MS) {
@@ -442,11 +454,15 @@ export async function startMcpLoopbackServer(port: number): Promise<{
         const messageProvider =
           normalizeMessageChannel(getHeader(req, "x-openclaw-message-channel")) ?? undefined;
         const accountId = getHeader(req, "x-openclaw-account-id")?.trim() || undefined;
+        const messageTo = getHeader(req, "x-openclaw-message-to")?.trim() || undefined;
+        const messageThreadId = getHeader(req, "x-openclaw-thread-id")?.trim() || undefined;
         const { tools, toolSchema } = getTools({
           cfg,
           sessionKey: reqSessionKey,
           messageProvider,
           accountId,
+          messageTo,
+          messageThreadId,
         });
 
         // Handle batch or single request.
