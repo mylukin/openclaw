@@ -148,6 +148,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streamingStartPromise: Promise<void> | null = null;
   type StreamTextUpdateMode = "snapshot" | "delta";
 
+  /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
+  const stripIncompleteAtTag = (text: string): string => {
+    const lastAtIdx = text.lastIndexOf("<at");
+    if (lastAtIdx === -1) {
+      return text;
+    }
+    const tail = text.substring(lastAtIdx);
+    // Tag is complete if it contains the closing </at> or self-closing />
+    if (/<\/at>/i.test(tail) || /\/>/i.test(tail)) {
+      return text;
+    }
+    // Incomplete tag — strip it from rendered output only
+    return text.substring(0, lastAtIdx);
+  };
+
   const queueStreamingUpdate = (
     nextText: string,
     options?: {
@@ -172,7 +187,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await streamingStartPromise;
       }
       if (streaming?.isActive()) {
-        await streaming.update(streamText);
+        await streaming.update(stripIncompleteAtTag(streamText));
       }
     });
   };
