@@ -1720,17 +1720,11 @@ export async function runEmbeddedAttempt(
                 }
               }
             } else {
-              // No imageModel configured, use main model directly
-              if (mainModelSupportsImages) {
-                await abortable(
-                  activeSession.prompt(effectivePrompt, { images: imageResult.images }),
-                );
-              } else {
-                log.debug(
-                  `Image pre-analysis: no imageModel configured and main model doesn't support images, ignoring images`,
-                );
-                await abortable(activeSession.prompt(effectivePrompt));
-              }
+              // No imageModel configured; images were only loaded when mainModelSupportsImages is true
+              // (detectAndLoadPromptImages returns [] for non-vision models when usePreAnalysis is false).
+              await abortable(
+                activeSession.prompt(effectivePrompt, { images: imageResult.images }),
+              );
             }
           } else {
             await abortable(activeSession.prompt(effectivePrompt));

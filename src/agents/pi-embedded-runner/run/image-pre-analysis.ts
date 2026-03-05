@@ -9,6 +9,7 @@
  * to still understand image content through a vision-capable model.
  */
 
+import { complete } from "@mariozechner/pi-ai";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { getApiKeyForModel, requireApiKey } from "../../model-auth.js";
@@ -115,9 +116,6 @@ export async function analyzeImagesWithImageModel(params: {
           const apiKey = requireApiKey(apiKeyInfo, model.provider);
           authStorage.setRuntimeApiKey(model.provider, apiKey);
 
-          // Import complete dynamically to avoid circular dependencies
-          const { complete } = await import("@mariozechner/pi-ai");
-
           // Build context with image
           const context = {
             messages: [
@@ -138,7 +136,7 @@ export async function analyzeImagesWithImageModel(params: {
 
           const message = await complete(model, context, {
             apiKey,
-            maxTokens: 1024,
+            maxTokens: 2048,
           });
 
           // Extract text from response

@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { runEmbeddedPiAgent } from "../../agents/pi-embedded-runner/run.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { transcribeAudioFile } from "../../media-understanding/transcribe-audio.js";
 import { textToSpeechTelephony } from "../../tts/tts.js";
