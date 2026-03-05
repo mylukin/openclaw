@@ -248,6 +248,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamText += nextText;
   };
 
+  /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
+  const stripIncompleteAtTag = (text: string): string => {
+    const lastAtIdx = text.lastIndexOf("<at");
+    if (lastAtIdx === -1) {
+      return text;
+    }
+    const tail = text.substring(lastAtIdx);
+    if (/<\/at>/i.test(tail) || /\/>/i.test(tail)) {
+      return text;
+    }
+    return text.substring(0, lastAtIdx);
+  };
+
   const queueStreamingRender = (renderedSnapshot?: string) => {
     partialUpdateQueue = partialUpdateQueue.then(async () => {
       if (streamingStartPromise) {
@@ -257,7 +270,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         return;
       }
       const rendered = renderedSnapshot ?? composeStreamingContent("live");
-      const renderedForCard = normalizeMentionTagsForCard(rendered);
+      const safeRendered = stripIncompleteAtTag(rendered);
+      const renderedForCard = normalizeMentionTagsForCard(safeRendered);
       if (!renderedForCard || renderedForCard === lastRenderedStreamContent) {
         return;
       }
