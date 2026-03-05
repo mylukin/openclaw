@@ -28,6 +28,7 @@ vi.mock("../agents/agent-scope.js", () => ({
 
 vi.mock("../agents/model-selection.js", () => ({
   buildModelAliasIndex: mockBuildModelAliasIndex,
+  isCliProvider: vi.fn().mockReturnValue(false),
   resolveModelRefFromString: mockResolveModelRefFromString,
 }));
 
