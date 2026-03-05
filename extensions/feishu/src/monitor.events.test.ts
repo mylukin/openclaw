@@ -1,4 +1,4 @@
-import type { ClawdbotConfig } from "openclaw/plugin-sdk";
+import type { ClawdbotConfig } from "openclaw/plugin-sdk/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const probeFeishuMock = vi.hoisted(() => vi.fn());
@@ -39,8 +39,8 @@ vi.mock("./runtime.js", () => ({
   }),
 }));
 
-vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk")>();
+vi.mock("openclaw/plugin-sdk/compat", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/compat")>();
   return {
     ...actual,
     getGlobalHookRunner: () => hookRunnerMocks,
