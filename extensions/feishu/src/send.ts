@@ -187,6 +187,11 @@ export async function getMessageFeishu(params: {
           id_type?: string;
           sender_type?: string;
         };
+        mentions?: Array<{
+          key?: string;
+          name?: string;
+          id?: { open_id?: string; user_id?: string; union_id?: string };
+        }>;
         create_time?: string;
       };
     };
@@ -208,9 +213,10 @@ export async function getMessageFeishu(params: {
 
     const msgType = item.msg_type ?? "text";
     const rawContent = item.body?.content ?? "";
-    const content = parseQuotedMessageContent(rawContent, msgType);
-
-    content = enrichMentionPlaceholders(content, item.mentions);
+    const content = enrichMentionPlaceholders(
+      parseQuotedMessageContent(rawContent, msgType),
+      item.mentions,
+    );
 
     return {
       messageId: item.message_id ?? messageId,
@@ -334,7 +340,7 @@ export async function sendMessageFeishu(
 
   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
 
-  if (replyToMessageId) {
+  if (replyToMessageId && replyInThread) {
     let response;
     try {
       response = await client.im.message.reply({
@@ -407,7 +413,7 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
   const content = JSON.stringify(card);
 
-  if (replyToMessageId) {
+  if (replyToMessageId && replyInThread) {
     let response;
     try {
       response = await client.im.message.reply({
