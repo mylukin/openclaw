@@ -61,6 +61,7 @@ export type CreateFeishuReplyDispatcherParams = {
   onFinalTextDelivered?: (params: {
     text: string;
     messageId?: string;
+    messageIds?: string[];
     chatId: string;
     accountId?: string;
   }) => Promise<void> | void;
@@ -85,6 +86,34 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const threadReplyMode = threadReply === true;
   const effectiveReplyInThread = threadReplyMode ? true : replyInThread;
   const account = resolveFeishuAccount({ cfg, accountId });
+
+  // Emit message_sent plugin hooks via the runtime SDK so downstream consumers
+  // (e.g. bot-company journal) can record outbound messages. The feishu reply
+  // dispatcher bypasses the core deliverOutboundPayloads pipeline, so hooks
+  // must be emitted explicitly here. Using core.hooks avoids the bundle singleton
+  // splitting issue that makes direct getGlobalHookRunner() imports fail.
+  const emitMessageSent = (event: {
+    content: string;
+    success: boolean;
+    messageId?: string;
+    error?: string;
+  }) => {
+    core.hooks.emitMessageSent(
+      {
+        to: chatId,
+        content: event.content,
+        success: event.success,
+        ...(event.messageId ? { messageId: event.messageId } : {}),
+        ...(event.error ? { error: event.error } : {}),
+        metadata: { chatId },
+      },
+      {
+        channelId: "feishu",
+        accountId: accountId ?? account.accountId,
+        conversationId: chatId,
+      },
+    );
+  };
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
 
   let typingState: TypingIndicatorState | null = null;
@@ -168,7 +197,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let finalTextEmitted = false;
   let replaceNextPartialAfterTool = false;
 
-  const emitFinalTextIfNeeded = async (text: string, messageId?: string) => {
+  const emitFinalTextIfNeeded = async (
+    text: string,
+    delivery?: { messageId?: string; messageIds?: string[] },
+  ) => {
     const normalized = text.trim();
     if (!normalized || finalTextEmitted || typeof params.onFinalTextDelivered !== "function") {
       return;
@@ -177,7 +209,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     try {
       await params.onFinalTextDelivered({
         text: normalized,
-        messageId,
+        ...(delivery?.messageId ? { messageId: delivery.messageId } : {}),
+        ...(delivery?.messageIds && delivery.messageIds.length > 0
+          ? { messageIds: delivery.messageIds }
+          : {}),
         chatId,
         accountId: accountId ?? account.accountId,
       });
@@ -389,7 +424,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await streaming.close(normalizeMentionTagsForCard(text));
       }
       if (options?.emitFinalText !== false) {
-        await emitFinalTextIfNeeded(finalText, streamMessageId);
+        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+        await emitFinalTextIfNeeded(
+          finalText,
+          streamMessageId ? { messageId: streamMessageId } : undefined,
+        );
       }
     }
     streaming = null;
@@ -481,7 +520,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
 
           let first = true;
-          let firstMessageId: string | undefined;
+          let lastMessageId: string | undefined;
+          const deliveredMessageIds: string[] = [];
           if (useCard) {
             for (const chunk of core.channel.text.chunkTextWithMode(
               text,
@@ -498,8 +538,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 accountId,
               });
               const sentMessageId = sent?.messageId;
-              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
-                firstMessageId = sentMessageId;
+              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                lastMessageId = sentMessageId;
+                deliveredMessageIds.push(sentMessageId);
               }
               first = false;
             }
@@ -520,14 +561,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 accountId,
               });
               const sentMessageId = sent?.messageId;
-              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
-                firstMessageId = sentMessageId;
+              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                lastMessageId = sentMessageId;
+                deliveredMessageIds.push(sentMessageId);
               }
               first = false;
             }
           }
           if (info?.kind === "final") {
-            await emitFinalTextIfNeeded(text, firstMessageId);
+            emitMessageSent({ content: text, success: true, messageId: lastMessageId });
+            await emitFinalTextIfNeeded(text, {
+              ...(lastMessageId ? { messageId: lastMessageId } : {}),
+              ...(deliveredMessageIds.length > 0 ? { messageIds: deliveredMessageIds } : {}),
+            });
           }
         }
 
