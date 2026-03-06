@@ -12,7 +12,7 @@ import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
 import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
 import { createFeishuWSClient, createEventDispatcher } from "./client.js";
-import { probeFeishu } from "./probe.js";
+import { fetchBotOpenIdForMonitor } from "./monitor.startup.js";
 import { getMessageFeishu } from "./send.js";
 import type { ResolvedFeishuAccount } from "./types.js";
 
@@ -43,6 +43,17 @@ export type FeishuReactionCreatedEvent = {
   operator_type?: string;
   user_id?: { open_id?: string };
   action_time?: string;
+};
+
+type FeishuMessageRecalledEvent = {
+  message_id?: string;
+  chat_id?: string;
+  recall_time?: string;
+  action_time?: string;
+  operator_id?: unknown;
+  user_id?: unknown;
+  deleter_id?: unknown;
+  message?: unknown;
 };
 
 type ResolveReactionSyntheticEventParams = {
@@ -235,15 +246,97 @@ export async function resolveReactionSyntheticEvent(
   };
 }
 
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object") {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function pickFirstString(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function resolveOpenIdLike(value: unknown): string | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  return pickFirstString(
+    asNonEmptyString(record.open_id),
+    asNonEmptyString(record.user_id),
+    asNonEmptyString(record.union_id),
+    resolveOpenIdLike(record.sender_id),
+    resolveOpenIdLike(record.id),
+    resolveOpenIdLike(record.user),
+  );
+}
+
+function buildRecalledEventSummary(eventData: unknown): {
+  messageId: string;
+  chatId: string;
+  operatorOpenId: string;
+  senderOpenId: string;
+  rootId: string;
+  threadId: string;
+  recallTime: string;
+} {
+  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
+  const message = asRecord(event.message);
+  const messageSender = asRecord(message?.sender);
+  return {
+    messageId:
+      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
+      "unknown",
+    chatId:
+      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
+      "unknown",
+    operatorOpenId:
+      pickFirstString(
+        resolveOpenIdLike(event.operator_id),
+        resolveOpenIdLike(event.deleter_id),
+        resolveOpenIdLike(event.user_id),
+        resolveOpenIdLike(message?.recalled_by),
+        resolveOpenIdLike(message?.deleted_by),
+      ) ?? "unknown",
+    senderOpenId:
+      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
+      "unknown",
+    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
+    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
+    recallTime:
+      pickFirstString(
+        asNonEmptyString(event.recall_time),
+        asNonEmptyString(event.action_time),
+        asNonEmptyString(message?.update_time),
+      ) ?? "unknown",
+  };
+}
+
 export function getBotOpenId(accountId: string): string | undefined {
   const value = botOpenIds.get(accountId)?.trim();
   return value ? value : undefined;
 }
 
-async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
+async function fetchBotOpenId(
+  account: ResolvedFeishuAccount,
+  options: { runtime?: RuntimeEnv; abortSignal?: AbortSignal } = {},
+): Promise<string | undefined> {
   try {
-    const result = await probeFeishu(account);
-    return result.ok ? result.botOpenId : undefined;
+    return await fetchBotOpenIdForMonitor(account, options);
   } catch {
     return undefined;
   }
@@ -296,6 +389,18 @@ function registerEventHandlers(
     },
     "im.message.message_read_v1": async () => {
       // Ignore read receipts
+    },
+    "im.message.recalled_v1": async (data) => {
+      try {
+        const summary = buildRecalledEventSummary(data);
+        log(
+          `feishu[${accountId}]: message recalled chat=${summary.chatId} message=${summary.messageId} ` +
+            `operator=${summary.operatorOpenId} sender=${summary.senderOpenId} ` +
+            `root=${summary.rootId} thread=${summary.threadId} recall_time=${summary.recallTime}`,
+        );
+      } catch (err) {
+        error(`feishu[${accountId}]: error handling message recalled event: ${String(err)}`);
+      }
     },
     "im.chat.member.bot.added_v1": async (data) => {
       try {
@@ -492,6 +597,7 @@ type MonitorAccountParams = {
   account: ResolvedFeishuAccount;
   runtime?: RuntimeEnv;
   abortSignal?: AbortSignal;
+  botOpenIdSource?: { kind: "prefetched"; botOpenId?: string } | { kind: "fetch" };
 };
 
 /**
@@ -502,8 +608,11 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
   const { accountId } = account;
   const log = runtime?.log ?? console.log;
 
-  // Fetch bot open_id
-  const botOpenId = await fetchBotOpenId(account);
+  const botOpenIdSource = params.botOpenIdSource ?? { kind: "fetch" as const };
+  const botOpenId =
+    botOpenIdSource.kind === "prefetched"
+      ? botOpenIdSource.botOpenId
+      : await fetchBotOpenIdForMonitor(account, { runtime, abortSignal });
   botOpenIds.set(accountId, botOpenId ?? "");
   log(`feishu[${accountId}]: bot open_id resolved: ${botOpenId ?? "unknown"}`);
 
@@ -703,7 +812,23 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
     `feishu: starting ${accounts.length} account(s): ${accounts.map((a) => a.accountId).join(", ")}`,
   );
 
-  // Start all accounts in parallel
+  // Probe bot info sequentially so startup does not burst requests across accounts.
+  const prefetchedBotOpenIds = new Map<string, string | undefined>();
+  for (const account of accounts) {
+    if (opts.abortSignal?.aborted) {
+      break;
+    }
+    prefetchedBotOpenIds.set(
+      account.accountId,
+      await fetchBotOpenId(account, { runtime: opts.runtime, abortSignal: opts.abortSignal }),
+    );
+  }
+
+  if (opts.abortSignal?.aborted) {
+    return;
+  }
+
+  // Start account monitors in parallel after preflight completes.
   await Promise.all(
     accounts.map((account) =>
       monitorSingleAccount({
@@ -711,6 +836,10 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
         account,
         runtime: opts.runtime,
         abortSignal: opts.abortSignal,
+        botOpenIdSource: {
+          kind: "prefetched",
+          botOpenId: prefetchedBotOpenIds.get(account.accountId),
+        },
       }),
     ),
   );
