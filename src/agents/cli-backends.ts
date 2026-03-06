@@ -61,6 +61,10 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
       resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
     },
   },
+  mcp: {
+    enabled: true,
+    strict: true,
+  },
   serialize: true,
 };
 
@@ -118,6 +122,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
   const baseResume = base.reliability?.watchdog?.resume ?? {};
   const overrideFresh = override.reliability?.watchdog?.fresh ?? {};
   const overrideResume = override.reliability?.watchdog?.resume ?? {};
+  const baseMcp = base.mcp ?? {};
+  const overrideMcp = override.mcp ?? {};
+  const mergedMcp = (() => {
+    const mergedServers = {
+      ...baseMcp.servers,
+      ...overrideMcp.servers,
+    };
+    const next = {
+      ...baseMcp,
+      ...overrideMcp,
+      ...(Object.keys(mergedServers).length ? { servers: mergedServers } : {}),
+    };
+    return Object.keys(next).length ? next : undefined;
+  })();
   return {
     ...base,
     ...override,
@@ -144,6 +162,7 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
         },
       },
     },
+    mcp: mergedMcp,
   };
 }
 
