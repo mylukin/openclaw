@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   createReplyPrefixContext,
   createTypingCallbacks,
@@ -26,6 +27,34 @@ function shouldUseCard(text: string): boolean {
  * Messages older than this are likely replays after context compaction (#30418). */
 const TYPING_INDICATOR_MAX_AGE_MS = 2 * 60_000;
 const MS_EPOCH_MIN = 1_000_000_000_000;
+
+function resolveFinalDeliveryContent(text: string, mediaUrls: string[]): string {
+  const normalized = text.trim();
+  if (normalized) {
+    return normalized;
+  }
+  if (mediaUrls.length === 0) {
+    return normalized;
+  }
+  const names = mediaUrls
+    .map((mediaUrl) => {
+      const trimmed = mediaUrl.trim();
+      if (!trimmed) {
+        return null;
+      }
+      const withoutHash = trimmed.split("#")[0] ?? trimmed;
+      const withoutQuery = withoutHash.split("?")[0] ?? withoutHash;
+      try {
+        const parsed = new URL(withoutQuery);
+        return path.basename(parsed.pathname) || null;
+      } catch {
+        const base = path.basename(withoutQuery);
+        return base && base !== "." && base !== "/" ? base : null;
+      }
+    })
+    .filter((value): value is string => Boolean(value));
+  return names.length > 0 ? names.join(", ") : "media";
+}
 
 function normalizeEpochMs(timestamp: number | undefined): number | undefined {
   if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
@@ -97,6 +126,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     success: boolean;
     messageId?: string;
     error?: string;
+    metadata?: Record<string, unknown>;
   }) => {
     core.hooks.emitMessageSent(
       {
@@ -105,7 +135,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         success: event.success,
         ...(event.messageId ? { messageId: event.messageId } : {}),
         ...(event.error ? { error: event.error } : {}),
-        metadata: { chatId },
+        metadata: { chatId, ...(event.metadata ?? {}) },
       },
       {
         channelId: "feishu",
@@ -512,9 +542,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               deliveredFinalTexts.add(text);
             }
             // Send media even when streaming handled the text
+            const deliveredMediaMessageIds: string[] = [];
             if (hasMedia) {
               for (const mediaUrl of mediaList) {
-                await sendMediaFeishu({
+                const sent = await sendMediaFeishu({
                   cfg,
                   to: chatId,
                   mediaUrl,
@@ -522,7 +553,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   replyInThread: effectiveReplyInThread,
                   accountId,
                 });
+                if (typeof sent?.messageId === "string" && sent.messageId.trim()) {
+                  deliveredMediaMessageIds.push(sent.messageId);
+                }
               }
+            }
+            if (info?.kind === "final" && !hasText && deliveredMediaMessageIds.length > 0) {
+              const finalContent = resolveFinalDeliveryContent(text, mediaList);
+              emitMessageSent({
+                content: finalContent,
+                success: true,
+                messageId: deliveredMediaMessageIds.at(-1),
+                metadata: { chatId, messageIds: deliveredMediaMessageIds },
+              });
+              await emitFinalTextIfNeeded(finalContent, {
+                messageId: deliveredMediaMessageIds.at(-1),
+                messageIds: deliveredMediaMessageIds,
+              });
             }
             return;
           }
@@ -586,9 +633,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         }
 
+        const deliveredMediaMessageIds: string[] = [];
         if (hasMedia) {
           for (const mediaUrl of mediaList) {
-            await sendMediaFeishu({
+            const sent = await sendMediaFeishu({
               cfg,
               to: chatId,
               mediaUrl,
@@ -596,7 +644,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               replyInThread: effectiveReplyInThread,
               accountId,
             });
+            if (typeof sent?.messageId === "string" && sent.messageId.trim()) {
+              deliveredMediaMessageIds.push(sent.messageId);
+            }
           }
+        }
+        if (info?.kind === "final" && !hasText && deliveredMediaMessageIds.length > 0) {
+          const finalContent = resolveFinalDeliveryContent(text, mediaList);
+          emitMessageSent({
+            content: finalContent,
+            success: true,
+            messageId: deliveredMediaMessageIds.at(-1),
+            metadata: { chatId, messageIds: deliveredMediaMessageIds },
+          });
+          await emitFinalTextIfNeeded(finalContent, {
+            messageId: deliveredMediaMessageIds.at(-1),
+            messageIds: deliveredMediaMessageIds,
+          });
         }
       },
       onError: async (error, info) => {
