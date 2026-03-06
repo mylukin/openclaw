@@ -8,6 +8,7 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
+const emitMessageSentMock = vi.hoisted(() => vi.fn());
 const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
 const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
 const streamingInstances = vi.hoisted(() => [] as any[]);
@@ -66,7 +67,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     streamingInstances.length = 0;
-    sendMediaFeishuMock.mockResolvedValue(undefined);
+    sendMediaFeishuMock.mockResolvedValue({ messageId: "om_media_1", chatId: "oc_chat" });
 
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
@@ -102,6 +103,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
           createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
           resolveHumanDelayConfig: vi.fn(() => undefined),
         },
+      },
+      hooks: {
+        emitMessageSent: emitMessageSentMock,
       },
     });
   });
@@ -589,6 +593,184 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         replyToMessageId: "om_msg",
         replyInThread: true,
       }),
+    );
+  });
+
+  it("emits persistence signals for media-only final replies", async () => {
+    const onFinalTextDelivered = vi.fn(async () => {});
+    sendMediaFeishuMock.mockResolvedValueOnce({ messageId: "om_media_1", chatId: "oc_chat" });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+      onFinalTextDelivered,
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver(
+      { mediaUrl: "https://example.com/path/photo.png?x=1" },
+      { kind: "final" },
+    );
+
+    expect(emitMessageSentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "oc_chat",
+        content: "photo.png",
+        success: true,
+        messageId: "om_media_1",
+        metadata: expect.objectContaining({
+          chatId: "oc_chat",
+          messageIds: ["om_media_1"],
+        }),
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_chat",
+      }),
+    );
+    expect(onFinalTextDelivered).toHaveBeenCalledWith({
+      text: "photo.png",
+      messageId: "om_media_1",
+      messageIds: ["om_media_1"],
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+  });
+
+  it("emits onFinalTextDelivered for non-streaming final text replies", async () => {
+    const onFinalTextDelivered = vi.fn(async () => {});
+    sendMessageFeishuMock.mockResolvedValue({ messageId: "om_final_1", chatId: "oc_chat" });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+      onFinalTextDelivered,
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "@Trent 请继续" }, { kind: "final" });
+
+    expect(onFinalTextDelivered).toHaveBeenCalledTimes(1);
+    expect(onFinalTextDelivered).toHaveBeenCalledWith({
+      text: "@Trent 请继续",
+      messageId: "om_final_1",
+      messageIds: ["om_final_1"],
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+  });
+
+  it("emits every provider message id for chunked non-streaming final text replies", async () => {
+    const onFinalTextDelivered = vi.fn(async () => {});
+    sendMessageFeishuMock
+      .mockResolvedValueOnce({ messageId: "om_chunk_1", chatId: "oc_chat" })
+      .mockResolvedValueOnce({ messageId: "om_chunk_2", chatId: "oc_chat" });
+    getFeishuRuntimeMock.mockReturnValue({
+      channel: {
+        text: {
+          resolveTextChunkLimit: vi.fn(() => 16),
+          resolveChunkMode: vi.fn(() => "line"),
+          resolveMarkdownTableMode: vi.fn(() => "preserve"),
+          convertMarkdownTables: vi.fn((text) => text),
+          chunkTextWithMode: vi.fn(() => ["第一段", "第二段"]),
+        },
+        reply: {
+          createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
+          resolveHumanDelayConfig: vi.fn(() => undefined),
+        },
+      },
+      hooks: {
+        emitMessageSent: emitMessageSentMock,
+      },
+    });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+      onFinalTextDelivered,
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "第一段\n第二段" }, { kind: "final" });
+
+    expect(onFinalTextDelivered).toHaveBeenCalledTimes(1);
+    expect(onFinalTextDelivered).toHaveBeenCalledWith({
+      text: "第一段\n第二段",
+      messageId: "om_chunk_2",
+      messageIds: ["om_chunk_1", "om_chunk_2"],
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+  });
+
+  it("emits onFinalTextDelivered when streaming closes with final text", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+    const onFinalTextDelivered = vi.fn(async () => {});
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+      onFinalTextDelivered,
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "最终回复内容" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(onFinalTextDelivered).toHaveBeenCalledTimes(1);
+    expect(onFinalTextDelivered).toHaveBeenCalledWith({
+      text: "最终回复内容",
+      messageId: "om_stream_1",
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+  });
+
+  it("normalizes user_id mention tags before closing streaming card", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver(
+      { text: '是 <at user_id="ou_vivi">Vivi（薇薇）</at> 的回合，不是我' },
+      { kind: "final" },
+    );
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "是 <at id=ou_vivi></at> 的回合，不是我",
     );
   });
 });
