@@ -411,4 +411,63 @@ describe("createStreamJsonProcessor", () => {
     expect(onAssistantTurn).toHaveBeenCalledWith("delta text fallback");
     expect(output.text).toBe("delta text fallback");
   });
+
+  it("handles unknown top-level envelope types without requiring exhaustive enumeration", () => {
+    const onAssistantTurn = vi.fn();
+    const processor = createStreamJsonProcessor(createBackend(), {
+      onAssistantTurn,
+    });
+
+    processor.feed(
+      `${JSON.stringify({
+        type: "custom_agent_event",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "message from unknown envelope type" }],
+        },
+      })}\n`,
+    );
+
+    const output = processor.finish();
+    expect(onAssistantTurn).toHaveBeenCalledWith("message from unknown envelope type");
+    expect(output.text).toBe("message from unknown envelope type");
+  });
+
+  it("ignores rate_limit_event envelopes while preserving assistant stream output", () => {
+    const onAssistantTurn = vi.fn();
+    const processor = createStreamJsonProcessor(createBackend(), {
+      onAssistantTurn,
+    });
+
+    processor.feed(
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "part 1" }],
+        },
+      })}\n`,
+    );
+    processor.feed(
+      `${JSON.stringify({
+        type: "rate_limit_event",
+        current_requests_per_minute: 10,
+      })}\n`,
+    );
+    processor.feed(
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "part 2" }],
+        },
+      })}\n`,
+    );
+
+    const output = processor.finish();
+    expect(onAssistantTurn).toHaveBeenCalledTimes(2);
+    expect(onAssistantTurn).toHaveBeenNthCalledWith(1, "part 1");
+    expect(onAssistantTurn).toHaveBeenNthCalledWith(2, "part 2");
+    expect(output.text).toBe("part 2");
+  });
 });

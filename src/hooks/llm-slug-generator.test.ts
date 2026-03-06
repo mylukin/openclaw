@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import type { OpenClawConfig } from "../config/config.js";
 
 const {
@@ -26,10 +27,14 @@ vi.mock("../agents/agent-scope.js", () => ({
   resolveAgentEffectiveModelPrimary: mockResolveAgentEffectiveModelPrimary,
 }));
 
-vi.mock("../agents/model-selection.js", () => ({
-  buildModelAliasIndex: mockBuildModelAliasIndex,
-  resolveModelRefFromString: mockResolveModelRefFromString,
-}));
+vi.mock("../agents/model-selection.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../agents/model-selection.js")>();
+  return {
+    ...orig,
+    buildModelAliasIndex: mockBuildModelAliasIndex,
+    resolveModelRefFromString: mockResolveModelRefFromString,
+  };
+});
 
 vi.mock("../agents/pi-embedded.js", () => ({
   runEmbeddedPiAgent: mockRunEmbeddedPiAgent,
@@ -115,6 +120,24 @@ describe("generateSlugViaLLM", () => {
     expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         timeoutMs: 5_000,
+      }),
+    );
+  });
+
+  it("falls back to default embedded provider when primary model is CLI backend", async () => {
+    mockResolveModelRefFromString.mockReturnValue({
+      ref: { provider: "claude-cli", model: "sonnet" },
+    });
+
+    await generateSlugViaLLM({
+      sessionContent: "Conversation body",
+      cfg: {} as OpenClawConfig,
+    });
+
+    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: DEFAULT_PROVIDER,
+        model: DEFAULT_MODEL,
       }),
     );
   });
