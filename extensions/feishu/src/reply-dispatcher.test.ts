@@ -8,6 +8,7 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
+const emitMessageSentMock = vi.hoisted(() => vi.fn());
 const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
 const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
 const streamingInstances = vi.hoisted(() => [] as any[]);
@@ -77,7 +78,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     streamingInstances.length = 0;
-    sendMediaFeishuMock.mockResolvedValue(undefined);
+    sendMediaFeishuMock.mockResolvedValue({ messageId: "om_media_1", chatId: "oc_chat" });
 
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
@@ -115,7 +116,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         },
       },
       hooks: {
-        emitMessageSent: vi.fn(),
+        emitMessageSent: emitMessageSentMock,
       },
     });
   });
@@ -849,6 +850,49 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("emits persistence signals for media-only final replies", async () => {
+    const onFinalTextDelivered = vi.fn(async () => {});
+    sendMediaFeishuMock.mockResolvedValueOnce({ messageId: "om_media_1", chatId: "oc_chat" });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+      onFinalTextDelivered,
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver(
+      { mediaUrl: "https://example.com/path/photo.png?x=1" },
+      { kind: "final" },
+    );
+
+    expect(emitMessageSentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "oc_chat",
+        content: "photo.png",
+        success: true,
+        messageId: "om_media_1",
+        metadata: expect.objectContaining({
+          chatId: "oc_chat",
+          messageIds: ["om_media_1"],
+        }),
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_chat",
+      }),
+    );
+    expect(onFinalTextDelivered).toHaveBeenCalledWith({
+      text: "photo.png",
+      messageId: "om_media_1",
+      messageIds: ["om_media_1"],
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+  });
+
   it("emits onFinalTextDelivered for non-streaming final text replies", async () => {
     const onFinalTextDelivered = vi.fn(async () => {});
     sendMessageFeishuMock.mockResolvedValue({ messageId: "om_final_1", chatId: "oc_chat" });
@@ -894,7 +938,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         },
       },
       hooks: {
-        emitMessageSent: vi.fn(),
+        emitMessageSent: emitMessageSentMock,
       },
     });
 
