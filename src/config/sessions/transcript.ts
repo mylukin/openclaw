@@ -153,6 +153,17 @@ const ZERO_USAGE = {
   },
 };
 
+export type SessionTranscriptMessageMeta = {
+  channel?: string;
+  accountId?: string;
+  chatId?: string;
+  chatType?: "direct" | "group";
+  providerMessageId?: string;
+  providerMessageIds?: string[];
+  parentId?: string;
+  threadId?: string | number;
+};
+
 function normalizeNonNegativeNumber(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return undefined;
@@ -260,6 +271,7 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   sessionKey: string;
   text?: string;
   mediaUrls?: string[];
+  messageMeta?: SessionTranscriptMessageMeta;
   /** Optional override for store path (mostly for tests). */
   storePath?: string;
 }): Promise<{ ok: true; sessionFile: string } | { ok: false; reason: string }> {
@@ -330,6 +342,7 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     },
     stopReason: "stop",
     timestamp: Date.now(),
+    ...(params.messageMeta ? { openclawMessageMeta: params.messageMeta } : {}),
   });
   // Restore leafId so delivery-mirror doesn't affect the main chain.
   // branch() only updates in-memory leafId; on next SessionManager.open(),

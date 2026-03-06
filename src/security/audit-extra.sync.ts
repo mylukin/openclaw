@@ -1090,7 +1090,10 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
   if (unknownExact.length > 0) {
     const unknownDetails = unknownExact
       .map((entry) => {
-        const suggestions = suggestKnownNodeCommands(entry, knownCommands);
+        // entry may be "path: commandName"; extract the command name for fuzzy matching.
+        const colonIdx = entry.lastIndexOf(": ");
+        const cmdName = colonIdx >= 0 ? entry.slice(colonIdx + 2) : entry;
+        const suggestions = suggestKnownNodeCommands(cmdName, knownCommands);
         if (suggestions.length === 0) {
           return entry;
         }

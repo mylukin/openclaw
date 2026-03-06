@@ -61,6 +61,7 @@ export type CreateFeishuReplyDispatcherParams = {
   onFinalTextDelivered?: (params: {
     text: string;
     messageId?: string;
+    messageIds?: string[];
     chatId: string;
     accountId?: string;
   }) => Promise<void> | void;
@@ -85,6 +86,34 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const threadReplyMode = threadReply === true;
   const effectiveReplyInThread = threadReplyMode ? true : replyInThread;
   const account = resolveFeishuAccount({ cfg, accountId });
+
+  // Emit message_sent plugin hooks via the runtime SDK so downstream consumers
+  // (e.g. bot-company journal) can record outbound messages. The feishu reply
+  // dispatcher bypasses the core deliverOutboundPayloads pipeline, so hooks
+  // must be emitted explicitly here. Using core.hooks avoids the bundle singleton
+  // splitting issue that makes direct getGlobalHookRunner() imports fail.
+  const emitMessageSent = (event: {
+    content: string;
+    success: boolean;
+    messageId?: string;
+    error?: string;
+  }) => {
+    core.hooks.emitMessageSent(
+      {
+        to: chatId,
+        content: event.content,
+        success: event.success,
+        ...(event.messageId ? { messageId: event.messageId } : {}),
+        ...(event.error ? { error: event.error } : {}),
+        metadata: { chatId },
+      },
+      {
+        channelId: "feishu",
+        accountId: accountId ?? account.accountId,
+        conversationId: chatId,
+      },
+    );
+  };
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
 
   let typingState: TypingIndicatorState | null = null;
@@ -167,8 +196,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streamingStartPromise: Promise<void> | null = null;
   let finalTextEmitted = false;
   let replaceNextPartialAfterTool = false;
+  const deliveredFinalTexts = new Set<string>();
 
-  const emitFinalTextIfNeeded = async (text: string, messageId?: string) => {
+  const emitFinalTextIfNeeded = async (
+    text: string,
+    delivery?: { messageId?: string; messageIds?: string[] },
+  ) => {
     const normalized = text.trim();
     if (!normalized || finalTextEmitted || typeof params.onFinalTextDelivered !== "function") {
       return;
@@ -177,7 +210,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     try {
       await params.onFinalTextDelivered({
         text: normalized,
-        messageId,
+        ...(delivery?.messageId ? { messageId: delivery.messageId } : {}),
+        ...(delivery?.messageIds && delivery.messageIds.length > 0
+          ? { messageIds: delivery.messageIds }
+          : {}),
         chatId,
         accountId: accountId ?? account.accountId,
       });
@@ -186,29 +222,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         `feishu[${account.accountId}] onFinalTextDelivered failed: ${String(error)}`,
       );
     }
-    if (streamPhase === "tool") {
-      if (toolUseCount >= 2) {
-        return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
-      }
-      const toolName = lastToolName?.trim();
-      return toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
-    }
-    return undefined;
-  };
-
-  const composeStreamingContent = (mode: "live" | "final" = "live"): string => {
-    const assistantText = streamText;
-    if (mode === "final") {
-      return assistantText;
-    }
-    const statusLine = resolveStatusLine();
-    if (!statusLine) {
-      return assistantText;
-    }
-    if (!assistantText) {
-      return statusLine;
-    }
-    return `${statusLine}\n---\n${assistantText}`;
   };
 
   const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -235,7 +248,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (toolUseCount >= 2) {
         return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
       }
-      return `🔧 正在使用 ${lastToolName ?? "工具"}...`;
+      const toolName = lastToolName?.trim();
+      return toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
     }
     return undefined;
   };
@@ -298,8 +312,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (!renderedForCard || renderedForCard === lastRenderedStreamContent) {
         return;
       }
-      lastRenderedStreamContent = rendered;
-      await streaming.update(rendered);
+      lastRenderedStreamContent = renderedForCard;
+      await streaming.update(renderedForCard, { mode: "replace" });
     });
   };
 
@@ -400,9 +414,22 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     await partialUpdateQueue;
     const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
-      let text = composeStreamingContent("final");
-      if (mentionTargets?.length) {
-        text = buildMentionedCardContent(mentionTargets, text);
+      const finalText = composeStreamingContent("final");
+      if (!finalText.trim()) {
+        await streaming.discard();
+      } else {
+        let text = finalText;
+        if (mentionTargets?.length) {
+          text = buildMentionedCardContent(mentionTargets, text);
+        }
+        await streaming.close(normalizeMentionTagsForCard(text));
+      }
+      if (options?.emitFinalText !== false) {
+        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+        await emitFinalTextIfNeeded(
+          finalText,
+          streamMessageId ? { messageId: streamMessageId } : undefined,
+        );
       }
     }
     streaming = null;
@@ -424,6 +451,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
       onReplyStart: () => {
+        deliveredFinalTexts.clear();
         if (streamingEnabled && renderMode === "card") {
           startStreaming();
         }
@@ -439,12 +467,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               : [];
         const hasText = Boolean(text.trim());
         const hasMedia = mediaList.length > 0;
+        // Suppress only exact duplicate final text payloads to avoid
+        // dropping legitimate multi-part final replies.
+        const skipTextForDuplicateFinal =
+          info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
+        const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
 
-        if (!hasText && !hasMedia) {
+        if (!shouldDeliverText && !hasMedia) {
           return;
         }
 
-        if (hasText) {
+        if (shouldDeliverText) {
           const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
 
           if (info?.kind === "block") {
@@ -476,6 +509,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             if (info?.kind === "final") {
               streamText = text;
               await closeStreaming({ emitFinalText: true });
+              deliveredFinalTexts.add(text);
             }
             // Send media even when streaming handled the text
             if (hasMedia) {
@@ -494,7 +528,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
 
           let first = true;
-          let firstMessageId: string | undefined;
+          let lastMessageId: string | undefined;
+          const deliveredMessageIds: string[] = [];
           if (useCard) {
             for (const chunk of core.channel.text.chunkTextWithMode(
               text,
@@ -511,8 +546,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 accountId,
               });
               const sentMessageId = sent?.messageId;
-              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
-                firstMessageId = sentMessageId;
+              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                lastMessageId = sentMessageId;
+                deliveredMessageIds.push(sentMessageId);
               }
               first = false;
             }
@@ -533,14 +569,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 accountId,
               });
               const sentMessageId = sent?.messageId;
-              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
-                firstMessageId = sentMessageId;
+              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                lastMessageId = sentMessageId;
+                deliveredMessageIds.push(sentMessageId);
               }
               first = false;
             }
           }
           if (info?.kind === "final") {
-            await emitFinalTextIfNeeded(text, firstMessageId);
+            deliveredFinalTexts.add(text);
+            emitMessageSent({ content: text, success: true, messageId: lastMessageId });
+            await emitFinalTextIfNeeded(text, {
+              ...(lastMessageId ? { messageId: lastMessageId } : {}),
+              ...(deliveredMessageIds.length > 0 ? { messageIds: deliveredMessageIds } : {}),
+            });
           }
         }
 
@@ -620,6 +662,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
               replaceNextPartialAfterTool = Boolean(streamText);
             }
+            queueThinkingPrelude();
             streamPhase = "tool";
             stagedStatusLine = resolveStatusLine();
             if (!shouldRenderStreamingStatus()) {
@@ -642,7 +685,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             // streaming — text arrives as complete chunks via onPartialReply —
             // so the card must be started here. startStreaming() is idempotent
             // (guarded by streamingStartPromise), so calling it here is safe
-            // even when the card was already started by onReplyStart or deliver.
+            // even when the card was already started by deliver.
+            queueThinkingPrelude();
             startStreaming();
             queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
           }
