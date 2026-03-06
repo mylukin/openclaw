@@ -120,7 +120,7 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
     expect(ctx.content).toBe("hello world");
   });
 
-  it("strips only bot mention and preserves human mention text", () => {
+  it("keeps raw @name text and normalizes mention placeholders to <at> tags", () => {
     const event = makeEvent(
       "group",
       [
@@ -130,7 +130,9 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
       "@Bot @_bot_1 请 @Luke @_user_1 review",
     );
     const ctx = parseFeishuMessageEvent(event as any, BOT_OPEN_ID);
-    expect(ctx.content).toBe("请 @Luke @_user_1 review");
+    expect(ctx.content).toBe(
+      '@Bot <at user_id="ou_bot_123">Bot</at> 请 @Luke <at user_id="ou_luke">Luke</at> review',
+    );
   });
 
   it("returns mentionedBot=true for post message with at (no top-level mentions)", () => {
