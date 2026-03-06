@@ -145,7 +145,21 @@ function resolveAdapterCapabilities(
   };
 }
 
-const ADAPTERS_BY_CHANNEL_ACCOUNT = new Map<string, SessionBindingAdapter>();
+// Store the adapter map on globalThis so extensions loaded via jiti (from TypeScript source)
+// and core code loaded from the bundled dist share the same adapter registry.
+const SESSION_BINDING_ADAPTERS_KEY = "__openclawSessionBindingAdapters";
+
+function resolveAdaptersMap(): Map<string, SessionBindingAdapter> {
+  const g = globalThis as typeof globalThis & {
+    [SESSION_BINDING_ADAPTERS_KEY]?: Map<string, SessionBindingAdapter>;
+  };
+  if (!g[SESSION_BINDING_ADAPTERS_KEY]) {
+    g[SESSION_BINDING_ADAPTERS_KEY] = new Map();
+  }
+  return g[SESSION_BINDING_ADAPTERS_KEY];
+}
+
+const ADAPTERS_BY_CHANNEL_ACCOUNT = resolveAdaptersMap();
 
 export function registerSessionBindingAdapter(adapter: SessionBindingAdapter): void {
   const key = toAdapterKey({
