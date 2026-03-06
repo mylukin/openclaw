@@ -419,9 +419,9 @@ export const FIELD_HELP: Record<string, string> = {
   "gateway.nodes.denyCommands":
     "Node command names to block even if present in node claims or default allowlist (exact command-name matching only, e.g. `system.run`; does not inspect shell text inside that command).",
   "gateway.nodes.overrides":
-    "Per-node command policy overrides, keyed by node displayName, nodeId, or nodeId prefix. " +
+    "Per-node command policy overrides, keyed by nodeId or nodeId prefix. " +
     "Each entry may specify allowCommands and denyCommands that merge with the global lists. " +
-    "Match precedence is nodeId exact, then displayName exact, then longest nodeId prefix.",
+    "Match precedence is nodeId exact, then longest nodeId prefix.",
   nodeHost:
     "Node host controls for features exposed from this gateway node to other nodes or clients. Keep defaults unless you intentionally proxy local capabilities across your node network.",
   "nodeHost.browserProxy":

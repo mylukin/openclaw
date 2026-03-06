@@ -966,7 +966,6 @@ export function attachGatewayWsMessageHandler(params: {
             platform: connectParams.client.platform,
             deviceFamily: connectParams.client.deviceFamily,
             nodeId: device?.id ?? connectParams.client.id,
-            displayName: connectParams.client.displayName,
           });
           const declared = Array.isArray(connectParams.commands) ? connectParams.commands : [];
           const filtered = declared
