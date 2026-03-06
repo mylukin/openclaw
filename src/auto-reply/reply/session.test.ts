@@ -889,6 +889,7 @@ describe("initSessionState reset policy", () => {
 
     expect(result.isNewSession).toBe(true);
     expect(result.sessionId).not.toBe(existingSessionId);
+    expect(result.previousSessionEntry?.sessionId).toBe(existingSessionId);
     expect(clearBootstrapSnapshotOnSessionRolloverSpy).toHaveBeenCalledWith({
       sessionKey,
       previousSessionId: existingSessionId,

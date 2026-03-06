@@ -31,6 +31,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
 import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
 import {
+  couldBeSilentTokenStart,
   HEARTBEAT_TOKEN,
   isSilentReplyPrefixText,
   isSilentReplyText,
@@ -184,11 +185,24 @@ export async function runAgentTurnWithFallback(params: {
         }
         return { text: sanitized, skip: false };
       };
+      // Buffer potential silent-token prefix from BPE-split streaming chunks (e.g. "NO" + "_REPLY").
+      // Only buffers SILENT_REPLY_TOKEN; HEARTBEAT_TOKEN is handled by normalizeStreamingText
+      // via string includes() which works on partial text without prefix-buffering.
+      let silentPrefixBuf = "";
       const handlePartialForTyping = async (payload: ReplyPayload): Promise<string | undefined> => {
-        if (isSilentReplyPrefixText(payload.text, SILENT_REPLY_TOKEN)) {
+        const combinedText = silentPrefixBuf + (payload.text ?? "");
+        silentPrefixBuf = "";
+        if (isSilentReplyText(combinedText, SILENT_REPLY_TOKEN)) {
           return undefined;
         }
-        const { text, skip } = normalizeStreamingText(payload);
+        if (isSilentReplyPrefixText(combinedText, SILENT_REPLY_TOKEN)) {
+          return undefined;
+        }
+        if (couldBeSilentTokenStart(combinedText, SILENT_REPLY_TOKEN)) {
+          silentPrefixBuf = combinedText;
+          return undefined;
+        }
+        const { text, skip } = normalizeStreamingText({ ...payload, text: combinedText });
         if (skip || !text) {
           return undefined;
         }
@@ -223,6 +237,42 @@ export async function runAgentTurnWithFallback(params: {
             const cliSessionId = getCliSessionId(params.getActiveSessionEntry(), provider);
             return (async () => {
               let lifecycleTerminalEmitted = false;
+              // Serialized chain for streaming card updates.  Each onAssistantTurn
+              // appends an async step that mirrors the embedded path: first await
+              // signalTextDelta (which triggers startStreaming on first call), then
+              // forward to onPartialReply.  Awaiting this chain after the CLI run
+              // ensures markRunComplete() isn't called before streaming initialises.
+              let streamingChain: Promise<void> = Promise.resolve();
+              let cliReasoningOpen = false;
+              const queueStreamingStep = (step: () => Promise<void>) => {
+                streamingChain = streamingChain.then(step).catch((err) => {
+                  defaultRuntime.error(
+                    `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                });
+              };
+              const escapeMarkdownItalic = (value: string): string =>
+                value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
+              const formatReasoningPayload = (text: string): string => {
+                const trimmed = text.trim();
+                if (!trimmed) {
+                  return "";
+                }
+                const lines = escapeMarkdownItalic(trimmed)
+                  .split("\n")
+                  .map((line) => line.trim());
+                const italicized = lines.map((line) => (line ? `_${line}_` : "")).join("\n");
+                return `Reasoning:\n${italicized}`;
+              };
+              const queueReasoningEndIfNeeded = () => {
+                if (!cliReasoningOpen) {
+                  return;
+                }
+                cliReasoningOpen = false;
+                queueStreamingStep(async () => {
+                  await params.opts?.onReasoningEnd?.();
+                });
+              };
               try {
                 const result = await runCliAgent({
                   sessionId: params.followupRun.run.sessionId,
@@ -238,6 +288,7 @@ export async function runAgentTurnWithFallback(params: {
                   timeoutMs: params.followupRun.run.timeoutMs,
                   runId,
                   extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                  skillsSnapshot: params.followupRun.run.skillsSnapshot,
                   ownerNumbers: params.followupRun.run.ownerNumbers,
                   cliSessionId,
                   bootstrapPromptWarningSignaturesSeen,
@@ -246,10 +297,105 @@ export async function runAgentTurnWithFallback(params: {
                       bootstrapPromptWarningSignaturesSeen.length - 1
                     ],
                   images: params.opts?.images,
+                  abortSignal: params.opts?.abortSignal,
+                  trigger: params.isHeartbeat ? "heartbeat" : "user",
+                  messageChannel: params.followupRun.run.messageProvider,
+                  messageAccountId:
+                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
+                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
+                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
+                  onSystemInit: ({ subtype }) => {
+                    if (subtype === "init") {
+                      queueAssistantMessageStart();
+                    }
+                  },
+                  onAssistantTurn: (text) => {
+                    queueReasoningEndIfNeeded();
+                    emitAgentEvent({
+                      runId,
+                      stream: "assistant",
+                      data: { text },
+                    });
+                    // Mirror the embedded path's onPartialReply flow:
+                    // 1. handlePartialForTyping awaits signalTextDelta (starts
+                    //    streaming card on first call via typing → onReplyStart)
+                    // 2. then onPartialReply queues the card content update
+                    // Chained (not fire-and-forget) so signalTextDelta completes
+                    // before onPartialReply, and markRunComplete waits for all.
+                    queueStreamingStep(async () => {
+                      const normalizedText = await handlePartialForTyping({ text });
+                      if (normalizedText !== undefined && params.opts?.onPartialReply) {
+                        await params.opts.onPartialReply({ text: normalizedText });
+                      }
+                    });
+                  },
+                  onThinkingTurn: ({ text, delta }) => {
+                    if (!text.trim()) {
+                      return;
+                    }
+                    cliReasoningOpen = true;
+                    emitAgentEvent({
+                      runId,
+                      stream: "thinking",
+                      data: {
+                        text,
+                        ...(delta ? { delta } : {}),
+                      },
+                    });
+                    queueStreamingStep(async () => {
+                      await params.typingSignals.signalReasoningDelta();
+                      const rendered = formatReasoningPayload(text);
+                      if (!rendered) {
+                        return;
+                      }
+                      await params.opts?.onReasoningStream?.({
+                        text: rendered,
+                        isReasoning: true,
+                      });
+                    });
+                  },
+                  onToolUseEvent: (payload) => {
+                    queueReasoningEndIfNeeded();
+                    emitAgentEvent({
+                      runId,
+                      stream: "tool",
+                      data: {
+                        phase: "start",
+                        name: payload.name,
+                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                        ...(payload.input !== undefined ? { input: payload.input } : {}),
+                      },
+                    });
+                    queueStreamingStep(async () => {
+                      await params.typingSignals.signalToolStart();
+                      await params.opts?.onToolStart?.({
+                        name: payload.name,
+                        phase: "start",
+                      });
+                    });
+                  },
+                  onToolResult: (payload) => {
+                    queueReasoningEndIfNeeded();
+                    const preview =
+                      typeof payload.text === "string" && payload.text.trim()
+                        ? payload.text.trim().slice(0, 1_200)
+                        : undefined;
+                    emitAgentEvent({
+                      runId,
+                      stream: "tool",
+                      data: {
+                        phase: "result",
+                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                        ...(preview ? { partialResult: preview, result: preview } : {}),
+                        ...(payload.isError ? { isError: true } : {}),
+                      },
+                    });
+                  },
                 });
                 bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
                   result.meta?.systemPromptReport,
                 );
+                queueReasoningEndIfNeeded();
 
                 // CLI backends don't emit streaming assistant events, so we need to
                 // emit one with the final text so server-chat can populate its buffer
@@ -276,6 +422,8 @@ export async function runAgentTurnWithFallback(params: {
 
                 return result;
               } catch (err) {
+                queueReasoningEndIfNeeded();
+                await streamingChain;
                 emitAgentEvent({
                   runId,
                   stream: "lifecycle",

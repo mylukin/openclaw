@@ -9,6 +9,12 @@ import { resolveCliNoOutputTimeoutMs } from "./cli-runner/helpers.js";
 const supervisorSpawnMock = vi.fn();
 const enqueueSystemEventMock = vi.fn();
 const requestHeartbeatNowMock = vi.fn();
+const ensureMcpConfigFileMock = vi.hoisted(() => vi.fn(() => "/tmp/openclaw-mcp.json"));
+
+vi.mock("../gateway/mcp-http.js", () => ({
+  MCP_PORT_OFFSET: 1,
+  ensureMcpConfigFile: (...args: unknown[]) => ensureMcpConfigFileMock(...args),
+}));
 
 vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({
@@ -57,10 +63,12 @@ function createManagedRun(exit: MockRunExit, pid = 1234) {
 }
 
 describe("runCliAgent with process supervisor", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     supervisorSpawnMock.mockClear();
     enqueueSystemEventMock.mockClear();
     requestHeartbeatNowMock.mockClear();
+    ensureMcpConfigFileMock.mockClear();
+    ensureMcpConfigFileMock.mockReturnValue("/tmp/openclaw-mcp.json");
   });
 
   it("runs CLI through supervisor and returns payload", async () => {
@@ -105,6 +113,51 @@ describe("runCliAgent with process supervisor", () => {
     expect(input.noOutputTimeoutMs).toBeGreaterThanOrEqual(1_000);
     expect(input.replaceExistingScope).toBe(true);
     expect(input.scopeKey).toContain("thread-123");
+    expect(ensureMcpConfigFileMock).not.toHaveBeenCalled();
+  });
+
+  it("adds strict MCP config flags for claude-cli", async () => {
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    await runCliAgent({
+      sessionId: "s1",
+      sessionKey: "agent:main:main",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      config: {
+        gateway: {
+          port: 19000,
+        },
+      } as OpenClawConfig,
+      prompt: "hi",
+      provider: "claude-cli",
+      model: "sonnet",
+      timeoutMs: 1_000,
+      runId: "run-claude-mcp",
+    });
+
+    expect(ensureMcpConfigFileMock).toHaveBeenCalledTimes(1);
+    expect(ensureMcpConfigFileMock).toHaveBeenCalledWith(
+      path.join(os.homedir(), ".openclaw"),
+      19001,
+    );
+    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
+    expect(input.argv).toContain("--strict-mcp-config");
+    expect(input.argv).toContain("--mcp-config");
+    const mcpConfigIndex = input.argv?.indexOf("--mcp-config") ?? -1;
+    expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
+    expect(input.argv?.[mcpConfigIndex + 1]).toBe("/tmp/openclaw-mcp.json");
   });
 
   it("fails with timeout when no-output watchdog trips", async () => {
@@ -293,6 +346,50 @@ describe("runCliAgent with process supervisor", () => {
 
     const input = supervisorSpawnMock.mock.calls[0]?.[0] as { cwd?: string };
     expect(input.cwd).toBe(path.resolve(fallbackWorkspace));
+  });
+
+  it("cancels running CLI process on abort signal", async () => {
+    const managedRun = createManagedRun({
+      reason: "manual-cancel",
+      exitCode: null,
+      exitSignal: "SIGTERM",
+      durationMs: 25,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      noOutputTimedOut: false,
+    });
+    managedRun.wait = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return {
+        reason: "manual-cancel",
+        exitCode: null,
+        exitSignal: "SIGTERM",
+        durationMs: 25,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      };
+    });
+    supervisorSpawnMock.mockResolvedValueOnce(managedRun);
+    const abortController = new AbortController();
+    const runPromise = runCliAgent({
+      sessionId: "s1",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      prompt: "hi",
+      provider: "codex-cli",
+      model: "gpt-5.2-codex",
+      timeoutMs: 1_000,
+      runId: "run-abort",
+      abortSignal: abortController.signal,
+    });
+
+    await vi.waitFor(() => expect(supervisorSpawnMock).toHaveBeenCalledTimes(1));
+    abortController.abort("stop");
+    await expect(runPromise).rejects.toMatchObject({ name: "AbortError" });
+    expect(managedRun.cancel).toHaveBeenCalledWith("manual-cancel");
   });
 });
 

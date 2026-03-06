@@ -625,6 +625,8 @@ export async function runCronIsolatedAgentTurn(params: {
             disableMessageTool: toolPolicy.disableMessageTool,
             allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
             abortSignal,
+            trigger: "cron",
+            messageChannel,
             bootstrapPromptWarningSignaturesSeen,
             bootstrapPromptWarningSignature,
           });
