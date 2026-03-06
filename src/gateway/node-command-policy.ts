@@ -173,8 +173,7 @@ function normalizePlatformId(platform?: string, deviceFamily?: string): Platform
 
 export function resolveNodeCommandAllowlist(
   cfg: OpenClawConfig,
-  node?: Pick<NodeSession, "platform" | "deviceFamily"> &
-    Partial<Pick<NodeSession, "nodeId" | "displayName">>,
+  node?: Pick<NodeSession, "platform" | "deviceFamily"> & Partial<Pick<NodeSession, "nodeId">>,
 ): Set<string> {
   const platformId = normalizePlatformId(node?.platform, node?.deviceFamily);
   const base = PLATFORM_DEFAULTS[platformId] ?? PLATFORM_DEFAULTS.unknown;
