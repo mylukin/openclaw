@@ -260,6 +260,7 @@ type MessageSentEvent = {
   content: string;
   error?: string;
   messageId?: string;
+  metadata?: Record<string, unknown>;
 };
 
 function hasMediaPayload(payload: ReplyPayload): boolean {
@@ -359,6 +360,7 @@ function createMessageSentEmitter(params: {
       accountId: params.accountId ?? undefined,
       conversationId: params.to,
       messageId: event.messageId,
+      metadata: event.metadata,
       isGroup: params.mirrorIsGroup,
       groupId: params.mirrorGroupId,
     });
@@ -732,6 +734,9 @@ async function deliverOutboundPayloadsCore(
           success: true,
           content: payloadSummary.text,
           messageId: delivery.messageId,
+          ...(delivery.meta && Object.keys(delivery.meta).length > 0
+            ? { metadata: delivery.meta }
+            : {}),
         });
         continue;
       }
