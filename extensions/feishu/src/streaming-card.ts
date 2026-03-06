@@ -3,11 +3,11 @@
  */
 
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk";
-import type { FeishuDomain } from "./types.js";
 
-type Credentials = { appId: string; appSecret: string; domain?: FeishuDomain };
+type Credentials = { appId: string; appSecret: string; domain?: string };
 type CardState = { cardId: string; messageId: string; sequence: number; currentText: string };
+type UpdateMode = "merge" | "replace";
+type PendingUpdate = { text: string; mode: UpdateMode };
 
 /** Optional header for streaming cards (title bar with color template) */
 export type StreamingCardHeader = {
@@ -15,67 +15,6 @@ export type StreamingCardHeader = {
   /** Color template: blue, green, red, orange, purple, indigo, wathet, turquoise, yellow, grey, carmine, violet, lime */
   template?: string;
 };
-
-// Token cache (keyed by domain + appId)
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
-
-function resolveApiBase(domain?: FeishuDomain): string {
-  if (domain === "lark") {
-    return "https://open.larksuite.com/open-apis";
-  }
-  if (domain && domain !== "feishu" && domain.startsWith("http")) {
-    return `${domain.replace(/\/+$/, "")}/open-apis`;
-  }
-  return "https://open.feishu.cn/open-apis";
-}
-
-function resolveAllowedHostnames(domain?: FeishuDomain): string[] {
-  if (domain === "lark") {
-    return ["open.larksuite.com"];
-  }
-  if (domain && domain !== "feishu" && domain.startsWith("http")) {
-    try {
-      return [new URL(domain).hostname];
-    } catch {
-      return [];
-    }
-  }
-  return ["open.feishu.cn"];
-}
-
-async function getToken(creds: Credentials): Promise<string> {
-  const key = `${creds.domain ?? "feishu"}|${creds.appId}`;
-  const cached = tokenCache.get(key);
-  if (cached && cached.expiresAt > Date.now() + 60000) {
-    return cached.token;
-  }
-
-  const { response, release } = await fetchWithSsrFGuard({
-    url: `${resolveApiBase(creds.domain)}/auth/v3/tenant_access_token/internal`,
-    init: {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ app_id: creds.appId, app_secret: creds.appSecret }),
-    },
-    policy: { allowedHostnames: resolveAllowedHostnames(creds.domain) },
-    auditContext: "feishu.streaming-card.token",
-  });
-  const data = (await response.json()) as {
-    code: number;
-    msg: string;
-    tenant_access_token?: string;
-    expire?: number;
-  };
-  await release();
-  if (data.code !== 0 || !data.tenant_access_token) {
-    throw new Error(`Token error: ${data.msg}`);
-  }
-  tokenCache.set(key, {
-    token: data.tenant_access_token,
-    expiresAt: Date.now() + (data.expire ?? 7200) * 1000,
-  });
-  return data.tenant_access_token;
-}
 
 function truncateSummary(text: string, max = 50): string {
   if (!text) {
@@ -107,18 +46,16 @@ export function mergeStreamingText(
 /** Streaming card session manager */
 export class FeishuStreamingSession {
   private client: Client;
-  private creds: Credentials;
   private state: CardState | null = null;
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
   private log?: (msg: string) => void;
   private lastUpdateTime = 0;
-  private pendingText: string | null = null;
+  private pendingUpdate: PendingUpdate | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
 
-  constructor(client: Client, creds: Credentials, log?: (msg: string) => void) {
+  constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
-    this.creds = creds;
     this.log = log;
   }
 
@@ -136,7 +73,6 @@ export class FeishuStreamingSession {
       return;
     }
 
-    const apiBase = resolveApiBase(this.creds.domain);
     const cardJson: Record<string, unknown> = {
       schema: "2.0",
       config: {
@@ -155,27 +91,14 @@ export class FeishuStreamingSession {
       };
     }
 
-    // Create card entity
-    const { response: createRes, release: releaseCreate } = await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards`,
-      init: {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ type: "card_json", data: JSON.stringify(cardJson) }),
+    // Create card entity via SDK
+    const createData = await this.client.cardkit.v1.card.create({
+      data: {
+        type: "card_json",
+        data: JSON.stringify(cardJson),
       },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.create",
     });
-    const createData = (await createRes.json()) as {
-      code: number;
-      msg: string;
-      data?: { card_id: string };
-    };
-    await releaseCreate();
-    if (createData.code !== 0 || !createData.data?.card_id) {
+    if ((createData.code ?? 0) !== 0 || !createData.data?.card_id) {
       throw new Error(`Create card failed: ${createData.msg}`);
     }
     const cardId = createData.data.card_id;
@@ -183,7 +106,7 @@ export class FeishuStreamingSession {
 
     // Topic-group replies require root_id routing. Prefer create+root_id when available.
     let sendRes;
-    if (options?.rootId) {
+    if (options?.rootId && options.replyInThread) {
       const createData = {
         receive_id: receiveId,
         msg_type: "interactive",
@@ -194,7 +117,7 @@ export class FeishuStreamingSession {
         params: { receive_id_type: receiveIdType },
         data: createData,
       });
-    } else if (options?.replyToMessageId) {
+    } else if (options?.replyToMessageId && options.replyInThread) {
       sendRes = await this.client.im.message.reply({
         path: { message_id: options.replyToMessageId },
         data: {
@@ -225,36 +148,39 @@ export class FeishuStreamingSession {
     if (!this.state) {
       return;
     }
-    const apiBase = resolveApiBase(this.creds.domain);
     this.state.sequence += 1;
-    await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
-      init: {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json",
+    await this.client.cardkit.v1.cardElement
+      .content({
+        path: {
+          card_id: this.state.cardId,
+          element_id: "content",
         },
-        body: JSON.stringify({
+        data: {
           content: text,
           sequence: this.state.sequence,
           uuid: `s_${this.state.cardId}_${this.state.sequence}`,
-        }),
-      },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.update",
-    })
-      .then(async ({ release }) => {
-        await release();
+        },
+      })
+      .then((response) => {
+        if ((response.code ?? 0) !== 0) {
+          throw new Error(response.msg || `code ${response.code}`);
+        }
       })
       .catch((error) => onError?.(error));
   }
 
-  async update(text: string): Promise<void> {
+  async update(
+    text: string,
+    options?: {
+      mode?: UpdateMode;
+    },
+  ): Promise<void> {
     if (!this.state || this.closed) {
       return;
     }
-    const mergedInput = mergeStreamingText(this.pendingText ?? this.state.currentText, text);
+    const mode = options?.mode ?? "merge";
+    const pendingBase = this.pendingUpdate?.text ?? this.state.currentText;
+    const mergedInput = mode === "replace" ? text : mergeStreamingText(pendingBase, text);
     if (!mergedInput || mergedInput === this.state.currentText) {
       return;
     }
@@ -262,17 +188,18 @@ export class FeishuStreamingSession {
     // Throttle: skip if updated recently, but remember pending text
     const now = Date.now();
     if (now - this.lastUpdateTime < this.updateThrottleMs) {
-      this.pendingText = mergedInput;
+      this.pendingUpdate = { text: mergedInput, mode: "replace" };
       return;
     }
-    this.pendingText = null;
+    this.pendingUpdate = null;
     this.lastUpdateTime = now;
 
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) {
         return;
       }
-      const mergedText = mergeStreamingText(this.state.currentText, mergedInput);
+      const mergedText =
+        mode === "replace" ? mergedInput : mergeStreamingText(this.state.currentText, mergedInput);
       if (!mergedText || mergedText === this.state.currentText) {
         return;
       }
@@ -289,46 +216,66 @@ export class FeishuStreamingSession {
     this.closed = true;
     await this.queue;
 
-    const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
-    const apiBase = resolveApiBase(this.creds.domain);
+    const hasExplicitFinalText = finalText !== undefined;
+    const pendingMerged = this.pendingUpdate
+      ? this.pendingUpdate.mode === "replace"
+        ? this.pendingUpdate.text
+        : mergeStreamingText(this.state.currentText, this.pendingUpdate.text)
+      : this.state.currentText;
+    this.pendingUpdate = null;
+    const text = hasExplicitFinalText ? finalText : pendingMerged;
 
-    // Only send final update if content differs from what's already displayed
-    if (text && text !== this.state.currentText) {
+    // Explicit finalText (even empty) must win over transient status lines.
+    if (
+      hasExplicitFinalText
+        ? text !== this.state.currentText
+        : Boolean(text && text !== this.state.currentText)
+    ) {
       await this.updateCardContent(text);
       this.state.currentText = text;
     }
 
     // Close streaming mode
     this.state.sequence += 1;
-    await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
-      init: {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json; charset=utf-8",
-        },
-        body: JSON.stringify({
+    await this.client.cardkit.v1.card
+      .settings({
+        path: { card_id: this.state.cardId },
+        data: {
           settings: JSON.stringify({
             config: { streaming_mode: false, summary: { content: truncateSummary(text) } },
           }),
           sequence: this.state.sequence,
           uuid: `c_${this.state.cardId}_${this.state.sequence}`,
-        }),
-      },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.close",
-    })
-      .then(async ({ release }) => {
-        await release();
+        },
+      })
+      .then((response) => {
+        if ((response.code ?? 0) !== 0) {
+          throw new Error(response.msg || `code ${response.code}`);
+        }
       })
       .catch((e) => this.log?.(`Close failed: ${String(e)}`));
 
     this.log?.(`Closed streaming: cardId=${this.state.cardId}`);
   }
 
+  async discard(): Promise<void> {
+    if (!this.state || this.closed) {
+      return;
+    }
+    this.closed = true;
+    await this.queue;
+    const messageId = this.state.messageId;
+    const cardId = this.state.cardId;
+    this.pendingUpdate = null;
+    await this.deleteMessage(messageId);
+    this.log?.(`Discarded streaming card: cardId=${cardId}, messageId=${messageId}`);
+  }
+
   isActive(): boolean {
     return this.state !== null && !this.closed;
+  }
+
+  getMessageId(): string | undefined {
+    return this.state?.messageId;
   }
 }

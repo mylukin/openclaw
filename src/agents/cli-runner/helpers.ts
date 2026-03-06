@@ -247,6 +247,7 @@ export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput
 }
 
 export type StreamJsonCallbacks = {
+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   onAssistantTurn?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
@@ -255,6 +256,20 @@ export type StreamJsonCallbacks = {
 };
 
 const MAX_STREAM_EVENT_DEDUPE_KEYS = 2_048;
+const KNOWN_STREAM_TOP_LEVEL_TYPES = new Set([
+  "assistant",
+  "user",
+  "system",
+  "result",
+  "rate_limit_event",
+]);
+const KNOWN_STREAM_CONTENT_BLOCK_TYPES = new Set([
+  "text",
+  "thinking",
+  "tool_use",
+  "tool_result",
+  "tool_result_error",
+]);
 
 type StreamContentBlock = Record<string, unknown>;
 
@@ -495,6 +510,19 @@ function buildFallbackAssistantText(params: {
   return collectText(params.rawMessage) || collectText(params.message);
 }
 
+function logUnknownStreamTypeOnce(params: {
+  seen: Set<string>;
+  value: string;
+  kind: "top-level" | "content-block";
+}): void {
+  const normalized = params.value.trim();
+  if (!normalized || params.seen.has(normalized)) {
+    return;
+  }
+  params.seen.add(normalized);
+  log.debug(`stream-json unknown ${params.kind} type observed: ${normalized}`);
+}
+
 export function createStreamJsonProcessor(
   backend: CliBackendConfig,
   callbacks?: StreamJsonCallbacks,
@@ -513,6 +541,8 @@ export function createStreamJsonProcessor(
   const emittedToolResultKeys = new Set<string>();
   const emittedToolResultOrder: string[] = [];
   let lastAnonymousToolUseKey: string | undefined;
+  const seenUnknownTopLevelTypes = new Set<string>();
+  const seenUnknownContentBlockTypes = new Set<string>();
 
   const processLine = (line: string) => {
     const trimmed = line.trim();
@@ -530,6 +560,13 @@ export function createStreamJsonProcessor(
     }
 
     const type = typeof parsed.type === "string" ? parsed.type : "";
+    if (type && !KNOWN_STREAM_TOP_LEVEL_TYPES.has(type)) {
+      logUnknownStreamTypeOnce({
+        seen: seenUnknownTopLevelTypes,
+        value: type,
+        kind: "top-level",
+      });
+    }
 
     if (!sessionId) {
       sessionId = pickSessionId(parsed, backend);
@@ -550,6 +587,12 @@ export function createStreamJsonProcessor(
     if (type === "system") {
       const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
       log.debug(`stream-json system: subtype=${subtype} sessionId=${sessionId ?? "none"}`);
+      if (subtype === "init") {
+        callbacks?.onSystemInit?.({ subtype, sessionId });
+      }
+      return;
+    }
+    if (type === "rate_limit_event") {
       return;
     }
 
@@ -559,6 +602,17 @@ export function createStreamJsonProcessor(
     const isAssistantEnvelope = type === "assistant" || messageRole === "assistant";
     const contentBlocks = extractContentBlocks(message);
     if (contentBlocks.length > 0) {
+      for (const block of contentBlocks) {
+        const blockType = typeof block.type === "string" ? block.type : "";
+        if (!blockType || KNOWN_STREAM_CONTENT_BLOCK_TYPES.has(blockType)) {
+          continue;
+        }
+        logUnknownStreamTypeOnce({
+          seen: seenUnknownContentBlockTypes,
+          value: blockType,
+          kind: "content-block",
+        });
+      }
       const blockTypes = contentBlocks
         .map((block) => (typeof block.type === "string" ? block.type : "?"))
         .join(",");
@@ -673,7 +727,7 @@ export function resolveSystemPromptUsage(params: {
   if (!systemPrompt) {
     return null;
   }
-  const when = params.backend.systemPromptWhen ?? "first";
+  const when = params.backend.systemPromptWhen ?? "always";
   if (when === "never") {
     return null;
   }

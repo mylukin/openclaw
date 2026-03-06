@@ -330,15 +330,20 @@ export async function sendMessageFeishu(
 
   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
 
-  if (replyToMessageId) {
-    const response = await client.im.message.reply({
-      path: { message_id: replyToMessageId },
-      data: {
-        content,
-        msg_type: msgType,
-        ...(replyInThread ? { reply_in_thread: true } : {}),
-      },
-    });
+  if (replyToMessageId && replyInThread) {
+    let response;
+    try {
+      response = await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          content,
+          msg_type: msgType,
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
+      });
+    } catch (err) {
+      rethrowWithFeishuErrorDetail(err, "Feishu reply failed");
+    }
     if (shouldFallbackFromReplyTarget(response)) {
       const fallback = await client.im.message.create({
         params: { receive_id_type: receiveIdType },
@@ -390,15 +395,20 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
   const content = JSON.stringify(card);
 
-  if (replyToMessageId) {
-    const response = await client.im.message.reply({
-      path: { message_id: replyToMessageId },
-      data: {
-        content,
-        msg_type: "interactive",
-        ...(replyInThread ? { reply_in_thread: true } : {}),
-      },
-    });
+  if (replyToMessageId && replyInThread) {
+    let response;
+    try {
+      response = await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          content,
+          msg_type: "interactive",
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
+      });
+    } catch (err) {
+      rethrowWithFeishuErrorDetail(err, "Feishu card reply failed");
+    }
     if (shouldFallbackFromReplyTarget(response)) {
       const fallback = await client.im.message.create({
         params: { receive_id_type: receiveIdType },
