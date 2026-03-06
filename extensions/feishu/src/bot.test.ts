@@ -67,6 +67,17 @@ vi.mock("./client.js", () => ({
   createFeishuClient: mockCreateFeishuClient,
 }));
 
+vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    getSessionBindingService: () => ({
+      resolveByConversation: () => undefined,
+      touch: vi.fn(),
+    }),
+  };
+});
+
 function createRuntimeEnv(): RuntimeEnv {
   return {
     log: vi.fn(),
@@ -2023,7 +2034,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_quote_reply",
-        rootId: "om_original_msg",
+        rootId: undefined,
       }),
     );
   });
@@ -2061,7 +2072,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_topic_root",
-        rootId: "om_topic_root",
+        rootId: undefined,
       }),
     );
   });
@@ -2099,7 +2110,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_topic_sender_root",
-        rootId: "om_topic_sender_root",
+        rootId: undefined,
       }),
     );
   });
