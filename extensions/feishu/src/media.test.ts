@@ -219,7 +219,7 @@ describe("sendMediaFeishu msg_type routing", () => {
 
     expect(messageCreateMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ msg_type: "file" }),
+        data: expect.objectContaining({ msg_type: "media" }),
       }),
     );
 
@@ -259,7 +259,7 @@ describe("sendMediaFeishu msg_type routing", () => {
 
     expect(messageCreateMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ msg_type: "file" }),
+        data: expect.objectContaining({ msg_type: "media" }),
       }),
     );
     expect(messageReplyMock).not.toHaveBeenCalled();

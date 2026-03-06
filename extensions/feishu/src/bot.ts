@@ -1,3 +1,4 @@
+import { getSessionBindingService } from "openclaw/plugin-sdk";
 import type { ClawdbotConfig, RuntimeEnv } from "openclaw/plugin-sdk/feishu";
 import {
   buildAgentMediaPayload,
@@ -5,7 +6,6 @@ import {
   clearHistoryEntriesIfEnabled,
   createScopedPairingAccess,
   DEFAULT_GROUP_HISTORY_LIMIT,
-  getSessionBindingService,
   type HistoryEntry,
   issuePairingChallenge,
   normalizeAgentId,
