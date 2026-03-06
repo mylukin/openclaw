@@ -166,6 +166,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let partialUpdateQueue: Promise<void> = Promise.resolve();
   let streamingStartPromise: Promise<void> | null = null;
   let finalTextEmitted = false;
+  let replaceNextPartialAfterTool = false;
 
   const emitFinalTextIfNeeded = async (text: string, messageId?: string) => {
     const normalized = text.trim();
@@ -305,9 +306,22 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (options?.dedupeWithLastPartial && nextText === lastPartial) {
       return;
     }
+    const shouldResetAfterTool =
+      replaceNextPartialAfterTool &&
+      options?.dedupeWithLastPartial === true &&
+      Boolean(streamText) &&
+      !nextText.startsWith(streamText);
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
+    if (shouldResetAfterTool) {
+      streamText = nextText;
+      replaceNextPartialAfterTool = false;
+      streamPhase = "streaming";
+      queueStreamingRender();
+      return;
+    }
+    replaceNextPartialAfterTool = false;
     const hadVisibleText = Boolean(streamText);
     mergeStreamingText(nextText);
     const shouldRenderStagedStatus =
@@ -388,6 +402,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     lastToolName = undefined;
     hasThinkingPrelude = false;
     stagedStatusLine = undefined;
+    replaceNextPartialAfterTool = false;
   };
 
   const { dispatcher, replyOptions, markDispatchIdle } =
@@ -585,11 +600,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         : undefined,
       onToolStart: streamingEnabled
-        ? (payload) => {
+        ? (payload: { name?: string; phase?: string }) => {
             const isStartPhase = !payload?.phase || payload.phase === "start";
             if (isStartPhase) {
               toolUseCount += 1;
               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
+              replaceNextPartialAfterTool = Boolean(streamText);
             }
             queueThinkingPrelude();
             streamPhase = "tool";

@@ -150,6 +150,36 @@ describe("FeishuStreamingSession.close", () => {
     expect((session as any).state.currentText).toBe("");
   });
 
+  it("treats explicit non-empty final text as authoritative", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。",
+    };
+    (session as any).pendingUpdate = {
+      text: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。\n我刚",
+      mode: "replace",
+    };
+    const updateCardContentSpy = vi
+      .spyOn(session as any, "updateCardContent")
+      .mockResolvedValue(undefined);
+
+    await session.close("<at id=ou_luke></at> 加了。\n我刚又确认了一遍");
+
+    expect(updateCardContentSpy).toHaveBeenCalledWith(
+      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
+    );
+    expect((session as any).state.currentText).toBe(
+      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
+    );
+  });
+
   it("keeps pending merge behavior when final text is omitted", async () => {
     const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {

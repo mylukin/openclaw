@@ -439,6 +439,53 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
+  it("replaces pre-tool status text when the first post-tool partial restarts the answer", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "**Checking SEO JSON-LD in PR #16**" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({
+      text: '<at user_id="ou_luke">Luke</at> 加了。',
+    });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({
+      text: '<at user_id="ou_luke">Luke</at> 加了。\n我刚又确认了一遍',
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith(
+      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
+      {
+        mode: "replace",
+      },
+    );
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
+    );
+  });
+
   it("sends media-only payloads as attachments", async () => {
     createFeishuReplyDispatcher({
       cfg: {} as never,

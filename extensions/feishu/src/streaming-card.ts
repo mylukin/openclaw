@@ -252,11 +252,7 @@ export class FeishuStreamingSession {
         : mergeStreamingText(this.state.currentText, this.pendingUpdate.text)
       : this.state.currentText;
     this.pendingUpdate = null;
-    const text = hasExplicitFinalText
-      ? finalText.length > 0
-        ? mergeStreamingText(pendingMerged, finalText)
-        : finalText
-      : pendingMerged;
+    const text = hasExplicitFinalText ? finalText : pendingMerged;
 
     // Explicit finalText (even empty) must win over transient status lines.
     if (
