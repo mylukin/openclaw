@@ -1,13 +1,9 @@
-import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { appendCliTurnToSessionTranscript } from "../config/sessions.js";
-import type { CliBackendConfig } from "../config/types.js";
 import { MCP_PORT_OFFSET, ensureMcpConfigFile } from "../gateway/mcp-http.js";
 import { shouldLogVerbose } from "../globals.js";
 import { isTruthyEnvValue } from "../infra/env.js";
@@ -390,6 +386,9 @@ export async function runCliAgent(params: {
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
+  messageAccountId?: string;
+  messageTo?: string;
+  messageThreadId?: string | number;
 }): Promise<EmbeddedPiRunResult> {
   const started = Date.now();
   const workspaceResolution = resolveRunWorkspaceDir({
@@ -422,15 +421,12 @@ export async function runCliAgent(params: {
 
   // MCP tool access only for Claude CLI; other backends get a "tools disabled" hint.
   let mcpConfigPath: string | undefined;
-  let useStrictMcp = true;
   if (isClaude) {
     try {
-      const mcpResolved = await resolveClaudeMcpConfigForRun({
-        backend,
-        config: params.config,
-      });
-      mcpConfigPath = mcpResolved.mcpConfigPath;
-      useStrictMcp = mcpResolved.useStrictMcp;
+      const gatewayPort = params.config?.gateway?.port ?? 18789;
+      const mcpPort = gatewayPort + MCP_PORT_OFFSET;
+      const openclawDir = path.join(os.homedir(), ".openclaw");
+      mcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);
     } catch (err) {
       log.warn(`mcp config setup failed: ${String(err)}`);
     }
@@ -601,7 +597,7 @@ export async function runCliAgent(params: {
     });
     // --mcp-config is a Claude Code specific flag.
     if (mcpConfigPath && backendResolved.id === "claude-cli") {
-      if (useStrictMcp && !args.includes("--strict-mcp-config")) {
+      if (!args.includes("--strict-mcp-config")) {
         args.push("--strict-mcp-config");
       }
       args.push("--mcp-config", mcpConfigPath);
@@ -656,6 +652,15 @@ export async function runCliAgent(params: {
           const next = { ...process.env, ...backend.env };
           for (const key of backend.clearEnv ?? []) {
             delete next[key];
+          }
+          if (mcpConfigPath) {
+            next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
+            next.OPENCLAW_MCP_ACCOUNT_ID = params.messageAccountId ?? "";
+            next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
+            next.OPENCLAW_MCP_MESSAGE_CHANNEL = params.messageChannel ?? "";
+            next.OPENCLAW_MCP_TO = params.messageTo ?? "";
+            next.OPENCLAW_MCP_THREAD_ID =
+              params.messageThreadId != null ? String(params.messageThreadId) : "";
           }
           return next;
         })();
@@ -929,6 +934,9 @@ export async function runClaudeCliAgent(params: {
   abortSignal?: AbortSignal;
   trigger?: PluginHookAgentContext["trigger"];
   messageChannel?: string;
+  messageAccountId?: string;
+  messageTo?: string;
+  messageThreadId?: string | number;
 }): Promise<EmbeddedPiRunResult> {
   return runCliAgent({
     sessionId: params.sessionId,
@@ -956,5 +964,8 @@ export async function runClaudeCliAgent(params: {
     abortSignal: params.abortSignal,
     trigger: params.trigger,
     messageChannel: params.messageChannel,
+    messageAccountId: params.messageAccountId,
+    messageTo: params.messageTo,
+    messageThreadId: params.messageThreadId,
   });
 }

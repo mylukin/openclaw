@@ -774,7 +774,7 @@ export function buildCliArgs(params: {
   useResume: boolean;
 }): string[] {
   const args: string[] = [...params.baseArgs];
-  if (!params.useResume && params.backend.modelArg && params.modelId) {
+  if (params.backend.modelArg && params.modelId) {
     args.push(params.backend.modelArg, params.modelId);
   }
   if (params.systemPrompt && params.backend.systemPromptArg) {

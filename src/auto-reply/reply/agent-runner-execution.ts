@@ -277,6 +277,15 @@ export async function runAgentTurnWithFallback(params: {
                   abortSignal: params.opts?.abortSignal,
                   trigger: params.isHeartbeat ? "heartbeat" : "user",
                   messageChannel: params.followupRun.run.messageProvider,
+                  messageAccountId:
+                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
+                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
+                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
+                  onSystemInit: ({ subtype }) => {
+                    if (subtype === "init") {
+                      queueAssistantMessageStart();
+                    }
+                  },
                   onAssistantTurn: (text) => {
                     queueReasoningEndIfNeeded();
                     emitAgentEvent({
