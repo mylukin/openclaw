@@ -472,6 +472,7 @@ function normalizeMentions(
   text: string,
   mentions?: FeishuMessageEvent["message"]["mentions"],
   botStripId?: string,
+  chatType?: string,
 ): string {
   if (!mentions || mentions.length === 0) return text;
 
@@ -486,8 +487,19 @@ function normalizeMentions(
       // Strip the full bot mention: optional "@Name " prefix + key
       const pattern = new RegExp(`(?:@${escaped(mention.name)}\\s+)?${escaped(mention.key)}`, "g");
       result = result.replace(pattern, "").trim();
+    } else if (chatType !== "group" && chatType !== "private") {
+      // P2P / unspecified: normalize non-bot mentions to <at> tags or @Name fallback
+      const keyPattern = new RegExp(escaped(mention.key), "g");
+      if (mentionId) {
+        result = result.replace(
+          keyPattern,
+          () => `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`,
+        );
+      } else {
+        result = result.replace(keyPattern, () => `@${mention.name}`);
+      }
     }
-    // Non-bot mentions: leave text as-is
+    // group/private: non-bot mentions left as-is
   }
 
   return result;
@@ -779,7 +791,12 @@ export function parseFeishuMessageEvent(
   // mentionedBot flag already captures whether the bot was addressed, so
   // keeping the mention tag in content only breaks command detection (#35994).
   // Non-bot mentions (e.g. mention-forward targets) are still normalized to <at> tags.
-  const content = normalizeMentions(rawContent, event.message.mentions, botOpenId);
+  const content = normalizeMentions(
+    rawContent,
+    event.message.mentions,
+    botOpenId,
+    event.message.chat_type,
+  );
   const senderOpenId = event.sender.sender_id.open_id?.trim();
   const senderUserId = event.sender.sender_id.user_id?.trim();
   const senderFallbackId = senderOpenId || senderUserId || "";
