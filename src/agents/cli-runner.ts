@@ -398,6 +398,7 @@ export async function runCliAgent(params: {
   bootstrapPromptWarningSignature?: string;
   images?: ImageContent[];
   onAssistantTurn?: (text: string) => void;
+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   onToolUse?: (toolName: string) => void;
   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
@@ -741,6 +742,7 @@ export async function runCliAgent(params: {
         const streamProcessor =
           outputMode === "stream-json"
             ? createStreamJsonProcessor(backend, {
+                onSystemInit: params.onSystemInit,
                 onAssistantTurn: params.onAssistantTurn,
                 onToolUse: params.onToolUse,
                 onThinkingTurn: params.onThinkingTurn,
@@ -999,6 +1001,7 @@ export async function runClaudeCliAgent(params: {
   claudeSessionId?: string;
   images?: ImageContent[];
   onAssistantTurn?: (text: string) => void;
+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   onToolUse?: (toolName: string) => void;
   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
@@ -1029,6 +1032,7 @@ export async function runClaudeCliAgent(params: {
     cliSessionId: params.claudeSessionId,
     images: params.images,
     onAssistantTurn: params.onAssistantTurn,
+    onSystemInit: params.onSystemInit,
     onToolUse: params.onToolUse,
     onThinkingTurn: params.onThinkingTurn,
     onToolUseEvent: params.onToolUseEvent,

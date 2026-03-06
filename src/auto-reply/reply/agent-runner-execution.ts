@@ -46,6 +46,7 @@ import {
 import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
 import type { FollowupRun } from "./queue.js";
 import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
+import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
 export type RuntimeFallbackAttempt = {
@@ -236,12 +237,24 @@ export async function runAgentTurnWithFallback(params: {
               // forward to onPartialReply.  Awaiting this chain after the CLI run
               // ensures markRunComplete() isn't called before streaming initialises.
               let streamingChain: Promise<void> = Promise.resolve();
+              const streamingDirectiveAccumulator = createStreamingDirectiveAccumulator();
               let cliReasoningOpen = false;
+              let assistantMessageStartQueued = false;
               const queueStreamingStep = (step: () => Promise<void>) => {
                 streamingChain = streamingChain.then(step).catch((err) => {
                   defaultRuntime.error(
                     `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
                   );
+                });
+              };
+              const queueAssistantMessageStart = () => {
+                if (assistantMessageStartQueued) {
+                  return;
+                }
+                assistantMessageStartQueued = true;
+                queueStreamingStep(async () => {
+                  await params.typingSignals.signalMessageStart();
+                  await params.opts?.onAssistantMessageStart?.();
                 });
               };
               const escapeMarkdownItalic = (value: string): string =>
@@ -293,16 +306,13 @@ export async function runAgentTurnWithFallback(params: {
                   abortSignal: params.opts?.abortSignal,
                   trigger: params.isHeartbeat ? "heartbeat" : "user",
                   messageChannel: params.followupRun.run.messageProvider,
-                  messageAccountId:
-                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
-                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
-                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
                   onSystemInit: ({ subtype }) => {
                     if (subtype === "init") {
                       queueAssistantMessageStart();
                     }
                   },
                   onAssistantTurn: (text) => {
+                    queueAssistantMessageStart();
                     queueReasoningEndIfNeeded();
                     emitAgentEvent({
                       runId,
@@ -316,7 +326,15 @@ export async function runAgentTurnWithFallback(params: {
                     // Chained (not fire-and-forget) so signalTextDelta completes
                     // before onPartialReply, and markRunComplete waits for all.
                     queueStreamingStep(async () => {
-                      const normalizedText = await handlePartialForTyping({ text });
+                      const parsedChunk = streamingDirectiveAccumulator.consume(text, {
+                        silentToken: SILENT_REPLY_TOKEN,
+                      });
+                      const normalizedText = await handlePartialForTyping({
+                        text: parsedChunk?.text,
+                        mediaUrl: parsedChunk?.mediaUrl,
+                        mediaUrls: parsedChunk?.mediaUrls,
+                        audioAsVoice: parsedChunk?.audioAsVoice,
+                      });
                       if (normalizedText !== undefined && params.opts?.onPartialReply) {
                         await params.opts.onPartialReply({ text: normalizedText });
                       }
@@ -326,6 +344,7 @@ export async function runAgentTurnWithFallback(params: {
                     if (!text.trim()) {
                       return;
                     }
+                    queueAssistantMessageStart();
                     cliReasoningOpen = true;
                     emitAgentEvent({
                       runId,
@@ -348,6 +367,7 @@ export async function runAgentTurnWithFallback(params: {
                     });
                   },
                   onToolUseEvent: (payload) => {
+                    queueAssistantMessageStart();
                     queueReasoningEndIfNeeded();
                     emitAgentEvent({
                       runId,

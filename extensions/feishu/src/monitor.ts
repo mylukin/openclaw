@@ -7,7 +7,6 @@ import {
   type HistoryEntry,
   getGlobalHookRunner,
   installRequestBodyLimitGuard,
-  getGlobalHookRunner,
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
@@ -234,6 +233,11 @@ export async function resolveReactionSyntheticEvent(
       }),
     },
   };
+}
+
+export function getBotOpenId(accountId: string): string | undefined {
+  const value = botOpenIds.get(accountId)?.trim();
+  return value ? value : undefined;
 }
 
 async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
