@@ -408,7 +408,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "node-123", displayName: "lukin-dev" },
+      { platform: "linux", deviceFamily: "", nodeId: "node-123" },
     );
     expect(allow.has("camera.snap")).toBe(false);
     expect(allow.has("browser.proxy")).toBe(false);
@@ -429,7 +429,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "ios", deviceFamily: "iPhone", nodeId: "n1", displayName: "my-node" },
+      { platform: "ios", deviceFamily: "iPhone", nodeId: "n1" },
     );
     expect(allow.has("camera.snap")).toBe(true);
     expect(allow.has("screen.record")).toBe(true);
@@ -446,7 +446,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "node-abc", displayName: "my-display" },
+      { platform: "linux", deviceFamily: "", nodeId: "node-abc" },
     );
     expect(allow.has("system.run")).toBe(true);
   });
@@ -462,7 +462,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
+      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20" },
     );
     expect(allow.has("browser.proxy")).toBe(false);
     expect(allow.has("system.run")).toBe(true);
@@ -480,7 +480,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "my-node", displayName: "my-node" },
+      { platform: "linux", deviceFamily: "", nodeId: "my-node" },
     );
     // Global deny applies, per-node deny for "other-node" does not
     expect(allow.has("camera.snap")).toBe(false);
@@ -501,7 +501,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "my-node", displayName: "my-node" },
+      { platform: "linux", deviceFamily: "", nodeId: "my-node" },
     );
     // camera.snap added by allow but removed by deny
     expect(allow.has("camera.snap")).toBe(false);
@@ -520,7 +520,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "any-node", displayName: "" },
+      { platform: "linux", deviceFamily: "", nodeId: "any-node" },
     );
     // Empty key should not match — system.run stays allowed
     expect(allow.has("system.run")).toBe(true);
@@ -538,7 +538,7 @@ describe("resolveNodeCommandAllowlist", () => {
           },
         },
       },
-      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
+      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20" },
     );
     // "node-lukin-" is the longest prefix → only browser.proxy denied
     expect(allow.has("browser.proxy")).toBe(false);
