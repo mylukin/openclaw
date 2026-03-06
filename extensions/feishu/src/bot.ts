@@ -1489,6 +1489,7 @@ export async function handleFeishuMessage(params: {
             threadReply,
             mentionTargets: ctx.mentionTargets,
             accountId: account.accountId,
+            botOpenId,
             messageCreateTimeMs,
           });
 
@@ -1587,6 +1588,7 @@ export async function handleFeishuMessage(params: {
         threadReply,
         mentionTargets: ctx.mentionTargets,
         accountId: account.accountId,
+        botOpenId,
         messageCreateTimeMs,
       });
 

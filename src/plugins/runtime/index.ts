@@ -3,6 +3,7 @@ import {
   getApiKeyForModel as getApiKeyForModelRaw,
   resolveApiKeyForProvider as resolveApiKeyForProviderRaw,
 } from "../../agents/model-auth.js";
+import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
 import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { transcribeAudioFile } from "../../media-understanding/transcribe-audio.js";
@@ -53,7 +54,7 @@ export type CreatePluginRuntimeOptions = {
 export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): PluginRuntime {
   const runtime = {
     version: resolveVersion(),
-    agents: { runEmbeddedPiAgent },
+    agents: { runEmbeddedPiAgent, runModelAwareAgent },
     config: createRuntimeConfig(),
     subagent: _options.subagent ?? createUnavailableSubagentRuntime(),
     system: createRuntimeSystem(),
