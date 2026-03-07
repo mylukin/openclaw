@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ImageContent } from "@mariozechner/pi-ai";
+import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
@@ -27,6 +27,7 @@ import {
   buildBootstrapTruncationReportMeta,
 } from "./bootstrap-budget.js";
 import {
+  COMPACTION_SYSTEM_PROMPT,
   DEFAULT_COMPACTION_TIMEOUT_MS,
   compactBootstrapFiles,
   resolveCompactionConfig,
@@ -52,7 +53,7 @@ import {
 import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
-import { resolveApiKeyForProvider } from "./model-auth.js";
+import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
 import {
   buildBootstrapContextFiles,
   classifyFailoverReason,
@@ -65,6 +66,7 @@ import {
   type BootstrapProfile,
 } from "./pi-embedded-helpers.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
+import { resolveModel } from "./pi-embedded-runner/model.js";
 import {
   applySkillEnvOverrides,
   applySkillEnvOverridesFromSnapshot,
@@ -639,18 +641,60 @@ export async function runCliAgent(params: {
         if (profile === "compaction") {
           compactionAttempted = true;
           const compactionCfg = resolveCompactionConfig(params.config);
-          compactionModelUsed = compactionCfg.model ?? modelId;
+          // Resolve compaction model: config.model (may be "provider/model") or
+          // inherit the agent's current model + provider.
+          const compactionModelId = compactionCfg.model ?? modelId;
+          const compactionProvider = compactionCfg.model?.includes("/")
+            ? compactionCfg.model.split("/")[0]
+            : params.provider;
+          const compactionModelRef = compactionCfg.model?.includes("/")
+            ? compactionCfg.model.split("/").slice(1).join("/")
+            : compactionModelId;
+          compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
           try {
+            // Resolve model via the unified model registry (provider-agnostic).
+            const resolved = resolveModel(
+              compactionProvider,
+              compactionModelRef,
+              undefined,
+              params.config,
+            );
+            if (!resolved.model) {
+              throw new Error(
+                resolved.error ??
+                  `Unknown compaction model: ${compactionProvider}/${compactionModelRef}`,
+              );
+            }
+            const apiKey = requireApiKey(
+              await getApiKeyForModel({ model: resolved.model, cfg: params.config }),
+              compactionProvider,
+            );
+
+            const isTextBlock = (b: { type: string }): b is { type: "text"; text: string } =>
+              b.type === "text";
+            const compactionSignal = AbortSignal.timeout(
+              compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS,
+            );
+
             const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
               contextFiles: lastProfileContextFiles,
               config: compactionCfg,
-              defaultModel: modelId,
-              provider: params.provider,
-              apiKeyResolver: () =>
-                resolveApiKeyForProvider({ provider: "anthropic", cfg: params.config }).then(
-                  (auth) => ({ apiKey: auth.apiKey ?? "", provider: "anthropic" }),
-                ),
-              signal: AbortSignal.timeout(compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS),
+              llmFn: async (userPrompt, signal) => {
+                const res = await completeSimple(
+                  resolved.model!,
+                  {
+                    systemPrompt: COMPACTION_SYSTEM_PROMPT,
+                    messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
+                  },
+                  { apiKey, maxTokens: 4096, temperature: 0, signal },
+                );
+                const texts = res.content.filter(isTextBlock);
+                if (texts.length === 0) {
+                  throw new Error("No text content in compaction response");
+                }
+                return texts.map((b) => b.text).join("\n");
+              },
+              signal: compactionSignal,
             });
 
             compactedFilesList = results.filter((r) => r.success).map((r) => r.path);

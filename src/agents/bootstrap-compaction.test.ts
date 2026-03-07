@@ -1,36 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  type BootstrapCompactionConfig,
+  type CompactionLlmFn,
   DEFAULT_COMPACTION_TIMEOUT_MS,
   clearCompactionCache,
   compactBootstrapFile,
   compactBootstrapFiles,
-  isAnthropicProvider,
   isCompactableFile,
   resolveCompactionConfig,
 } from "./bootstrap-compaction.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function makeFetchResponse(text: string, ok = true, status = 200): Response {
-  return {
-    ok,
-    status,
-    text: () => Promise.resolve(`{"error":"${text}"}`),
-    json: () =>
-      Promise.resolve({
-        content: [{ type: "text", text }],
-      }),
-  } as unknown as Response;
-}
-
-function makeApiKeyResolver(
-  apiKey = "test-key",
-): () => Promise<{ apiKey: string; provider: string }> {
-  return () => Promise.resolve({ apiKey, provider: "anthropic" });
-}
-
-const TEST_DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 
 const STRUCTURED_SUMMARY = `## Key Rules
 - Rule A
@@ -44,6 +23,16 @@ const STRUCTURED_SUMMARY = `## Key Rules
 
 ## Critical References
 - /path/to/file.ts`;
+
+/** Creates a mock llmFn that returns the given text. */
+function makeLlmFn(response: string): CompactionLlmFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(response) as CompactionLlmFn & ReturnType<typeof vi.fn>;
+}
+
+/** Creates a mock llmFn that rejects with the given error. */
+function makeFailingLlmFn(error: Error): CompactionLlmFn & ReturnType<typeof vi.fn> {
+  return vi.fn().mockRejectedValue(error) as CompactionLlmFn & ReturnType<typeof vi.fn>;
+}
 
 // ── isCompactableFile ─────────────────────────────────────────────────────────
 
@@ -155,46 +144,21 @@ describe("resolveCompactionConfig", () => {
   });
 });
 
-// ── isAnthropicProvider ──────────────────────────────────────────────────────
-
-describe("isAnthropicProvider", () => {
-  it("recognizes anthropic providers", () => {
-    expect(isAnthropicProvider("anthropic")).toBe(true);
-    expect(isAnthropicProvider("anthropic-vertex")).toBe(true);
-    expect(isAnthropicProvider("anthropic-bedrock")).toBe(true);
-  });
-
-  it("rejects non-anthropic providers", () => {
-    expect(isAnthropicProvider("openai-crs")).toBe(false);
-    expect(isAnthropicProvider("claude-cli")).toBe(false);
-    expect(isAnthropicProvider("vllm-local")).toBe(false);
-    expect(isAnthropicProvider("")).toBe(false);
-  });
-});
-
 // ── compactBootstrapFile ──────────────────────────────────────────────────────
 
 describe("compactBootstrapFile", () => {
   beforeEach(() => {
     clearCompactionCache();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("calls the Anthropic API and returns compacted content", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+  it("calls llmFn and returns compacted content", async () => {
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const { compacted, result } = await compactBootstrapFile({
       content: "Some long memory content that needs compaction.",
       filePath: "/workspace/MEMORY.md",
-      config: { model: "claude-haiku-4-5-20251001" },
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      config: {},
+      llmFn,
     });
 
     expect(compacted).toBe(STRUCTURED_SUMMARY);
@@ -202,130 +166,48 @@ describe("compactBootstrapFile", () => {
     expect(result.path).toBe("/workspace/MEMORY.md");
     expect(result.charsBefore).toBe("Some long memory content that needs compaction.".length);
     expect(result.charsAfter).toBe(STRUCTURED_SUMMARY.length);
-    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(llmFn).toHaveBeenCalledOnce();
   });
 
-  it("sends correct Anthropic API request", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+  it("passes content as user prompt to llmFn", async () => {
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     await compactBootstrapFile({
-      content: "Memory content",
-      filePath: "/workspace/MEMORY.md",
-      config: { model: "claude-haiku-4-5-20251001" },
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver("my-api-key"),
-    });
-
-    expect(mockFetch).toHaveBeenCalledWith(
-      "https://api.anthropic.com/v1/messages",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({
-          "x-api-key": "my-api-key",
-          "anthropic-version": "2023-06-01",
-        }),
-      }),
-    );
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
-    expect(body.model).toBe("claude-haiku-4-5-20251001");
-    expect(body.max_tokens).toBe(4096);
-    expect(body.messages).toHaveLength(1);
-    expect((body.messages as Array<{ role: string }>)[0].role).toBe("user");
-  });
-
-  it("uses defaultModel when config.model is undefined", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
-
-    await compactBootstrapFile({
-      content: "Memory content",
+      content: "Memory content to compact",
       filePath: "/workspace/MEMORY.md",
       config: {},
-      defaultModel: "my-custom-model",
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
-    expect(body.model).toBe("my-custom-model");
+    expect(llmFn).toHaveBeenCalledWith("Memory content to compact", undefined);
   });
 
-  it("skips compaction and returns original content for non-Anthropic provider", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
-
-    const content = "Memory content for non-anthropic agent";
-    const { compacted, result } = await compactBootstrapFile({
-      content,
-      filePath: "/workspace/MEMORY.md",
-      config: {},
-      defaultModel: "gpt-4o",
-      provider: "openai-crs",
-      apiKeyResolver: makeApiKeyResolver(),
-    });
-
-    expect(result.success).toBe(false);
-    expect(result.fallbackReason).toContain("not Anthropic");
-    expect(compacted).toBe(content);
-    expect(mockFetch).not.toHaveBeenCalled(); // no LLM call at all
-  });
-
-  it("allows non-Anthropic provider when config.model is explicitly set", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
-
-    const { result } = await compactBootstrapFile({
-      content: "Memory content",
-      filePath: "/workspace/MEMORY.md",
-      config: { model: "claude-haiku-4-5-20251001" },
-      defaultModel: "gpt-4o",
-      provider: "openai-crs",
-      apiKeyResolver: makeApiKeyResolver(),
-    });
-
-    expect(result.success).toBe(true);
-    expect(mockFetch).toHaveBeenCalledOnce();
-  });
-
-  it("returns original content with success=false on API error", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(
-      Object.assign(makeFetchResponse("Error message", false, 500), {
-        text: () => Promise.resolve("Internal Server Error"),
-      }),
-    );
-    vi.stubGlobal("fetch", mockFetch);
+  it("returns original content with success=false on llmFn error", async () => {
+    const llmFn = makeFailingLlmFn(new Error("API error 500"));
 
     const content = "Original memory content";
     const { compacted, result } = await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(result.success).toBe(false);
     expect(compacted).toBe(content);
-    expect(result.fallbackReason).toBeTruthy();
+    expect(result.fallbackReason).toContain("API error 500");
     expect(result.charsAfter).toBe(content.length);
   });
 
-  it("returns original content with success=false on fetch rejection", async () => {
-    const mockFetch = vi.fn().mockRejectedValue(new Error("Network error"));
-    vi.stubGlobal("fetch", mockFetch);
+  it("returns original content with success=false on llmFn rejection", async () => {
+    const llmFn = makeFailingLlmFn(new Error("Network error"));
 
     const content = "Original memory content";
     const { compacted, result } = await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(result.success).toBe(false);
@@ -334,30 +216,39 @@ describe("compactBootstrapFile", () => {
   });
 
   it("truncates input to COMPACTION_MAX_INPUT_CHARS with head+tail split before sending", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const longContent = "H".repeat(5_000) + "T".repeat(10_000); // 15K, exceeds 10K limit
     await compactBootstrapFile({
       content: longContent,
       filePath: "/workspace/MEMORY.md",
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
-      messages: Array<{ content: string }>;
-    };
-    const sent = body.messages[0].content;
+    const sentPrompt = llmFn.mock.calls[0][0] as string;
     // Head 30% = 3000 chars, tail 70% = 7000 chars, plus omission marker in between
-    expect(sent).toContain("[... middle content omitted for compaction ...]");
-    expect(sent.startsWith("H")).toBe(true);
-    expect(sent.endsWith("T")).toBe(true);
+    expect(sentPrompt).toContain("[... middle content omitted for compaction ...]");
+    expect(sentPrompt.startsWith("H")).toBe(true);
+    expect(sentPrompt.endsWith("T")).toBe(true);
     // Total should be 10K + marker length
     const markerLen = "\n\n[... middle content omitted for compaction ...]\n\n".length;
-    expect(sent.length).toBe(10_000 + markerLen);
+    expect(sentPrompt.length).toBe(10_000 + markerLen);
+  });
+
+  it("passes signal to llmFn", async () => {
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
+    const signal = AbortSignal.abort();
+
+    await compactBootstrapFile({
+      content: "Memory content",
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+      signal,
+    });
+
+    expect(llmFn).toHaveBeenCalledWith("Memory content", signal);
   });
 });
 
@@ -366,103 +257,76 @@ describe("compactBootstrapFile", () => {
 describe("compactBootstrapFile - content-hash cache", () => {
   beforeEach(() => {
     clearCompactionCache();
-    vi.stubGlobal("fetch", vi.fn());
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
   });
 
   it("returns cached result without calling LLM on second call with same content", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const content = "Memory content for caching test";
-    const config: BootstrapCompactionConfig = {};
-    const apiKeyResolver = makeApiKeyResolver();
 
     // First call — should hit the LLM
     const first = await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
-    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(llmFn).toHaveBeenCalledOnce();
 
     // Second call with same content — should use cache
     const second = await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
-    expect(mockFetch).toHaveBeenCalledOnce(); // still only one call
+    expect(llmFn).toHaveBeenCalledOnce(); // still only one call
     expect(second.compacted).toBe(first.compacted);
   });
 
   it("calls LLM again when content changes (cache miss)", async () => {
-    const mockFetch = vi
+    const llmFn = vi
       .fn()
-      .mockResolvedValueOnce(makeFetchResponse("Summary A"))
-      .mockResolvedValueOnce(makeFetchResponse("Summary B"));
-    vi.stubGlobal("fetch", mockFetch);
-
-    const config: BootstrapCompactionConfig = {};
-    const apiKeyResolver = makeApiKeyResolver();
+      .mockResolvedValueOnce("Summary A")
+      .mockResolvedValueOnce("Summary B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
 
     await compactBootstrapFile({
       content: "Content version 1",
       filePath: "/workspace/MEMORY.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
-    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(llmFn).toHaveBeenCalledTimes(1);
 
     await compactBootstrapFile({
       content: "Content version 2 — different content",
       filePath: "/workspace/MEMORY.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(llmFn).toHaveBeenCalledTimes(2);
   });
 
   it("cache is keyed by file path — different paths do not share cache", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const content = "Same content for both files";
-    const config: BootstrapCompactionConfig = {};
-    const apiKeyResolver = makeApiKeyResolver();
 
     await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
     await compactBootstrapFile({
       content,
       filePath: "/workspace/memory/2026-03-07.md",
-      config,
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver,
+      config: {},
+      llmFn,
     });
 
     // Different file paths → two separate LLM calls
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(llmFn).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -473,24 +337,16 @@ describe("compactBootstrapFile - timeout handling", () => {
     clearCompactionCache();
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("falls back gracefully when signal is already aborted", async () => {
-    // Simulate a fetch that is aborted immediately
+  it("falls back gracefully when llmFn is aborted", async () => {
     const abortError = new DOMException("The operation was aborted.", "AbortError");
-    const mockFetch = vi.fn().mockRejectedValue(abortError);
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeFailingLlmFn(abortError);
 
     const content = "Memory content";
     const { compacted, result } = await compactBootstrapFile({
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
       signal: AbortSignal.abort(), // pre-aborted
     });
 
@@ -505,14 +361,11 @@ describe("compactBootstrapFile - timeout handling", () => {
 describe("compactBootstrapFiles", () => {
   beforeEach(() => {
     clearCompactionCache();
-    vi.stubGlobal("fetch", vi.fn());
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
   });
 
   it("returns unchanged files when no compactable files present", async () => {
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
+
     const contextFiles = [
       { path: "/workspace/AGENTS.md", content: "Agents content" },
       { path: "/workspace/SOUL.md", content: "Soul content" },
@@ -521,18 +374,16 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(result).toEqual(contextFiles);
     expect(results).toHaveLength(0);
+    expect(llmFn).not.toHaveBeenCalled();
   });
 
   it("compacts MEMORY.md and replaces its content", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const contextFiles = [
       { path: "/workspace/AGENTS.md", content: "Agents content (not compactable)" },
@@ -541,10 +392,8 @@ describe("compactBootstrapFiles", () => {
 
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
-      config: { model: "claude-haiku-4-5-20251001" },
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      config: {},
+      llmFn,
     });
 
     expect(result).toHaveLength(2);
@@ -558,8 +407,7 @@ describe("compactBootstrapFiles", () => {
   });
 
   it("compacts memory/YYYY-MM-DD.md files", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const contextFiles = [
       { path: "/workspace/memory/2026-03-07.md", content: "Daily log content".repeat(50) },
@@ -568,9 +416,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(result[0].content).toBe(STRUCTURED_SUMMARY);
@@ -578,8 +424,7 @@ describe("compactBootstrapFiles", () => {
   });
 
   it("selects only the largest 3 compactable files", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const contextFiles = [
       { path: "/workspace/MEMORY.md", content: "A".repeat(5000) },
@@ -592,13 +437,11 @@ describe("compactBootstrapFiles", () => {
     const { results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(results).toHaveLength(3);
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(llmFn).toHaveBeenCalledTimes(3);
     // Verify the 3 largest were selected (MEMORY.md=5000, 2026-03-06=4000, 2026-03-05=3000)
     const compactedPaths = results.map((r) => r.path).toSorted();
     expect(compactedPaths).toContain("/workspace/MEMORY.md");
@@ -609,8 +452,7 @@ describe("compactBootstrapFiles", () => {
   });
 
   it("preserves original content for files that fail compaction", async () => {
-    const mockFetch = vi.fn().mockRejectedValue(new Error("API unavailable"));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeFailingLlmFn(new Error("API unavailable"));
 
     const originalContent = "Memory content to compact";
     const contextFiles = [{ path: "/workspace/MEMORY.md", content: originalContent }];
@@ -618,9 +460,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     // Content should be unchanged on failure
@@ -630,9 +470,7 @@ describe("compactBootstrapFiles", () => {
   });
 
   it("returns CompactionResult with correct charsBefore and charsAfter on success", async () => {
-    const compactedText = STRUCTURED_SUMMARY;
-    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(compactedText));
-    vi.stubGlobal("fetch", mockFetch);
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
 
     const originalContent = "Original content";
     const contextFiles = [{ path: "/workspace/MEMORY.md", content: originalContent }];
@@ -640,12 +478,10 @@ describe("compactBootstrapFiles", () => {
     const { results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
-      defaultModel: TEST_DEFAULT_MODEL,
-      provider: "anthropic",
-      apiKeyResolver: makeApiKeyResolver(),
+      llmFn,
     });
 
     expect(results[0].charsBefore).toBe(originalContent.length);
-    expect(results[0].charsAfter).toBe(compactedText.length);
+    expect(results[0].charsAfter).toBe(STRUCTURED_SUMMARY.length);
   });
 });

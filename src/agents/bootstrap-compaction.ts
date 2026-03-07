@@ -6,13 +6,10 @@ import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 export const DEFAULT_COMPACTION_TIMEOUT_MS = 30_000;
-const COMPACTION_MAX_TOKENS = 4096;
 const COMPACTION_MAX_INPUT_CHARS = 10_000;
 const COMPACTION_MAX_FILES = 3;
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION = "2023-06-01";
 
-const COMPACTION_SYSTEM_PROMPT = [
+export const COMPACTION_SYSTEM_PROMPT = [
   "You are a memory compaction assistant. Given the content of a memory file, produce a structured summary using EXACTLY the following template — no additional sections, no content outside the headers:",
   "",
   "## Key Rules",
@@ -39,10 +36,8 @@ const COMPACTION_SYSTEM_PROMPT = [
 
 export interface BootstrapCompactionConfig {
   /**
-   * Anthropic model to use for compaction.
-   * undefined = inherited from the agent's current model (must be Anthropic).
-   * Compaction only works with Anthropic models — non-Anthropic agents skip
-   * compaction and fall through to the next bootstrap profile (minimal).
+   * Model to use for compaction (provider/model format, e.g. "anthropic/claude-haiku-4-5-20251001").
+   * When unset, inherits the agent's current model.
    */
   model?: string;
   /** Timeout in ms. Default 30_000. */
@@ -61,6 +56,16 @@ export interface CompactionResult {
   /** If failed, the reason */
   fallbackReason?: string;
 }
+
+/**
+ * Provider-agnostic LLM call function.
+ * Takes the user prompt (with system prompt already embedded by the caller or
+ * handled internally) and returns the model's text response.
+ *
+ * The caller is responsible for wiring up model resolution, auth, and the
+ * actual API call (via completeSimple or equivalent).
+ */
+export type CompactionLlmFn = (userPrompt: string, signal?: AbortSignal) => Promise<string>;
 
 // ── Content-hash cache ────────────────────────────────────────────────────────
 
@@ -114,54 +119,6 @@ export function isCompactableFile(filePath: string): boolean {
   return false;
 }
 
-// ── Internal: LLM call via fetch ──────────────────────────────────────────────
-
-interface AnthropicTextBlock {
-  type: "text";
-  text: string;
-}
-
-interface AnthropicMessagesResponse {
-  content: AnthropicTextBlock[];
-}
-
-async function callAnthropicApi(params: {
-  apiKey: string;
-  model: string;
-  system: string;
-  userContent: string;
-  maxTokens: number;
-  signal?: AbortSignal;
-}): Promise<string> {
-  const response = await fetch(ANTHROPIC_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": params.apiKey,
-      "anthropic-version": ANTHROPIC_API_VERSION,
-    },
-    body: JSON.stringify({
-      model: params.model,
-      max_tokens: params.maxTokens,
-      system: params.system,
-      messages: [{ role: "user", content: params.userContent }],
-    }),
-    signal: params.signal,
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Anthropic API error ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  const data = (await response.json()) as AnthropicMessagesResponse;
-  const textBlocks = data.content.filter((b) => b.type === "text");
-  if (textBlocks.length === 0) {
-    throw new Error("No text content in Anthropic response");
-  }
-  return textBlocks.map((b) => b.text).join("\n");
-}
-
 // ── Core compaction functions ─────────────────────────────────────────────────
 
 /**
@@ -170,50 +127,22 @@ async function callAnthropicApi(params: {
  * Uses content-hash caching: if the file content hasn't changed since last
  * compaction, returns the cached result without calling the LLM.
  *
+ * The actual LLM call is delegated to `llmFn`, making this function
+ * provider-agnostic. The caller wires up model resolution and auth.
+ *
  * Always returns successfully — on LLM failure, returns the original content
  * with success=false and fallbackReason set.
  */
-/**
- * Known Anthropic provider strings. Compaction requires an Anthropic model;
- * non-Anthropic providers are rejected early with a clear fallback reason.
- */
-const ANTHROPIC_PROVIDERS = new Set(["anthropic", "anthropic-vertex", "anthropic-bedrock"]);
-
-export function isAnthropicProvider(provider: string): boolean {
-  return ANTHROPIC_PROVIDERS.has(provider);
-}
-
 export async function compactBootstrapFile(params: {
   content: string;
   filePath: string;
   config: BootstrapCompactionConfig;
-  /** Fallback model when config.model is not set. Must be an Anthropic model. */
-  defaultModel: string;
-  /** Provider of the agent. Used to verify Anthropic compatibility. */
-  provider: string;
-  apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
+  /** Provider-agnostic LLM call. The caller resolves model + auth. */
+  llmFn: CompactionLlmFn;
   signal?: AbortSignal;
 }): Promise<{ compacted: string; result: CompactionResult }> {
-  const { content, filePath, config, signal } = params;
+  const { content, filePath, signal } = params;
   const charsBefore = content.length;
-
-  // Compaction is Anthropic-only. If config.model is set, it's expected to be
-  // an Anthropic model. If not set, we inherit the agent's model but only when
-  // the agent itself is using an Anthropic provider.
-  if (!config.model && !isAnthropicProvider(params.provider)) {
-    return {
-      compacted: content,
-      result: {
-        path: filePath,
-        charsBefore,
-        charsAfter: charsBefore,
-        success: false,
-        fallbackReason: `compaction skipped: provider "${params.provider}" is not Anthropic`,
-      },
-    };
-  }
-
-  const compactionModel = config.model ?? params.defaultModel;
 
   // Enforce max input size — head+tail split to preserve recent content at end of file.
   // MEMORY.md and daily memory files have latest entries at the bottom.
@@ -245,15 +174,7 @@ export async function compactBootstrapFile(params: {
   }
 
   try {
-    const { apiKey } = await params.apiKeyResolver();
-    const compacted = await callAnthropicApi({
-      apiKey,
-      model: compactionModel,
-      system: COMPACTION_SYSTEM_PROMPT,
-      userContent: inputContent,
-      maxTokens: COMPACTION_MAX_TOKENS,
-      signal,
-    });
+    const compacted = await params.llmFn(inputContent, signal);
 
     compactionCache.set(filePath, { hash: contentHash, compacted });
 
@@ -289,11 +210,8 @@ export async function compactBootstrapFile(params: {
 export async function compactBootstrapFiles(params: {
   contextFiles: EmbeddedContextFile[];
   config: BootstrapCompactionConfig;
-  /** Fallback model when config.model is not set. Must be an Anthropic model. */
-  defaultModel: string;
-  /** Provider of the agent. Used to verify Anthropic compatibility. */
-  provider: string;
-  apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
+  /** Provider-agnostic LLM call. The caller resolves model + auth. */
+  llmFn: CompactionLlmFn;
   signal?: AbortSignal;
 }): Promise<{
   contextFiles: EmbeddedContextFile[];
@@ -320,9 +238,7 @@ export async function compactBootstrapFiles(params: {
       content: file.content,
       filePath: file.path,
       config,
-      defaultModel: params.defaultModel,
-      provider: params.provider,
-      apiKeyResolver: params.apiKeyResolver,
+      llmFn: params.llmFn,
       signal,
     });
     results.push(result);
