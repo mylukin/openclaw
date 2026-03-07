@@ -6,7 +6,6 @@ import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 export const DEFAULT_COMPACTION_TIMEOUT_MS = 30_000;
-const DEFAULT_COMPACTION_MODEL = "claude-haiku-4-5-20251001";
 const COMPACTION_MAX_TOKENS = 4096;
 const COMPACTION_MAX_INPUT_CHARS = 10_000;
 const COMPACTION_MAX_FILES = 3;
@@ -173,18 +172,28 @@ export async function compactBootstrapFile(params: {
   content: string;
   filePath: string;
   config: BootstrapCompactionConfig;
+  /** Fallback model when config.model is not set. Inherited from the agent's current model. */
+  defaultModel: string;
   apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
   signal?: AbortSignal;
 }): Promise<{ compacted: string; result: CompactionResult }> {
   const { content, filePath, config, signal } = params;
   const charsBefore = content.length;
-  const compactionModel = config.model ?? DEFAULT_COMPACTION_MODEL;
+  const compactionModel = config.model ?? params.defaultModel;
 
-  // Enforce max input size
-  const inputContent =
-    content.length > COMPACTION_MAX_INPUT_CHARS
-      ? content.slice(0, COMPACTION_MAX_INPUT_CHARS)
-      : content;
+  // Enforce max input size — head+tail split to preserve recent content at end of file.
+  // MEMORY.md and daily memory files have latest entries at the bottom.
+  let inputContent: string;
+  if (content.length > COMPACTION_MAX_INPUT_CHARS) {
+    const headChars = Math.floor(COMPACTION_MAX_INPUT_CHARS * 0.3);
+    const tailChars = COMPACTION_MAX_INPUT_CHARS - headChars;
+    inputContent =
+      content.slice(0, headChars) +
+      "\n\n[... middle content omitted for compaction ...]\n\n" +
+      content.slice(-tailChars);
+  } else {
+    inputContent = content;
+  }
 
   // Cache lookup
   const contentHash = getContentHash(inputContent);
@@ -246,6 +255,8 @@ export async function compactBootstrapFile(params: {
 export async function compactBootstrapFiles(params: {
   contextFiles: EmbeddedContextFile[];
   config: BootstrapCompactionConfig;
+  /** Fallback model when config.model is not set. Inherited from the agent's current model. */
+  defaultModel: string;
   apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
   signal?: AbortSignal;
 }): Promise<{
@@ -273,6 +284,7 @@ export async function compactBootstrapFiles(params: {
       content: file.content,
       filePath: file.path,
       config,
+      defaultModel: params.defaultModel,
       apiKeyResolver: params.apiKeyResolver,
       signal,
     });

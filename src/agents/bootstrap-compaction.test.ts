@@ -29,6 +29,8 @@ function makeApiKeyResolver(
   return () => Promise.resolve({ apiKey, provider: "anthropic" });
 }
 
+const TEST_DEFAULT_MODEL = "claude-haiku-4-5-20251001";
+
 const STRUCTURED_SUMMARY = `## Key Rules
 - Rule A
 - Rule B
@@ -172,6 +174,7 @@ describe("compactBootstrapFile", () => {
       content: "Some long memory content that needs compaction.",
       filePath: "/workspace/MEMORY.md",
       config: { model: "claude-haiku-4-5-20251001" },
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -191,6 +194,7 @@ describe("compactBootstrapFile", () => {
       content: "Memory content",
       filePath: "/workspace/MEMORY.md",
       config: { model: "claude-haiku-4-5-20251001" },
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver("my-api-key"),
     });
 
@@ -212,7 +216,7 @@ describe("compactBootstrapFile", () => {
     expect((body.messages as Array<{ role: string }>)[0].role).toBe("user");
   });
 
-  it("uses default model when config.model is undefined", async () => {
+  it("uses defaultModel when config.model is undefined", async () => {
     const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
     vi.stubGlobal("fetch", mockFetch);
 
@@ -220,11 +224,12 @@ describe("compactBootstrapFile", () => {
       content: "Memory content",
       filePath: "/workspace/MEMORY.md",
       config: {},
+      defaultModel: "my-custom-model",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
-    expect(body.model).toBe("claude-haiku-4-5-20251001");
+    expect(body.model).toBe("my-custom-model");
   });
 
   it("returns original content with success=false on API error", async () => {
@@ -240,6 +245,7 @@ describe("compactBootstrapFile", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -258,6 +264,7 @@ describe("compactBootstrapFile", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -266,22 +273,30 @@ describe("compactBootstrapFile", () => {
     expect(result.fallbackReason).toContain("Network error");
   });
 
-  it("truncates input to COMPACTION_MAX_INPUT_CHARS before hashing and sending", async () => {
+  it("truncates input to COMPACTION_MAX_INPUT_CHARS with head+tail split before sending", async () => {
     const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
     vi.stubGlobal("fetch", mockFetch);
 
-    const longContent = "x".repeat(15_000); // exceeds 10_000 limit
+    const longContent = "H".repeat(5_000) + "T".repeat(10_000); // 15K, exceeds 10K limit
     await compactBootstrapFile({
       content: longContent,
       filePath: "/workspace/MEMORY.md",
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
       messages: Array<{ content: string }>;
     };
-    expect(body.messages[0].content.length).toBe(10_000);
+    const sent = body.messages[0].content;
+    // Head 30% = 3000 chars, tail 70% = 7000 chars, plus omission marker in between
+    expect(sent).toContain("[... middle content omitted for compaction ...]");
+    expect(sent.startsWith("H")).toBe(true);
+    expect(sent.endsWith("T")).toBe(true);
+    // Total should be 10K + marker length
+    const markerLen = "\n\n[... middle content omitted for compaction ...]\n\n".length;
+    expect(sent.length).toBe(10_000 + markerLen);
   });
 });
 
@@ -310,6 +325,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledOnce();
@@ -319,6 +335,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledOnce(); // still only one call
@@ -339,6 +356,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       content: "Content version 1",
       filePath: "/workspace/MEMORY.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledTimes(1);
@@ -347,6 +365,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       content: "Content version 2 — different content",
       filePath: "/workspace/MEMORY.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -364,12 +383,14 @@ describe("compactBootstrapFile - content-hash cache", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
     await compactBootstrapFile({
       content,
       filePath: "/workspace/memory/2026-03-07.md",
       config,
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver,
     });
 
@@ -400,6 +421,7 @@ describe("compactBootstrapFile - timeout handling", () => {
       content,
       filePath: "/workspace/MEMORY.md",
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
       signal: AbortSignal.abort(), // pre-aborted
     });
@@ -431,6 +453,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -450,6 +473,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: { model: "claude-haiku-4-5-20251001" },
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -474,6 +498,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -496,6 +521,7 @@ describe("compactBootstrapFiles", () => {
     const { results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -520,6 +546,7 @@ describe("compactBootstrapFiles", () => {
     const { contextFiles: result, results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -540,6 +567,7 @@ describe("compactBootstrapFiles", () => {
     const { results } = await compactBootstrapFiles({
       contextFiles,
       config: {},
+      defaultModel: TEST_DEFAULT_MODEL,
       apiKeyResolver: makeApiKeyResolver(),
     });
 
