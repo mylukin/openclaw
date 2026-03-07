@@ -5,6 +5,7 @@ import {
   clearCompactionCache,
   compactBootstrapFile,
   compactBootstrapFiles,
+  isAnthropicProvider,
   isCompactableFile,
   resolveCompactionConfig,
 } from "./bootstrap-compaction.js";
@@ -154,6 +155,23 @@ describe("resolveCompactionConfig", () => {
   });
 });
 
+// ── isAnthropicProvider ──────────────────────────────────────────────────────
+
+describe("isAnthropicProvider", () => {
+  it("recognizes anthropic providers", () => {
+    expect(isAnthropicProvider("anthropic")).toBe(true);
+    expect(isAnthropicProvider("anthropic-vertex")).toBe(true);
+    expect(isAnthropicProvider("anthropic-bedrock")).toBe(true);
+  });
+
+  it("rejects non-anthropic providers", () => {
+    expect(isAnthropicProvider("openai-crs")).toBe(false);
+    expect(isAnthropicProvider("claude-cli")).toBe(false);
+    expect(isAnthropicProvider("vllm-local")).toBe(false);
+    expect(isAnthropicProvider("")).toBe(false);
+  });
+});
+
 // ── compactBootstrapFile ──────────────────────────────────────────────────────
 
 describe("compactBootstrapFile", () => {
@@ -175,6 +193,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: { model: "claude-haiku-4-5-20251001" },
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -195,6 +214,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: { model: "claude-haiku-4-5-20251001" },
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver("my-api-key"),
     });
 
@@ -225,11 +245,49 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       defaultModel: "my-custom-model",
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
     expect(body.model).toBe("my-custom-model");
+  });
+
+  it("skips compaction and returns original content for non-Anthropic provider", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const content = "Memory content for non-anthropic agent";
+    const { compacted, result } = await compactBootstrapFile({
+      content,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      defaultModel: "gpt-4o",
+      provider: "openai-crs",
+      apiKeyResolver: makeApiKeyResolver(),
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.fallbackReason).toContain("not Anthropic");
+    expect(compacted).toBe(content);
+    expect(mockFetch).not.toHaveBeenCalled(); // no LLM call at all
+  });
+
+  it("allows non-Anthropic provider when config.model is explicitly set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(makeFetchResponse(STRUCTURED_SUMMARY));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const { result } = await compactBootstrapFile({
+      content: "Memory content",
+      filePath: "/workspace/MEMORY.md",
+      config: { model: "claude-haiku-4-5-20251001" },
+      defaultModel: "gpt-4o",
+      provider: "openai-crs",
+      apiKeyResolver: makeApiKeyResolver(),
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it("returns original content with success=false on API error", async () => {
@@ -246,6 +304,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -265,6 +324,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -283,6 +343,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -326,6 +387,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledOnce();
@@ -336,6 +398,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledOnce(); // still only one call
@@ -357,6 +420,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledTimes(1);
@@ -366,6 +430,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -384,6 +449,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
     await compactBootstrapFile({
@@ -391,6 +457,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/memory/2026-03-07.md",
       config,
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver,
     });
 
@@ -422,6 +489,7 @@ describe("compactBootstrapFile - timeout handling", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
       signal: AbortSignal.abort(), // pre-aborted
     });
@@ -454,6 +522,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -474,6 +543,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: { model: "claude-haiku-4-5-20251001" },
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -499,6 +569,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -522,6 +593,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -547,6 +619,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 
@@ -568,6 +641,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       defaultModel: TEST_DEFAULT_MODEL,
+      provider: "anthropic",
       apiKeyResolver: makeApiKeyResolver(),
     });
 

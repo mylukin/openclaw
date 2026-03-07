@@ -38,7 +38,12 @@ const COMPACTION_SYSTEM_PROMPT = [
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface BootstrapCompactionConfig {
-  /** Model to use for compaction. undefined = system default. */
+  /**
+   * Anthropic model to use for compaction.
+   * undefined = inherited from the agent's current model (must be Anthropic).
+   * Compaction only works with Anthropic models — non-Anthropic agents skip
+   * compaction and fall through to the next bootstrap profile (minimal).
+   */
   model?: string;
   /** Timeout in ms. Default 30_000. */
   timeoutMs?: number;
@@ -168,17 +173,46 @@ async function callAnthropicApi(params: {
  * Always returns successfully — on LLM failure, returns the original content
  * with success=false and fallbackReason set.
  */
+/**
+ * Known Anthropic provider strings. Compaction requires an Anthropic model;
+ * non-Anthropic providers are rejected early with a clear fallback reason.
+ */
+const ANTHROPIC_PROVIDERS = new Set(["anthropic", "anthropic-vertex", "anthropic-bedrock"]);
+
+export function isAnthropicProvider(provider: string): boolean {
+  return ANTHROPIC_PROVIDERS.has(provider);
+}
+
 export async function compactBootstrapFile(params: {
   content: string;
   filePath: string;
   config: BootstrapCompactionConfig;
-  /** Fallback model when config.model is not set. Inherited from the agent's current model. */
+  /** Fallback model when config.model is not set. Must be an Anthropic model. */
   defaultModel: string;
+  /** Provider of the agent. Used to verify Anthropic compatibility. */
+  provider: string;
   apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
   signal?: AbortSignal;
 }): Promise<{ compacted: string; result: CompactionResult }> {
   const { content, filePath, config, signal } = params;
   const charsBefore = content.length;
+
+  // Compaction is Anthropic-only. If config.model is set, it's expected to be
+  // an Anthropic model. If not set, we inherit the agent's model but only when
+  // the agent itself is using an Anthropic provider.
+  if (!config.model && !isAnthropicProvider(params.provider)) {
+    return {
+      compacted: content,
+      result: {
+        path: filePath,
+        charsBefore,
+        charsAfter: charsBefore,
+        success: false,
+        fallbackReason: `compaction skipped: provider "${params.provider}" is not Anthropic`,
+      },
+    };
+  }
+
   const compactionModel = config.model ?? params.defaultModel;
 
   // Enforce max input size — head+tail split to preserve recent content at end of file.
@@ -255,8 +289,10 @@ export async function compactBootstrapFile(params: {
 export async function compactBootstrapFiles(params: {
   contextFiles: EmbeddedContextFile[];
   config: BootstrapCompactionConfig;
-  /** Fallback model when config.model is not set. Inherited from the agent's current model. */
+  /** Fallback model when config.model is not set. Must be an Anthropic model. */
   defaultModel: string;
+  /** Provider of the agent. Used to verify Anthropic compatibility. */
+  provider: string;
   apiKeyResolver: () => Promise<{ apiKey: string; provider: string }>;
   signal?: AbortSignal;
 }): Promise<{
@@ -285,6 +321,7 @@ export async function compactBootstrapFiles(params: {
       filePath: file.path,
       config,
       defaultModel: params.defaultModel,
+      provider: params.provider,
       apiKeyResolver: params.apiKeyResolver,
       signal,
     });

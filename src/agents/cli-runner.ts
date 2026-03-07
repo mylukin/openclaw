@@ -641,14 +641,14 @@ export async function runCliAgent(params: {
           const compactionCfg = resolveCompactionConfig(params.config);
           compactionModelUsed = compactionCfg.model ?? modelId;
           try {
-            const compactionProvider = compactionCfg.model ? "anthropic" : params.provider;
             const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
               contextFiles: lastProfileContextFiles,
               config: compactionCfg,
               defaultModel: modelId,
+              provider: params.provider,
               apiKeyResolver: () =>
-                resolveApiKeyForProvider({ provider: compactionProvider, cfg: params.config }).then(
-                  (auth) => ({ apiKey: auth.apiKey ?? "", provider: compactionProvider }),
+                resolveApiKeyForProvider({ provider: "anthropic", cfg: params.config }).then(
+                  (auth) => ({ apiKey: auth.apiKey ?? "", provider: "anthropic" }),
                 ),
               signal: AbortSignal.timeout(compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS),
             });
