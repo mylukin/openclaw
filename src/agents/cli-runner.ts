@@ -477,6 +477,16 @@ export async function runCliAgent(params: {
         .join("\n");
 
   const sessionLabel = params.sessionKey ?? params.sessionId;
+
+  // Resolve context window early — needed by Layer 3 (dynamic budget) and Layer 1 (pre-flight guard).
+  const contextWindowInfo = resolveContextWindowInfo({
+    cfg: params.config,
+    provider: params.provider,
+    modelId: normalizedModel,
+    defaultTokens: 200_000,
+  });
+  let contextWindowTokens = contextWindowInfo.tokens;
+
   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
     workspaceDir,
     config: params.config,
@@ -485,7 +495,7 @@ export async function runCliAgent(params: {
     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
   });
   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
-  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
+  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
   const bootstrapAnalysis = analyzeBootstrapBudget({
     files: buildBootstrapInjectionStats({
       bootstrapFiles,
@@ -590,20 +600,13 @@ export async function runCliAgent(params: {
   });
   let systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
   let activeProfile: BootstrapProfile = "normal";
-  let contextWindowTokens = 0;
 
   // Layer 1: Pre-flight context window guard
-  // Estimate tokens and downgrade bootstrap profile if system prompt is too large.
+  // Estimate tokens for the TOTAL prompt (system + task + images), not just system prompt.
   if (!hookSystemPromptOverride) {
-    const contextWindowInfo = resolveContextWindowInfo({
-      cfg: params.config,
-      provider: params.provider,
-      modelId: normalizedModel,
-      defaultTokens: 200_000,
-    });
-    contextWindowTokens = contextWindowInfo.tokens;
     const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
-    let estimatedTokens = estimatePromptTokens(systemPrompt);
+    // Estimate total prompt: system prompt + user task prompt (promptForRun includes prepended context)
+    let estimatedTokens = estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun);
 
     if (estimatedTokens > hardLimitTokens) {
       const warnForProfile = makeBootstrapWarn({
@@ -634,7 +637,8 @@ export async function runCliAgent(params: {
         });
         activeProfile = profile;
         systemPrompt = profileSystemPrompt;
-        estimatedTokens = estimatePromptTokens(profileSystemPrompt);
+        estimatedTokens =
+          estimatePromptTokens(profileSystemPrompt) + estimatePromptTokens(promptForRun);
         if (estimatedTokens <= hardLimitTokens) {
           break;
         }
