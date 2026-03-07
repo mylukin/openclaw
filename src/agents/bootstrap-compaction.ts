@@ -142,7 +142,7 @@ export async function compactBootstrapFile(params: {
   /** Provider-agnostic LLM call. The caller resolves model + auth. */
   llmFn: CompactionLlmFn;
   /** Resolved "provider/model" used for compaction. Included in cache key so switching models invalidates. */
-  modelRef?: string;
+  modelRef: string;
   signal?: AbortSignal;
 }): Promise<{ compacted: string; result: CompactionResult }> {
   const { content, filePath, signal } = params;
@@ -165,7 +165,7 @@ export async function compactBootstrapFile(params: {
   // Cache lookup — hash the FULL content (pre-truncation) so middle-of-file
   // edits invalidate the cache. Include cache version + resolved model so
   // prompt changes and model switches also miss.
-  const hashInput = `v${COMPACTION_CACHE_VERSION}:${params.modelRef ?? ""}:${content}`;
+  const hashInput = `v${COMPACTION_CACHE_VERSION}:${params.modelRef}:${content}`;
   const contentHash = getContentHash(hashInput);
   const cached = compactionCache.get(filePath);
   if (cached?.hash === contentHash) {
@@ -220,7 +220,7 @@ export async function compactBootstrapFiles(params: {
   /** Provider-agnostic LLM call. The caller resolves model + auth. */
   llmFn: CompactionLlmFn;
   /** Resolved "provider/model" used for compaction. Passed to per-file cache key. */
-  modelRef?: string;
+  modelRef: string;
   signal?: AbortSignal;
 }): Promise<{
   contextFiles: EmbeddedContextFile[];

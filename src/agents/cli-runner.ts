@@ -54,7 +54,11 @@ import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
-import { isCliProvider, resolveDefaultModelForAgent } from "./model-selection.js";
+import {
+  isCliProvider,
+  resolveDefaultModelForAgent,
+  resolveNonCliModelRef,
+} from "./model-selection.js";
 import {
   buildBootstrapContextFiles,
   classifyFailoverReason,
@@ -665,8 +669,9 @@ export async function runCliAgent(params: {
               cfg: params.config ?? {},
               agentId: params.agentId,
             });
-            compactionProvider = agentDefault.provider;
-            compactionModelRef = agentDefault.model;
+            const resolved = resolveNonCliModelRef(agentDefault, params.config);
+            compactionProvider = resolved.provider;
+            compactionModelRef = resolved.model;
           }
 
           compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;

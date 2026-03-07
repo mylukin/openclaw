@@ -159,6 +159,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(compacted).toBe(STRUCTURED_SUMMARY);
@@ -177,6 +178,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(llmFn).toHaveBeenCalledWith("Memory content to compact", undefined);
@@ -191,6 +193,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(result.success).toBe(false);
@@ -208,6 +211,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(result.success).toBe(false);
@@ -224,6 +228,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     const sentPrompt = llmFn.mock.calls[0][0] as string;
@@ -245,6 +250,7 @@ describe("compactBootstrapFile", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
       signal,
     });
 
@@ -270,6 +276,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledOnce();
 
@@ -279,6 +286,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledOnce(); // still only one call
     expect(second.compacted).toBe(first.compacted);
@@ -295,6 +303,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledTimes(1);
 
@@ -303,6 +312,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledTimes(2);
   });
@@ -317,12 +327,14 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     await compactBootstrapFile({
       content,
       filePath: "/workspace/memory/2026-03-07.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     // Different file paths → two separate LLM calls
@@ -347,6 +359,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledTimes(1);
 
@@ -356,12 +369,13 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
     expect(llmFn).toHaveBeenCalledTimes(2);
     expect(compacted).toBe("Summary B");
   });
 
-  it("invalidates cache when modelRef changes (same content, different model)", async () => {
+  it("cache invalidates when modelRef changes", async () => {
     const llmFn = vi
       .fn()
       .mockResolvedValueOnce("Summary model-A")
@@ -374,7 +388,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
-      modelRef: "anthropic/claude-haiku-4-5-20251001",
+      modelRef: "provider/model-a",
     });
     expect(llmFn).toHaveBeenCalledTimes(1);
 
@@ -384,7 +398,7 @@ describe("compactBootstrapFile - content-hash cache", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
-      modelRef: "openai/gpt-4o",
+      modelRef: "provider/model-b",
     });
     expect(llmFn).toHaveBeenCalledTimes(2);
     expect(compacted).toBe("Summary model-B");
@@ -431,6 +445,7 @@ describe("compactBootstrapFile - timeout handling", () => {
       filePath: "/workspace/MEMORY.md",
       config: {},
       llmFn,
+      modelRef: "test/model",
       signal: AbortSignal.abort(), // pre-aborted
     });
 
@@ -459,6 +474,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(result).toEqual(contextFiles);
@@ -478,6 +494,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(result).toHaveLength(2);
@@ -501,6 +518,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(result[0].content).toBe(STRUCTURED_SUMMARY);
@@ -522,6 +540,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(results).toHaveLength(3);
@@ -545,6 +564,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     // Content should be unchanged on failure
@@ -563,6 +583,7 @@ describe("compactBootstrapFiles", () => {
       contextFiles,
       config: {},
       llmFn,
+      modelRef: "test/model",
     });
 
     expect(results[0].charsBefore).toBe(originalContent.length);
