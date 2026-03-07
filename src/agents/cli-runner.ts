@@ -26,6 +26,11 @@ import {
   buildBootstrapPromptWarning,
   buildBootstrapTruncationReportMeta,
 } from "./bootstrap-budget.js";
+import {
+  DEFAULT_COMPACTION_TIMEOUT_MS,
+  compactBootstrapFiles,
+  resolveCompactionConfig,
+} from "./bootstrap-compaction.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
 import {
@@ -47,6 +52,7 @@ import {
 import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
+import { resolveApiKeyForProvider } from "./model-auth.js";
 import {
   buildBootstrapContextFiles,
   classifyFailoverReason,
@@ -609,18 +615,86 @@ export async function runCliAgent(params: {
     // Estimate total prompt: system prompt + user task prompt (promptForRun includes prepended context)
     let estimatedTokens = estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun);
 
+    // Compaction observability state
+    let compactionAttempted = false;
+    let compactedFilesList: string[] = [];
+    let compactionCharsBefore = 0;
+    let compactionCharsAfter = 0;
+    let compactionModelUsed = "";
+    let compactionFallbackReason: string | undefined;
+
     if (estimatedTokens > hardLimitTokens) {
       const warnForProfile = makeBootstrapWarn({
         sessionLabel,
         warn: (message) => log.warn(message),
       });
-      for (const profile of ["reduced", "minimal"] as BootstrapProfile[]) {
+
+      // Track last-built profile context files so compaction can compact them
+      let lastProfileContextFiles = contextFiles;
+
+      for (const profile of ["reduced", "compaction", "minimal"] as (
+        | BootstrapProfile
+        | "compaction"
+      )[]) {
+        if (profile === "compaction") {
+          compactionAttempted = true;
+          const compactionCfg = resolveCompactionConfig(params.config);
+          compactionModelUsed = compactionCfg.model ?? modelId;
+          try {
+            const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
+              contextFiles: lastProfileContextFiles,
+              config: compactionCfg,
+              apiKeyResolver: () =>
+                resolveApiKeyForProvider({ provider: "anthropic", cfg: params.config }).then(
+                  (auth) => ({ apiKey: auth.apiKey ?? "", provider: "anthropic" }),
+                ),
+              signal: AbortSignal.timeout(compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS),
+            });
+
+            compactedFilesList = results.filter((r) => r.success).map((r) => r.path);
+            compactionCharsBefore = results.reduce((sum, r) => sum + r.charsBefore, 0);
+            compactionCharsAfter = results.reduce((sum, r) => sum + r.charsAfter, 0);
+
+            if (compactedFilesList.length > 0) {
+              const compactedSystemPrompt = buildSystemPrompt({
+                workspaceDir,
+                config: params.config,
+                defaultThinkLevel: params.thinkLevel,
+                extraSystemPrompt,
+                skillsPrompt,
+                ownerNumbers: params.ownerNumbers,
+                heartbeatPrompt,
+                docsPath: docsPath ?? undefined,
+                tools: [],
+                contextFiles: compactedContextFiles,
+                bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
+                modelDisplay,
+                agentId: sessionAgentId,
+              });
+              const compactedTokens =
+                estimatePromptTokens(compactedSystemPrompt) + estimatePromptTokens(promptForRun);
+              if (compactedTokens <= hardLimitTokens) {
+                systemPrompt = compactedSystemPrompt;
+                estimatedTokens = compactedTokens;
+                break;
+              }
+            }
+          } catch (err) {
+            compactionFallbackReason = err instanceof Error ? err.message : String(err);
+            log.warn(
+              `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
+            );
+          }
+          continue;
+        }
+
         const profileConfig = getBootstrapProfileConfig(profile);
         const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
           maxChars: profileConfig.maxCharsPerFile,
           totalMaxChars: profileConfig.totalMaxChars,
           warn: warnForProfile,
         });
+        lastProfileContextFiles = profileContextFiles;
         const profileSystemPrompt = buildSystemPrompt({
           workspaceDir,
           config: params.config,
@@ -660,6 +734,14 @@ export async function runCliAgent(params: {
       files_injected: contextFiles.length,
       files_truncated: bootstrapAnalysis.truncatedFiles.length,
       files_skipped: bootstrapFiles.length - contextFiles.length,
+      compaction_attempted: compactionAttempted,
+      ...(compactionAttempted && {
+        compacted_files: compactedFilesList,
+        chars_before: compactionCharsBefore,
+        chars_after: compactionCharsAfter,
+        compaction_model: compactionModelUsed,
+        ...(compactionFallbackReason ? { fallback_reason: compactionFallbackReason } : {}),
+      }),
     });
   }
 
