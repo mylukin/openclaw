@@ -360,6 +360,58 @@ describe("compactBootstrapFile - content-hash cache", () => {
     expect(llmFn).toHaveBeenCalledTimes(2);
     expect(compacted).toBe("Summary B");
   });
+
+  it("invalidates cache when modelRef changes (same content, different model)", async () => {
+    const llmFn = vi
+      .fn()
+      .mockResolvedValueOnce("Summary model-A")
+      .mockResolvedValueOnce("Summary model-B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
+
+    const content = "Same content for both calls";
+
+    await compactBootstrapFile({
+      content,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+      modelRef: "anthropic/claude-haiku-4-5-20251001",
+    });
+    expect(llmFn).toHaveBeenCalledTimes(1);
+
+    // Same content, different model → cache miss
+    const { compacted } = await compactBootstrapFile({
+      content,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+      modelRef: "openai/gpt-4o",
+    });
+    expect(llmFn).toHaveBeenCalledTimes(2);
+    expect(compacted).toBe("Summary model-B");
+  });
+
+  it("hits cache when both content and modelRef are identical", async () => {
+    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
+
+    const content = "Content for model-aware cache test";
+    const modelRef = "anthropic/claude-haiku-4-5-20251001";
+
+    await compactBootstrapFile({
+      content,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+      modelRef,
+    });
+    await compactBootstrapFile({
+      content,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+      modelRef,
+    });
+    expect(llmFn).toHaveBeenCalledOnce();
+  });
 });
 
 // ── Timeout handling ──────────────────────────────────────────────────────────

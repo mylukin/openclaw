@@ -51,11 +51,10 @@ import {
   writeCliImages,
 } from "./cli-runner/helpers.js";
 import { resolveContextWindowInfo } from "./context-window-guard.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
-import { isCliProvider } from "./model-selection.js";
+import { isCliProvider, resolveDefaultModelForAgent } from "./model-selection.js";
 import {
   buildBootstrapContextFiles,
   classifyFailoverReason,
@@ -659,11 +658,15 @@ export async function runCliAgent(params: {
           }
 
           // CLI backends (claude-cli, codex-cli) are wrappers around real LLM
-          // providers — they don't exist in the model registry. Fall back to the
-          // system default Anthropic model for compaction.
+          // providers — they don't exist in the model registry. Resolve the
+          // agent's configured default model to get the real provider + model.
           if (isCliProvider(compactionProvider, params.config)) {
-            compactionProvider = DEFAULT_PROVIDER;
-            compactionModelRef = DEFAULT_MODEL;
+            const agentDefault = resolveDefaultModelForAgent({
+              cfg: params.config ?? {},
+              agentId: params.agentId,
+            });
+            compactionProvider = agentDefault.provider;
+            compactionModelRef = agentDefault.model;
           }
 
           compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
@@ -695,6 +698,7 @@ export async function runCliAgent(params: {
             const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
               contextFiles: lastProfileContextFiles,
               config: compactionCfg,
+              modelRef: compactionModelUsed,
               llmFn: async (userPrompt, signal) => {
                 const res = await completeSimple(
                   resolved.model!,
