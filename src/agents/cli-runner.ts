@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ImageContent } from "@mariozechner/pi-ai";
+import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
@@ -26,6 +26,12 @@ import {
   buildBootstrapPromptWarning,
   buildBootstrapTruncationReportMeta,
 } from "./bootstrap-budget.js";
+import {
+  COMPACTION_SYSTEM_PROMPT,
+  DEFAULT_COMPACTION_TIMEOUT_MS,
+  compactBootstrapFiles,
+  resolveCompactionConfig,
+} from "./bootstrap-compaction.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
 import {
@@ -44,16 +50,28 @@ import {
   resolveSystemPromptUsage,
   writeCliImages,
 } from "./cli-runner/helpers.js";
+import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
+import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
 import {
+  isCliProvider,
+  resolveDefaultModelForAgent,
+  resolveNonCliModelRef,
+} from "./model-selection.js";
+import {
+  buildBootstrapContextFiles,
   classifyFailoverReason,
+  getBootstrapProfileConfig,
+  isContextOverflowError,
   isFailoverErrorMessage,
   resolveBootstrapMaxChars,
   resolveBootstrapPromptTruncationWarningMode,
   resolveBootstrapTotalMaxChars,
+  type BootstrapProfile,
 } from "./pi-embedded-helpers.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
+import { resolveModel } from "./pi-embedded-runner/model.js";
 import {
   applySkillEnvOverrides,
   applySkillEnvOverridesFromSnapshot,
@@ -96,6 +114,11 @@ function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): stri
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Rough token estimate using chars/4 heuristic (conservative for English-heavy content). */
+function estimatePromptTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 function resolveConfiguredPath(rawPath: string | undefined): string | undefined {
@@ -467,15 +490,26 @@ export async function runCliAgent(params: {
         .join("\n");
 
   const sessionLabel = params.sessionKey ?? params.sessionId;
+
+  // Resolve context window early — needed by Layer 3 (dynamic budget) and Layer 1 (pre-flight guard).
+  const contextWindowInfo = resolveContextWindowInfo({
+    cfg: params.config,
+    provider: params.provider,
+    modelId: normalizedModel,
+    defaultTokens: 200_000,
+  });
+  let contextWindowTokens = contextWindowInfo.tokens;
+
   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
     workspaceDir,
     config: params.config,
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+    contextWindowTokens,
   });
   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
-  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
+  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
   const bootstrapAnalysis = analyzeBootstrapBudget({
     files: buildBootstrapInjectionStats({
       bootstrapFiles,
@@ -578,7 +612,210 @@ export async function runCliAgent(params: {
     modelDisplay,
     agentId: sessionAgentId,
   });
-  const systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
+  let systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
+  let activeProfile: BootstrapProfile = "normal";
+
+  // Layer 1: Pre-flight context window guard
+  // Estimate tokens for the TOTAL prompt (system + task + images), not just system prompt.
+  if (!hookSystemPromptOverride) {
+    const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
+    // Estimate total prompt: system prompt + user task prompt (promptForRun includes prepended context)
+    let estimatedTokens = estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun);
+
+    // Compaction observability state
+    let compactionAttempted = false;
+    let compactedFilesList: string[] = [];
+    let compactionCharsBefore = 0;
+    let compactionCharsAfter = 0;
+    let compactionModelUsed = "";
+    let compactionFallbackReason: string | undefined;
+
+    if (estimatedTokens > hardLimitTokens) {
+      const warnForProfile = makeBootstrapWarn({
+        sessionLabel,
+        warn: (message) => log.warn(message),
+      });
+
+      // Track last-built profile context files so compaction can compact them
+      let lastProfileContextFiles = contextFiles;
+
+      for (const profile of ["reduced", "compaction", "minimal"] as (
+        | BootstrapProfile
+        | "compaction"
+      )[]) {
+        if (profile === "compaction") {
+          compactionAttempted = true;
+          const compactionCfg = resolveCompactionConfig(params.config);
+          // Resolve compaction model: config.model (may be "provider/model") or
+          // inherit the agent's current model + provider.
+          let compactionProvider: string;
+          let compactionModelRef: string;
+          if (compactionCfg.model?.includes("/")) {
+            compactionProvider = compactionCfg.model.split("/")[0];
+            compactionModelRef = compactionCfg.model.split("/").slice(1).join("/");
+          } else if (compactionCfg.model) {
+            compactionProvider = params.provider;
+            compactionModelRef = compactionCfg.model;
+          } else {
+            compactionProvider = params.provider;
+            compactionModelRef = modelId;
+          }
+
+          // CLI backends (claude-cli, codex-cli) are wrappers around real LLM
+          // providers — they don't exist in the model registry. Resolve the
+          // agent's configured default model to get the real provider + model.
+          if (isCliProvider(compactionProvider, params.config)) {
+            const agentDefault = resolveDefaultModelForAgent({
+              cfg: params.config ?? {},
+              agentId: params.agentId,
+            });
+            const resolved = resolveNonCliModelRef(agentDefault, params.config);
+            compactionProvider = resolved.provider;
+            compactionModelRef = resolved.model;
+          }
+
+          compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
+          try {
+            // Resolve model via the unified model registry (provider-agnostic).
+            const resolved = resolveModel(
+              compactionProvider,
+              compactionModelRef,
+              undefined,
+              params.config,
+            );
+            if (!resolved.model) {
+              throw new Error(
+                resolved.error ??
+                  `Unknown compaction model: ${compactionProvider}/${compactionModelRef}`,
+              );
+            }
+            const apiKey = requireApiKey(
+              await getApiKeyForModel({ model: resolved.model, cfg: params.config }),
+              compactionProvider,
+            );
+
+            const isTextBlock = (b: { type: string }): b is { type: "text"; text: string } =>
+              b.type === "text";
+            const compactionSignal = AbortSignal.timeout(
+              compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS,
+            );
+
+            const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
+              contextFiles: lastProfileContextFiles,
+              config: compactionCfg,
+              modelRef: compactionModelUsed,
+              llmFn: async (userPrompt, signal) => {
+                const res = await completeSimple(
+                  resolved.model!,
+                  {
+                    systemPrompt: COMPACTION_SYSTEM_PROMPT,
+                    messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
+                  },
+                  { apiKey, maxTokens: 4096, temperature: 0, signal },
+                );
+                const texts = res.content.filter(isTextBlock);
+                if (texts.length === 0) {
+                  throw new Error("No text content in compaction response");
+                }
+                return texts.map((b) => b.text).join("\n");
+              },
+              signal: compactionSignal,
+            });
+
+            compactedFilesList = results.filter((r) => r.success).map((r) => r.path);
+            compactionCharsBefore = results.reduce((sum, r) => sum + r.charsBefore, 0);
+            compactionCharsAfter = results.reduce((sum, r) => sum + r.charsAfter, 0);
+
+            if (compactedFilesList.length > 0) {
+              const compactedSystemPrompt = buildSystemPrompt({
+                workspaceDir,
+                config: params.config,
+                defaultThinkLevel: params.thinkLevel,
+                extraSystemPrompt,
+                skillsPrompt,
+                ownerNumbers: params.ownerNumbers,
+                heartbeatPrompt,
+                docsPath: docsPath ?? undefined,
+                tools: [],
+                contextFiles: compactedContextFiles,
+                bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
+                modelDisplay,
+                agentId: sessionAgentId,
+              });
+              const compactedTokens =
+                estimatePromptTokens(compactedSystemPrompt) + estimatePromptTokens(promptForRun);
+              if (compactedTokens <= hardLimitTokens) {
+                systemPrompt = compactedSystemPrompt;
+                estimatedTokens = compactedTokens;
+                break;
+              }
+            }
+          } catch (err) {
+            compactionFallbackReason = err instanceof Error ? err.message : String(err);
+            log.warn(
+              `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
+            );
+          }
+          continue;
+        }
+
+        const profileConfig = getBootstrapProfileConfig(profile);
+        const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+          maxChars: profileConfig.maxCharsPerFile,
+          totalMaxChars: profileConfig.totalMaxChars,
+          warn: warnForProfile,
+        });
+        lastProfileContextFiles = profileContextFiles;
+        const profileSystemPrompt = buildSystemPrompt({
+          workspaceDir,
+          config: params.config,
+          defaultThinkLevel: params.thinkLevel,
+          extraSystemPrompt,
+          skillsPrompt,
+          ownerNumbers: params.ownerNumbers,
+          heartbeatPrompt,
+          docsPath: docsPath ?? undefined,
+          tools: [],
+          contextFiles: profileContextFiles,
+          bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
+          modelDisplay,
+          agentId: sessionAgentId,
+        });
+        activeProfile = profile;
+        systemPrompt = profileSystemPrompt;
+        estimatedTokens =
+          estimatePromptTokens(profileSystemPrompt) + estimatePromptTokens(promptForRun);
+        if (estimatedTokens <= hardLimitTokens) {
+          break;
+        }
+      }
+      if (estimatedTokens > hardLimitTokens) {
+        log.error(
+          `cli-runner: system prompt exceeds context limit after minimal profile (estimated=${estimatedTokens} tokens, limit=${hardLimitTokens}); proceeding anyway`,
+        );
+      }
+    }
+
+    log.info("cli-runner prompt stats", {
+      estimated_tokens: estimatedTokens,
+      context_window: contextWindowTokens,
+      reserve: contextWindowTokens - hardLimitTokens,
+      trim_profile: activeProfile,
+      retry_count: 0,
+      files_injected: contextFiles.length,
+      files_truncated: bootstrapAnalysis.truncatedFiles.length,
+      files_skipped: bootstrapFiles.length - contextFiles.length,
+      compaction_attempted: compactionAttempted,
+      ...(compactionAttempted && {
+        compacted_files: compactedFilesList,
+        chars_before: compactionCharsBefore,
+        chars_after: compactionCharsAfter,
+        compaction_model: compactionModelUsed,
+        ...(compactionFallbackReason ? { fallback_reason: compactionFallbackReason } : {}),
+      }),
+    });
+  }
+
   const systemPromptReport = buildSystemPromptReport({
     source: "run",
     generatedAt: Date.now(),
@@ -936,6 +1173,75 @@ export async function runCliAgent(params: {
       };
     } catch (err) {
       if (err instanceof FailoverError) {
+        // Layer 2: Context overflow retry with minimal bootstrap profile
+        if (isContextOverflowError(err.message) && activeProfile !== "minimal") {
+          const preRetryEstimatedTokens = estimatePromptTokens(systemPrompt);
+          log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
+            retry_count: 1,
+            trim_profile: "minimal",
+            reason: "context_overflow",
+            previous_profile: activeProfile,
+            estimated_tokens: preRetryEstimatedTokens,
+            context_window: contextWindowTokens,
+          });
+          const minimalConfig = getBootstrapProfileConfig("minimal");
+          const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+            maxChars: minimalConfig.maxCharsPerFile,
+            totalMaxChars: minimalConfig.totalMaxChars,
+            warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+          });
+          const minimalSystemPrompt = buildSystemPrompt({
+            workspaceDir,
+            config: params.config,
+            defaultThinkLevel: params.thinkLevel,
+            extraSystemPrompt,
+            skillsPrompt,
+            ownerNumbers: params.ownerNumbers,
+            heartbeatPrompt,
+            docsPath: docsPath ?? undefined,
+            tools: [],
+            contextFiles: minimalContextFiles,
+            bootstrapTruncationWarningLines: [],
+            modelDisplay,
+            agentId: sessionAgentId,
+          });
+          // Reassign the `let` binding so executeCliWithSession sees the new prompt
+          systemPrompt = minimalSystemPrompt;
+          activeProfile = "minimal";
+          try {
+            const output = await executeCliWithSession(undefined);
+            const text = output.text?.trim();
+            const payloads = text ? [{ text }] : undefined;
+            return {
+              payloads,
+              meta: {
+                durationMs: Date.now() - started,
+                systemPromptReport,
+                agentMeta: {
+                  sessionId: output.sessionId ?? params.sessionId ?? "",
+                  provider: params.provider,
+                  model: modelId,
+                  usage: output.usage,
+                },
+              },
+            };
+          } catch (retryErr) {
+            if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
+              const estimatedTks = estimatePromptTokens(minimalSystemPrompt);
+              throw new FailoverError(
+                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). 建议改走 pi-embedded runtime 或拆任务。`,
+                {
+                  reason: "unknown",
+                  provider: params.provider,
+                  model: modelId,
+                  status: resolveFailoverStatus("unknown"),
+                },
+              );
+            }
+            throw retryErr;
+          }
+        }
+
         // Check if this is a session expired error and we have a session to clear
         if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
           log.warn(
