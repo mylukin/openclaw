@@ -86,7 +86,7 @@ export const AgentDefaultsSchema = z
       .optional(),
     compaction: z
       .object({
-        /** Anthropic model for bootstrap compaction (e.g. "claude-haiku-4-5-20251001"). Inherits agent default when unset. */
+        /** Model for bootstrap compaction (e.g. "anthropic/claude-haiku-4-5-20251001"). Inherits agent default when unset. */
         model: z.string().optional(),
         /** Bootstrap compaction LLM call timeout in ms. Default 30_000. */
         timeoutMs: z.number().int().positive().optional(),
