@@ -44,14 +44,19 @@ import {
   resolveSystemPromptUsage,
   writeCliImages,
 } from "./cli-runner/helpers.js";
+import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import {
+  buildBootstrapContextFiles,
   classifyFailoverReason,
+  getBootstrapProfileConfig,
+  isContextOverflowError,
   isFailoverErrorMessage,
   resolveBootstrapMaxChars,
   resolveBootstrapPromptTruncationWarningMode,
   resolveBootstrapTotalMaxChars,
+  type BootstrapProfile,
 } from "./pi-embedded-helpers.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
 import {
@@ -96,6 +101,11 @@ function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): stri
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Rough token estimate using chars/4 heuristic (conservative for English-heavy content). */
+function estimatePromptTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 function resolveConfiguredPath(rawPath: string | undefined): string | undefined {
@@ -467,15 +477,26 @@ export async function runCliAgent(params: {
         .join("\n");
 
   const sessionLabel = params.sessionKey ?? params.sessionId;
+
+  // Resolve context window early — needed by Layer 3 (dynamic budget) and Layer 1 (pre-flight guard).
+  const contextWindowInfo = resolveContextWindowInfo({
+    cfg: params.config,
+    provider: params.provider,
+    modelId: normalizedModel,
+    defaultTokens: 200_000,
+  });
+  let contextWindowTokens = contextWindowInfo.tokens;
+
   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
     workspaceDir,
     config: params.config,
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+    contextWindowTokens,
   });
   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
-  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
+  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
   const bootstrapAnalysis = analyzeBootstrapBudget({
     files: buildBootstrapInjectionStats({
       bootstrapFiles,
@@ -578,7 +599,70 @@ export async function runCliAgent(params: {
     modelDisplay,
     agentId: sessionAgentId,
   });
-  const systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
+  let systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
+  let activeProfile: BootstrapProfile = "normal";
+
+  // Layer 1: Pre-flight context window guard
+  // Estimate tokens for the TOTAL prompt (system + task + images), not just system prompt.
+  if (!hookSystemPromptOverride) {
+    const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
+    // Estimate total prompt: system prompt + user task prompt (promptForRun includes prepended context)
+    let estimatedTokens = estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun);
+
+    if (estimatedTokens > hardLimitTokens) {
+      const warnForProfile = makeBootstrapWarn({
+        sessionLabel,
+        warn: (message) => log.warn(message),
+      });
+      for (const profile of ["reduced", "minimal"] as BootstrapProfile[]) {
+        const profileConfig = getBootstrapProfileConfig(profile);
+        const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+          maxChars: profileConfig.maxCharsPerFile,
+          totalMaxChars: profileConfig.totalMaxChars,
+          warn: warnForProfile,
+        });
+        const profileSystemPrompt = buildSystemPrompt({
+          workspaceDir,
+          config: params.config,
+          defaultThinkLevel: params.thinkLevel,
+          extraSystemPrompt,
+          skillsPrompt,
+          ownerNumbers: params.ownerNumbers,
+          heartbeatPrompt,
+          docsPath: docsPath ?? undefined,
+          tools: [],
+          contextFiles: profileContextFiles,
+          bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
+          modelDisplay,
+          agentId: sessionAgentId,
+        });
+        activeProfile = profile;
+        systemPrompt = profileSystemPrompt;
+        estimatedTokens =
+          estimatePromptTokens(profileSystemPrompt) + estimatePromptTokens(promptForRun);
+        if (estimatedTokens <= hardLimitTokens) {
+          break;
+        }
+      }
+      if (estimatedTokens > hardLimitTokens) {
+        log.error(
+          `cli-runner: system prompt exceeds context limit after minimal profile (estimated=${estimatedTokens} tokens, limit=${hardLimitTokens}); proceeding anyway`,
+        );
+      }
+    }
+
+    log.info("cli-runner prompt stats", {
+      estimated_tokens: estimatedTokens,
+      context_window: contextWindowTokens,
+      reserve: contextWindowTokens - hardLimitTokens,
+      trim_profile: activeProfile,
+      retry_count: 0,
+      files_injected: contextFiles.length,
+      files_truncated: bootstrapAnalysis.truncatedFiles.length,
+      files_skipped: bootstrapFiles.length - contextFiles.length,
+    });
+  }
+
   const systemPromptReport = buildSystemPromptReport({
     source: "run",
     generatedAt: Date.now(),
@@ -936,6 +1020,75 @@ export async function runCliAgent(params: {
       };
     } catch (err) {
       if (err instanceof FailoverError) {
+        // Layer 2: Context overflow retry with minimal bootstrap profile
+        if (isContextOverflowError(err.message) && activeProfile !== "minimal") {
+          const preRetryEstimatedTokens = estimatePromptTokens(systemPrompt);
+          log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
+            retry_count: 1,
+            trim_profile: "minimal",
+            reason: "context_overflow",
+            previous_profile: activeProfile,
+            estimated_tokens: preRetryEstimatedTokens,
+            context_window: contextWindowTokens,
+          });
+          const minimalConfig = getBootstrapProfileConfig("minimal");
+          const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+            maxChars: minimalConfig.maxCharsPerFile,
+            totalMaxChars: minimalConfig.totalMaxChars,
+            warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+          });
+          const minimalSystemPrompt = buildSystemPrompt({
+            workspaceDir,
+            config: params.config,
+            defaultThinkLevel: params.thinkLevel,
+            extraSystemPrompt,
+            skillsPrompt,
+            ownerNumbers: params.ownerNumbers,
+            heartbeatPrompt,
+            docsPath: docsPath ?? undefined,
+            tools: [],
+            contextFiles: minimalContextFiles,
+            bootstrapTruncationWarningLines: [],
+            modelDisplay,
+            agentId: sessionAgentId,
+          });
+          // Reassign the `let` binding so executeCliWithSession sees the new prompt
+          systemPrompt = minimalSystemPrompt;
+          activeProfile = "minimal";
+          try {
+            const output = await executeCliWithSession(undefined);
+            const text = output.text?.trim();
+            const payloads = text ? [{ text }] : undefined;
+            return {
+              payloads,
+              meta: {
+                durationMs: Date.now() - started,
+                systemPromptReport,
+                agentMeta: {
+                  sessionId: output.sessionId ?? params.sessionId ?? "",
+                  provider: params.provider,
+                  model: modelId,
+                  usage: output.usage,
+                },
+              },
+            };
+          } catch (retryErr) {
+            if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
+              const estimatedTks = estimatePromptTokens(minimalSystemPrompt);
+              throw new FailoverError(
+                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). 建议改走 pi-embedded runtime 或拆任务。`,
+                {
+                  reason: "unknown",
+                  provider: params.provider,
+                  model: modelId,
+                  status: resolveFailoverStatus("unknown"),
+                },
+              );
+            }
+            throw retryErr;
+          }
+        }
+
         // Check if this is a session expired error and we have a session to clear
         if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
           log.warn(
