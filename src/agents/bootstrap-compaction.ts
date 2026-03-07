@@ -8,6 +8,8 @@ import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
 export const DEFAULT_COMPACTION_TIMEOUT_MS = 30_000;
 const COMPACTION_MAX_INPUT_CHARS = 10_000;
 const COMPACTION_MAX_FILES = 3;
+/** Bump this when COMPACTION_SYSTEM_PROMPT changes to invalidate caches. */
+const COMPACTION_CACHE_VERSION = 1;
 
 export const COMPACTION_SYSTEM_PROMPT = [
   "You are a memory compaction assistant. Given the content of a memory file, produce a structured summary using EXACTLY the following template — no additional sections, no content outside the headers:",
@@ -158,8 +160,9 @@ export async function compactBootstrapFile(params: {
     inputContent = content;
   }
 
-  // Cache lookup
-  const contentHash = getContentHash(inputContent);
+  // Cache lookup — hash the FULL content (pre-truncation) so middle-of-file
+  // edits invalidate the cache. Include cache version so prompt changes also miss.
+  const contentHash = getContentHash(`v${COMPACTION_CACHE_VERSION}:${content}`);
   const cached = compactionCache.get(filePath);
   if (cached?.hash === contentHash) {
     return {

@@ -328,6 +328,38 @@ describe("compactBootstrapFile - content-hash cache", () => {
     // Different file paths → two separate LLM calls
     expect(llmFn).toHaveBeenCalledTimes(2);
   });
+
+  it("invalidates cache when only middle content changes (full-content hash)", async () => {
+    const llmFn = vi
+      .fn()
+      .mockResolvedValueOnce("Summary A")
+      .mockResolvedValueOnce("Summary B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
+
+    // Content > 10K so it gets truncated (head 3K + tail 7K).
+    // Head and tail stay identical; only the middle (which is omitted from LLM input) changes.
+    const head = "H".repeat(3_000);
+    const tail = "T".repeat(7_000);
+    const contentV1 = head + "MIDDLE-V1".repeat(500) + tail; // well over 10K
+    const contentV2 = head + "MIDDLE-V2".repeat(500) + tail; // same head/tail, different middle
+
+    await compactBootstrapFile({
+      content: contentV1,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+    });
+    expect(llmFn).toHaveBeenCalledTimes(1);
+
+    // Middle changed → full-content hash differs → cache miss → second LLM call
+    const { compacted } = await compactBootstrapFile({
+      content: contentV2,
+      filePath: "/workspace/MEMORY.md",
+      config: {},
+      llmFn,
+    });
+    expect(llmFn).toHaveBeenCalledTimes(2);
+    expect(compacted).toBe("Summary B");
+  });
 });
 
 // ── Timeout handling ──────────────────────────────────────────────────────────

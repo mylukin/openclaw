@@ -51,9 +51,11 @@ import {
   writeCliImages,
 } from "./cli-runner/helpers.js";
 import { resolveContextWindowInfo } from "./context-window-guard.js";
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
+import { isCliProvider } from "./model-selection.js";
 import {
   buildBootstrapContextFiles,
   classifyFailoverReason,
@@ -643,13 +645,27 @@ export async function runCliAgent(params: {
           const compactionCfg = resolveCompactionConfig(params.config);
           // Resolve compaction model: config.model (may be "provider/model") or
           // inherit the agent's current model + provider.
-          const compactionModelId = compactionCfg.model ?? modelId;
-          const compactionProvider = compactionCfg.model?.includes("/")
-            ? compactionCfg.model.split("/")[0]
-            : params.provider;
-          const compactionModelRef = compactionCfg.model?.includes("/")
-            ? compactionCfg.model.split("/").slice(1).join("/")
-            : compactionModelId;
+          let compactionProvider: string;
+          let compactionModelRef: string;
+          if (compactionCfg.model?.includes("/")) {
+            compactionProvider = compactionCfg.model.split("/")[0];
+            compactionModelRef = compactionCfg.model.split("/").slice(1).join("/");
+          } else if (compactionCfg.model) {
+            compactionProvider = params.provider;
+            compactionModelRef = compactionCfg.model;
+          } else {
+            compactionProvider = params.provider;
+            compactionModelRef = modelId;
+          }
+
+          // CLI backends (claude-cli, codex-cli) are wrappers around real LLM
+          // providers — they don't exist in the model registry. Fall back to the
+          // system default Anthropic model for compaction.
+          if (isCliProvider(compactionProvider, params.config)) {
+            compactionProvider = DEFAULT_PROVIDER;
+            compactionModelRef = DEFAULT_MODEL;
+          }
+
           compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
           try {
             // Resolve model via the unified model registry (provider-agnostic).
