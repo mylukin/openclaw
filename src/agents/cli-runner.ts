@@ -493,6 +493,7 @@ export async function runCliAgent(params: {
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+    contextWindowTokens,
   });
   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
   const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
