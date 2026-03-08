@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage } from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { createOpenClawTools } from "../agents/openclaw-tools.js";
 import {
@@ -304,6 +305,27 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+// ---------- Token ----------
+
+/**
+ * Resolve the MCP loopback bearer token for the given openclawDir.
+ * Reads from `<openclawDir>/mcp-token`; generates and persists a new one if absent.
+ */
+export function resolveMcpLoopbackToken(openclawDir: string): string {
+  const tokenPath = path.join(openclawDir, "mcp-token");
+  try {
+    return fs.readFileSync(tokenPath, "utf-8").trim();
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
+  }
+  const token = crypto.randomBytes(32).toString("hex");
+  fs.mkdirSync(openclawDir, { recursive: true });
+  fs.writeFileSync(tokenPath, token, { encoding: "utf-8", mode: 0o600 });
+  return token;
+}
+
 // ---------- MCP config file ----------
 
 /**
@@ -318,6 +340,7 @@ export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): strin
         type: "http",
         url: `http://127.0.0.1:${mcpPort}/mcp`,
         headers: {
+          Authorization: "Bearer ${OPENCLAW_MCP_TOKEN}",
           "x-session-key": "${OPENCLAW_MCP_SESSION_KEY}",
           "x-openclaw-agent-id": "${OPENCLAW_MCP_AGENT_ID}",
           "x-openclaw-account-id": "${OPENCLAW_MCP_ACCOUNT_ID}",
@@ -354,6 +377,9 @@ export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): strin
 export async function startMcpLoopbackServer(port: number): Promise<{
   close: () => Promise<void>;
 }> {
+  const openclawDir = path.join(os.homedir(), ".openclaw");
+  const mcpToken = resolveMcpLoopbackToken(openclawDir);
+
   // Per-tool-context cache with TTL; clears when runtime config snapshot changes.
   const TOOL_CACHE_TTL_MS = 30_000;
   const toolCache = new Map<
@@ -439,6 +465,23 @@ export async function startMcpLoopbackServer(port: number): Promise<{
     if (req.method !== "POST") {
       res.writeHead(405, { Allow: "POST" });
       res.end();
+      return;
+    }
+
+    // Bearer token auth check.
+    const authHeader = getHeader(req, "authorization") ?? "";
+    const expectedAuth = `Bearer ${mcpToken}`;
+    if (authHeader !== expectedAuth) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+
+    // Content-Type check.
+    const contentType = getHeader(req, "content-type") ?? "";
+    if (!contentType.startsWith("application/json")) {
+      res.writeHead(415, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unsupported_media_type" }));
       return;
     }
 

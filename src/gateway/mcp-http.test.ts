@@ -1,6 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getFreePortBlockWithPermissionFallback } from "../test-utils/ports.js";
-import { startMcpLoopbackServer } from "./mcp-http.js";
+import { resolveMcpLoopbackToken, startMcpLoopbackServer } from "./mcp-http.js";
 
 type MockConfig = {
   marker: string;
@@ -74,6 +77,7 @@ vi.mock("../routing/session-key.js", () => ({
 }));
 
 let server: Awaited<ReturnType<typeof startMcpLoopbackServer>> | null = null;
+let testToken = "";
 
 async function sendJsonRpc(params: {
   port: number;
@@ -84,11 +88,25 @@ async function sendJsonRpc(params: {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      authorization: `Bearer ${testToken}`,
       ...params.headers,
     },
     body: JSON.stringify(params.body),
   });
   return await response.json();
+}
+
+async function sendRaw(params: {
+  port: number;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}) {
+  return fetch(`http://127.0.0.1:${params.port}/mcp`, {
+    method: params.method ?? "POST",
+    headers: { ...params.headers },
+    body: params.body,
+  });
 }
 
 describe("mcp-http", () => {
@@ -99,6 +117,9 @@ describe("mcp-http", () => {
     };
     groupPolicyMock.mockReset();
     groupPolicyMock.mockReturnValue(undefined);
+    // Resolve (or generate) the real loopback token so tests can send authorized requests.
+    const openclawDir = path.join(os.homedir(), ".openclaw");
+    testToken = resolveMcpLoopbackToken(openclawDir);
   });
 
   afterEach(async () => {
@@ -154,5 +175,86 @@ describe("mcp-http", () => {
     expect(lastCall?.sessionKey).toBe("agent:main:telegram:group:chat123");
     expect(lastCall?.messageProvider).toBe("telegram");
     expect(lastCall?.accountId).toBe("work");
+  });
+
+  it("returns 401 when Authorization header is missing", async () => {
+    const port = await getFreePortBlockWithPermissionFallback({
+      offsets: [0],
+      fallbackBase: 49_000,
+    });
+    server = await startMcpLoopbackServer(port);
+
+    const res = await sendRaw({
+      port,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("unauthorized");
+  });
+
+  it("returns 401 when Authorization header has wrong token", async () => {
+    const port = await getFreePortBlockWithPermissionFallback({
+      offsets: [0],
+      fallbackBase: 49_100,
+    });
+    server = await startMcpLoopbackServer(port);
+
+    const res = await sendRaw({
+      port,
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer wrong-token-value",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("unauthorized");
+  });
+
+  it("returns 415 when Content-Type is not application/json", async () => {
+    const port = await getFreePortBlockWithPermissionFallback({
+      offsets: [0],
+      fallbackBase: 49_200,
+    });
+    server = await startMcpLoopbackServer(port);
+
+    const res = await sendRaw({
+      port,
+      headers: {
+        "content-type": "text/plain",
+        authorization: `Bearer ${testToken}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(415);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("unsupported_media_type");
+  });
+});
+
+describe("resolveMcpLoopbackToken", () => {
+  it("creates token file if absent and returns a 64-char hex string", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-token-test-"));
+    try {
+      const token = resolveMcpLoopbackToken(tmpDir);
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      expect(fs.existsSync(path.join(tmpDir, "mcp-token"))).toBe(true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads existing token file and returns same value on second call", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-token-test-"));
+    try {
+      const first = resolveMcpLoopbackToken(tmpDir);
+      const second = resolveMcpLoopbackToken(tmpDir);
+      expect(second).toBe(first);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

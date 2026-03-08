@@ -4,7 +4,11 @@ import type { ImageContent } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { MCP_PORT_OFFSET, ensureMcpConfigFile } from "../gateway/mcp-http.js";
+import {
+  MCP_PORT_OFFSET,
+  ensureMcpConfigFile,
+  resolveMcpLoopbackToken,
+} from "../gateway/mcp-http.js";
 import { shouldLogVerbose } from "../globals.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
@@ -117,11 +121,11 @@ export async function runCliAgent(params: {
     }
   }
 
-  const extraSystemPrompt = isClaude
-    ? params.extraSystemPrompt?.trim() || undefined
-    : [params.extraSystemPrompt?.trim(), "Tools are disabled in this session. Do not call tools."]
-        .filter(Boolean)
-        .join("\n");
+  const toolsDisabledHint = "Tools are disabled in this session. Do not call tools.";
+  const extraSystemPrompt =
+    isClaude && mcpConfigPath
+      ? params.extraSystemPrompt?.trim() || undefined
+      : [params.extraSystemPrompt?.trim(), toolsDisabledHint].filter(Boolean).join("\n");
 
   const sessionLabel = params.sessionKey ?? params.sessionId;
   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
@@ -319,6 +323,8 @@ export async function runCliAgent(params: {
             delete next[key];
           }
           if (mcpConfigPath) {
+            const openclawDir = path.join(os.homedir(), ".openclaw");
+            next.OPENCLAW_MCP_TOKEN = resolveMcpLoopbackToken(openclawDir);
             next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
             next.OPENCLAW_MCP_ACCOUNT_ID = params.accountId ?? "";
             next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
