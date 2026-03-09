@@ -170,7 +170,10 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         return {
           channel: "feishu",
           ...result,
-          meta: { contentType: resolveOutboundMediaContentType(mediaUrl) },
+          meta: {
+            contentType: resolveOutboundMediaContentType(mediaUrl),
+            ...(result.rawContent ? { rawContent: result.rawContent } : {}),
+          },
         };
       } catch (err) {
         // Log the error for debugging
