@@ -261,6 +261,7 @@ type MessageSentEvent = {
   error?: string;
   messageId?: string;
   metadata?: Record<string, unknown>;
+  channelData?: Record<string, unknown>;
 };
 
 function hasMediaPayload(payload: ReplyPayload): boolean {
@@ -355,6 +356,7 @@ function createMessageSentEmitter(params: {
       conversationId: params.to,
       messageId: event.messageId,
       metadata: event.metadata,
+      channelData: event.channelData,
       isGroup: params.mirrorIsGroup,
       groupId: params.mirrorGroupId,
     });
@@ -724,6 +726,7 @@ async function deliverOutboundPayloadsCore(
           content: payloadSummary.text,
           messageId: delivery.messageId,
           metadata: delivery.meta,
+          channelData: effectivePayload.channelData,
         });
         continue;
       }
@@ -734,12 +737,13 @@ async function deliverOutboundPayloadsCore(
         } else {
           await sendTextChunks(payloadSummary.text, sendOverrides);
         }
-        const messageId = results.at(-1)?.messageId;
+        const currentResults = results.slice(beforeCount);
+        const lastResult = currentResults.at(-1);
         emitMessageSent({
-          success: results.length > beforeCount,
+          success: currentResults.length > 0,
           content: payloadSummary.text,
-          messageId,
-          metadata: results.at(-1)?.meta,
+          messageId: lastResult?.messageId,
+          metadata: lastResult?.meta,
         });
         continue;
       }
@@ -761,12 +765,13 @@ async function deliverOutboundPayloadsCore(
         }
         const beforeCount = results.length;
         await sendTextChunks(fallbackText, sendOverrides);
-        const messageId = results.at(-1)?.messageId;
+        const currentResults = results.slice(beforeCount);
+        const lastResult = currentResults.at(-1);
         emitMessageSent({
-          success: results.length > beforeCount,
+          success: currentResults.length > 0,
           content: payloadSummary.text,
-          messageId,
-          metadata: results.at(-1)?.meta,
+          messageId: lastResult?.messageId,
+          metadata: lastResult?.meta,
         });
         continue;
       }

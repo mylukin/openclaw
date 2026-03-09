@@ -52,6 +52,7 @@ export type CanonicalSentMessageHookContext = {
   conversationId?: string;
   messageId?: string;
   metadata?: Record<string, unknown>;
+  channelData?: Record<string, unknown>;
   isGroup?: boolean;
   groupId?: string;
 };
@@ -124,6 +125,7 @@ export function buildCanonicalSentMessageHookContext(params: {
   conversationId?: string;
   messageId?: string;
   metadata?: Record<string, unknown>;
+  channelData?: Record<string, unknown>;
   isGroup?: boolean;
   groupId?: string;
 }): CanonicalSentMessageHookContext {
@@ -137,6 +139,7 @@ export function buildCanonicalSentMessageHookContext(params: {
     conversationId: params.conversationId ?? params.to,
     messageId: params.messageId,
     metadata: params.metadata,
+    channelData: params.channelData,
     isGroup: params.isGroup,
     groupId: params.groupId,
   };
@@ -188,6 +191,9 @@ export function toPluginMessageSentEvent(
     ...(canonical.messageId ? { messageId: canonical.messageId } : {}),
     ...(canonical.metadata && Object.keys(canonical.metadata).length > 0
       ? { metadata: canonical.metadata }
+      : {}),
+    ...(canonical.channelData && Object.keys(canonical.channelData).length > 0
+      ? { channelData: canonical.channelData }
       : {}),
     ...(canonical.error ? { error: canonical.error } : {}),
   };

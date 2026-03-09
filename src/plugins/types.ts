@@ -589,6 +589,7 @@ export type PluginHookMessageSentEvent = {
   success: boolean;
   messageId?: string;
   metadata?: Record<string, unknown>;
+  channelData?: Record<string, unknown>;
   error?: string;
 };
 
