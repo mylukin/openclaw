@@ -166,12 +166,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
           mediaLocalRoots,
           replyToMessageId,
         });
+        const contentType = resolveOutboundMediaContentType(mediaUrl);
         return {
           channel: "feishu",
           ...result,
           meta: {
-            contentType: resolveOutboundMediaContentType(mediaUrl),
-            ...(result.rawContent ? { rawContent: result.rawContent } : {}),
+            contentType,
+            rawContent: `[${contentType}: ${mediaUrl}]`,
           },
         };
       } catch (err) {
