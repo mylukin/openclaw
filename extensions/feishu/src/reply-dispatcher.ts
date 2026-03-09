@@ -56,6 +56,40 @@ function resolveFinalDeliveryContent(text: string, mediaUrls: string[]): string 
   return names.length > 0 ? names.join(", ") : "media";
 }
 
+const IMAGE_EXTENSIONS = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".gif",
+  ".webp",
+  ".bmp",
+  ".ico",
+  ".tiff",
+]);
+const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
+const AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
+
+function resolveMediaFileName(mediaUrl: string): string {
+  const trimmed = mediaUrl.trim();
+  if (!trimmed) return "media";
+  const withoutHash = trimmed.split("#")[0] ?? trimmed;
+  const withoutQuery = withoutHash.split("?")[0] ?? withoutHash;
+  try {
+    const parsed = new URL(withoutQuery);
+    return path.basename(parsed.pathname) || "media";
+  } catch {
+    const base = path.basename(withoutQuery);
+    return base && base !== "." && base !== "/" ? base : "media";
+  }
+}
+
+function resolveMediaContentType(ext: string): string {
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
+  return "file";
+}
+
 function normalizeEpochMs(timestamp: number | undefined): number | undefined {
   if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
     return undefined;
@@ -255,35 +289,33 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       });
       if (typeof sent?.messageId === "string" && sent.messageId.trim()) {
         deliveredMediaMessageIds.push(sent.messageId);
+        // Emit a separate message_sent event for each media message so
+        // downstream consumers (e.g. bot-company journal) can record them
+        // with the correct content type and individual message IDs.
+        const mediaName = resolveMediaFileName(mediaUrl);
+        const mediaContentType = resolveMediaContentType(path.extname(mediaName).toLowerCase());
+        emitMessageSent({
+          content: `[${mediaContentType}: ${mediaName}]`,
+          success: true,
+          messageId: sent.messageId,
+          metadata: { chatId, contentType: mediaContentType, mediaUrl },
+        });
       }
     }
-    // For media-only finals, wait for any pending streaming renders to settle
-    // before checking visibility. This avoids guessing whether queued text will
-    // actually be displayed — after the queue flushes, hasVisibleTextInReply
-    // definitively reflects whether text was delivered or the render failed.
-    if (info?.kind === "final" && !hasText) {
+    // For media-only finals with no visible text, fire the onFinalTextDelivered
+    // callback so replay synthetic outbound triggers correctly.
+    if (info?.kind === "final" && !hasText && !hasVisibleTextInReply) {
       if (streamingStartPromise) {
         await streamingStartPromise;
       }
       await partialUpdateQueue.catch(() => undefined);
-    }
-    if (
-      info?.kind === "final" &&
-      !hasText &&
-      !hasVisibleTextInReply &&
-      deliveredMediaMessageIds.length > 0
-    ) {
-      const finalContent = resolveFinalDeliveryContent(text, mediaList);
-      emitMessageSent({
-        content: finalContent,
-        success: true,
-        messageId: deliveredMediaMessageIds.at(-1),
-        metadata: { chatId, messageIds: deliveredMediaMessageIds },
-      });
-      await emitFinalTextIfNeeded(finalContent, {
-        messageId: deliveredMediaMessageIds.at(-1),
-        messageIds: deliveredMediaMessageIds,
-      });
+      if (deliveredMediaMessageIds.length > 0) {
+        const finalContent = resolveFinalDeliveryContent(text, mediaList);
+        await emitFinalTextIfNeeded(finalContent, {
+          messageId: deliveredMediaMessageIds.at(-1),
+          messageIds: deliveredMediaMessageIds,
+        });
+      }
     }
   };
 
@@ -519,13 +551,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         }
         await streaming.close(normalizeMentionTagsForCard(text));
         hasVisibleTextInReply = true;
-      }
-      if (options?.emitFinalText !== false) {
-        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
-        await emitFinalTextIfNeeded(
-          finalText,
-          streamMessageId ? { messageId: streamMessageId } : undefined,
-        );
+        // Only emit for non-discarded cards — discarded cards have empty content
+        // and should not be recorded in the journal.
+        if (options?.emitFinalText !== false) {
+          emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+          await emitFinalTextIfNeeded(
+            finalText,
+            streamMessageId ? { messageId: streamMessageId } : undefined,
+          );
+        }
       }
     }
     streaming = null;
