@@ -65,6 +65,7 @@ vi.mock("../../agents/skills/refresh.js", () => ({
 
 vi.mock("../../agents/workspace.js", () => ({
   ensureAgentWorkspace: vi.fn().mockResolvedValue({ dir: "/tmp/workspace" }),
+  DEFAULT_IDENTITY_FILENAME: "IDENTITY.md",
 }));
 
 vi.mock("../../agents/model-catalog.js", () => ({
