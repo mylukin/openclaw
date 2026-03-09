@@ -34,6 +34,9 @@ const MUTABLE_ARGV1_INTERPRETER_PATTERNS = [
   /^ruby$/,
 ] as const;
 
+const DENO_SUBCOMMANDS_WITH_SCRIPT = new Set(["run", "task", "compile", "bundle"]);
+const BUN_SUBCOMMANDS_WITH_SCRIPT = new Set(["run", "x", "build"]);
+
 function normalizeString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -148,6 +151,35 @@ function resolvePosixShellScriptOperandIndex(argv: string[]): number | null {
   return null;
 }
 
+function resolveSubcommandScriptOperandIndex(
+  argv: string[],
+  subcommandIndex: number,
+): number | null {
+  let i = subcommandIndex + 1;
+  let afterDoubleDash = false;
+  while (i < argv.length) {
+    const token = argv[i]?.trim() ?? "";
+    if (!token) {
+      i++;
+      continue;
+    }
+    if (!afterDoubleDash && token === "--") {
+      afterDoubleDash = true;
+      i++;
+      continue;
+    }
+    if (!afterDoubleDash && token.startsWith("-")) {
+      i++;
+      continue;
+    }
+    if (token.startsWith("http://") || token.startsWith("https://")) {
+      return null;
+    }
+    return i;
+  }
+  return null;
+}
+
 function resolveMutableFileOperandIndex(argv: string[]): number | null {
   const unwrapped = unwrapArgvForMutableOperand(argv);
   const executable = normalizeExecutableToken(unwrapped.argv[0] ?? "");
@@ -164,6 +196,17 @@ function resolveMutableFileOperandIndex(argv: string[]): number | null {
   const operand = unwrapped.argv[1]?.trim() ?? "";
   if (!operand || operand === "-" || operand.startsWith("-")) {
     return null;
+  }
+  if (/^bun$/.test(executable)) {
+    if (BUN_SUBCOMMANDS_WITH_SCRIPT.has(operand)) {
+      const scriptLocalIndex = resolveSubcommandScriptOperandIndex(unwrapped.argv, 1);
+      return scriptLocalIndex === null ? null : unwrapped.baseIndex + scriptLocalIndex;
+    }
+  } else if (/^deno$/.test(executable)) {
+    if (DENO_SUBCOMMANDS_WITH_SCRIPT.has(operand)) {
+      const scriptLocalIndex = resolveSubcommandScriptOperandIndex(unwrapped.argv, 1);
+      return scriptLocalIndex === null ? null : unwrapped.baseIndex + scriptLocalIndex;
+    }
   }
   return unwrapped.baseIndex + 1;
 }
