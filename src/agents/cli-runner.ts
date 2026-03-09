@@ -113,11 +113,13 @@ export async function runCliAgent(params: {
   let mcpConfigPath: string | undefined;
   if (isClaude) {
     try {
-      // TODO(fix8): Use the actual runtime port from the gateway server binding result
-      // instead of the configured port. Currently, if the gateway binds to a different
-      // port (e.g. due to port conflict), the MCP config file will have the wrong URL.
-      // The runtime port should be threaded through runCliAgent's params from the caller.
-      const gatewayPort = params.config?.gateway?.port ?? 18789;
+      const runtimeGatewayPort = process.env.OPENCLAW_GATEWAY_PORT
+        ? parseInt(process.env.OPENCLAW_GATEWAY_PORT, 10)
+        : null;
+      const gatewayPort =
+        runtimeGatewayPort && !isNaN(runtimeGatewayPort)
+          ? runtimeGatewayPort
+          : (params.config?.gateway?.port ?? 18789);
       const mcpPort = gatewayPort + MCP_PORT_OFFSET;
       const openclawDir = path.join(resolveEffectiveHomeDir() ?? os.homedir(), ".openclaw");
       mcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);

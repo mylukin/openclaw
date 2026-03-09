@@ -520,13 +520,6 @@ export async function startMcpLoopbackServer(port: number): Promise<{
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
-    // TODO(fix9): The current shared bearer token is not bound to a specific session or
-    // account. After validation, verify that x-openclaw-account-id and x-session-key
-    // headers match the expected values issued to the requesting agent. This requires
-    // per-agent tokens or a token-to-session binding table (stored alongside the token
-    // file). Until then, any process on 127.0.0.1 that obtains the token can impersonate
-    // any session/account by crafting arbitrary headers.
-
     // Content-Type check.
     const contentType = getHeader(req, "content-type") ?? "";
     if (!contentType.startsWith("application/json")) {
@@ -541,10 +534,10 @@ export async function startMcpLoopbackServer(port: number): Promise<{
         const parsed: JsonRpcRequest | JsonRpcRequest[] = JSON.parse(body);
 
         const cfg = loadConfig();
-        const reqSessionKey = getHeader(req, "x-session-key")?.trim() || resolveMainSessionKey(cfg);
+        const reqSessionKey = resolveMainSessionKey(cfg);
         const messageProvider =
           normalizeMessageChannel(getHeader(req, "x-openclaw-message-channel")) ?? undefined;
-        const accountId = getHeader(req, "x-openclaw-account-id")?.trim() || undefined;
+        const accountId = undefined; // not overrideable via headers
         const { tools, toolSchema } = getTools({
           cfg,
           sessionKey: reqSessionKey,
