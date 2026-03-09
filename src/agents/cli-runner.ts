@@ -12,6 +12,7 @@ import {
 import { shouldLogVerbose } from "../globals.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
+import { resolveEffectiveHomeDir } from "../infra/home-dir.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getProcessSupervisor } from "../process/supervisor/index.js";
@@ -112,9 +113,13 @@ export async function runCliAgent(params: {
   let mcpConfigPath: string | undefined;
   if (isClaude) {
     try {
+      // TODO(fix8): Use the actual runtime port from the gateway server binding result
+      // instead of the configured port. Currently, if the gateway binds to a different
+      // port (e.g. due to port conflict), the MCP config file will have the wrong URL.
+      // The runtime port should be threaded through runCliAgent's params from the caller.
       const gatewayPort = params.config?.gateway?.port ?? 18789;
       const mcpPort = gatewayPort + MCP_PORT_OFFSET;
-      const openclawDir = path.join(os.homedir(), ".openclaw");
+      const openclawDir = path.join(resolveEffectiveHomeDir() ?? os.homedir(), ".openclaw");
       mcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);
     } catch (err) {
       log.warn(`mcp config setup failed: ${String(err)}`);
@@ -323,7 +328,7 @@ export async function runCliAgent(params: {
             delete next[key];
           }
           if (mcpConfigPath) {
-            const openclawDir = path.join(os.homedir(), ".openclaw");
+            const openclawDir = path.join(resolveEffectiveHomeDir() ?? os.homedir(), ".openclaw");
             next.OPENCLAW_MCP_TOKEN = resolveMcpLoopbackToken(openclawDir);
             next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
             next.OPENCLAW_MCP_ACCOUNT_ID = params.accountId ?? "";

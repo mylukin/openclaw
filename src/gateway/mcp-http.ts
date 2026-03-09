@@ -21,6 +21,7 @@ import {
 } from "../agents/tool-policy.js";
 import { loadConfig } from "../config/config.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
+import { resolveEffectiveHomeDir } from "../infra/home-dir.js";
 import { logDebug, logWarn } from "../logger.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
@@ -121,9 +122,18 @@ function resolveFilteredTools(params: {
     ],
   });
 
+  // Apply config-level gateway tools allow/deny overrides, matching the pattern in tools-invoke-http.ts.
+  const gatewayToolsCfg = params.cfg.gateway?.tools;
+  const defaultGatewayDeny = (DEFAULT_GATEWAY_HTTP_TOOL_DENY as readonly string[]).filter(
+    (name) => !gatewayToolsCfg?.allow?.includes(name),
+  );
+  const gatewayDenySet = new Set([
+    ...defaultGatewayDeny,
+    ...(Array.isArray(gatewayToolsCfg?.deny) ? gatewayToolsCfg.deny : []),
+  ]);
+
   return policyFiltered.filter(
-    (t) =>
-      !NATIVE_TOOL_EXCLUDE.has(t.name) && !DEFAULT_GATEWAY_HTTP_TOOL_DENY.includes(t.name as never),
+    (t) => !NATIVE_TOOL_EXCLUDE.has(t.name) && !gatewayDenySet.has(t.name),
   );
 }
 
@@ -164,15 +174,44 @@ function flattenUnionSchema(raw: Record<string, unknown>): Record<string, unknow
     const props = variant.properties as Record<string, unknown> | undefined;
     if (props) {
       for (const [key, schema] of Object.entries(props)) {
-        // First variant wins for each property definition.
         if (!(key in mergedProps)) {
           mergedProps[key] = schema;
+        } else {
+          // Merge discriminator fields: combine enum/const values across variants.
+          const existing = mergedProps[key] as Record<string, unknown>;
+          const incoming = schema as Record<string, unknown>;
+          if (Array.isArray(existing.enum) && Array.isArray(incoming.enum)) {
+            mergedProps[key] = {
+              ...existing,
+              enum: [
+                ...new Set([...(existing.enum as unknown[]), ...(incoming.enum as unknown[])]),
+              ],
+            };
+          } else if (
+            "const" in existing &&
+            "const" in incoming &&
+            existing.const !== incoming.const
+          ) {
+            // Promote differing const values to an enum.
+            const merged: Record<string, unknown> = {
+              ...existing,
+              enum: [existing.const, incoming.const],
+            };
+            delete merged.const;
+            mergedProps[key] = merged;
+          } else {
+            logWarn(
+              `mcp: flattenUnionSchema: conflicting definitions for property "${key}", keeping first variant`,
+            );
+          }
         }
       }
     }
-    if (Array.isArray(variant.required)) {
-      requiredSets.push(new Set((variant.required as string[] | undefined) ?? []));
-    }
+    // Every variant contributes a required set (empty if the variant has no required array),
+    // so the intersection only marks fields required by ALL variants.
+    requiredSets.push(
+      new Set(Array.isArray(variant.required) ? (variant.required as string[]) : []),
+    );
   }
   // Only mark a field as required if ALL variants require it.
   const required =
@@ -333,7 +372,9 @@ export function resolveMcpLoopbackToken(openclawDir: string): string {
  * Returns the absolute path to the config file.
  */
 export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): string {
-  const filePath = path.join(openclawDir, "mcp.json");
+  // Include the port in the filename to avoid collisions between gateway instances
+  // running on different ports (fix10: shared mcp.json race condition).
+  const filePath = path.join(openclawDir, `mcp-${mcpPort}.json`);
   const config = {
     mcpServers: {
       openclaw: {
@@ -362,7 +403,10 @@ export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): strin
   }
 
   fs.mkdirSync(openclawDir, { recursive: true });
-  fs.writeFileSync(filePath, content, "utf-8");
+  // Atomic write: write to a temp file first, then rename to avoid partial reads.
+  const tmpPath = filePath + ".tmp";
+  fs.writeFileSync(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+  fs.renameSync(tmpPath, filePath);
   return filePath;
 }
 
@@ -377,7 +421,7 @@ export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): strin
 export async function startMcpLoopbackServer(port: number): Promise<{
   close: () => Promise<void>;
 }> {
-  const openclawDir = path.join(os.homedir(), ".openclaw");
+  const openclawDir = path.join(resolveEffectiveHomeDir() ?? os.homedir(), ".openclaw");
   const mcpToken = resolveMcpLoopbackToken(openclawDir);
 
   // Per-tool-context cache with TTL; clears when runtime config snapshot changes.
@@ -476,6 +520,12 @@ export async function startMcpLoopbackServer(port: number): Promise<{
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
+    // TODO(fix9): The current shared bearer token is not bound to a specific session or
+    // account. After validation, verify that x-openclaw-account-id and x-session-key
+    // headers match the expected values issued to the requesting agent. This requires
+    // per-agent tokens or a token-to-session binding table (stored alongside the token
+    // file). Until then, any process on 127.0.0.1 that obtains the token can impersonate
+    // any session/account by crafting arbitrary headers.
 
     // Content-Type check.
     const contentType = getHeader(req, "content-type") ?? "";

@@ -142,7 +142,14 @@ export async function handleToolsInvokeHttpRequest(
     rateLimiter?: AuthRateLimiter;
   },
 ): Promise<boolean> {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "bad_request", message: "Invalid request URL" }));
+    return true;
+  }
   if (url.pathname !== "/tools/invoke") {
     return false;
   }
