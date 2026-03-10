@@ -580,6 +580,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       responsePrefix: prefixContext.responsePrefix,
       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
+      // Log when a stray HEARTBEAT_OK token is stripped from a Feishu reply,
+      // mirroring the onHeartbeatStrip pattern used by the web reply path.
+      onHeartbeatStrip: () => {
+        params.runtime.log?.(`feishu[${account.accountId}] stripped stray HEARTBEAT_OK from reply`);
+      },
       onReplyStart: () => {
         deliveredFinalTexts.clear();
         hasVisibleTextInReply = false;

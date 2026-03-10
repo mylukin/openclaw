@@ -63,6 +63,8 @@ export {
   resolveSessionFilePathOptions,
 } from "../config/sessions.js";
 export type { SessionEntry, SessionTranscriptMessageMeta } from "../config/sessions.js";
+export { HEARTBEAT_TOKEN } from "../auto-reply/tokens.js";
+export { stripHeartbeatToken } from "../auto-reply/heartbeat.js";
 export { stripEnvelopeFromMessage } from "../gateway/chat-sanitize.js";
 export { resolveUserPath } from "../utils.js";
 export type { PluginRuntime } from "../plugins/runtime/types.js";
