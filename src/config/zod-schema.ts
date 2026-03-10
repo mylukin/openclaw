@@ -828,6 +828,7 @@ export const OpenClawSchema = z
             extraDirs: z.array(z.string()).optional(),
             watch: z.boolean().optional(),
             watchDebounceMs: z.number().int().min(0).optional(),
+            allowSymlinksOutsideRoot: z.boolean().optional(),
           })
           .strict()
           .optional(),
