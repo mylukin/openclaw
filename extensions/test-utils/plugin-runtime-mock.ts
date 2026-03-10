@@ -37,6 +37,10 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
     version: "1.0.0-test",
     agents: {
       runEmbeddedPiAgent: vi.fn() as unknown as PluginRuntime["agents"]["runEmbeddedPiAgent"],
+      runModelAwareAgent: vi.fn() as unknown as PluginRuntime["agents"]["runModelAwareAgent"],
+    },
+    hooks: {
+      emitMessageSent: vi.fn() as unknown as PluginRuntime["hooks"]["emitMessageSent"],
     },
     config: {
       loadConfig: vi.fn(() => ({})) as unknown as PluginRuntime["config"]["loadConfig"],
