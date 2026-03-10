@@ -223,11 +223,15 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       }
     }
 
-    // No media URL, just return text result
+    // No media URL — use the already-normalized caption; drop stray HEARTBEAT_OK
+    const fallbackText = effectiveCaption ?? "";
+    if (!fallbackText) {
+      return { channel: "feishu", messageId: "", chatId: "" };
+    }
     const result = await sendOutboundText({
       cfg,
       to,
-      text: text ?? "",
+      text: fallbackText,
       accountId: accountId ?? undefined,
       replyToMessageId,
     });

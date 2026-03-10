@@ -358,6 +358,38 @@ describe("feishuOutbound HEARTBEAT_TOKEN filtering", () => {
     );
   });
 
+  it("sendMedia: suppresses HEARTBEAT_OK when no mediaUrl is provided (fallback path)", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      mediaUrl: "",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "" }));
+  });
+
+  it("sendMedia: sends normal text when no mediaUrl is provided (fallback path)", async () => {
+    await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "Just a message",
+      mediaUrl: "",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        text: "Just a message",
+      }),
+    );
+  });
+
   it("sendMedia: strips HEARTBEAT_OK from caption and sends remaining caption + media", async () => {
     await feishuOutbound.sendMedia?.({
       cfg: {} as any,
