@@ -1389,7 +1389,7 @@ export async function runCliAgent(params: {
                 estimatePromptTokens(promptForRun) +
                 imageTokenEstimate;
               throw new FailoverError(
-                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). 建议改走 pi-embedded runtime 或拆任务。`,
+                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). Consider switching to the pi-embedded runtime or splitting the task.`,
                 {
                   reason: "unknown",
                   provider: params.provider,

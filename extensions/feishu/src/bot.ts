@@ -14,7 +14,7 @@ import {
   resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/feishu";
-import { appendAssistantMessageToSessionTranscript } from "../../../src/config/sessions.js";
+import { appendAssistantMessageToSessionTranscript } from "openclaw/plugin-sdk/feishu";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { tryRecordMessage, tryRecordMessagePersistent } from "./dedup.js";
