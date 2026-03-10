@@ -54,6 +54,7 @@ export { createDedupeCache } from "../infra/dedupe.js";
 export { installRequestBodyLimitGuard } from "../infra/http-body.js";
 export { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
 export { emptyPluginConfigSchema } from "../plugins/config-schema.js";
+export { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 export type { PluginRuntime } from "../plugins/runtime/types.js";
 export type { AnyAgentTool, OpenClawPluginApi } from "../plugins/types.js";
 export { DEFAULT_ACCOUNT_ID, normalizeAgentId } from "../routing/session-key.js";
