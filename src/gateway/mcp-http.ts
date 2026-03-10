@@ -286,21 +286,34 @@ async function handleJsonRpc(
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
 
+const READ_BODY_TIMEOUT_MS = 10_000; // 10 s — guards against slow-loris on loopback
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let received = 0;
+    const timer = setTimeout(() => {
+      req.destroy();
+      reject(new Error("Request body read timed out"));
+    }, READ_BODY_TIMEOUT_MS);
     req.on("data", (chunk: Buffer) => {
       received += chunk.length;
       if (received > MAX_BODY_BYTES) {
+        clearTimeout(timer);
         req.destroy();
         reject(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`));
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
+    req.on("end", () => {
+      clearTimeout(timer);
+      resolve(Buffer.concat(chunks).toString("utf-8"));
+    });
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 

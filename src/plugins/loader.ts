@@ -558,10 +558,14 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
     if (jitiLoader) {
       return jitiLoader;
     }
-    // Bun compiled binaries cannot resolve jiti's babel.cjs from the virtual
-    // filesystem.  Bypass jiti entirely and use require() which is synchronous
-    // and Bun handles ESM→CJS interop automatically for .js files.
-    if (typeof (globalThis as Record<string, unknown>).Bun !== "undefined") {
+    // Compiled Bun binaries cannot resolve jiti's babel.cjs from the virtual
+    // filesystem.  Bypass jiti and use require() only for compiled binaries
+    // (detected via the embedded-plugins marker injected at build time).
+    // Plain `bun run` (non-compiled) supports jiti normally.
+    const isCompiledBunBinary = Array.isArray(
+      (globalThis as Record<string, unknown>).__OPENCLAW_EMBEDDED_PLUGINS__,
+    );
+    if (isCompiledBunBinary) {
       jitiLoader = ((specifier: string) => {
         return require(specifier);
       }) as unknown as ReturnType<typeof createJiti>;

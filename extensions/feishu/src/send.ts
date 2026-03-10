@@ -242,6 +242,11 @@ export async function getMessageFeishu(params: {
           id_type?: string;
           sender_type?: string;
         };
+        mentions?: Array<{
+          key?: string;
+          name?: string;
+          id?: { open_id?: string; user_id?: string; union_id?: string };
+        }>;
         create_time?: string;
       };
     };
