@@ -359,3 +359,44 @@ describe("feishuOutbound.sendMedia renderMode", () => {
     );
   });
 });
+
+describe("feishuOutbound.sendMedia HEARTBEAT_OK suppression", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendMessageFeishuMock.mockResolvedValue({ messageId: "text_msg" });
+    sendMarkdownCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+    sendMediaFeishuMock.mockResolvedValue({ messageId: "media_msg" });
+  });
+
+  it("swallows HEARTBEAT_OK with no mediaUrl — sends nothing to Feishu", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "" }));
+  });
+
+  it("still sends normal text with no mediaUrl", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "hello world",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        text: "hello world",
+        accountId: "main",
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "text_msg" }));
+  });
+});

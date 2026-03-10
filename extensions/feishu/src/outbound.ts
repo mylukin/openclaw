@@ -145,12 +145,14 @@ export const feishuOutbound: ChannelOutboundAdapter = {
     threadId,
   }) => {
     const replyToMessageId = resolveReplyToMessageId({ replyToId, threadId });
+    // Strip pure HEARTBEAT_OK tokens so they never leak to Feishu.
+    const effectiveCaption = text?.trim() === "HEARTBEAT_OK" ? "" : text;
     // Send text first if provided
-    if (text?.trim()) {
+    if (effectiveCaption?.trim()) {
       await sendOutboundText({
         cfg,
         to,
-        text,
+        text: effectiveCaption,
         accountId: accountId ?? undefined,
         replyToMessageId,
       });
@@ -192,11 +194,14 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       }
     }
 
-    // No media URL, just return text result
+    // No media URL — use filtered caption. If suppressed, nothing to send.
+    if (!effectiveCaption?.trim()) {
+      return { channel: "feishu" as const, messageId: "" };
+    }
     const result = await sendOutboundText({
       cfg,
       to,
-      text: text ?? "",
+      text: effectiveCaption,
       accountId: accountId ?? undefined,
       replyToMessageId,
     });
