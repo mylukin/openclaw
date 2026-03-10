@@ -101,6 +101,8 @@ export function isContextOverflowError(errorMessage?: string): boolean {
     lower.includes("model token limit") ||
     (hasRequestSizeExceeds && hasContextWindow) ||
     lower.includes("context overflow:") ||
+    lower.includes("context overflow \u2014") || // claude-cli uses em-dash: "Context overflow — prompt too large"
+    lower.includes("context overflow --") || // ascii fallback variant
     lower.includes("exceed context limit") ||
     lower.includes("exceeds the model's maximum context") ||
     (lower.includes("max_tokens") && lower.includes("exceed") && lower.includes("context")) ||
