@@ -97,6 +97,7 @@ describe("plugin-sdk exports", () => {
       "DEFAULT_GROUP_HISTORY_LIMIT",
       "DEFAULT_ACCOUNT_ID",
       "SILENT_REPLY_TOKEN",
+      "HEARTBEAT_TOKEN",
       "PAIRING_APPROVED_MESSAGE",
     ];
 

@@ -2,6 +2,7 @@ import path from "node:path";
 import {
   createReplyPrefixContext,
   createTypingCallbacks,
+  HEARTBEAT_TOKEN,
   logTypingFailure,
   type ClawdbotConfig,
   type ReplyPayload,
@@ -598,6 +599,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               : [];
         const hasText = Boolean(text.trim());
         const hasMedia = mediaList.length > 0;
+
+        // Defense-in-depth: drop stray HEARTBEAT_OK that leaked through normalization
+        const isStrayHeartbeat =
+          text.trim() === HEARTBEAT_TOKEN ||
+          text
+            .trim()
+            .replace(/<[^>]*>/g, "")
+            .replace(/^[*`~]+|[*`~]+$/g, "")
+            .trim() === HEARTBEAT_TOKEN;
+        if (isStrayHeartbeat && !hasMedia) {
+          return;
+        }
+
         // Suppress only exact duplicate final text payloads to avoid
         // dropping legitimate multi-part final replies.
         const skipTextForDuplicateFinal =
