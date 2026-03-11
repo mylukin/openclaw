@@ -517,7 +517,7 @@ async function applyMessageSendingHook(params: {
           channel: params.channel,
           accountId: params.accountId,
           mediaUrls: params.payloadSummary.mediaUrls,
-          replyToId: params.payload.replyToId ?? undefined,
+          replyToId: params.payload.replyToId,
         },
       },
       {
