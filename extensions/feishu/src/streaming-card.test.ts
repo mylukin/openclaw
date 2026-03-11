@@ -25,7 +25,10 @@ function createClientMock() {
     data: { message_id: "message-id" },
   }));
   const cardCreate = vi.fn(async () => ({ code: 0, msg: "ok", data: { card_id: "card-id" } }));
-  const cardSettings = vi.fn(async () => ({ code: 0, msg: "ok" }));
+  const cardSettings = vi.fn(async (_arg: { path?: unknown; data?: { settings?: string } }) => ({
+    code: 0,
+    msg: "ok",
+  }));
   const cardElementContent = vi.fn(async () => ({ code: 0, msg: "ok" }));
 
   const client = {
@@ -285,6 +288,7 @@ describe("FeishuStreamingSession.close", () => {
       sequence: 1,
       currentText: "",
     };
+    (session as any).lastStreamingModeRenewAt = Date.now();
 
     await session.close(
       '<at user_id="ou_user_1">Lukin</at> 已完成 <b>发布</b><br/>请查看 <a href="https://example.com">链接</a>',
@@ -298,5 +302,100 @@ describe("FeishuStreamingSession.close", () => {
       config?: { summary?: { content?: string } };
     };
     expect(settingsPayload.config?.summary?.content).toBe("Lukin 已完成 发布 请查看 链接");
+  });
+});
+
+describe("FeishuStreamingSession.renewStreamingMode", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  function makeSession(client: ReturnType<typeof createClientMock>["client"]) {
+    const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 2,
+      currentText: "text",
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+    return session;
+  }
+
+  it("does not renew when last renewal is within 8 minutes", async () => {
+    const { client, cardSettings } = createClientMock();
+    const session = makeSession(client);
+
+    await (session as any).renewStreamingMode();
+
+    expect(cardSettings).not.toHaveBeenCalled();
+    expect((session as any).state.sequence).toBe(2);
+  });
+
+  it("renews and advances sequence when 8 minutes have elapsed", async () => {
+    const { client, cardSettings } = createClientMock();
+    const session = makeSession(client);
+    (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
+
+    await (session as any).renewStreamingMode();
+
+    expect(cardSettings).toHaveBeenCalledOnce();
+    const arg = cardSettings.mock.calls[0]?.[0] as {
+      data?: { settings?: string; sequence?: number };
+    };
+    const settings = JSON.parse(arg.data?.settings ?? "{}") as {
+      config?: { streaming_mode?: boolean };
+    };
+    expect(settings.config?.streaming_mode).toBe(true);
+    expect(arg.data?.sequence).toBe(3);
+    expect((session as any).state.sequence).toBe(3);
+  });
+
+  it("does not advance sequence when renewal API returns non-zero code", async () => {
+    const { client, cardSettings } = createClientMock();
+    cardSettings.mockResolvedValueOnce({ code: 200850, msg: "Card streaming timeout" });
+    const session = makeSession(client);
+    (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
+
+    await (session as any).renewStreamingMode();
+
+    expect(cardSettings).toHaveBeenCalledOnce();
+    // sequence must not advance on failure — no wasted hole
+    expect((session as any).state.sequence).toBe(2);
+  });
+
+  it("does not advance sequence when renewal API throws", async () => {
+    const { client, cardSettings } = createClientMock();
+    cardSettings.mockRejectedValueOnce(new Error("network error"));
+    const session = makeSession(client);
+    (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
+
+    await (session as any).renewStreamingMode();
+
+    expect((session as any).state.sequence).toBe(2);
+  });
+
+  it("updates lastStreamingModeRenewAt only on success", async () => {
+    const { client, cardSettings } = createClientMock();
+    cardSettings.mockRejectedValueOnce(new Error("network error"));
+    const session = makeSession(client);
+    const renewedAt = Date.now() - 8 * 60 * 1000 - 1;
+    (session as any).lastStreamingModeRenewAt = renewedAt;
+
+    await (session as any).renewStreamingMode();
+
+    expect((session as any).lastStreamingModeRenewAt).toBe(renewedAt);
+  });
+
+  it("start() initialises lastStreamingModeRenewAt so first update does not trigger renewal", async () => {
+    const { client, cardSettings } = createClientMock();
+    const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
+    await session.start("chat-id");
+
+    // Immediately call updateCardContent — renewal must not fire
+    const before = cardSettings.mock.calls.length; // calls from start (card.create, not settings)
+    await (session as any).updateCardContent("hello");
+    expect(cardSettings.mock.calls.length).toBe(before);
   });
 });
