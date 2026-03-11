@@ -980,6 +980,8 @@ export async function runCliAgent(params: {
   // Helper function to execute CLI with given session ID
   const executeCliWithSession = async (
     cliSessionIdToUse?: string,
+    promptOverride?: string,
+    isSystemCall?: boolean,
   ): Promise<{
     text: string;
     sessionId?: string;
@@ -1009,8 +1011,8 @@ export async function runCliAgent(params: {
 
     let imagePaths: string[] | undefined;
     let cleanupImages: (() => Promise<void>) | undefined;
-    let prompt = promptForRun;
-    if (params.images && params.images.length > 0) {
+    let prompt = promptOverride ?? promptForRun;
+    if (!promptOverride && params.images && params.images.length > 0) {
       const imagePayload = await writeCliImages(params.images);
       imagePaths = imagePayload.paths;
       cleanupImages = imagePayload.cleanup;
@@ -1124,14 +1126,19 @@ export async function runCliAgent(params: {
         // Stream-json mode: process NDJSON lines as they arrive via onStdout
         const streamProcessor =
           outputMode === "stream-json"
-            ? createStreamJsonProcessor(backend, {
-                onSystemInit: params.onSystemInit,
-                onAssistantTurn: params.onAssistantTurn,
-                onToolUse: params.onToolUse,
-                onThinkingTurn: params.onThinkingTurn,
-                onToolUseEvent: params.onToolUseEvent,
-                onToolResult: params.onToolResult,
-              })
+            ? createStreamJsonProcessor(
+                backend,
+                isSystemCall
+                  ? {} // suppress all stream callbacks for internal system calls (e.g. /compact)
+                  : {
+                      onSystemInit: params.onSystemInit,
+                      onAssistantTurn: params.onAssistantTurn,
+                      onToolUse: params.onToolUse,
+                      onThinkingTurn: params.onThinkingTurn,
+                      onToolUseEvent: params.onToolUseEvent,
+                      onToolResult: params.onToolResult,
+                    },
+              )
             : undefined;
 
         const managedRun = await supervisor.spawn({
@@ -1253,31 +1260,35 @@ export async function runCliAgent(params: {
           const parsed = parseCliJson(stdout, backend);
           output = parsed ?? { text: stdout };
         }
-        try {
-          const appendResult = await appendCliTurnToSessionTranscript({
-            sessionFile: params.sessionFile,
-            sessionId: params.sessionId,
-            userText: params.prompt,
-            assistantText: output.text,
+        if (!isSystemCall) {
+          try {
+            const appendResult = await appendCliTurnToSessionTranscript({
+              sessionFile: params.sessionFile,
+              sessionId: params.sessionId,
+              userText: params.prompt,
+              assistantText: output.text,
+              provider: params.provider,
+              model: normalizedModel,
+              usage: output.usage,
+            });
+            if (!appendResult.ok) {
+              log.debug(`cli transcript append skipped: ${appendResult.reason}`);
+            }
+          } catch (err) {
+            log.warn(`cli transcript append failed: ${String(err)}`);
+          }
+        }
+        if (!isSystemCall) {
+          emitCliLlmOutputHook({
+            hookRunner,
+            hookCtx,
+            runId: params.runId,
+            sessionId: output.sessionId ?? resolvedSessionId ?? params.sessionId,
             provider: params.provider,
             model: normalizedModel,
-            usage: output.usage,
+            output,
           });
-          if (!appendResult.ok) {
-            log.debug(`cli transcript append skipped: ${appendResult.reason}`);
-          }
-        } catch (err) {
-          log.warn(`cli transcript append failed: ${String(err)}`);
         }
-        emitCliLlmOutputHook({
-          hookRunner,
-          hookCtx,
-          runId: params.runId,
-          sessionId: output.sessionId ?? resolvedSessionId ?? params.sessionId,
-          provider: params.provider,
-          model: normalizedModel,
-          output,
-        });
         return output;
       });
 
@@ -1311,62 +1322,101 @@ export async function runCliAgent(params: {
       };
     } catch (err) {
       if (err instanceof FailoverError) {
-        // Layer 2: Context overflow retry with minimal bootstrap profile
-        if (isContextOverflowError(err.message) && activeProfile !== "minimal") {
+        // Layer 2: Context overflow recovery — compact session history then retry with minimal profile
+        if (isContextOverflowError(err.message)) {
           const preRetryEstimatedTokens =
             estimatePromptTokens(systemPrompt) +
             estimatePromptTokens(promptForRun) +
             imageTokenEstimate;
-          log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
-            retry_count: 1,
-            trim_profile: "minimal",
-            reason: "context_overflow",
-            previous_profile: activeProfile,
-            estimated_tokens: preRetryEstimatedTokens,
-            context_window: contextWindowTokens,
-          });
-          const minimalConfig = getBootstrapProfileConfig("minimal");
-          const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
-            maxChars: minimalConfig.maxCharsPerFile,
-            totalMaxChars: minimalConfig.totalMaxChars,
-            warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
-          });
-          const minimalWarning = buildBootstrapPromptWarning({
-            analysis: analyzeBootstrapBudget({
-              files: buildBootstrapInjectionStats({
-                bootstrapFiles,
-                injectedFiles: minimalContextFiles,
+
+          // Step 2a: Send /compact to the existing session to shrink conversation history.
+          // /compact supports non-interactive (-p) mode (supportsNonInteractive=true in claude-cli source).
+          // Only meaningful for claude-cli backend with an existing session to resume.
+          const sessionToCompact = params.cliSessionId;
+          let compactSucceeded = false;
+          if (sessionToCompact && isClaude) {
+            try {
+              log.warn("cli-runner: context overflow detected, sending /compact to session", {
+                session: redactRunIdentifier(sessionToCompact),
+                previous_profile: activeProfile,
+                estimated_tokens: preRetryEstimatedTokens,
+                context_window: contextWindowTokens,
+              });
+              await executeCliWithSession(sessionToCompact, "/compact", true /* isSystemCall */);
+              compactSucceeded = true;
+              log.warn("cli-runner: /compact succeeded, will retry with minimal profile");
+            } catch (compactErr) {
+              // If compact failed because the session expired, re-throw immediately so the
+              // session_expired handler below can clear the stale session and retry correctly.
+              if (compactErr instanceof FailoverError && compactErr.reason === "session_expired") {
+                throw compactErr;
+              }
+              log.warn(
+                `cli-runner: /compact failed (${compactErr instanceof Error ? compactErr.message : String(compactErr)}), proceeding with profile downgrade only`,
+              );
+            }
+          } else {
+            log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
+              provider: params.provider,
+              previous_profile: activeProfile,
+              estimated_tokens: preRetryEstimatedTokens,
+              context_window: contextWindowTokens,
+            });
+          }
+
+          // Step 2b: Downgrade bootstrap profile to minimal to also shrink system prompt.
+          if (activeProfile !== "minimal") {
+            const minimalConfig = getBootstrapProfileConfig("minimal");
+            const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+              maxChars: minimalConfig.maxCharsPerFile,
+              totalMaxChars: minimalConfig.totalMaxChars,
+              warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
+            });
+            const minimalWarning = buildBootstrapPromptWarning({
+              analysis: analyzeBootstrapBudget({
+                files: buildBootstrapInjectionStats({
+                  bootstrapFiles,
+                  injectedFiles: minimalContextFiles,
+                }),
+                bootstrapMaxChars: minimalConfig.maxCharsPerFile,
+                bootstrapTotalMaxChars: minimalConfig.totalMaxChars,
               }),
-              bootstrapMaxChars: minimalConfig.maxCharsPerFile,
-              bootstrapTotalMaxChars: minimalConfig.totalMaxChars,
-            }),
-            mode: bootstrapPromptWarningMode,
-            seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-            previousSignature: params.bootstrapPromptWarningSignature,
-          });
-          const minimalSystemPrompt = buildSystemPrompt({
-            workspaceDir,
-            config: params.config,
-            defaultThinkLevel: params.thinkLevel,
-            extraSystemPrompt,
-            skillsPrompt,
-            ownerNumbers: params.ownerNumbers,
-            heartbeatPrompt,
-            docsPath: docsPath ?? undefined,
-            tools: [],
-            contextFiles: minimalContextFiles,
-            bootstrapTruncationWarningLines: minimalWarning.lines,
-            modelDisplay,
-            agentId: sessionAgentId,
-          });
-          // Reassign the `let` bindings so executeCliWithSession sees the new prompt
-          systemPrompt = minimalSystemPrompt;
-          activeContextFiles = minimalContextFiles;
-          activeProfile = "minimal";
-          // Rebuild report to reflect the minimal profile used for retry
-          systemPromptReport = buildReportForActiveContext();
+              mode: bootstrapPromptWarningMode,
+              seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
+              previousSignature: params.bootstrapPromptWarningSignature,
+            });
+            const minimalSystemPrompt = buildSystemPrompt({
+              workspaceDir,
+              config: params.config,
+              defaultThinkLevel: params.thinkLevel,
+              extraSystemPrompt,
+              skillsPrompt,
+              ownerNumbers: params.ownerNumbers,
+              heartbeatPrompt,
+              docsPath: docsPath ?? undefined,
+              tools: [],
+              contextFiles: minimalContextFiles,
+              bootstrapTruncationWarningLines: minimalWarning.lines,
+              modelDisplay,
+              agentId: sessionAgentId,
+            });
+            // Reassign the `let` bindings so executeCliWithSession sees the new prompt
+            systemPrompt = minimalSystemPrompt;
+            activeContextFiles = minimalContextFiles;
+            activeProfile = "minimal";
+            // Rebuild report to reflect the minimal profile used for retry
+            systemPromptReport = buildReportForActiveContext();
+          }
+
+          // Step 2c: Retry the original prompt with compacted session + minimal profile.
+          // Session selection:
+          // - If compact succeeded: resume the compacted session (history is shorter now).
+          // - If compact failed or no session: use undefined to start a fresh session so the
+          //   minimal system prompt is guaranteed to be injected (avoids systemPromptWhen:"first"
+          //   skipping re-injection on resume when the profile was just downgraded to minimal).
+          const sessionForRetry = compactSucceeded ? params.cliSessionId : undefined;
           try {
-            const output = await executeCliWithSession(undefined);
+            const output = await executeCliWithSession(sessionForRetry);
             const text = output.text?.trim();
             const payloads = text ? [{ text }] : undefined;
             return {
@@ -1375,7 +1425,7 @@ export async function runCliAgent(params: {
                 durationMs: Date.now() - started,
                 systemPromptReport,
                 agentMeta: {
-                  sessionId: output.sessionId ?? params.sessionId ?? "",
+                  sessionId: output.sessionId ?? sessionForRetry ?? params.sessionId ?? "",
                   provider: params.provider,
                   model: modelId,
                   usage: output.usage,
@@ -1385,11 +1435,11 @@ export async function runCliAgent(params: {
           } catch (retryErr) {
             if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
               const estimatedTks =
-                estimatePromptTokens(minimalSystemPrompt) +
+                estimatePromptTokens(systemPrompt) +
                 estimatePromptTokens(promptForRun) +
                 imageTokenEstimate;
               throw new FailoverError(
-                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). Consider switching to the pi-embedded runtime or splitting the task.`,
+                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal, compact=${compactSucceeded}). Consider switching to the pi-embedded runtime or splitting the task.`,
                 {
                   reason: "unknown",
                   provider: params.provider,
