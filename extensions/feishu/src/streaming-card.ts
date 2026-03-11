@@ -90,7 +90,6 @@ async function getToken(creds: Credentials): Promise<string> {
   return data.tenant_access_token;
 }
 
-
 function truncateSummary(text: string, max = 50): string {
   if (!text) {
     return "";
@@ -171,6 +170,9 @@ export class FeishuStreamingSession {
   private lastUpdateTime = 0;
   private pendingUpdate: PendingUpdate | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
+  private lastStreamingModeRenewAt = 0;
+  // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
+  private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
 
   constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
@@ -257,13 +259,48 @@ export class FeishuStreamingSession {
     }
 
     this.state = { cardId, messageId: sendRes.data.message_id, sequence: 1, currentText: "" };
+    this.lastStreamingModeRenewAt = Date.now();
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
+  }
+
+  private async renewStreamingMode(): Promise<void> {
+    if (!this.state) {
+      return;
+    }
+    if (
+      Date.now() - this.lastStreamingModeRenewAt <
+      FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS
+    ) {
+      return;
+    }
+    // Snapshot the candidate sequence but only commit it to state on success,
+    // so a failed renewal does not leave a permanent hole in the sequence.
+    const seq = this.state.sequence + 1;
+    try {
+      const response = await this.client.cardkit.v1.card.settings({
+        path: { card_id: this.state.cardId },
+        data: {
+          settings: JSON.stringify({ config: { streaming_mode: true } }),
+          sequence: seq,
+          uuid: `r_${this.state.cardId}_${seq}`,
+        },
+      });
+      if ((response.code ?? 0) !== 0) {
+        throw new Error(response.msg || `code ${response.code}`);
+      }
+      this.state.sequence = seq;
+      this.lastStreamingModeRenewAt = Date.now();
+      this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
+    } catch (e) {
+      this.log?.(`Renew streaming mode failed: ${String(e)}`);
+    }
   }
 
   private async updateCardContent(text: string, onError?: (error: unknown) => void): Promise<void> {
     if (!this.state) {
       return;
     }
+    await this.renewStreamingMode();
     this.state.sequence += 1;
     await this.client.cardkit.v1.cardElement
       .content({
