@@ -490,14 +490,28 @@ function normalizeMentions(
 
   for (const mention of mentions) {
     const mentionId = mention.id.open_id;
-    const replacement =
-      botStripId && mentionId === botStripId
-        ? ""
-        : mentionId
+    const isBotMention = Boolean(botStripId && mentionId === botStripId);
+
+    result = result
+      .replace(new RegExp(escaped(mention.key), "g"), (match, offset, str) => {
+        if (isBotMention) {
+          // Strip the bot's addressing-prefix mention key unless the raw @Name
+          // display text immediately precedes it (Feishu includes both in
+          // content). When the display text is present, normalize to <at> so
+          // the full mention is preserved for the model context.
+          const before = (str as string).substring(0, offset as number).trimEnd();
+          if (before.endsWith(`@${mention.name}`)) {
+            return mentionId
+              ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
+              : `@${mention.name}`;
+          }
+          return "";
+        }
+        return mentionId
           ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
           : `@${mention.name}`;
-
-    result = result.replace(new RegExp(escaped(mention.key), "g"), () => replacement).trim();
+      })
+      .trim();
   }
 
   return result;
@@ -1530,7 +1544,7 @@ export async function handleFeishuMessage(params: {
             skipReplyToInMessages: !isGroup,
             replyInThread,
             streamingInThread,
-            rootId: replyInThread ? ctx.rootId : undefined,
+            rootId: ctx.rootId,
             threadReply: replyInThread && threadReply,
             mentionTargets: ctx.mentionTargets,
             accountId: account.accountId,
@@ -1695,7 +1709,7 @@ export async function handleFeishuMessage(params: {
         skipReplyToInMessages: !isGroup,
         replyInThread: boundSessionKey ? true : replyInThread,
         streamingInThread: boundSessionKey ? true : streamingInThread,
-        rootId: boundSessionKey ? ctx.rootId : replyInThread ? ctx.rootId : undefined,
+        rootId: ctx.rootId,
         threadReply: boundSessionKey ? true : replyInThread && threadReply,
         mentionTargets: ctx.mentionTargets,
         accountId: account.accountId,

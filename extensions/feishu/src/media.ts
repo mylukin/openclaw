@@ -481,8 +481,11 @@ export async function sendMediaFeishu(params: {
       fileType,
       accountId,
     });
-    // Feishu API: opus -> "audio", mp4/video -> "media" (playable), others -> "file"
-    const msgType = fileType === "opus" ? "audio" : fileType === "mp4" ? "media" : "file";
+    // Feishu API: opus -> "audio", mp4/video -> "media" (playable in thread replies),
+    // others -> "file". When replyToMessageId is set but replyInThread is not true,
+    // "media" type is not compatible with message.create — use "file" instead.
+    const useMediaType = fileType === "mp4" && !(replyToMessageId && !replyInThread);
+    const msgType = fileType === "opus" ? "audio" : useMediaType ? "media" : "file";
     return sendFileFeishu({
       cfg,
       to,

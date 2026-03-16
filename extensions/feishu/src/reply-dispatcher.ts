@@ -193,6 +193,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streamingStartPromise: Promise<void> | null = null;
   let finalTextEmitted = false;
   let replaceNextPartialAfterTool = false;
+  let lastFinalText: string | undefined;
 
   const emitFinalTextIfNeeded = async (
     text: string,
@@ -469,108 +470,119 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
         if (hasText) {
           const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+          const normalizedText = text.trim();
+          // Duplicate-final-text guard: skip re-sending the same final text
+          // but still allow media to propagate through the outer hasMedia block.
+          const isTextDuplicate =
+            info?.kind === "final" && normalizedText !== "" && normalizedText === lastFinalText;
 
-          if (info?.kind === "block") {
-            // Drop internal block chunks unless we can safely consume them as
-            // streaming-card fallback content.
-            if (!(streamingEnabled && useCard)) {
+          if (!isTextDuplicate) {
+            if (info?.kind === "final" && normalizedText) {
+              lastFinalText = normalizedText;
+            }
+
+            if (info?.kind === "block") {
+              // Drop internal block chunks unless we can safely consume them as
+              // streaming-card fallback content.
+              if (!(streamingEnabled && useCard)) {
+                return;
+              }
+              startStreaming();
+              if (streamingStartPromise) {
+                await streamingStartPromise;
+              }
+            }
+
+            if (info?.kind === "final" && streamingEnabled && useCard) {
+              startStreaming();
+              if (streamingStartPromise) {
+                await streamingStartPromise;
+              }
+            }
+
+            if (streaming?.isActive()) {
+              if (info?.kind === "block") {
+                // Some runtimes emit block payloads without onPartial/final callbacks.
+                // Mirror block text into streamText so onIdle close still sends content.
+                queueThinkingPrelude();
+                queueStreamingUpdate(text);
+              }
+              if (info?.kind === "final") {
+                streamText = text;
+                await closeStreaming({ emitFinalText: true });
+              }
+              // Send media even when streaming handled the text
+              if (hasMedia) {
+                for (const mediaUrl of mediaList) {
+                  await sendMediaFeishu({
+                    cfg,
+                    to: chatId,
+                    mediaUrl,
+                    replyToMessageId: sendReplyToMessageId,
+                    replyInThread: effectiveReplyInThread,
+                    accountId,
+                  });
+                }
+              }
               return;
             }
-            startStreaming();
-            if (streamingStartPromise) {
-              await streamingStartPromise;
-            }
-          }
 
-          if (info?.kind === "final" && streamingEnabled && useCard) {
-            startStreaming();
-            if (streamingStartPromise) {
-              await streamingStartPromise;
-            }
-          }
-
-          if (streaming?.isActive()) {
-            if (info?.kind === "block") {
-              // Some runtimes emit block payloads without onPartial/final callbacks.
-              // Mirror block text into streamText so onIdle close still sends content.
-              queueThinkingPrelude();
-              queueStreamingUpdate(text);
-            }
-            if (info?.kind === "final") {
-              streamText = text;
-              await closeStreaming({ emitFinalText: true });
-            }
-            // Send media even when streaming handled the text
-            if (hasMedia) {
-              for (const mediaUrl of mediaList) {
-                await sendMediaFeishu({
+            let first = true;
+            let lastMessageId: string | undefined;
+            const deliveredMessageIds: string[] = [];
+            if (useCard) {
+              for (const chunk of core.channel.text.chunkTextWithMode(
+                text,
+                textChunkLimit,
+                chunkMode,
+              )) {
+                const sent = await sendMarkdownCardFeishu({
                   cfg,
                   to: chatId,
-                  mediaUrl,
+                  text: chunk,
                   replyToMessageId: sendReplyToMessageId,
                   replyInThread: effectiveReplyInThread,
+                  mentions: first ? mentionTargets : undefined,
                   accountId,
                 });
+                const sentMessageId = sent?.messageId;
+                if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                  lastMessageId = sentMessageId;
+                  deliveredMessageIds.push(sentMessageId);
+                }
+                first = false;
+              }
+            } else {
+              const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+              for (const chunk of core.channel.text.chunkTextWithMode(
+                converted,
+                textChunkLimit,
+                chunkMode,
+              )) {
+                const sent = await sendMessageFeishu({
+                  cfg,
+                  to: chatId,
+                  text: chunk,
+                  replyToMessageId: sendReplyToMessageId,
+                  replyInThread: effectiveReplyInThread,
+                  mentions: first ? mentionTargets : undefined,
+                  accountId,
+                });
+                const sentMessageId = sent?.messageId;
+                if (typeof sentMessageId === "string" && sentMessageId.trim()) {
+                  lastMessageId = sentMessageId;
+                  deliveredMessageIds.push(sentMessageId);
+                }
+                first = false;
               }
             }
-            return;
-          }
-
-          let first = true;
-          let lastMessageId: string | undefined;
-          const deliveredMessageIds: string[] = [];
-          if (useCard) {
-            for (const chunk of core.channel.text.chunkTextWithMode(
-              text,
-              textChunkLimit,
-              chunkMode,
-            )) {
-              const sent = await sendMarkdownCardFeishu({
-                cfg,
-                to: chatId,
-                text: chunk,
-                replyToMessageId: sendReplyToMessageId,
-                replyInThread: effectiveReplyInThread,
-                mentions: first ? mentionTargets : undefined,
-                accountId,
+            if (info?.kind === "final") {
+              emitMessageSent({ content: text, success: true, messageId: lastMessageId });
+              await emitFinalTextIfNeeded(text, {
+                ...(lastMessageId ? { messageId: lastMessageId } : {}),
+                ...(deliveredMessageIds.length > 0 ? { messageIds: deliveredMessageIds } : {}),
               });
-              const sentMessageId = sent?.messageId;
-              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
-                lastMessageId = sentMessageId;
-                deliveredMessageIds.push(sentMessageId);
-              }
-              first = false;
             }
-          } else {
-            const converted = core.channel.text.convertMarkdownTables(text, tableMode);
-            for (const chunk of core.channel.text.chunkTextWithMode(
-              converted,
-              textChunkLimit,
-              chunkMode,
-            )) {
-              const sent = await sendMessageFeishu({
-                cfg,
-                to: chatId,
-                text: chunk,
-                replyToMessageId: sendReplyToMessageId,
-                replyInThread: effectiveReplyInThread,
-                mentions: first ? mentionTargets : undefined,
-                accountId,
-              });
-              const sentMessageId = sent?.messageId;
-              if (typeof sentMessageId === "string" && sentMessageId.trim()) {
-                lastMessageId = sentMessageId;
-                deliveredMessageIds.push(sentMessageId);
-              }
-              first = false;
-            }
-          }
-          if (info?.kind === "final") {
-            emitMessageSent({ content: text, success: true, messageId: lastMessageId });
-            await emitFinalTextIfNeeded(text, {
-              ...(lastMessageId ? { messageId: lastMessageId } : {}),
-              ...(deliveredMessageIds.length > 0 ? { messageIds: deliveredMessageIds } : {}),
-            });
           }
         }
 
