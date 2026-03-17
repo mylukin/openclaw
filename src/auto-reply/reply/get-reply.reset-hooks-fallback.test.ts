@@ -11,7 +11,6 @@ const mocks = vi.hoisted(() => ({
 
 registerGetReplyCommonMocks();
 
-
 vi.mock("../../link-understanding/apply.js", () => ({
   applyLinkUnderstanding: vi.fn(async () => undefined),
 }));
