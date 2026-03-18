@@ -967,6 +967,12 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
   if (isJsonApiInternalServerError(raw)) {
     return "timeout";
   }
+  // Catch bare "internal server error" text that isn't wrapped in a JSON
+  // payload (e.g. "HTTP 400: Internal server error" from OpenAI proxies).
+  // This is always a server-side fault and should trigger failover.
+  if (raw.toLowerCase().includes("internal server error")) {
+    return "timeout";
+  }
   if (isCloudCodeAssistFormatError(raw)) {
     return "format";
   }
