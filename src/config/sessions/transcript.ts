@@ -265,7 +265,6 @@ export async function appendCliTurnToSessionTranscript(params: {
   return { ok: true };
 }
 
-
 export async function appendAssistantMessageToSessionTranscript(params: {
   agentId?: string;
   sessionKey: string;
