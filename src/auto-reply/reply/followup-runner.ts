@@ -146,7 +146,7 @@ export function createFollowupRunner(params: {
         });
       }
       let autoCompactionCompleted = false;
-      let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+      let runResult: Awaited<ReturnType<typeof runModelAwareAgent>>;
       let fallbackProvider = queued.run.provider;
       let fallbackModel = queued.run.model;
       const activeSessionEntry =
