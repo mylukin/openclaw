@@ -9,6 +9,7 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
+const emitMessageSentMock = vi.hoisted(() => vi.fn());
 const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
 const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
 const streamingInstances = vi.hoisted(() => [] as any[]);
@@ -50,6 +51,12 @@ vi.mock("./streaming-card.js", async () => {
 });
 
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
+
+async function flushAsyncTasks(iterations = 8): Promise<void> {
+  for (let i = 0; i < iterations; i += 1) {
+    await Promise.resolve();
+  }
+}
 
 describe("createFeishuReplyDispatcher streaming behavior", () => {
   type ReplyDispatcherArgs = Parameters<typeof createFeishuReplyDispatcher>[0];
@@ -94,6 +101,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
           createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
           resolveHumanDelayConfig: vi.fn(() => undefined),
         },
+      },
+      hooks: {
+        emitMessageSent: emitMessageSentMock,
       },
     });
   });
@@ -238,15 +248,55 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(sendMediaFeishuMock).not.toHaveBeenCalled();
   });
 
-  it("sets disableBlockStreaming in replyOptions to prevent silent reply drops", async () => {
-    const result = createFeishuReplyDispatcher({
+  it("does not force streaming in auto mode for reasoning/tool events without card content", async () => {
+    const dispatcher = createFeishuReplyDispatcher({
       cfg: {} as never,
       agentId: "agent",
-      runtime: {} as never,
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
     });
 
-    expect(result.replyOptions).toHaveProperty("disableBlockStreaming", true);
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await dispatcher.replyOptions.onReasoningStream?.({ text: "reasoning...", isReasoning: true });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(0);
+
+    await options.deliver({ text: "plain text" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(0);
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("renders staged thinking status with first partial text chunk in auto mode", async () => {
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(
+      1,
+      "💭 思考中...\n---\n第一段答案",
+      {
+        mode: "replace",
+      },
+    );
+    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(2, "第一段答案", {
+      mode: "replace",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案");
   });
 
   it("uses streaming session for auto mode markdown payloads", async () => {
@@ -365,7 +415,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
-  it("treats block updates as delta chunks", async () => {
+  it("stages thinking prelude on assistant message start without opening a card", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -384,6 +434,99 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await result.replyOptions.onPartialReply?.({ text: "hello" });
     await options.deliver({ text: "lo world" }, { kind: "block" });
     await options.onIdle?.();
+    expect(streamingInstances).toHaveLength(0);
+  });
+
+  it("stages thinking/tool status lines until first text chunk and keeps final close content text-only", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await dispatcher.replyOptions.onReasoningStream?.({
+      text: "Reasoning:\n_step_",
+      isReasoning: true,
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(0);
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(0);
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(
+      1,
+      "🔧 正在使用Read工具...\n---\n第一段答案",
+      {
+        mode: "replace",
+      },
+    );
+    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(2, "第一段答案", {
+      mode: "replace",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith(
+      "🔧 已使用 2 个工具，正在处理...\n---\n第一段答案",
+      { mode: "replace" },
+    );
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案\n第二段答案" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案\n第二段答案", {
+      mode: "replace",
+    });
+
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n第二段答案");
+  });
+
+  it("stages tool status when tool event is first and renders with first text", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(0);
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
@@ -642,6 +785,36 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         replyInThread: true,
       }),
     );
+  });
+
+  it("does not create streaming card when final content is empty", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onReasoningStream?.({ text: "thinking", isReasoning: true });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.onIdle?.();
+
+    expect(streamingInstances).toHaveLength(0);
   });
 
   it("passes replyInThread to media attachments", async () => {

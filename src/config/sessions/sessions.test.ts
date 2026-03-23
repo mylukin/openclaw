@@ -21,7 +21,10 @@ import {
   validateSessionId,
 } from "./paths.js";
 import { evaluateSessionFreshness, resolveSessionResetPolicy } from "./reset.js";
-import { appendAssistantMessageToSessionTranscript } from "./transcript.js";
+import {
+  appendAssistantMessageToSessionTranscript,
+  appendCliTurnToSessionTranscript,
+} from "./transcript.js";
 import type { SessionEntry } from "./types.js";
 
 function useTempSessionsFixture(prefix: string) {
@@ -403,6 +406,14 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     const result = await appendAssistantMessageToSessionTranscript({
       sessionKey,
       text: "Hello from delivery mirror!",
+      messageMeta: {
+        channel: "feishu",
+        accountId: "default",
+        chatId: "oc_dm_1",
+        chatType: "direct",
+        providerMessageId: "om_reply_1",
+        providerMessageIds: ["om_reply_1"],
+      },
       storePath: fixture.storePath(),
     });
 
@@ -426,6 +437,14 @@ describe("appendAssistantMessageToSessionTranscript", () => {
       expect(messageLine.message.role).toBe("assistant");
       expect(messageLine.message.content[0].type).toBe("text");
       expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
+      expect(messageLine.message.openclawMessageMeta).toEqual({
+        channel: "feishu",
+        accountId: "default",
+        chatId: "oc_dm_1",
+        chatType: "direct",
+        providerMessageId: "om_reply_1",
+        providerMessageIds: ["om_reply_1"],
+      });
     }
   });
 
@@ -537,6 +556,70 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     expect(result.ok).toBe(true);
     const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
     expect(lines.length).toBe(3);
+  });
+});
+
+describe("appendCliTurnToSessionTranscript", () => {
+  const fixture = useTempSessionsFixture("transcript-cli-test-");
+
+  it("appends user+assistant turns to a session transcript", async () => {
+    const sessionFile = path.join(fixture.sessionsDir(), "cli-session.jsonl");
+
+    const result = await appendCliTurnToSessionTranscript({
+      sessionFile,
+      sessionId: "cli-session",
+      userText: "Summarize yesterday notes",
+      assistantText: "Done.",
+      provider: "claude-cli",
+      model: "sonnet",
+      usage: {
+        input: 12,
+        output: 8,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
+    const entries = lines.map((line) => JSON.parse(line));
+    const header = entries.find((entry) => entry.type === "session");
+    expect(header.type).toBe("session");
+    expect(header.id).toBe("cli-session");
+
+    const messages = entries.filter((entry) => entry.type === "message");
+    expect(messages.length).toBe(2);
+
+    const userLine = messages[0];
+    expect(userLine.type).toBe("message");
+    expect(userLine.message.role).toBe("user");
+    expect(userLine.message.content[0].text).toBe("Summarize yesterday notes");
+
+    const assistantLine = messages[1];
+    expect(assistantLine.type).toBe("message");
+    expect(assistantLine.message.role).toBe("assistant");
+    expect(assistantLine.message.provider).toBe("claude-cli");
+    expect(assistantLine.message.model).toBe("sonnet");
+    expect(assistantLine.message.usage.totalTokens).toBe(20);
+  });
+
+  it("uses zero usage when cli output does not include usage", async () => {
+    const sessionFile = path.join(fixture.sessionsDir(), "cli-session-no-usage.jsonl");
+
+    const result = await appendCliTurnToSessionTranscript({
+      sessionFile,
+      sessionId: "cli-session-no-usage",
+      userText: "ping",
+      assistantText: "pong",
+      provider: "claude-cli",
+      model: "sonnet",
+    });
+
+    expect(result.ok).toBe(true);
+    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
+    const entries = lines.map((line) => JSON.parse(line));
+    const messages = entries.filter((entry) => entry.type === "message");
+    const assistantLine = messages[1];
+    expect(assistantLine.message.role).toBe("assistant");
+    expect(assistantLine.message.usage.totalTokens).toBe(0);
   });
 });
 

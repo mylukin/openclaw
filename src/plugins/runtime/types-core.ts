@@ -11,6 +11,10 @@ export type RuntimeLogger = {
 /** Core runtime helpers exposed to trusted native plugins. */
 export type PluginRuntimeCore = {
   version: string;
+  agents: {
+    runEmbeddedPiAgent: typeof import("../../agents/pi-embedded.js").runEmbeddedPiAgent;
+    runModelAwareAgent: typeof import("../../agents/model-aware-runner.js").runModelAwareAgent;
+  };
   config: {
     loadConfig: typeof import("../../config/config.js").loadConfig;
     writeConfigFile: typeof import("../../config/config.js").writeConfigFile;
@@ -86,6 +90,29 @@ export type PluginRuntimeCore = {
       bindings?: Record<string, unknown>,
       opts?: { level?: LogLevel },
     ) => RuntimeLogger;
+  };
+  hooks: {
+    /**
+     * Emit a message_sent plugin hook event.
+     * Use this from extensions that bypass the core deliverOutboundPayloads pipeline
+     * (e.g. channel-specific reply dispatchers) so downstream plugins (bot-company
+     * journal, analytics, etc.) can still observe outbound messages.
+     */
+    emitMessageSent: (
+      event: {
+        to: string;
+        content: string;
+        success: boolean;
+        messageId?: string;
+        error?: string;
+        metadata?: Record<string, unknown>;
+      },
+      context: {
+        channelId: string;
+        accountId?: string;
+        conversationId?: string;
+      },
+    ) => void;
   };
   state: {
     resolveStateDir: typeof import("../../config/paths.js").resolveStateDir;

@@ -860,4 +860,10 @@ describe("classifyFailoverReason", () => {
       ),
     ).toBe("timeout");
   });
+
+  it("classifies bare 'Internal server error' text as timeout", () => {
+    expect(classifyFailoverReason("HTTP 400: Internal server error")).toBe("timeout");
+    expect(classifyFailoverReason("400 Internal server error")).toBe("timeout");
+    expect(classifyFailoverReason("Internal server error")).toBe("timeout");
+  });
 });

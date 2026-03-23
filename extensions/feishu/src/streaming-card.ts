@@ -169,6 +169,10 @@ export class FeishuStreamingSession {
   private pendingText: string | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
+  private lastStreamingModeRenewAt = 0;
+  private renewTimer: ReturnType<typeof setInterval> | null = null;
+  // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
+  private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
 
   constructor(client: Client, creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
@@ -289,7 +293,63 @@ export class FeishuStreamingSession {
       currentText: "",
       hasNote: !!options?.note,
     };
+    this.lastStreamingModeRenewAt = Date.now();
+    this.startRenewTimer();
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
+  }
+
+  /** Proactive timer -- renews streaming_mode even when no content updates are flowing. */
+  private startRenewTimer(): void {
+    this.stopRenewTimer();
+    this.renewTimer = setInterval(() => {
+      this.renewStreamingMode().catch(() => {});
+    }, FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS);
+    this.renewTimer.unref();
+  }
+
+  private stopRenewTimer(): void {
+    if (this.renewTimer !== null) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = null;
+    }
+  }
+
+  private async renewStreamingMode(): Promise<void> {
+    if (!this.state) {
+      return;
+    }
+    if (
+      Date.now() - this.lastStreamingModeRenewAt <
+      FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS
+    ) {
+      return;
+    }
+    const apiBase = resolveApiBase(this.creds.domain);
+    this.state.sequence += 1;
+    try {
+      const { release } = await fetchWithSsrFGuard({
+        url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
+        init: {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${await getToken(this.creds)}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({
+            settings: JSON.stringify({ config: { streaming_mode: true } }),
+            sequence: this.state.sequence,
+            uuid: `r_${this.state.cardId}_${this.state.sequence}`,
+          }),
+        },
+        policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+        auditContext: "feishu.streaming-card.renew",
+      });
+      await release();
+      this.lastStreamingModeRenewAt = Date.now();
+      this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
+    } catch (e) {
+      this.log?.(`Renew streaming mode failed: ${String(e)}`);
+    }
   }
 
   private async updateCardContent(text: string, onError?: (error: unknown) => void): Promise<void> {
@@ -395,6 +455,7 @@ export class FeishuStreamingSession {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    this.stopRenewTimer();
     await this.queue;
 
     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
@@ -442,6 +503,33 @@ export class FeishuStreamingSession {
     this.pendingText = null;
 
     this.log?.(`Closed streaming: cardId=${finalState.cardId}`);
+  }
+
+  /** Discard the streaming card by deleting the message entirely. */
+  async discard(): Promise<void> {
+    if (!this.state || this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.stopRenewTimer();
+    await this.queue;
+
+    const messageId = this.state.messageId;
+    this.state = null;
+    this.pendingText = null;
+
+    try {
+      await this.client.im.v1.message.delete({
+        path: { message_id: messageId },
+      });
+      this.log?.(`Discarded streaming message: ${messageId}`);
+    } catch (e) {
+      this.log?.(`Discard failed: ${String(e)}`);
+    }
   }
 
   isActive(): boolean {

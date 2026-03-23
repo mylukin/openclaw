@@ -50,6 +50,8 @@ const ERROR_PATTERNS = {
     /\bstop reason:\s*(?:abort|error|malformed_response|network_error)\b/i,
     /\breason:\s*(?:abort|error|malformed_response|network_error)\b/i,
     /\bunhandled stop reason:\s*(?:abort|error|malformed_response|network_error)\b/i,
+    // OpenAI generic 500: "An error occurred while processing your request. You can retry your request..."
+    /you can retry your request/i,
   ],
   billing: [
     /["']?(?:status|code)["']?\s*[:=]\s*402\b|\bhttp\s*402\b|\berror(?:\s+code)?\s*[:=]?\s*402\b|\b(?:got|returned|received)\s+(?:a\s+)?402\b|^\s*402\s+payment/i,

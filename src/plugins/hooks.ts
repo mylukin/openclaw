@@ -22,6 +22,8 @@ import type {
   PluginHookInboundClaimContext,
   PluginHookInboundClaimEvent,
   PluginHookInboundClaimResult,
+  PluginHookChatMemberBotEvent,
+  PluginHookChatMemberUserEvent,
   PluginHookLlmInputEvent,
   PluginHookLlmOutputEvent,
   PluginHookBeforeResetEvent,
@@ -73,6 +75,8 @@ export type {
   PluginHookInboundClaimEvent,
   PluginHookInboundClaimResult,
   PluginHookAfterCompactionEvent,
+  PluginHookChatMemberBotEvent,
+  PluginHookChatMemberUserEvent,
   PluginHookMessageContext,
   PluginHookMessageReceivedEvent,
   PluginHookMessageSendingEvent,
@@ -623,6 +627,65 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
   }
 
   // =========================================================================
+  // Chat Member Hooks
+  // =========================================================================
+
+  /**
+   * Run chat_member_user_added hook.
+   * Runs in parallel (fire-and-forget).
+   */
+  async function runChatMemberUserAdded(
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> {
+    return runVoidHook("chat_member_user_added", event, ctx);
+  }
+
+  /**
+   * Run chat_member_user_deleted hook.
+   * Runs in parallel (fire-and-forget).
+   */
+  async function runChatMemberUserDeleted(
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> {
+    return runVoidHook("chat_member_user_deleted", event, ctx);
+  }
+
+  /**
+   * Run chat_member_user_withdrawn hook.
+   * Runs in parallel (fire-and-forget).
+   */
+  async function runChatMemberUserWithdrawn(
+    event: PluginHookChatMemberUserEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> {
+    return runVoidHook("chat_member_user_withdrawn", event, ctx);
+  }
+
+  /**
+   * Run chat_member_bot_added hook.
+   * Runs in parallel (fire-and-forget).
+   */
+  async function runChatMemberBotAdded(
+    event: PluginHookChatMemberBotEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> {
+    return runVoidHook("chat_member_bot_added", event, ctx);
+  }
+
+  /**
+   * Run chat_member_bot_deleted hook.
+   * Runs in parallel (fire-and-forget).
+   */
+  async function runChatMemberBotDeleted(
+    event: PluginHookChatMemberBotEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> {
+    return runVoidHook("chat_member_bot_deleted", event, ctx);
+  }
+
+  // =========================================================================
   // Tool Hooks
   // =========================================================================
 
@@ -936,6 +999,12 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     runMessageReceived,
     runMessageSending,
     runMessageSent,
+    // Chat member hooks
+    runChatMemberUserAdded,
+    runChatMemberUserDeleted,
+    runChatMemberUserWithdrawn,
+    runChatMemberBotAdded,
+    runChatMemberBotDeleted,
     // Tool hooks
     runBeforeToolCall,
     runAfterToolCall,

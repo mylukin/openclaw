@@ -37,6 +37,13 @@ export function resolveConversationIdFromTargets(params: {
     if (target.includes(":") && explicitConversationId === undefined) {
       continue;
     }
+    if (target.startsWith("chat:")) {
+      const chatId = normalizeConversationId(target.slice("chat:".length));
+      if (chatId) {
+        return chatId;
+      }
+      continue;
+    }
     const mentionMatch = target.match(/^<#(\d+)>$/);
     if (mentionMatch?.[1]) {
       return mentionMatch[1];

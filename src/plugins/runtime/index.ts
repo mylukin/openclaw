@@ -11,6 +11,7 @@ import {
   createLazyRuntimeModule,
 } from "../../shared/lazy-runtime.js";
 import { listWebSearchProviders, runWebSearch } from "../../web-search/runtime.js";
+import { getGlobalHookRunner } from "../hook-runner-global.js";
 import { createRuntimeAgent } from "./runtime-agent.js";
 import { createRuntimeChannel } from "./runtime-channel.js";
 import { createRuntimeConfig } from "./runtime-config.js";
@@ -48,6 +49,12 @@ const loadMediaUnderstandingRuntime = createLazyRuntimeModule(
 const loadModelAuthRuntime = createLazyRuntimeModule(
   () => import("./runtime-model-auth.runtime.js"),
 );
+const loadEmbeddedPiRuntime = createLazyRuntimeModule(
+  () => import("./runtime-embedded-pi.runtime.js"),
+);
+const loadModelAwareRuntime = createLazyRuntimeModule(
+  () => import("./runtime-model-aware.runtime.js"),
+);
 
 function createRuntimeTts(): PluginRuntime["tts"] {
   const bindTtsRuntime = createLazyRuntimeMethodBinder(loadTtsRuntime);
@@ -70,6 +77,15 @@ function createRuntimeMediaUnderstandingFacade(): PluginRuntime["mediaUnderstand
     ),
     describeVideoFile: bindMediaUnderstandingRuntime((runtime) => runtime.describeVideoFile),
     transcribeAudioFile: bindMediaUnderstandingRuntime((runtime) => runtime.transcribeAudioFile),
+  };
+}
+
+function createRuntimeAgents(): PluginRuntime["agents"] {
+  const bindEmbeddedPi = createLazyRuntimeMethodBinder(loadEmbeddedPiRuntime);
+  const bindModelAware = createLazyRuntimeMethodBinder(loadModelAwareRuntime);
+  return {
+    runEmbeddedPiAgent: bindEmbeddedPi((runtime) => runtime.runEmbeddedPiAgent),
+    runModelAwareAgent: bindModelAware((runtime) => runtime.runModelAwareAgent),
   };
 }
 
@@ -202,6 +218,7 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): 
   const mediaUnderstanding = createRuntimeMediaUnderstandingFacade();
   const runtime = {
     version: resolveVersion(),
+    agents: createRuntimeAgents(),
     config: createRuntimeConfig(),
     agent: createRuntimeAgent(),
     subagent: createLateBindingSubagent(
@@ -221,6 +238,15 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): 
     tools: createRuntimeTools(),
     channel: createRuntimeChannel(),
     events: createRuntimeEvents(),
+    hooks: {
+      emitMessageSent: (event, context) => {
+        const hookRunner = getGlobalHookRunner();
+        if (!hookRunner?.hasHooks("message_sent")) {
+          return;
+        }
+        void hookRunner.runMessageSent(event, context);
+      },
+    },
     logging: createRuntimeLogging(),
     state: { resolveStateDir },
   } satisfies Omit<PluginRuntime, "tts" | "mediaUnderstanding" | "stt" | "modelAuth"> &

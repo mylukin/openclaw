@@ -1006,6 +1006,37 @@ describe("deliverOutboundPayloads", () => {
       expect.objectContaining({
         text: "report.pdf",
         idempotencyKey: "idem-deliver-1",
+        messageMeta: {
+          channel: "telegram",
+          accountId: undefined,
+          chatId: "c1",
+          chatType: "direct",
+          providerMessageId: "m1",
+          providerMessageIds: ["m1"],
+        },
+      }),
+    );
+  });
+
+  it("stores every provider message id in transcript mirror metadata for chunked replies", async () => {
+    mocks.appendAssistantMessageToSessionTranscript.mockClear();
+
+    await runChunkedWhatsAppDelivery({
+      mirror: {
+        sessionKey: "agent:main:main",
+      },
+    });
+
+    expect(mocks.appendAssistantMessageToSessionTranscript).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageMeta: {
+          channel: "whatsapp",
+          accountId: undefined,
+          chatId: undefined,
+          chatType: "direct",
+          providerMessageId: "w2",
+          providerMessageIds: ["w1", "w2"],
+        },
       }),
     );
   });
@@ -1022,15 +1053,21 @@ describe("deliverOutboundPayloads", () => {
       deps: { sendWhatsApp },
     });
 
-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
-      expect.objectContaining({ to: "+1555", content: "hello", success: true }),
-      expect.objectContaining({ channelId: "whatsapp" }),
-    );
+    await vi.waitFor(() => {
+      expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "+1555", content: "hello", success: true, messageId: "w1" }),
+        expect.objectContaining({ channelId: "whatsapp", conversationId: "+1555" }),
+      );
+    });
   });
 
   it("emits message_sent success for sendPayload deliveries", async () => {
     hookMocks.runner.hasHooks.mockReturnValue(true);
-    const sendPayload = vi.fn().mockResolvedValue({ channel: "matrix", messageId: "mx-1" });
+    const sendPayload = vi.fn().mockResolvedValue({
+      channel: "matrix",
+      messageId: "mx-1",
+      meta: { mentions: [{ id: "ou_bot_beta", name: "Bot Beta" }] },
+    });
     const sendText = vi.fn();
     const sendMedia = vi.fn();
     setActivePluginRegistry(
@@ -1053,10 +1090,18 @@ describe("deliverOutboundPayloads", () => {
       payloads: [{ text: "payload text", channelData: { mode: "custom" } }],
     });
 
-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
-      expect.objectContaining({ to: "!room:1", content: "payload text", success: true }),
-      expect.objectContaining({ channelId: "matrix" }),
-    );
+    await vi.waitFor(() => {
+      expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "!room:1",
+          content: "payload text",
+          success: true,
+          messageId: "mx-1",
+          metadata: { mentions: [{ id: "ou_bot_beta", name: "Bot Beta" }] },
+        }),
+        expect.objectContaining({ channelId: "matrix", conversationId: "!room:1" }),
+      );
+    });
   });
 
   it("preserves channelData-only payloads with empty text for non-WhatsApp sendPayload channels", async () => {

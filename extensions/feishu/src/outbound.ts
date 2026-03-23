@@ -3,6 +3,7 @@ import path from "path";
 import { createAttachedChannelResultAdapter } from "openclaw/plugin-sdk/channel-send-result";
 import type { ChannelOutboundAdapter } from "../runtime-api.js";
 import { resolveFeishuAccount } from "./accounts.js";
+import { resolveMediaContentType } from "./media-types.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMarkdownCardFeishu, sendMessageFeishu, sendStructuredCardFeishu } from "./send.js";

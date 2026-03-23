@@ -5,6 +5,7 @@ import { registerFeishuChatTools } from "./src/chat.js";
 import { registerFeishuDocTools } from "./src/docx.js";
 import { registerFeishuDriveTools } from "./src/drive.js";
 import { registerFeishuPermTools } from "./src/perm.js";
+import { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
 import { setFeishuRuntime } from "./src/runtime.js";
 import { registerFeishuSubagentHooks } from "./src/subagent-hooks.js";
 import { registerFeishuWikiTools } from "./src/wiki.js";
@@ -12,6 +13,8 @@ import { registerFeishuWikiTools } from "./src/wiki.js";
 export { feishuPlugin } from "./src/channel.js";
 export { setFeishuRuntime } from "./src/runtime.js";
 export { monitorFeishuProvider } from "./src/monitor.js";
+export { getBotOpenId } from "./src/monitor.js";
+export { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
 export {
   sendMessageFeishu,
   sendCardFeishu,

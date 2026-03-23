@@ -840,6 +840,24 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
     diagnostics: discovery.diagnostics,
   });
   pushDiagnostics(registry.diagnostics, manifestRegistry.diagnostics);
+
+  // Embedded plugins (from Bun binary): manifests are injected by manifest-registry.ts.
+  // Add matching discovery candidates so the loader loop can find them.
+  const embeddedPlugins = (globalThis as Record<string, unknown>).__OPENCLAW_EMBEDDED_PLUGINS__ as
+    | Array<{ id: string; module: unknown; manifest: Record<string, unknown> }>
+    | undefined;
+  if (Array.isArray(embeddedPlugins)) {
+    for (const ep of embeddedPlugins) {
+      const rootDir = `__embedded__:${ep.id}`;
+      discovery.candidates.unshift({
+        idHint: ep.id,
+        source: rootDir,
+        rootDir,
+        origin: "bundled",
+      });
+    }
+  }
+
   warnWhenAllowlistIsOpen({
     logger,
     pluginsEnabled: normalized.enabled,
@@ -1069,42 +1087,52 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
       continue;
     }
 
-    const pluginRoot = safeRealpathOrResolve(candidate.rootDir);
-    const loadSource =
-      (registrationMode === "setup-only" || registrationMode === "setup-runtime") &&
-      manifestRecord.setupSource
-        ? manifestRecord.setupSource
-        : candidate.source;
-    const opened = openBoundaryFileSync({
-      absolutePath: loadSource,
-      rootPath: pluginRoot,
-      boundaryLabel: "plugin root",
-      rejectHardlinks: candidate.origin !== "bundled",
-      skipLexicalRootCheck: true,
-    });
-    if (!opened.ok) {
-      pushPluginLoadError("plugin entry path escapes plugin root or fails alias checks");
-      continue;
-    }
-    const safeSource = opened.path;
-    fs.closeSync(opened.fd);
-
     let mod: OpenClawPluginModule | null = null;
-    try {
-      mod = getJiti(safeSource)(safeSource) as OpenClawPluginModule;
-    } catch (err) {
-      recordPluginError({
-        logger,
-        registry,
-        record,
-        seenIds,
-        pluginId,
-        origin: candidate.origin,
-        error: err,
-        logPrefix: `[plugins] ${record.id} failed to load from ${record.source}: `,
-        diagnosticMessagePrefix: "failed to load plugin: ",
+
+    // Embedded plugins: module is already loaded in memory, skip file I/O.
+    const embeddedEntry = candidate.source.startsWith("__embedded__:")
+      ? embeddedPlugins?.find((e) => `__embedded__:${e.id}` === candidate.source)
+      : undefined;
+
+    if (embeddedEntry) {
+      mod = embeddedEntry.module as OpenClawPluginModule;
+    } else {
+      const pluginRoot = safeRealpathOrResolve(candidate.rootDir);
+      const loadSource =
+        (registrationMode === "setup-only" || registrationMode === "setup-runtime") &&
+        manifestRecord.setupSource
+          ? manifestRecord.setupSource
+          : candidate.source;
+      const opened = openBoundaryFileSync({
+        absolutePath: loadSource,
+        rootPath: pluginRoot,
+        boundaryLabel: "plugin root",
+        rejectHardlinks: candidate.origin !== "bundled",
+        skipLexicalRootCheck: true,
       });
-      continue;
+      if (!opened.ok) {
+        pushPluginLoadError("plugin entry path escapes plugin root or fails alias checks");
+        continue;
+      }
+      const safeSource = opened.path;
+      fs.closeSync(opened.fd);
+
+      try {
+        mod = getJiti(safeSource)(safeSource) as OpenClawPluginModule;
+      } catch (err) {
+        recordPluginError({
+          logger,
+          registry,
+          record,
+          seenIds,
+          pluginId,
+          origin: candidate.origin,
+          error: err,
+          logPrefix: `[plugins] ${record.id} failed to load from ${record.source}: `,
+          diagnosticMessagePrefix: "failed to load plugin: ",
+        });
+        continue;
+      }
     }
 
     if (

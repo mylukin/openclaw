@@ -165,6 +165,8 @@ export function isContextOverflowError(errorMessage?: string): boolean {
     lower.includes("model token limit") ||
     (hasRequestSizeExceeds && hasContextWindow) ||
     lower.includes("context overflow:") ||
+    lower.includes("context overflow \u2014") || // claude-cli uses em-dash: "Context overflow — prompt too large"
+    lower.includes("context overflow --") || // ascii fallback variant
     lower.includes("exceed context limit") ||
     lower.includes("exceeds the model's maximum context") ||
     (lower.includes("max_tokens") && lower.includes("exceed") && lower.includes("context")) ||
@@ -891,6 +893,12 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
     return "timeout";
   }
   if (isJsonApiInternalServerError(raw)) {
+    return "timeout";
+  }
+  // Catch bare "internal server error" text that isn't wrapped in a JSON
+  // payload (e.g. "HTTP 400: Internal server error" from OpenAI proxies).
+  // This is always a server-side fault and should trigger failover.
+  if (raw.toLowerCase().includes("internal server error")) {
     return "timeout";
   }
   if (isCloudCodeAssistFormatError(raw)) {
