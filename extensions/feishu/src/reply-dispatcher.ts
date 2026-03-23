@@ -565,13 +565,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       await streamingStartPromise;
     }
     await partialUpdateQueue;
+    const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
       let text = buildCombinedStreamText(reasoningText, streamText);
+      const finalText = text;
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
       }
       const finalNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
       await streaming.close(text, { note: finalNote });
+      hasVisibleTextInReply = true;
+      // Emit hooks for non-discarded streaming cards so downstream consumers
+      // (e.g. bot-company journal) can record the delivered text.
+      if (options?.emitFinalText && finalText.trim()) {
+        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+        await emitFinalTextIfNeeded(
+          finalText,
+          streamMessageId ? { messageId: streamMessageId } : undefined,
+        );
+      }
     }
     streaming = null;
     streamingStartPromise = null;
@@ -584,8 +596,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     text: string;
     useCard: boolean;
     infoKind?: string;
-    sendChunk: (params: { chunk: string; isFirst: boolean }) => Promise<void>;
-  }) => {
+    sendChunk: (params: {
+      chunk: string;
+      isFirst: boolean;
+    }) => Promise<{ messageId?: string } | void>;
+  }): Promise<{ lastMessageId?: string; deliveredMessageIds: string[] }> => {
+    const deliveredMessageIds: string[] = [];
+    let lastMessageId: string | undefined;
     const chunkSource = params.useCard
       ? params.text
       : core.channel.text.convertMarkdownTables(params.text, tableMode);
@@ -594,14 +611,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       core.channel.text.chunkTextWithMode(chunkSource, textChunkLimit, chunkMode),
     );
     for (const [index, chunk] of chunks.entries()) {
-      await params.sendChunk({
+      const result = await params.sendChunk({
         chunk,
         isFirst: index === 0,
       });
+      const sentId = result?.messageId;
+      if (typeof sentId === "string" && sentId.trim()) {
+        lastMessageId = sentId;
+        deliveredMessageIds.push(sentId);
+      }
     }
     if (params.infoKind === "final") {
       deliveredFinalTexts.add(params.text);
     }
+    return { lastMessageId, deliveredMessageIds };
   };
 
   const sendMediaReplies = async (payload: ReplyPayload) => {
@@ -691,15 +714,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
 
+          let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
           if (useCard) {
             const cardHeader = resolveCardHeader(agentId, identity);
             const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
-            await sendChunkedTextReply({
+            chunkResult = await sendChunkedTextReply({
               text,
               useCard: true,
               infoKind: info?.kind,
               sendChunk: async ({ chunk, isFirst }) => {
-                await sendStructuredCardFeishu({
+                const sent = await sendStructuredCardFeishu({
                   cfg,
                   to: chatId,
                   text: chunk,
@@ -710,15 +734,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   header: cardHeader,
                   note: cardNote,
                 });
+                return { messageId: sent?.messageId };
               },
             });
           } else {
-            await sendChunkedTextReply({
+            chunkResult = await sendChunkedTextReply({
               text,
               useCard: false,
               infoKind: info?.kind,
               sendChunk: async ({ chunk, isFirst }) => {
-                await sendMessageFeishu({
+                const sent = await sendMessageFeishu({
                   cfg,
                   to: chatId,
                   text: chunk,
@@ -727,7 +752,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   mentions: isFirst ? mentionTargets : undefined,
                   accountId,
                 });
+                return { messageId: sent?.messageId };
               },
+            });
+          }
+          if (chunkResult.deliveredMessageIds.length > 0) {
+            hasVisibleTextInReply = true;
+          }
+          if (info?.kind === "final") {
+            emitMessageSent({
+              content: text,
+              success: true,
+              messageId: chunkResult.lastMessageId,
+            });
+            await emitFinalTextIfNeeded(text, {
+              ...(chunkResult.lastMessageId ? { messageId: chunkResult.lastMessageId } : {}),
+              ...(chunkResult.deliveredMessageIds.length > 0
+                ? { messageIds: chunkResult.deliveredMessageIds }
+                : {}),
             });
           }
         }
@@ -740,11 +782,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         params.runtime.error?.(
           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
         );
-        await closeStreaming();
+        await closeStreaming({ emitFinalText: false });
         typingCallbacks?.onIdle?.();
       },
       onIdle: async () => {
-        await closeStreaming();
+        await closeStreaming({ emitFinalText: true });
         typingCallbacks?.onIdle?.();
       },
       onCleanup: () => {
