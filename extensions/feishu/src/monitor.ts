@@ -530,6 +530,9 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
   if (connectionMode === "webhook" && !account.verificationToken?.trim()) {
     throw new Error(`Feishu account "${accountId}" webhook mode requires verificationToken`);
   }
+  if (connectionMode === "webhook" && !account.encryptKey?.trim()) {
+    throw new Error(`Feishu account "${accountId}" webhook mode requires encryptKey`);
+  }
 
   const threadBindingManager = createFeishuThreadBindingManager({
     accountId,
@@ -561,11 +564,16 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
     fireAndForget: connectionMode === "webhook",
   });
 
-  if (connectionMode === "webhook") {
-    return monitorWebhook({ params, accountId, eventDispatcher });
-  }
+  try {
+    if (connectionMode === "webhook") {
+      return await monitorWebhook({ params, accountId, eventDispatcher });
+    }
 
-  return monitorWebSocket({ params, accountId, eventDispatcher });
+    return await monitorWebSocket({ params, accountId, eventDispatcher });
+  } finally {
+    threadBindingManager.stop();
+    log(`feishu[${accountId}]: thread binding adapter stopped (finally)`);
+  }
 }
 
 type ConnectionParams = {

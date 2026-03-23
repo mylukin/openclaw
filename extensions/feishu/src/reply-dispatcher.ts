@@ -2,7 +2,6 @@ import path from "node:path";
 import {
   resolveSendableOutboundReplyParts,
   resolveTextChunksWithFallback,
-  sendMediaWithLeadingCaption,
 } from "openclaw/plugin-sdk/reply-payload";
 import {
   createChannelReplyPipeline,
@@ -627,23 +626,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return { lastMessageId, deliveredMessageIds };
   };
 
-  const sendMediaReplies = async (payload: ReplyPayload) => {
-    await sendMediaWithLeadingCaption({
-      mediaUrls: resolveSendableOutboundReplyParts(payload).mediaUrls,
-      caption: "",
-      send: async ({ mediaUrl }) => {
-        await sendMediaFeishu({
-          cfg,
-          to: chatId,
-          mediaUrl,
-          replyToMessageId: sendReplyToMessageId,
-          replyInThread: effectiveReplyInThread,
-          accountId,
-        });
-      },
-    });
-  };
-
   const { dispatcher, replyOptions, markDispatchIdle } =
     core.channel.reply.createReplyDispatcherWithTyping({
       responsePrefix: prefixContext.responsePrefix,
@@ -709,7 +691,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             // Send media even when streaming handled the text
             if (hasMedia) {
-              await sendMediaReplies(payload);
+              await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
             }
             return;
           }
@@ -775,7 +757,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         }
 
         if (hasMedia) {
-          await sendMediaReplies(payload);
+          await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
         }
       },
       onError: async (error, info) => {
