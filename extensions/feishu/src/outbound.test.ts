@@ -290,6 +290,126 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
   });
 });
 
+describe("feishuOutbound HEARTBEAT_TOKEN filtering", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendMessageFeishuMock.mockResolvedValue({ messageId: "text_msg" });
+    sendMarkdownCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+    sendMediaFeishuMock.mockResolvedValue({ messageId: "media_msg" });
+  });
+
+  it("sendText: suppresses a bare HEARTBEAT_OK message and does not call send APIs", async () => {
+    const result = await sendText({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "" }));
+  });
+
+  it("sendText: strips HEARTBEAT_OK and sends the remaining content", async () => {
+    await sendText({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "Some important update. HEARTBEAT_OK",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        text: "Some important update.",
+        accountId: "main",
+      }),
+    );
+  });
+
+  it("sendText: passes through normal text without HEARTBEAT_OK unchanged", async () => {
+    await sendText({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "Hello world",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "Hello world" }),
+    );
+  });
+
+  it("sendMedia: strips HEARTBEAT_OK from caption and still sends media", async () => {
+    await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      mediaUrl: "https://example.com/image.png",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "chat_1", mediaUrl: "https://example.com/image.png" }),
+    );
+  });
+
+  it("sendMedia: suppresses HEARTBEAT_OK when no mediaUrl is provided (fallback path)", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      mediaUrl: "",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "" }));
+  });
+
+  it("sendMedia: sends normal text when no mediaUrl is provided (fallback path)", async () => {
+    await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "Just a message",
+      mediaUrl: "",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        text: "Just a message",
+      }),
+    );
+  });
+
+  it("sendMedia: strips HEARTBEAT_OK from caption and sends remaining caption + media", async () => {
+    await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "Check this out. HEARTBEAT_OK",
+      mediaUrl: "https://example.com/image.png",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Check this out.",
+      }),
+    );
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "chat_1", mediaUrl: "https://example.com/image.png" }),
+    );
+  });
+});
+
 describe("feishuOutbound.sendMedia renderMode", () => {
   beforeEach(() => {
     vi.clearAllMocks();

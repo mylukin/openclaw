@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/feishu";
+import { HEARTBEAT_TOKEN, stripHeartbeatToken } from "openclaw/plugin-sdk/feishu";
 import { resolveFeishuAccount } from "./accounts.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
@@ -64,6 +65,27 @@ function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
+/**
+ * Strip HEARTBEAT_TOKEN from outbound text before sending to Feishu.
+ * Returns the cleaned text, or null if nothing remains (pure heartbeat ack).
+ *
+ * HEARTBEAT_OK is an internal protocol token that must never be visible to users
+ * as a Feishu group/DM message. This guard is a last-resort safety net in the
+ * outbound layer — normalized replies should already have the token stripped by
+ * the reply-dispatcher pipeline, but direct deliveries (e.g. heartbeat-runner
+ * showOk path) bypass that pipeline and hit this adapter directly.
+ */
+function normalizeOutboundText(text: string): string | null {
+  if (!text.includes(HEARTBEAT_TOKEN)) {
+    return text;
+  }
+  const stripped = stripHeartbeatToken(text, { mode: "message" });
+  if (stripped.shouldSkip || !stripped.text) {
+    return null;
+  }
+  return stripped.text;
+}
+
 function resolveReplyToMessageId(params: {
   replyToId?: string | null;
   threadId?: string | number | null;
@@ -104,10 +126,18 @@ export const feishuOutbound: ChannelOutboundAdapter = {
   textChunkLimit: 4000,
   sendText: async ({ cfg, to, text, accountId, replyToId, threadId, mediaLocalRoots }) => {
     const replyToMessageId = resolveReplyToMessageId({ replyToId, threadId });
+
+    // Filter HEARTBEAT_TOKEN before sending. The token is an internal ack signal
+    // and must never appear as a visible message in Feishu group chats or DMs.
+    const effectiveText = normalizeOutboundText(text);
+    if (effectiveText === null) {
+      return { channel: "feishu" as const, messageId: "" };
+    }
+
     // Scheme A compatibility shim:
     // when upstream accidentally returns a local image path as plain text,
     // auto-upload and send as Feishu image message instead of leaking path text.
-    const localImagePath = normalizePossibleLocalImagePath(text);
+    const localImagePath = normalizePossibleLocalImagePath(effectiveText);
     if (localImagePath) {
       try {
         const result = await sendMediaFeishu({
@@ -128,7 +158,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
     const result = await sendOutboundText({
       cfg,
       to,
-      text,
+      text: effectiveText,
       accountId: accountId ?? undefined,
       replyToMessageId,
     });
@@ -145,12 +175,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
     threadId,
   }) => {
     const replyToMessageId = resolveReplyToMessageId({ replyToId, threadId });
-    // Send text first if provided
-    if (text?.trim()) {
+    // Send text first if provided (after stripping any HEARTBEAT_TOKEN)
+    const effectiveCaption = text ? normalizeOutboundText(text) : null;
+    if (effectiveCaption) {
       await sendOutboundText({
         cfg,
         to,
-        text,
+        text: effectiveCaption,
         accountId: accountId ?? undefined,
         replyToMessageId,
       });
@@ -192,11 +223,15 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       }
     }
 
-    // No media URL, just return text result
+    // No media URL — use the already-normalized caption; drop stray HEARTBEAT_OK
+    const fallbackText = effectiveCaption ?? "";
+    if (!fallbackText) {
+      return { channel: "feishu", messageId: "", chatId: "" };
+    }
     const result = await sendOutboundText({
       cfg,
       to,
-      text: text ?? "",
+      text: fallbackText,
       accountId: accountId ?? undefined,
       replyToMessageId,
     });
