@@ -2,30 +2,10 @@ import fs from "fs";
 import path from "path";
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/feishu";
 import { resolveFeishuAccount } from "./accounts.js";
+import { resolveMediaContentType } from "./media-types.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
-
-const OUTBOUND_IMAGE_EXTENSIONS = new Set([
-  ".jpg",
-  ".jpeg",
-  ".png",
-  ".gif",
-  ".webp",
-  ".bmp",
-  ".ico",
-  ".tiff",
-]);
-const OUTBOUND_VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
-const OUTBOUND_AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
-
-function resolveOutboundMediaContentType(url: string): string {
-  const ext = path.extname(url).toLowerCase();
-  if (OUTBOUND_IMAGE_EXTENSIONS.has(ext)) return "image";
-  if (OUTBOUND_VIDEO_EXTENSIONS.has(ext)) return "video";
-  if (OUTBOUND_AUDIO_EXTENSIONS.has(ext)) return "audio";
-  return "file";
-}
 
 function normalizePossibleLocalImagePath(text: string | undefined): string | null {
   const raw = text?.trim();
@@ -167,7 +147,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
           mediaLocalRoots,
           replyToMessageId,
         });
-        const contentType = resolveOutboundMediaContentType(mediaUrl);
+        const contentType = resolveMediaContentType(mediaUrl);
         return {
           channel: "feishu",
           ...result,

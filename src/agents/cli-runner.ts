@@ -685,11 +685,18 @@ export async function runCliAgent(params: {
       // Track last-built profile context files so compaction can compact them
       let lastProfileContextFiles = contextFiles;
 
-      for (const profile of ["reduced", "compaction", "minimal"] as (
-        | BootstrapProfile
-        | "compaction"
-      )[]) {
-        if (profile === "compaction") {
+      // Profiles to try in order: reduced → compaction → minimal.
+      // Compaction is a separate step (not a BootstrapProfile) that attempts to
+      // shrink context files via LLM summarisation. It runs between "reduced" and
+      // "minimal" so that if compaction succeeds we skip the more aggressive
+      // minimal profile, and if it fails we fall through to minimal.
+      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
+      let compactionDone = false;
+
+      for (const profile of profilesToTry) {
+        // --- Compaction step: run once, between "reduced" and "minimal" ---
+        if (!compactionDone && profile === "minimal") {
+          compactionDone = true;
           compactionAttempted = true;
           const compactionCfg = resolveCompactionConfig(params.config);
           // Resolve compaction model: config.model (may be "provider/model") or
@@ -832,7 +839,7 @@ export async function runCliAgent(params: {
               `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
             );
           }
-          continue;
+          // Compaction didn't fit or failed — fall through to "minimal" profile
         }
 
         const profileConfig = getBootstrapProfileConfig(profile);

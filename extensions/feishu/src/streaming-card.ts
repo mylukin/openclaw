@@ -335,7 +335,10 @@ export class FeishuStreamingSession {
       return false;
     }
     await this.renewStreamingMode();
-    this.state.sequence += 1;
+    // Snapshot the candidate sequence but only commit it to state on success,
+    // so a failed update does not leave a permanent hole in the sequence
+    // (matches the pattern in renewStreamingMode).
+    const seq = this.state.sequence + 1;
     let ok = true;
     await this.client.cardkit.v1.cardElement
       .content({
@@ -345,14 +348,15 @@ export class FeishuStreamingSession {
         },
         data: {
           content: text,
-          sequence: this.state.sequence,
-          uuid: `s_${this.state.cardId}_${this.state.sequence}`,
+          sequence: seq,
+          uuid: `s_${this.state.cardId}_${seq}`,
         },
       })
       .then((response) => {
         if ((response.code ?? 0) !== 0) {
           throw new Error(response.msg || `code ${response.code}`);
         }
+        this.state!.sequence = seq;
       })
       .catch((error) => {
         ok = false;

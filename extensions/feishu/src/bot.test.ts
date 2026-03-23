@@ -638,7 +638,9 @@ describe("handleFeishuMessage command authorization", () => {
         },
       });
 
-      const dispatcherParams = mockCreateFeishuReplyDispatcher.mock.calls.at(-1)?.[0] as
+      const dispatcherParams = (
+        mockCreateFeishuReplyDispatcher.mock.calls.at(-1) as unknown[]
+      )?.[0] as
         | {
             onFinalTextDelivered?: (params: {
               text: string;
@@ -725,9 +727,9 @@ describe("handleFeishuMessage command authorization", () => {
       },
     });
 
-    const dispatcherParams = mockCreateFeishuReplyDispatcher.mock.calls.at(-1)?.[0] as
-      | { onFinalTextDelivered?: unknown }
-      | undefined;
+    const dispatcherParams = (
+      mockCreateFeishuReplyDispatcher.mock.calls.at(-1) as unknown[]
+    )?.[0] as { onFinalTextDelivered?: unknown } | undefined;
     expect(dispatcherParams?.onFinalTextDelivered).toBeUndefined();
   });
 

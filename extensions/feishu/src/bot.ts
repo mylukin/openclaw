@@ -143,9 +143,6 @@ function extractSenderLookupSoftError(err: unknown): SenderLookupSoftError | nul
   if (typeof code === "number" && SOFT_SENDER_LOOKUP_ERROR_CODES.has(code)) {
     return { code, message };
   }
-  if (message.toLowerCase().includes("no user authority")) {
-    return { code: typeof code === "number" ? code : 41050, message };
-  }
   return null;
 }
 

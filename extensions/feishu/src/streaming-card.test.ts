@@ -300,7 +300,7 @@ describe("FeishuStreamingSession.close", () => {
     expect(cardElementContent).toHaveBeenCalled();
     // Fallback card.update was called with full card JSON
     expect(cardUpdate).toHaveBeenCalledOnce();
-    const updateArg = cardUpdate.mock.calls[0]?.[0] as {
+    const updateArg = (cardUpdate.mock.calls[0] as unknown[])?.[0] as {
       path?: { card_id?: string };
       data?: { card?: { data?: string } };
     };

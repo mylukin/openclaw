@@ -11,8 +11,6 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import { buildTtsSystemPromptHint } from "../../tts/tts.js";
 import { isRecord } from "../../utils.js";
-
-const log = createSubsystemLogger("agent/claude-cli/stream");
 import { buildModelAliasLines } from "../model-alias-lines.js";
 import { resolveDefaultModelForAgent } from "../model-selection.js";
 import { resolveOwnerDisplaySetting } from "../owner-display.js";
@@ -22,6 +20,7 @@ import { buildSystemPromptParams } from "../system-prompt-params.js";
 import { buildAgentSystemPrompt } from "../system-prompt.js";
 export { buildCliSupervisorScopeKey, resolveCliNoOutputTimeoutMs } from "./reliability.js";
 
+const log = createSubsystemLogger("agent/claude-cli/stream");
 const CLI_RUN_QUEUE = new KeyedAsyncQueue();
 export function enqueueCliRun<T>(key: string, task: () => Promise<T>): Promise<T> {
   return CLI_RUN_QUEUE.enqueue(key, task);

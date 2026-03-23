@@ -14,11 +14,11 @@ const getGlobalHookRunnerMock = vi.hoisted(() => vi.fn(() => null));
 
 vi.mock("../gateway/mcp-http.js", () => ({
   MCP_PORT_OFFSET: 1,
-  ensureMcpConfigFile: (...args: unknown[]) => ensureMcpConfigFileMock(...args),
+  ensureMcpConfigFile: (...args: unknown[]) => (ensureMcpConfigFileMock as Function)(...args),
 }));
 
 vi.mock("../plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: (...args: unknown[]) => getGlobalHookRunnerMock(...args),
+  getGlobalHookRunner: (...args: unknown[]) => (getGlobalHookRunnerMock as Function)(...args),
 }));
 
 vi.mock("../process/supervisor/index.js", () => ({
@@ -811,7 +811,7 @@ describe("runCliAgent with process supervisor", () => {
       runBeforeAgentStart: vi.fn(async () => undefined),
       runLlmOutput: vi.fn(async () => undefined),
     };
-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
+    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
@@ -883,7 +883,7 @@ describe("runCliAgent with process supervisor", () => {
       runBeforeAgentStart: vi.fn(async () => undefined),
       runLlmOutput: vi.fn(async () => undefined),
     };
-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
+    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
@@ -932,7 +932,7 @@ describe("runCliAgent with process supervisor", () => {
       runBeforeAgentStart: vi.fn(async () => undefined),
       runLlmOutput: vi.fn(async () => undefined),
     };
-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
+    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
@@ -985,7 +985,7 @@ describe("runCliAgent with process supervisor", () => {
       runBeforeAgentStart: vi.fn(async () => undefined),
       runLlmOutput: vi.fn(async () => undefined),
     };
-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
+    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({

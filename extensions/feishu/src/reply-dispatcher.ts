@@ -9,6 +9,7 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
+import { resolveMediaContentType } from "./media-types.js";
 import { sendMediaFeishu } from "./media.js";
 import type { MentionTarget } from "./mention.js";
 import { buildMentionedCardContent, normalizeMentionTagsForCard } from "./mention.js";
@@ -56,19 +57,6 @@ function resolveFinalDeliveryContent(text: string, mediaUrls: string[]): string 
   return names.length > 0 ? names.join(", ") : "media";
 }
 
-const IMAGE_EXTENSIONS = new Set([
-  ".jpg",
-  ".jpeg",
-  ".png",
-  ".gif",
-  ".webp",
-  ".bmp",
-  ".ico",
-  ".tiff",
-]);
-const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
-const AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
-
 function resolveMediaFileName(mediaUrl: string): string {
   const trimmed = mediaUrl.trim();
   if (!trimmed) return "media";
@@ -81,13 +69,6 @@ function resolveMediaFileName(mediaUrl: string): string {
     const base = path.basename(withoutQuery);
     return base && base !== "." && base !== "/" ? base : "media";
   }
-}
-
-function resolveMediaContentType(ext: string): string {
-  if (IMAGE_EXTENSIONS.has(ext)) return "image";
-  if (VIDEO_EXTENSIONS.has(ext)) return "video";
-  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
-  return "file";
 }
 
 function normalizeEpochMs(timestamp: number | undefined): number | undefined {

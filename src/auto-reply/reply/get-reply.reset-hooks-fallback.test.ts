@@ -57,7 +57,7 @@ function buildRegularContext(): MsgContext {
     Body: "hello",
     RawBody: "hello",
     CommandBody: "hello",
-    CommandSource: "message",
+    CommandSource: "text",
     CommandAuthorized: true,
     SessionKey: "agent:main:telegram:direct:123",
     From: "telegram:123",

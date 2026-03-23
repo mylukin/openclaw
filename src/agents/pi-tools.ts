@@ -397,7 +397,7 @@ export function createOpenClawCodingTools(options?: {
       if (allowReadOutsideWorkspace) {
         // Unrestricted: bypass pi-coding-agent's internal root boundary entirely.
         // tools.fs.allowReadOutsideWorkspace=true grants full host read access to the model.
-        piToolsLogger.debug(
+        piToolsLogger.warn(
           "tools.fs.allowReadOutsideWorkspace is enabled — read tool has no workspace boundary",
           {
             agentId,

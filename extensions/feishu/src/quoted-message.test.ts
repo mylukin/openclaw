@@ -52,7 +52,7 @@ function appendUserTurn(params: {
   sessionFile: string;
   messageId: string;
   body: string;
-  contentType?: "text" | "input_text";
+  contentType?: "text";
 }) {
   const sessionManager = SessionManager.open(params.sessionFile);
   sessionManager.appendMessage({
@@ -102,7 +102,7 @@ function appendUserTurn(params: {
 function appendAssistantTurn(params: {
   sessionFile: string;
   body: string;
-  contentType?: "text" | "output_text";
+  contentType?: "text";
   messageMeta?: Record<string, unknown>;
 }) {
   const sessionManager = SessionManager.open(params.sessionFile);
@@ -202,7 +202,7 @@ describe("resolveQuotedFeishuMessageContent", () => {
       sessionFile: fixture.sessionFile,
       messageId: "om_parent_input_text",
       body: "input_text 里的完整原文",
-      contentType: "input_text",
+      contentType: "text",
     });
 
     const fetchMessage = vi.fn(async () => null);
@@ -314,7 +314,7 @@ describe("resolveQuotedFeishuMessageContent", () => {
     appendAssistantTurn({
       sessionFile: fixture.sessionFile,
       body: "output_text 里的完整 bot 回复",
-      contentType: "output_text",
+      contentType: "text",
       messageMeta: {
         channel: "feishu",
         accountId: "default",
