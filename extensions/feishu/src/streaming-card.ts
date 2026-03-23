@@ -7,7 +7,13 @@ import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/feishu";
 import type { FeishuDomain } from "./types.js";
 
 type Credentials = { appId: string; appSecret: string; domain?: string };
-type CardState = { cardId: string; messageId: string; sequence: number; currentText: string };
+type CardState = {
+  cardId: string;
+  messageId: string;
+  sequence: number;
+  currentText: string;
+  header?: StreamingCardHeader;
+};
 type UpdateMode = "merge" | "replace";
 type PendingUpdate = { text: string; mode: UpdateMode };
 
@@ -171,6 +177,7 @@ export class FeishuStreamingSession {
   private pendingUpdate: PendingUpdate | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
   private lastStreamingModeRenewAt = 0;
+  private renewTimer: ReturnType<typeof setInterval> | null = null;
   // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
   private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
 
@@ -258,9 +265,32 @@ export class FeishuStreamingSession {
       throw new Error(`Send card failed: ${sendRes.msg}`);
     }
 
-    this.state = { cardId, messageId: sendRes.data.message_id, sequence: 1, currentText: "" };
+    this.state = {
+      cardId,
+      messageId: sendRes.data.message_id,
+      sequence: 1,
+      currentText: "",
+      header: options?.header,
+    };
     this.lastStreamingModeRenewAt = Date.now();
+    this.startRenewTimer();
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
+  }
+
+  /** Proactive timer — renews streaming_mode even when no content updates are flowing. */
+  private startRenewTimer(): void {
+    this.stopRenewTimer();
+    this.renewTimer = setInterval(() => {
+      this.renewStreamingMode().catch(() => {});
+    }, FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS);
+    this.renewTimer.unref();
+  }
+
+  private stopRenewTimer(): void {
+    if (this.renewTimer !== null) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = null;
+    }
   }
 
   private async renewStreamingMode(): Promise<void> {
@@ -296,12 +326,17 @@ export class FeishuStreamingSession {
     }
   }
 
-  private async updateCardContent(text: string, onError?: (error: unknown) => void): Promise<void> {
+  /** Push text via the streaming element API. Returns true on success, false on failure. */
+  private async updateCardContent(
+    text: string,
+    onError?: (error: unknown) => void,
+  ): Promise<boolean> {
     if (!this.state) {
-      return;
+      return false;
     }
     await this.renewStreamingMode();
     this.state.sequence += 1;
+    let ok = true;
     await this.client.cardkit.v1.cardElement
       .content({
         path: {
@@ -319,7 +354,54 @@ export class FeishuStreamingSession {
           throw new Error(response.msg || `code ${response.code}`);
         }
       })
-      .catch((error) => onError?.(error));
+      .catch((error) => {
+        ok = false;
+        onError?.(error);
+      });
+    return ok;
+  }
+
+  /**
+   * Fallback: full card replacement via card.update().
+   * Works regardless of streaming_mode state — used when the streaming
+   * element API fails (e.g. after the 10-minute auto-close).
+   */
+  private async updateCardFull(text: string): Promise<boolean> {
+    if (!this.state) {
+      return false;
+    }
+    const cardJson: Record<string, unknown> = {
+      schema: "2.0",
+      config: { update_multi: true },
+      body: {
+        elements: [{ tag: "markdown", content: text, element_id: "content" }],
+      },
+    };
+    if (this.state.header) {
+      cardJson.header = {
+        title: { tag: "plain_text", content: this.state.header.title },
+        template: this.state.header.template ?? "blue",
+      };
+    }
+    const seq = this.state.sequence + 1;
+    try {
+      const response = await this.client.cardkit.v1.card.update({
+        path: { card_id: this.state.cardId },
+        data: {
+          card: { type: "card_json", data: JSON.stringify(cardJson) },
+          sequence: seq,
+          uuid: `u_${this.state.cardId}_${seq}`,
+        },
+      });
+      if ((response.code ?? 0) !== 0) {
+        throw new Error(response.msg || `code ${response.code}`);
+      }
+      this.state.sequence = seq;
+      return true;
+    } catch (e) {
+      this.log?.(`Full card update failed: ${String(e)}`);
+      return false;
+    }
   }
 
   private async deleteMessage(messageId: string): Promise<void> {
@@ -380,6 +462,7 @@ export class FeishuStreamingSession {
       return;
     }
     this.closed = true;
+    this.stopRenewTimer();
     await this.queue;
 
     const hasExplicitFinalText = finalText !== undefined;
@@ -397,7 +480,13 @@ export class FeishuStreamingSession {
         ? text !== this.state.currentText
         : Boolean(text && text !== this.state.currentText)
     ) {
-      await this.updateCardContent(text);
+      const streamOk = await this.updateCardContent(text);
+      if (!streamOk) {
+        // Streaming element API failed (likely 10-min auto-close) — fall back
+        // to a full card replacement which works regardless of streaming state.
+        this.log?.("Streaming content update failed on close; falling back to full card update");
+        await this.updateCardFull(text);
+      }
       this.state.currentText = text;
     }
 
@@ -429,6 +518,7 @@ export class FeishuStreamingSession {
       return;
     }
     this.closed = true;
+    this.stopRenewTimer();
     await this.queue;
     const messageId = this.state.messageId;
     const cardId = this.state.cardId;
