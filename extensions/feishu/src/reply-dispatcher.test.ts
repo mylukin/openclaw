@@ -482,7 +482,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("step\n\n🔧 Tool calls (1)\n- Read\n\n⏳ Running Read..."),
+      expect.stringContaining("step\n\n🔧 Tool calls (1)\n\n⏳ Running Read..."),
       { title: "💭 Thinking" },
     );
 
@@ -495,7 +495,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("- Grep"),
+      "step\n\n🔧 Tool calls (2)",
       { title: "💭 Thinking" },
     );
 
@@ -536,7 +536,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("- Read"),
+      "🔧 Tool calls (1)\n\n⏳ Running Read...",
       { title: "🔧 Tool Activity" },
     );
 
@@ -579,7 +579,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (3)\n- exec ×3\n\n⏳ Running exec..."),
+      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
       { title: "🔧 Tool Activity" },
     );
   });
@@ -612,10 +612,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await dispatcher.replyOptions.onToolResult?.({});
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (1)\n- memory_search",
-      { title: "🔧 Tool Activity" },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
+      title: "🔧 Tool Activity",
+    });
   });
 
   it("clears running tool status as soon as assistant text starts streaming", async () => {
@@ -646,10 +645,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (1)\n- Bash",
-      { title: "🔧 Tool Activity" },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
+      title: "🔧 Tool Activity",
+    });
   });
 
   it("clears running tool status when visible assistant text arrives through block delivery", async () => {
@@ -681,13 +679,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await options.deliver({ text: "visible block text" }, { kind: "block" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (1)\n- Bash",
-      { title: "🔧 Tool Activity" },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
+      title: "🔧 Tool Activity",
+    });
   });
 
-  it("preserves prior tool history and count without restoring running status after text streaming", async () => {
+  it("preserves tool call count without restoring running status after text streaming", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -713,10 +710,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
     await flushAsyncTasks();
 
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (2)\n- Read\n- Grep",
-      { title: "🔧 Tool Activity" },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (2)", {
+      title: "🔧 Tool Activity",
+    });
   });
 
   it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
@@ -743,7 +739,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (2)\n- Bash\n- tool\n\n⏳ Running tool..."),
+      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running tool..."),
       { title: "🔧 Tool Activity" },
     );
   });
@@ -786,7 +782,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tool-memory" });
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (2)\n- memory_search\n- exec\n\n⏳ Running exec..."),
+      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running exec..."),
       { title: "🔧 Tool Activity" },
     );
   });
@@ -851,7 +847,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (3)\n- exec\n- read\n- exec\n\n⏳ Running exec..."),
+      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
       { title: "🔧 Tool Activity" },
     );
   });
@@ -1127,7 +1123,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("- Read"),
+      "thinking\n\n🔧 Tool calls (1)\n\n⏳ Running Read...",
       { title: "💭 Thinking" },
     );
     expect(streamingInstances[0].discard).toHaveBeenCalledTimes(1);
