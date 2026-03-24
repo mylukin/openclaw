@@ -573,13 +573,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
       const finalText = streamText;
-      if (!finalText.trim()) {
-        // No visible content was produced — discard the card entirely
+      const finalThinking = composeThinkingContent();
+      if (!finalText.trim() && !finalThinking) {
+        // No visible content and no thinking — discard the card entirely
         // to avoid leaving a stale "⏳ Thinking..." placeholder.
         await streaming.discard();
       } else {
-        // Set final thinking content before close so the collapsed panel has it
-        const finalThinking = composeThinkingContent();
+        // Store thinking content for the collapsed panel in the final card
         if (finalThinking) {
           await streaming.updateThinking(finalThinking);
         }
@@ -592,9 +592,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           : undefined;
         await streaming.close(text, { note: finalNote });
         hasVisibleTextInReply = true;
-        // Emit hooks for non-discarded streaming cards so downstream consumers
-        // (e.g. bot-company journal) can record the delivered text.
-        if (options?.emitFinalText) {
+        if (options?.emitFinalText && finalText.trim()) {
           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
           await emitFinalTextIfNeeded(
             finalText,
