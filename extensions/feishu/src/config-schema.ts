@@ -194,6 +194,8 @@ const FeishuSharedConfigShape = {
   reactionNotifications: ReactionNotificationModeSchema,
   typingIndicator: z.boolean().optional(),
   resolveSenderNames: z.boolean().optional(),
+  cardHeader: z.boolean().optional(),
+  cardNote: z.boolean().optional(),
 };
 
 /**

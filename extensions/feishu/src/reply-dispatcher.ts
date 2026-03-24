@@ -274,6 +274,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   });
   const chunkMode = core.channel.text.resolveChunkMode(cfg, "feishu");
   const tableMode = core.channel.text.resolveMarkdownTableMode({ cfg, channel: "feishu" });
+  const showCardHeader = account.config?.cardHeader ?? true;
+  const showCardNote = account.config?.cardNote ?? true;
   const renderMode = account.config?.renderMode ?? "auto";
   const streamingEnabled =
     account.config?.streaming !== false &&
@@ -557,8 +559,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         params.runtime.log?.(`feishu[${account.accountId}] ${message}`),
       );
       try {
-        const cardHeader = resolveCardHeader(agentId, identity);
-        const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+        const cardHeader = showCardHeader ? resolveCardHeader(agentId, identity) : undefined;
+        const cardNote = showCardNote
+          ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+          : undefined;
         await streaming.start(chatId, resolveReceiveIdType(chatId), {
           replyToMessageId,
           replyInThread: effectiveReplyInThread,
@@ -586,7 +590,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
       }
-      const finalNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+      const finalNote = showCardNote
+        ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+        : undefined;
       await streaming.close(text, { note: finalNote });
       hasVisibleTextInReply = true;
       // Emit hooks for non-discarded streaming cards so downstream consumers
@@ -720,8 +726,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
           if (useCard) {
-            const cardHeader = resolveCardHeader(agentId, identity);
-            const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+            const cardHeader = showCardHeader ? resolveCardHeader(agentId, identity) : undefined;
+            const cardNote = showCardNote
+              ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+              : undefined;
             chunkResult = await sendChunkedTextReply({
               text: cardText,
               useCard: true,

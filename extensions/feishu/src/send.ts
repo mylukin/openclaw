@@ -751,9 +751,9 @@ export async function sendStructuredCardFeishu(params: {
 }): Promise<FeishuSendResult> {
   const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId, header, note } =
     params;
-  let cardText = text;
+  let cardText = normalizeMentionTagsForCard(text);
   if (mentions && mentions.length > 0) {
-    cardText = buildMentionedCardContent(mentions, text);
+    cardText = buildMentionedCardContent(mentions, cardText);
   }
   const card = buildStructuredCard(cardText, { header, note });
   return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, accountId });
