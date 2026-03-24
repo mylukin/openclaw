@@ -3,7 +3,6 @@
  */
 
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { fetchWithSsrFGuard } from "../runtime-api.js";
 import { resolveFeishuCardTemplate, type CardHeaderConfig } from "./send.js";
 import type { FeishuDomain } from "./types.js";
 
@@ -42,81 +41,28 @@ type StreamingStartOptions = {
   header?: StreamingCardHeader;
 };
 
-// Token cache (keyed by domain + appId)
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
-
-function resolveApiBase(domain?: FeishuDomain): string {
-  if (domain === "lark") {
-    return "https://open.larksuite.com/open-apis";
-  }
-  if (domain && domain !== "feishu" && domain.startsWith("http")) {
-    return `${domain.replace(/\/+$/, "")}/open-apis`;
-  }
-  return "https://open.feishu.cn/open-apis";
-}
-
-function resolveAllowedHostnames(domain?: FeishuDomain): string[] {
-  if (domain === "lark") {
-    return ["open.larksuite.com"];
-  }
-  if (domain && domain !== "feishu" && domain.startsWith("http")) {
-    try {
-      return [new URL(domain).hostname];
-    } catch {
-      return [];
-    }
-  }
-  return ["open.feishu.cn"];
-}
-
-async function getToken(creds: Credentials): Promise<string> {
-  const key = `${creds.domain ?? "feishu"}|${creds.appId}`;
-  const cached = tokenCache.get(key);
-  if (cached && cached.expiresAt > Date.now() + 60000) {
-    return cached.token;
-  }
-
-  const { response, release } = await fetchWithSsrFGuard({
-    url: `${resolveApiBase(creds.domain)}/auth/v3/tenant_access_token/internal`,
-    init: {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ app_id: creds.appId, app_secret: creds.appSecret }),
-    },
-    policy: { allowedHostnames: resolveAllowedHostnames(creds.domain) },
-    auditContext: "feishu.streaming-card.token",
-  });
-  if (!response.ok) {
-    await release();
-    throw new Error(`Token request failed with HTTP ${response.status}`);
-  }
-  const data = (await response.json()) as {
-    code: number;
-    msg: string;
-    tenant_access_token?: string;
-    expire?: number;
-  };
-  await release();
-  if (data.code !== 0 || !data.tenant_access_token) {
-    throw new Error(`Token error: ${data.msg}`);
-  }
-  tokenCache.set(key, {
-    token: data.tenant_access_token,
-    expiresAt: Date.now() + (data.expire ?? 7200) * 1000,
-  });
-  return data.tenant_access_token;
-}
-
 function truncateSummary(text: string, max = 50): string {
   if (!text) {
     return "";
   }
-  // Strip HTML/XML tags (e.g. <at>, <b>, <a href="...">) before truncating
-  const clean = text
-    .replace(/<[^>]*>/g, "")
-    .replace(/\n/g, " ")
-    .trim();
+  const clean = stripHtmlTagsToText(text).replace(/\s+/g, " ").trim();
   return clean.length <= max ? clean : clean.slice(0, max - 3) + "...";
+}
+
+function stripHtmlTagsToText(text: string): string {
+  if (!text) {
+    return "";
+  }
+  return text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
 }
 
 export function mergeStreamingText(
@@ -168,7 +114,6 @@ export function resolveStreamingCardSendMode(options?: StreamingStartOptions) {
 /** Streaming card session manager */
 export class FeishuStreamingSession {
   private client: Client;
-  private creds: Credentials;
   private state: CardState | null = null;
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
@@ -182,9 +127,8 @@ export class FeishuStreamingSession {
   // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
   private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
 
-  constructor(client: Client, creds: Credentials, log?: (msg: string) => void) {
+  constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
-    this.creds = creds;
     this.log = log;
   }
 
@@ -197,7 +141,6 @@ export class FeishuStreamingSession {
       return;
     }
 
-    const apiBase = resolveApiBase(this.creds.domain);
     const elements: Record<string, unknown>[] = [
       { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
     ];
@@ -225,31 +168,14 @@ export class FeishuStreamingSession {
       };
     }
 
-    // Create card entity
-    const { response: createRes, release: releaseCreate } = await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards`,
-      init: {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ type: "card_json", data: JSON.stringify(cardJson) }),
+    // Create card entity via SDK
+    const createData = await this.client.cardkit.v1.card.create({
+      data: {
+        type: "card_json",
+        data: JSON.stringify(cardJson),
       },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.create",
     });
-    if (!createRes.ok) {
-      await releaseCreate();
-      throw new Error(`Create card request failed with HTTP ${createRes.status}`);
-    }
-    const createData = (await createRes.json()) as {
-      code: number;
-      msg: string;
-      data?: { card_id: string };
-    };
-    await releaseCreate();
-    if (createData.code !== 0 || !createData.data?.card_id) {
+    if ((createData.code ?? 0) !== 0 || !createData.data?.card_id) {
       throw new Error(`Create card failed: ${createData.msg}`);
     }
     const cardId = createData.data.card_id;
@@ -336,29 +262,21 @@ export class FeishuStreamingSession {
     ) {
       return;
     }
-    const apiBase = resolveApiBase(this.creds.domain);
     // Snapshot the candidate sequence but only commit it to state on success,
     // so a failed renewal does not leave a permanent hole in the sequence.
     const nextSeq = this.state.sequence + 1;
     try {
-      const { release } = await fetchWithSsrFGuard({
-        url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
-        init: {
-          method: "PATCH",
-          headers: {
-            Authorization: `Bearer ${await getToken(this.creds)}`,
-            "Content-Type": "application/json; charset=utf-8",
-          },
-          body: JSON.stringify({
-            settings: JSON.stringify({ config: { streaming_mode: true } }),
-            sequence: nextSeq,
-            uuid: `r_${this.state.cardId}_${nextSeq}`,
-          }),
+      const response = await this.client.cardkit.v1.card.settings({
+        path: { card_id: this.state.cardId },
+        data: {
+          settings: JSON.stringify({ config: { streaming_mode: true } }),
+          sequence: nextSeq,
+          uuid: `r_${this.state.cardId}_${nextSeq}`,
         },
-        policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-        auditContext: "feishu.streaming-card.renew",
       });
-      await release();
+      if ((response.code ?? 0) !== 0) {
+        throw new Error(response.msg || `code ${response.code}`);
+      }
       this.state.sequence = nextSeq;
       this.lastStreamingModeRenewAt = Date.now();
       this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
@@ -376,30 +294,27 @@ export class FeishuStreamingSession {
     if (!this.state) {
       return false;
     }
-    const apiBase = resolveApiBase(this.creds.domain);
+    await this.renewStreamingMode();
     // Snapshot the candidate sequence but only commit it to state on success,
     // so a failed update does not leave a permanent hole in the sequence.
     const nextSeq = this.state.sequence + 1;
     let ok = true;
-    await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/${elementId}/content`,
-      init: {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json",
+    await this.client.cardkit.v1.cardElement
+      .content({
+        path: {
+          card_id: this.state.cardId,
+          element_id: elementId,
         },
-        body: JSON.stringify({
+        data: {
           content: text,
           sequence: nextSeq,
           uuid: `s_${this.state.cardId}_${nextSeq}`,
-        }),
-      },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: `feishu.streaming-card.update.${elementId}`,
-    })
-      .then(async ({ release }) => {
-        await release();
+        },
+      })
+      .then((response) => {
+        if ((response.code ?? 0) !== 0) {
+          throw new Error(response.msg || `code ${response.code}`);
+        }
         this.state!.sequence = nextSeq;
       })
       .catch((error) => {
@@ -462,7 +377,6 @@ export class FeishuStreamingSession {
     if (!this.state) {
       return false;
     }
-    const apiBase = resolveApiBase(this.creds.domain);
     const config: Record<string, unknown> = { update_multi: true };
     if (options?.keepStreaming) {
       config.streaming_mode = true;
@@ -480,24 +394,17 @@ export class FeishuStreamingSession {
     }
     const nextSeq = this.state.sequence + 1;
     try {
-      const { release } = await fetchWithSsrFGuard({
-        url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}`,
-        init: {
-          method: "PUT",
-          headers: {
-            Authorization: `Bearer ${await getToken(this.creds)}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            card: { type: "card_json", data: JSON.stringify(cardJson) },
-            sequence: nextSeq,
-            uuid: `u_${this.state.cardId}_${nextSeq}`,
-          }),
+      const response = await this.client.cardkit.v1.card.update({
+        path: { card_id: this.state.cardId },
+        data: {
+          card: { type: "card_json", data: JSON.stringify(cardJson) },
+          sequence: nextSeq,
+          uuid: `u_${this.state.cardId}_${nextSeq}`,
         },
-        policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-        auditContext: "feishu.streaming-card.full-update",
       });
-      await release();
+      if ((response.code ?? 0) !== 0) {
+        throw new Error(response.msg || `code ${response.code}`);
+      }
       this.state.sequence = nextSeq;
       return true;
     } catch (e) {
@@ -562,27 +469,23 @@ export class FeishuStreamingSession {
       return;
     }
     this.state.noteText = note;
-    const apiBase = resolveApiBase(this.creds.domain);
     const nextSeq = this.state.sequence + 1;
-    await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/note/content`,
-      init: {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json",
+    await this.client.cardkit.v1.cardElement
+      .content({
+        path: {
+          card_id: this.state.cardId,
+          element_id: "note",
         },
-        body: JSON.stringify({
+        data: {
           content: `<font color='grey'>${note}</font>`,
           sequence: nextSeq,
           uuid: `n_${this.state.cardId}_${nextSeq}`,
-        }),
-      },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.note-update",
-    })
-      .then(async ({ release }) => {
-        await release();
+        },
+      })
+      .then((response) => {
+        if ((response.code ?? 0) !== 0) {
+          throw new Error(response.msg || `code ${response.code}`);
+        }
         this.state!.sequence = nextSeq;
       })
       .catch((e) => this.log?.(`Note update failed: ${String(e)}`));
@@ -602,7 +505,6 @@ export class FeishuStreamingSession {
 
     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
     const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
-    const apiBase = resolveApiBase(this.creds.domain);
 
     // Ensure thinking panel is collapsed in the final card
     this.state.thinkingExpanded = false;
@@ -636,27 +538,21 @@ export class FeishuStreamingSession {
 
     // Close streaming mode
     const closeSeq = this.state.sequence + 1;
-    await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
-      init: {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${await getToken(this.creds)}`,
-          "Content-Type": "application/json; charset=utf-8",
-        },
-        body: JSON.stringify({
+    await this.client.cardkit.v1.card
+      .settings({
+        path: { card_id: this.state.cardId },
+        data: {
           settings: JSON.stringify({
             config: { streaming_mode: false, summary: { content: truncateSummary(resolvedText) } },
           }),
           sequence: closeSeq,
           uuid: `c_${this.state.cardId}_${closeSeq}`,
-        }),
-      },
-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.close",
-    })
-      .then(async ({ release }) => {
-        await release();
+        },
+      })
+      .then((response) => {
+        if ((response.code ?? 0) !== 0) {
+          throw new Error(response.msg || `code ${response.code}`);
+        }
       })
       .catch((e) => this.log?.(`Close failed: ${String(e)}`));
     const finalState = this.state;
@@ -684,7 +580,7 @@ export class FeishuStreamingSession {
     this.pendingText = null;
 
     try {
-      await this.client.im.v1.message.delete({
+      await this.client.im.message.delete({
         path: { message_id: messageId },
       });
       this.log?.(`Discarded streaming message: ${messageId}`);
