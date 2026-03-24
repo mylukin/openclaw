@@ -649,9 +649,9 @@ export class FeishuStreamingSession {
     // Ensure thinking panel is collapsed in the final card
     this.state.thinkingExpanded = false;
     const previousText = this.state.currentText;
-    if (text) {
-      this.state.currentText = text;
-    }
+    // If no content was ever streamed, clear the initial placeholder
+    const resolvedText = text || "";
+    this.state.currentText = resolvedText;
 
     // When thinking content exists, use a single full card update to collapse
     // the thinking panel and set final content + note in one shot. This avoids
@@ -664,11 +664,11 @@ export class FeishuStreamingSession {
       });
     } else {
       // No thinking panel — use element API for content, then note.
-      if (text && text !== previousText) {
-        const streamOk = await this.updateCardContent(text);
+      if (resolvedText !== previousText) {
+        const streamOk = await this.updateCardContent(resolvedText);
         if (!streamOk) {
           this.log?.("Streaming content update failed on close; falling back to full card update");
-          await this.updateCardFull(text);
+          await this.updateCardFull(resolvedText);
         }
       }
       if (options?.note) {
@@ -688,7 +688,7 @@ export class FeishuStreamingSession {
         },
         body: JSON.stringify({
           settings: JSON.stringify({
-            config: { streaming_mode: false, summary: { content: truncateSummary(text) } },
+            config: { streaming_mode: false, summary: { content: truncateSummary(resolvedText) } },
           }),
           sequence: closeSeq,
           uuid: `c_${this.state.cardId}_${closeSeq}`,
