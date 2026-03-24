@@ -188,6 +188,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         metadata: {
           chatId,
           ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
+          ...(mentionTargets?.length
+            ? { mentions: mentionTargets.map((m) => ({ id: m.openId, name: m.name })) }
+            : {}),
           ...(event.metadata ?? {}),
         },
       },
