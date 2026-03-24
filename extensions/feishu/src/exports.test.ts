@@ -20,8 +20,10 @@ describe("feishu extension exports", () => {
       config: {},
       logger: {},
       runtime,
+      registrationMode: "full",
       registerChannel: vi.fn(),
       registerTool: vi.fn(),
+      on: vi.fn(),
     });
     expect(
       typeof (runtime as { channel: { reply: { createFeishuReplyDispatcher?: unknown } } }).channel

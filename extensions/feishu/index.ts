@@ -56,6 +56,15 @@ export default defineChannelPluginEntry({
   plugin: feishuPlugin,
   setRuntime: setFeishuRuntime,
   registerFull(api) {
+    // Expose the native feishu reply dispatcher on the runtime so external
+    // plugins (e.g. bot-company) can create streaming-card capable dispatchers
+    // instead of falling back to the generic route-reply path.
+    const replyRuntime = (api.runtime as { channel?: { reply?: Record<string, unknown> } })?.channel
+      ?.reply;
+    if (replyRuntime && typeof replyRuntime.createFeishuReplyDispatcher !== "function") {
+      replyRuntime.createFeishuReplyDispatcher = createFeishuReplyDispatcher;
+    }
+
     registerFeishuSubagentHooks(api);
     registerFeishuDocTools(api);
     registerFeishuChatTools(api);
