@@ -484,20 +484,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     });
   };
 
-  /** Collapse thinking panel when assistant text starts flowing. */
-  const collapseThinkingIfNeeded = () => {
-    if (thinkingCollapsed) {
-      return;
-    }
+  /** Mark that assistant text has started flowing — thinking panel will be
+   *  collapsed on close() rather than mid-stream to avoid Feishu full-card
+   *  update flickering during streaming. */
+  const markThinkingDone = () => {
     thinkingCollapsed = true;
-    partialUpdateQueue = partialUpdateQueue.then(async () => {
-      if (streamingStartPromise) {
-        await streamingStartPromise;
-      }
-      if (streaming?.isActive()) {
-        await streaming.collapseThinking(composeThinkingContent());
-      }
-    });
   };
 
   const queueStreamingUpdate = (
@@ -528,7 +519,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       lastPartial = nextText;
     }
     // Collapse thinking panel when first assistant text arrives
-    collapseThinkingIfNeeded();
+    markThinkingDone();
     queueStreamingRender();
   };
 
@@ -581,25 +572,35 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     await partialUpdateQueue;
     const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
-      // Close with assistant text only — thinking is in the collapsible panel
-      let text = streamText;
-      const finalText = text;
-      if (mentionTargets?.length) {
-        text = buildMentionedCardContent(mentionTargets, text);
-      }
-      const finalNote = showCardNote
-        ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
-        : undefined;
-      await streaming.close(text, { note: finalNote });
-      hasVisibleTextInReply = true;
-      // Emit hooks for non-discarded streaming cards so downstream consumers
-      // (e.g. bot-company journal) can record the delivered text.
-      if (options?.emitFinalText && finalText.trim()) {
-        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
-        await emitFinalTextIfNeeded(
-          finalText,
-          streamMessageId ? { messageId: streamMessageId } : undefined,
-        );
+      const finalText = streamText;
+      if (!finalText.trim()) {
+        // No visible content was produced — discard the card entirely
+        // to avoid leaving a stale "⏳ Thinking..." placeholder.
+        await streaming.discard();
+      } else {
+        // Set final thinking content before close so the collapsed panel has it
+        const finalThinking = composeThinkingContent();
+        if (finalThinking) {
+          await streaming.updateThinking(finalThinking);
+        }
+        let text = finalText;
+        if (mentionTargets?.length) {
+          text = buildMentionedCardContent(mentionTargets, text);
+        }
+        const finalNote = showCardNote
+          ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+          : undefined;
+        await streaming.close(text, { note: finalNote });
+        hasVisibleTextInReply = true;
+        // Emit hooks for non-discarded streaming cards so downstream consumers
+        // (e.g. bot-company journal) can record the delivered text.
+        if (options?.emitFinalText) {
+          emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+          await emitFinalTextIfNeeded(
+            finalText,
+            streamMessageId ? { messageId: streamMessageId } : undefined,
+          );
+        }
       }
     }
     streaming = null;

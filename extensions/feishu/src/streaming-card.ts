@@ -18,8 +18,6 @@ type CardState = {
   header?: StreamingCardHeader;
   thinkingText: string;
   thinkingExpanded: boolean;
-  /** Whether the thinking panel has been injected into the card via full update. */
-  thinkingInjected: boolean;
 };
 
 /** Options for customising the initial streaming card appearance. */
@@ -302,7 +300,6 @@ export class FeishuStreamingSession {
       header: options?.header,
       thinkingText: "",
       thinkingExpanded: true,
-      thinkingInjected: false,
     };
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
@@ -546,57 +543,14 @@ export class FeishuStreamingSession {
     await this.queue;
   }
 
-  /** Update thinking panel content (non-streaming, immediate).
-   *  On first call, injects the collapsible_panel via full card update. */
+  /** Store thinking content for inclusion in the final card on close().
+   *  No API call during streaming — the thinking panel is only materialized
+   *  in the single full-card update at close() to avoid mid-stream flickering. */
   async updateThinking(text: string): Promise<void> {
     if (!this.state || this.closed || !text) {
       return;
     }
     this.state.thinkingText = text;
-    this.queue = this.queue.then(async () => {
-      if (!this.state || this.closed) {
-        return;
-      }
-      if (!this.state.thinkingInjected) {
-        // First thinking update — inject the collapsible_panel via full card update
-        const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
-        if (ok) {
-          this.state.thinkingInjected = true;
-        } else {
-          // Injection failed — reset thinkingText so next call retries injection
-          this.state.thinkingText = "";
-          this.log?.("Thinking panel injection failed; will retry on next update");
-        }
-      } else {
-        await this.updateElementContent("thinking_content", text, (e) =>
-          this.log?.(`Thinking update failed: ${String(e)}`),
-        );
-      }
-    });
-    await this.queue;
-  }
-
-  /** Collapse the thinking panel via full card replacement. */
-  async collapseThinking(finalThinkingText?: string): Promise<void> {
-    if (!this.state || this.closed) {
-      return;
-    }
-    if (finalThinkingText !== undefined) {
-      this.state.thinkingText = finalThinkingText;
-    }
-    this.state.thinkingExpanded = false;
-    this.queue = this.queue.then(async () => {
-      if (!this.state || this.closed) {
-        return;
-      }
-      // Must use full card update to change the expanded property.
-      // keepStreaming so that subsequent element API updates still work.
-      const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
-      if (ok) {
-        this.state.thinkingInjected = true;
-      }
-    });
-    await this.queue;
   }
 
   private async updateNoteContent(note: string): Promise<void> {
