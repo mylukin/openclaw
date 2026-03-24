@@ -451,12 +451,9 @@ describe("FeishuStreamingSession.close", () => {
     const settingsPayload = JSON.parse(settingsBody.settings as string) as {
       config?: { summary?: { content?: string } };
     };
-    // truncateSummary strips newlines and truncates, but doesn't strip HTML tags.
-    // The actual truncateSummary function just replaces \n with space and truncates to 50 chars.
-    // So the summary will contain the HTML tags (truncated).
+    // truncateSummary strips HTML tags, newlines, and truncates to 50 chars.
     const summary = settingsPayload.config?.summary?.content ?? "";
-    expect(summary.length).toBeLessThanOrEqual(50);
-    expect(summary).toBeTruthy();
+    expect(summary).toBe("Lukin 已完成 发布请查看 链接");
   });
 });
 

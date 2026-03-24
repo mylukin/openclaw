@@ -111,7 +111,11 @@ function truncateSummary(text: string, max = 50): string {
   if (!text) {
     return "";
   }
-  const clean = text.replace(/\n/g, " ").trim();
+  // Strip HTML/XML tags (e.g. <at>, <b>, <a href="...">) before truncating
+  const clean = text
+    .replace(/<[^>]*>/g, "")
+    .replace(/\n/g, " ")
+    .trim();
   return clean.length <= max ? clean : clean.slice(0, max - 3) + "...";
 }
 
