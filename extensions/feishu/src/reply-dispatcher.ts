@@ -185,7 +185,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         success: event.success,
         ...(event.messageId ? { messageId: event.messageId } : {}),
         ...(event.error ? { error: event.error } : {}),
-        metadata: { chatId, ...(event.metadata ?? {}) },
+        metadata: {
+          chatId,
+          ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
+          ...(event.metadata ?? {}),
+        },
       },
       {
         channelId: "feishu",

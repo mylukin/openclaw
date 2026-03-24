@@ -523,6 +523,7 @@ async function applyMessageSendingHook(params: {
   channel: Exclude<OutboundChannel, "none">;
   accountId?: string;
   replyToId?: string | null;
+  threadId?: string | number | null;
 }): Promise<{
   cancelled: boolean;
   payload: ReplyPayload;
@@ -545,6 +546,7 @@ async function applyMessageSendingHook(params: {
           accountId: params.accountId,
           mediaUrls: params.payloadSummary.mediaUrls,
           replyToId: params.payload.replyToId ?? params.replyToId,
+          ...(params.threadId != null ? { threadId: params.threadId } : {}),
         },
       },
       {
@@ -768,6 +770,7 @@ async function deliverOutboundPayloadsCore(
         channel,
         accountId,
         replyToId: params.replyToId,
+        threadId: params.threadId,
       });
       if (hookResult.cancelled) {
         continue;
