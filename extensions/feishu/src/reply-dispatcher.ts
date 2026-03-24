@@ -445,7 +445,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         return;
       }
       lastRenderedStreamContent = renderedForCard;
-      await streaming.update(renderedForCard);
+      await streaming.update(renderedForCard, { replace: true });
       // Only mark visible when real assistant text exists — status-only renders
       // (e.g. "💭 思考中...") are discarded by closeStreaming() and should not
       // suppress media-only final persistence.
@@ -490,7 +490,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await streamingStartPromise;
       }
       if (streaming?.isActive()) {
-        await streaming.update(combined);
+        // Replace mode: buildCombinedStreamText produces the full card content
+        // each time (reasoning + answer), so we replace rather than merge to
+        // avoid mergeStreamingText concatenating incompatible formats (e.g.
+        // status line "💭 思考中..." vs blockquote "💭 **Thinking**").
+        await streaming.update(combined, { replace: true });
       }
     });
   };

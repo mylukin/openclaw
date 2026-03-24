@@ -449,19 +449,21 @@ export class FeishuStreamingSession {
     }
   }
 
-  async update(text: string): Promise<void> {
+  async update(text: string, options?: { replace?: boolean }): Promise<void> {
     if (!this.state || this.closed) {
       return;
     }
-    const mergedInput = mergeStreamingText(this.pendingText ?? this.state.currentText, text);
-    if (!mergedInput || mergedInput === this.state.currentText) {
+    const resolvedInput = options?.replace
+      ? text
+      : mergeStreamingText(this.pendingText ?? this.state.currentText, text);
+    if (!resolvedInput || resolvedInput === this.state.currentText) {
       return;
     }
 
     // Throttle: skip if updated recently, but remember pending text
     const now = Date.now();
     if (now - this.lastUpdateTime < this.updateThrottleMs) {
-      this.pendingText = mergedInput;
+      this.pendingText = resolvedInput;
       return;
     }
     this.pendingText = null;
@@ -471,16 +473,19 @@ export class FeishuStreamingSession {
       this.flushTimer = null;
     }
 
+    const replace = options?.replace === true;
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) {
         return;
       }
-      const mergedText = mergeStreamingText(this.state.currentText, mergedInput);
-      if (!mergedText || mergedText === this.state.currentText) {
+      const finalText = replace
+        ? resolvedInput
+        : mergeStreamingText(this.state.currentText, resolvedInput);
+      if (!finalText || finalText === this.state.currentText) {
         return;
       }
-      this.state.currentText = mergedText;
-      await this.updateCardContent(mergedText, (e) => this.log?.(`Update failed: ${String(e)}`));
+      this.state.currentText = finalText;
+      await this.updateCardContent(finalText, (e) => this.log?.(`Update failed: ${String(e)}`));
     });
     await this.queue;
   }
