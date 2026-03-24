@@ -495,7 +495,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "step\n\n🔧 Tool calls (2)",
+      "step\n\n🔧 Tool calls (2)\n\n⏳ Running Grep...",
       { title: "💭 Thinking" },
     );
 
@@ -684,7 +684,40 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
-  it("preserves tool call count without restoring running status after text streaming", async () => {
+  it("does not reset cumulative tool count when onReplyStart fires again mid-reply", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await options.onReplyStart?.();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await options.onReplyStart?.();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("🔧 Tool calls (2)"),
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
+  it("shows running status again when a new tool starts after earlier text streaming", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -710,9 +743,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
     await flushAsyncTasks();
 
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (2)", {
-      title: "🔧 Tool Activity",
-    });
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      "🔧 Tool calls (2)\n\n⏳ Running Grep...",
+      {
+        title: "🔧 Tool Activity",
+      },
+    );
   });
 
   it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
