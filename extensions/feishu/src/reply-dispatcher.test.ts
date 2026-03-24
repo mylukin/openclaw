@@ -652,6 +652,38 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("preserves prior tool history and count without restoring running status after text streaming", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      "🔧 Tool calls (2)\n- Read\n- Grep",
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
   it("restores the previous running tool when nested tool activity unwinds", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
