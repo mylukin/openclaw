@@ -555,7 +555,7 @@ describe("appendAssistantMessageToSessionTranscript", () => {
 
     expect(result.ok).toBe(true);
     const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
-    expect(lines.length).toBe(3);
+    expect(lines.length).toBe(4);
   });
 });
 
