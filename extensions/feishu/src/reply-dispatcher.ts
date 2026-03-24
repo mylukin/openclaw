@@ -386,10 +386,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
 
   const TOOL_DISPLAY_NAMES: Record<string, string> = {
-    feishu_chat_history: "聊天记录",
-    feishu_chat_info: "群信息",
-    feishu_chat_members: "群成员",
-    feishu_member_chats: "成员群列表",
+    feishu_chat_history: "Chat History",
+    feishu_chat_info: "Chat Info",
+    feishu_chat_members: "Chat Members",
+    feishu_member_chats: "Member Chats",
   };
 
   const normalizeToolName = (name: string | undefined): string | undefined => {
@@ -401,8 +401,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
   };
 
-  /** Build the full thinking panel content from reasoning text and tool status. */
-  const composeThinkingContent = (): string => {
+  /** Build the full thinking panel content from reasoning text and tool status.
+   *  When `final` is true, show completed status instead of in-progress status
+   *  so the closed card doesn't perpetually display "Using...". */
+  const composeThinkingContent = (options?: { final?: boolean }): string => {
     const parts: string[] = [];
     if (reasoningText) {
       const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
@@ -410,17 +412,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       parts.push(plain);
     }
     if (toolUseCount > 0) {
-      const toolName = lastToolName?.trim();
-      let toolStatus: string;
-      if (toolUseCount === 1) {
-        toolStatus = toolName ? `🔧 正在使用${toolName}...` : "🔧 正在使用工具...";
+      if (options?.final) {
+        // Completed status for the final card
+        if (parts.length > 0) parts.push("\n");
+        const plural = toolUseCount === 1 ? "tool" : "tools";
+        parts.push(`🔧 Used ${toolUseCount} ${plural}`);
       } else {
-        toolStatus = toolName
-          ? `🔧 正在使用${toolName}...（已使用 ${toolUseCount} 个工具）`
-          : `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
+        const toolName = lastToolName?.trim();
+        let toolStatus: string;
+        if (toolUseCount === 1) {
+          toolStatus = toolName ? `🔧 Using ${toolName}...` : "🔧 Using tool...";
+        } else {
+          toolStatus = toolName
+            ? `🔧 Using ${toolName}... (${toolUseCount} tools used)`
+            : `🔧 ${toolUseCount} tools used, processing...`;
+        }
+        if (parts.length > 0) parts.push("\n");
+        parts.push(toolStatus);
       }
-      if (parts.length > 0) parts.push("\n");
-      parts.push(toolStatus);
     }
     return parts.join("");
   };
@@ -573,7 +582,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
       const finalText = streamText;
-      const finalThinking = composeThinkingContent();
+      const finalThinking = composeThinkingContent({ final: true });
       if (!finalText.trim() && !finalThinking) {
         // No visible content and no thinking — discard the card entirely
         // to avoid leaving a stale "⏳ Thinking..." placeholder.
