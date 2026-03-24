@@ -89,6 +89,11 @@ type FeishuMessageGetItem = {
   msg_type?: string;
   body?: { content?: string };
   sender?: FeishuMessageSender;
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    id?: { open_id?: string; user_id?: string; union_id?: string };
+  }>;
   create_time?: string;
 };
 
@@ -278,7 +283,10 @@ function parseFeishuMessageItem(
     senderId: item.sender?.id,
     senderOpenId: item.sender?.id_type === "open_id" ? item.sender?.id : undefined,
     senderType: item.sender?.sender_type,
-    content: parseFeishuMessageContent(rawContent, msgType),
+    content: enrichMentionPlaceholders(
+      parseFeishuMessageContent(rawContent, msgType),
+      item.mentions,
+    ),
     contentType: msgType,
     createTime: item.create_time ? parseInt(String(item.create_time), 10) : undefined,
     threadId: item.thread_id || undefined,
