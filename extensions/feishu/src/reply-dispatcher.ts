@@ -306,8 +306,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
   let thinkingCollapsed = false;
-  /** Accumulated tool usage lines for thinking panel */
-  let thinkingToolLines: string[] = [];
 
   /**
    * Deliver media files and emit persistence signals for media-only final payloads.
@@ -403,7 +401,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
   };
 
-  /** Build the full thinking panel content from reasoning text and tool lines. */
+  /** Build the full thinking panel content from reasoning text and tool status. */
   const composeThinkingContent = (): string => {
     const parts: string[] = [];
     if (reasoningText) {
@@ -411,9 +409,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
       parts.push(plain);
     }
-    if (thinkingToolLines.length > 0) {
+    if (toolUseCount > 0) {
+      const toolName = lastToolName?.trim();
+      let toolStatus: string;
+      if (toolUseCount === 1) {
+        toolStatus = toolName ? `🔧 正在使用${toolName}...` : "🔧 正在使用工具...";
+      } else {
+        toolStatus = toolName
+          ? `🔧 正在使用${toolName}...（已使用 ${toolUseCount} 个工具）`
+          : `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
+      }
       if (parts.length > 0) parts.push("\n");
-      parts.push(thinkingToolLines.join("\n"));
+      parts.push(toolStatus);
     }
     return parts.join("") || "Thinking...";
   };
@@ -600,7 +607,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamText = "";
     lastPartial = "";
     reasoningText = "";
-    thinkingToolLines = [];
     thinkingCollapsed = false;
   };
 
@@ -650,7 +656,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         finalTextEmitted = false;
         hasThinkingPrelude = false;
         thinkingCollapsed = false;
-        thinkingToolLines = [];
         streamPhase = "idle";
         toolUseCount = 0;
         lastToolName = undefined;
@@ -853,10 +858,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               toolUseCount += 1;
               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
               replaceNextPartialAfterTool = Boolean(streamText);
-              // Append tool line to thinking panel
-              const toolName = lastToolName?.trim();
-              const toolLine = toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
-              thinkingToolLines.push(toolLine);
+              // Tool status is derived from toolUseCount/lastToolName in composeThinkingContent
             }
             queueThinkingPrelude();
             streamPhase = "tool";
