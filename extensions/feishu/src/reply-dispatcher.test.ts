@@ -618,6 +618,40 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("clears running tool status as soon as assistant text starts streaming", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Running Bash..."),
+      { title: "🔧 Tool Activity" },
+    );
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      "🔧 Tool calls (1)\n- Bash",
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
   it("restores the previous running tool when nested tool activity unwinds", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",

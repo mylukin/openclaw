@@ -553,6 +553,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
+    if (activeToolRunCount > 0) {
+      activeToolRunCount = 0;
+      lastToolName = undefined;
+      activeToolNames.length = 0;
+      streamPhase = "streaming";
+      queueThinkingPanelUpdate();
+    }
     // Collapse thinking panel when first assistant text arrives
     markThinkingDone();
     queueStreamingRender();
