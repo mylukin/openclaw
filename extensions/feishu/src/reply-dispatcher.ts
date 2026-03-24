@@ -301,10 +301,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let hasVisibleTextInReply = false;
   let replaceNextPartialAfterTool = false;
   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
-  let activeToolRunCount = 0;
-  let lastToolName: string | undefined;
-  let runningToolStatusVisible = false;
-  const activeToolNames: string[] = [];
+  const activeTools: Array<{ toolCallId?: string; name: string }> = [];
   const toolCallHistory: string[] = [];
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
@@ -404,6 +401,29 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
   };
 
+  const resolveTrackedToolName = (name: string | undefined): string =>
+    normalizeToolName(name) ?? "tool";
+
+  const getActiveRunningToolName = (): string | undefined => {
+    const current = activeTools[activeTools.length - 1];
+    return current?.name?.trim() ? current.name.trim() : undefined;
+  };
+
+  const removeActiveTool = (toolCallId: string | undefined): void => {
+    if (activeTools.length === 0) {
+      return;
+    }
+    const normalizedId = toolCallId?.trim();
+    if (normalizedId) {
+      const index = activeTools.findIndex((entry) => entry.toolCallId === normalizedId);
+      if (index >= 0) {
+        activeTools.splice(index, 1);
+        return;
+      }
+    }
+    activeTools.pop();
+  };
+
   const formatToolHistoryLines = (): string[] => {
     const ordered: Array<{ name: string; count: number }> = [];
     for (const name of toolCallHistory) {
@@ -438,11 +458,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
     if (toolCallHistory.length > 0) {
       const toolLines = formatToolHistoryLines();
+      const currentRunningTool = !streamText.trim() ? getActiveRunningToolName() : undefined;
       const toolStatus = options?.final
         ? `✅ Completed ${toolCallHistory.length} tool call${toolCallHistory.length === 1 ? "" : "s"}`
-        : runningToolStatusVisible && activeToolRunCount > 0 && lastToolName?.trim()
-          ? `⏳ Running ${lastToolName.trim()}...`
-          : runningToolStatusVisible && activeToolRunCount > 0
+        : currentRunningTool
+          ? `⏳ Running ${currentRunningTool}...`
+          : !streamText.trim() && activeTools.length > 0
             ? "⏳ Running tool..."
             : "";
       sections.push(
@@ -553,8 +574,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
-    if (activeToolRunCount > 0) {
-      runningToolStatusVisible = false;
+    if (activeTools.length > 0) {
       streamPhase = "streaming";
       queueThinkingPanelUpdate();
     }
@@ -648,10 +668,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     lastPartial = "";
     reasoningText = "";
     thinkingCollapsed = false;
-    activeToolRunCount = 0;
-    lastToolName = undefined;
-    runningToolStatusVisible = false;
-    activeToolNames.length = 0;
+    activeTools.length = 0;
     toolCallHistory.length = 0;
   };
 
@@ -702,10 +719,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         hasThinkingPrelude = false;
         thinkingCollapsed = false;
         streamPhase = "idle";
-        activeToolRunCount = 0;
-        lastToolName = undefined;
-        runningToolStatusVisible = false;
-        activeToolNames.length = 0;
+        activeTools.length = 0;
         toolCallHistory.length = 0;
         lastRenderedStreamContent = "";
         replaceNextPartialAfterTool = false;
@@ -898,14 +912,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         : undefined,
       onToolStart: streamingEnabled
-        ? (payload: { name?: string; phase?: string }) => {
+        ? (payload: { name?: string; phase?: string; toolCallId?: string }) => {
             const isStartPhase = !payload?.phase || payload.phase === "start";
             if (isStartPhase) {
-              activeToolRunCount += 1;
-              lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
-              runningToolStatusVisible = !streamText.trim();
-              activeToolNames.push(lastToolName ?? "tool");
-              toolCallHistory.push(lastToolName ?? "tool");
+              const trackedName = resolveTrackedToolName(payload?.name);
+              activeTools.push({
+                name: trackedName,
+                toolCallId: payload.toolCallId?.trim() || undefined,
+              });
+              toolCallHistory.push(trackedName);
               replaceNextPartialAfterTool = Boolean(streamText);
             }
             queueThinkingPrelude();
@@ -918,17 +933,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         : undefined,
       onToolResult: streamingEnabled
-        ? (_payload: ReplyPayload) => {
-            if (activeToolRunCount > 0) {
-              activeToolRunCount -= 1;
-            }
-            if (activeToolNames.length > 0) {
-              activeToolNames.pop();
-            }
-            lastToolName = activeToolNames[activeToolNames.length - 1];
-            runningToolStatusVisible =
-              runningToolStatusVisible && activeToolRunCount > 0 && Boolean(lastToolName?.trim());
-            if (activeToolRunCount === 0 && streamPhase === "tool") {
+        ? (payload: ReplyPayload) => {
+            removeActiveTool(payload.toolCallId);
+            if (activeTools.length === 0 && streamPhase === "tool") {
               streamPhase = streamText ? "streaming" : "idle";
             }
             if (!shouldRenderStreamingStatus()) {

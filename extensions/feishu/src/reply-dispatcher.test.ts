@@ -652,6 +652,41 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("clears running tool status when visible assistant text arrives through block delivery", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Running Bash..."),
+      { title: "🔧 Tool Activity" },
+    );
+
+    await options.deliver({ text: "visible block text" }, { kind: "block" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      "🔧 Tool calls (1)\n- Bash",
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
   it("preserves prior tool history and count without restoring running status after text streaming", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
@@ -680,6 +715,78 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       "🔧 Tool calls (2)\n- Read\n- Grep",
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
+  it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
+    await dispatcher.replyOptions.onToolStart?.({ phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("🔧 Tool calls (2)\n- Bash\n- tool\n\n⏳ Running tool..."),
+      { title: "🔧 Tool Activity" },
+    );
+  });
+
+  it("removes the correct active tool when tool results arrive out of order", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({
+      name: "memory_search",
+      phase: "start",
+      toolCallId: "tool-memory",
+    });
+    await dispatcher.replyOptions.onToolStart?.({
+      name: "exec",
+      phase: "start",
+      toolCallId: "tool-exec",
+    });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Running exec..."),
+      { title: "🔧 Tool Activity" },
+    );
+
+    await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tool-memory" });
+    await flushAsyncTasks();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("🔧 Tool calls (2)\n- memory_search\n- exec\n\n⏳ Running exec..."),
       { title: "🔧 Tool Activity" },
     );
   });
