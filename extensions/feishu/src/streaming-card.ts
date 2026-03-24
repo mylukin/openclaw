@@ -428,6 +428,27 @@ export class FeishuStreamingSession {
     const now = Date.now();
     if (now - this.lastUpdateTime < this.updateThrottleMs) {
       this.pendingText = resolvedInput;
+      // Schedule a flush so throttled updates don't get stranded
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          if (this.pendingText !== null && this.state && !this.closed) {
+            const pending = this.pendingText;
+            this.pendingText = null;
+            this.lastUpdateTime = Date.now();
+            const r = options?.replace === true;
+            this.queue = this.queue.then(async () => {
+              if (!this.state || this.closed) return;
+              const merged = r ? pending : mergeStreamingText(this.state.currentText, pending);
+              if (!merged || merged === this.state.currentText) return;
+              this.state.currentText = merged;
+              await this.updateCardContent(merged, (e) =>
+                this.log?.(`Update failed: ${String(e)}`),
+              );
+            });
+          }
+        }, this.updateThrottleMs);
+      }
       return;
     }
     this.pendingText = null;
@@ -454,14 +475,24 @@ export class FeishuStreamingSession {
     await this.queue;
   }
 
-  /** Store thinking content for inclusion in the final card on close().
-   *  No API call during streaming — the thinking panel is only materialized
-   *  in the single full-card update at close() to avoid mid-stream flickering. */
+  /** Update thinking content — shows in the content element during streaming
+   *  (as inline text), then materialized as a collapsible panel on close(). */
   async updateThinking(text: string): Promise<void> {
     if (!this.state || this.closed || !text) {
       return;
     }
     this.state.thinkingText = text;
+    // Show thinking in the content element during streaming (no full card update)
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) return;
+      // Only update content if no assistant text has arrived yet
+      if (!this.state.currentText) {
+        await this.updateCardContent(text, (e) =>
+          this.log?.(`Thinking content update failed: ${String(e)}`),
+        );
+      }
+    });
+    await this.queue;
   }
 
   private async updateNoteContent(note: string): Promise<void> {
