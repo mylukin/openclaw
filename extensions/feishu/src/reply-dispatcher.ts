@@ -279,6 +279,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     account.config?.streaming !== false &&
     renderMode !== "raw" &&
     (!threadReplyMode || streamingInThread === true);
+  // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
+  // replies without streamingInThread) so reasoningText gets accumulated and can
+  // be included in non-streaming card output.  Only skip for raw text mode.
+  const reasoningEnabled = renderMode !== "raw";
 
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
@@ -707,12 +711,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
 
+          // When streaming is off but reasoning was collected, prepend it to
+          // the final card so thinking is visible even without streaming cards.
+          const cardText =
+            useCard && info?.kind === "final" && reasoningText
+              ? buildCombinedStreamText(reasoningText, text)
+              : text;
+
           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
           if (useCard) {
             const cardHeader = resolveCardHeader(agentId, identity);
             const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
             chunkResult = await sendChunkedTextReply({
-              text,
+              text: cardText,
               useCard: true,
               infoKind: info?.kind,
               sendChunk: async ({ chunk, isFirst }) => {
@@ -800,17 +811,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             queueThinkingPrelude();
           }
         : undefined,
-      onReasoningStream: streamingEnabled
+      onReasoningStream: reasoningEnabled
         ? (payload?: { text?: string; mediaUrls?: string[]; isReasoning?: boolean }) => {
             queueThinkingPrelude();
             streamPhase = "thinking";
             stagedStatusLine = resolveStatusLine();
             // Update reasoning text if provided
             if (payload?.text) {
-              startStreaming();
-              queueReasoningUpdate(payload.text);
+              reasoningText = payload.text;
+              if (streamingEnabled) {
+                startStreaming();
+                queueReasoningUpdate(payload.text);
+              }
             }
-            if (!shouldRenderStreamingStatus()) {
+            if (!streamingEnabled || !shouldRenderStreamingStatus()) {
               return;
             }
             if (!streaming?.isActive()) {
@@ -819,13 +833,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             queueStreamingRender();
           }
         : undefined,
-      onReasoningEnd: streamingEnabled
+      onReasoningEnd: reasoningEnabled
         ? () => {
             if (streamPhase !== "thinking") {
               return;
             }
             streamPhase = streamText ? "streaming" : "idle";
-            if (!shouldRenderStreamingStatus()) {
+            if (!streamingEnabled || !shouldRenderStreamingStatus()) {
               return;
             }
             queueStreamingRender();
