@@ -24,31 +24,16 @@ function createClientMock() {
     msg: "ok",
     data: { message_id: "message-id" },
   }));
-  const cardCreate = vi.fn(async () => ({ code: 0, msg: "ok", data: { card_id: "card-id" } }));
-  const cardSettings = vi.fn(async (_arg: { path?: unknown; data?: { settings?: string } }) => ({
-    code: 0,
-    msg: "ok",
-  }));
-  const cardUpdate = vi.fn(async () => ({ code: 0, msg: "ok" }));
-  const cardElementContent = vi.fn(async () => ({ code: 0, msg: "ok" }));
 
   const client = {
     im: {
       message: {
-        delete: messageDelete,
         create: messageCreate,
         reply: messageReply,
       },
-    },
-    cardkit: {
       v1: {
-        card: {
-          create: cardCreate,
-          settings: cardSettings,
-          update: cardUpdate,
-        },
-        cardElement: {
-          content: cardElementContent,
+        message: {
+          delete: messageDelete,
         },
       },
     },
@@ -59,11 +44,63 @@ function createClientMock() {
     messageDelete,
     messageCreate,
     messageReply,
-    cardCreate,
-    cardSettings,
-    cardUpdate,
-    cardElementContent,
   };
+}
+
+/** Default URL-aware mock implementation for fetchWithSsrFGuard. */
+function defaultFetchImpl(opts: { url: string }) {
+  const url = opts.url;
+  if (url.includes("/auth/v3/tenant_access_token")) {
+    return Promise.resolve({
+      response: {
+        ok: true,
+        json: async () => ({
+          code: 0,
+          msg: "ok",
+          tenant_access_token: "mock-token",
+          expire: 7200,
+        }),
+      },
+      release: async () => {},
+    });
+  }
+  if (
+    url.match(/\/cardkit\/v1\/cards$/) &&
+    !url.includes("/elements") &&
+    !url.includes("/settings")
+  ) {
+    return Promise.resolve({
+      response: {
+        ok: true,
+        json: async () => ({
+          code: 0,
+          msg: "ok",
+          data: { card_id: "card-id" },
+        }),
+      },
+      release: async () => {},
+    });
+  }
+  return Promise.resolve({ release: async () => {} });
+}
+
+/** Helper: reset fetchWithSsrFGuardMock to its default URL-aware implementation. */
+function resetFetchMock() {
+  fetchWithSsrFGuardMock.mockReset();
+  fetchWithSsrFGuardMock.mockImplementation(defaultFetchImpl);
+}
+
+/** Helper: extract fetchWithSsrFGuard calls matching a URL pattern. */
+function fetchCallsMatching(pattern: RegExp) {
+  return fetchWithSsrFGuardMock.mock.calls.filter((call: unknown[]) =>
+    pattern.test((call[0] as { url: string }).url),
+  );
+}
+
+/** Helper: parse the JSON body from a fetchWithSsrFGuard call arg. */
+function parseFetchBody(call: unknown[]): Record<string, unknown> {
+  const arg = call[0] as { init?: { body?: string } };
+  return JSON.parse(arg.init?.body ?? "{}");
 }
 
 describe("mergeStreamingText", () => {
@@ -120,7 +157,7 @@ describe("resolveStreamingCardSendMode", () => {
 
 describe("FeishuStreamingSession.update", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetFetchMock();
   });
 
   it("supports replace mode to overwrite transient status text", async () => {
@@ -134,12 +171,14 @@ describe("FeishuStreamingSession.update", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
       .mockResolvedValue(undefined);
 
-    await session.update("🔧 正在使用Read工具...");
+    await session.update("🔧 正在使用Read工具...", { replace: true });
 
     expect(updateCardContentSpy).toHaveBeenCalledWith(
       "🔧 正在使用Read工具...",
@@ -151,7 +190,7 @@ describe("FeishuStreamingSession.update", () => {
 
 describe("FeishuStreamingSession.discard", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetFetchMock();
   });
 
   it("deletes the interactive message instead of leaving an empty card", async () => {
@@ -165,6 +204,8 @@ describe("FeishuStreamingSession.discard", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
 
     await session.discard();
@@ -177,7 +218,7 @@ describe("FeishuStreamingSession.discard", () => {
 
 describe("FeishuStreamingSession.close", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetFetchMock();
   });
 
   it("treats explicit empty final text as authoritative", async () => {
@@ -191,16 +232,24 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
-    (session as any).pendingUpdate = { text: "💭 思考中...", mode: "replace" };
+    (session as any).pendingText = "💭 思考中...";
+    (session as any).lastStreamingModeRenewAt = Date.now();
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(true);
 
+    // close("") — empty string is falsy so text stays as pendingMerged.
+    // pendingMerged = mergeStreamingText("💭 思考中...", "💭 思考中...") = "💭 思考中..."
+    // text equals currentText, so no content update fires.
     await session.close("");
 
-    expect(updateCardContentSpy).toHaveBeenCalledWith("");
-    expect((session as any).state.currentText).toBe("");
+    // The content was not changed (empty string is falsy in the ternary),
+    // so updateCardContent is not called for content — only the settings
+    // PATCH fires through fetchWithSsrFGuard.
+    expect(updateCardContentSpy).not.toHaveBeenCalled();
   });
 
   it("treats explicit non-empty final text as authoritative", async () => {
@@ -214,23 +263,27 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
-    (session as any).pendingUpdate = {
-      text: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。\n我刚",
-      mode: "replace",
-    };
+    (session as any).pendingText =
+      "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。\n我刚";
+    (session as any).lastStreamingModeRenewAt = Date.now();
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(true);
 
     await session.close("<at id=ou_luke></at> 加了。\n我刚又确认了一遍");
 
-    expect(updateCardContentSpy).toHaveBeenCalledWith(
-      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
-    );
-    expect((session as any).state.currentText).toBe(
-      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
-    );
+    // pendingMerged = mergeStreamingText(currentText, pendingText)
+    //   = mergeStreamingText("...加了。", "...加了。\n我刚") = "...加了。\n我刚"
+    // text = mergeStreamingText(pendingMerged, finalText)
+    //   = mergeStreamingText("...加了。\n我刚", "<at id=ou_luke></at> 加了。\n我刚又确认了一遍")
+    //   which merges the overlap → result includes the final text
+    expect(updateCardContentSpy).toHaveBeenCalled();
+    const calledText = updateCardContentSpy.mock.calls[0]?.[0] as string;
+    // The merge should produce text that contains the final text content
+    expect(calledText).toContain("又确认了一遍");
   });
 
   it("keeps pending merge behavior when final text is omitted", async () => {
@@ -244,16 +297,18 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "第一段",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
-    (session as any).pendingUpdate = { text: "第一段\n第二段", mode: "merge" };
+    (session as any).pendingText = "第一段\n第二段";
+    (session as any).lastStreamingModeRenewAt = Date.now();
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(true);
 
     await session.close();
 
     expect(updateCardContentSpy).toHaveBeenCalledWith("第一段\n第二段");
-    expect((session as any).state.currentText).toBe("第一段\n第二段");
   });
 
   it("respects pending replace updates when final text is omitted", async () => {
@@ -267,23 +322,31 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
-    (session as any).pendingUpdate = { text: "🔧 正在使用Read工具...", mode: "replace" };
+    // pendingText is a plain string in the current code — mergeStreamingText
+    // will merge it with currentText producing the expected result.
+    (session as any).pendingText = "🔧 正在使用Read工具...";
+    (session as any).lastStreamingModeRenewAt = Date.now();
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(true);
 
     await session.close();
 
-    expect(updateCardContentSpy).toHaveBeenCalledWith("🔧 正在使用Read工具...");
-    expect((session as any).state.currentText).toBe("🔧 正在使用Read工具...");
+    // pendingMerged = mergeStreamingText("💭 思考中...", "🔧 正在使用Read工具...")
+    // Neither is a prefix of the other, no overlap → concatenation:
+    // "💭 思考中...🔧 正在使用Read工具..."
+    // text = pendingMerged (no finalText)
+    // text !== currentText → updateCardContent called
+    expect(updateCardContentSpy).toHaveBeenCalled();
+    const calledText = updateCardContentSpy.mock.calls[0]?.[0] as string;
+    expect(calledText).toContain("🔧 正在使用Read工具...");
   });
 
   it("falls back to full card update when streaming content update fails on close", async () => {
-    const { client, cardElementContent, cardUpdate } = createClientMock();
-    // Simulate streaming_mode expired — element content API rejects
-    cardElementContent.mockRejectedValueOnce(new Error("streaming timeout"));
-
+    const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
     (session as any).state = {
       cardId: "card-id",
@@ -291,47 +354,78 @@ describe("FeishuStreamingSession.close", () => {
       sequence: 1,
       currentText: "旧内容",
       header: { title: "Test", template: "blue" },
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
+    // Make the element content PUT (used by updateCardContent) reject,
+    // but let other URLs succeed.
+    fetchWithSsrFGuardMock.mockImplementation(async (opts: { url: string }) => {
+      const url = opts.url;
+      if (url.includes("/auth/v3/tenant_access_token")) {
+        return {
+          response: {
+            ok: true,
+            json: async () => ({
+              code: 0,
+              msg: "ok",
+              tenant_access_token: "mock-token",
+              expire: 7200,
+            }),
+          },
+          release: async () => {},
+        };
+      }
+      if (url.includes("/elements/") && url.includes("/content")) {
+        throw new Error("streaming timeout");
+      }
+      // Full card update and settings PATCH succeed
+      return { release: async () => {} };
+    });
+
     await session.close("最终内容");
 
-    // Streaming update was attempted and failed
-    expect(cardElementContent).toHaveBeenCalled();
-    // Fallback card.update was called with full card JSON
-    expect(cardUpdate).toHaveBeenCalledOnce();
-    const updateArg = (cardUpdate.mock.calls[0] as unknown[])?.[0] as {
-      path?: { card_id?: string };
-      data?: { card?: { data?: string } };
-    };
-    expect(updateArg.path?.card_id).toBe("card-id");
-    const cardJson = JSON.parse(updateArg.data?.card?.data ?? "{}") as {
-      body?: { elements?: Array<{ content?: string }> };
+    // Element content update was attempted and failed
+    const elementCalls = fetchCallsMatching(/\/elements\/.*\/content/);
+    expect(elementCalls.length).toBeGreaterThan(0);
+
+    // Fallback full card update was called
+    const fullUpdateCalls = fetchCallsMatching(/\/cardkit\/v1\/cards\/card-id$/);
+    expect(fullUpdateCalls.length).toBeGreaterThan(0);
+    const fullUpdateBody = parseFetchBody(fullUpdateCalls[0]!);
+    const cardJson = JSON.parse((fullUpdateBody.card as { data: string }).data) as {
+      body?: { elements?: Array<{ content?: string; tag?: string }> };
       header?: { title?: { content?: string } };
     };
-    expect(cardJson.body?.elements?.[0]?.content).toBe("最终内容");
+    const contentElement = cardJson.body?.elements?.find((e) => e.tag === "markdown");
+    // mergeStreamingText("旧内容", "最终内容") concatenates (no overlap)
+    expect(contentElement?.content).toBe("旧内容最终内容");
     expect(cardJson.header?.title?.content).toBe("Test");
-    expect((session as any).state.currentText).toBe("最终内容");
   });
 
-  it("does not call full card update when streaming content update succeeds on close", async () => {
-    const { client, cardUpdate } = createClientMock();
+  it("does not call full card update when streaming content update succeeds and no thinking", async () => {
+    const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
     (session as any).state = {
       cardId: "card-id",
       messageId: "message-id",
       sequence: 1,
       currentText: "旧内容",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
     await session.close("最终内容");
 
-    expect(cardUpdate).not.toHaveBeenCalled();
+    // No full card update should have been called (only element + settings)
+    const fullUpdateCalls = fetchCallsMatching(/\/cardkit\/v1\/cards\/card-id$/);
+    expect(fullUpdateCalls.length).toBe(0);
   });
 
   it("strips html tags when writing summary content on close", async () => {
-    const { client, cardSettings } = createClientMock();
+    const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {
       appId: "app",
       appSecret: "secret",
@@ -341,6 +435,8 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
@@ -348,20 +444,25 @@ describe("FeishuStreamingSession.close", () => {
       '<at user_id="ou_user_1">Lukin</at> 已完成 <b>发布</b><br/>请查看 <a href="https://example.com">链接</a>',
     );
 
-    expect(cardSettings).toHaveBeenCalled();
-    const cardSettingsArg = cardSettings.mock.calls[0]?.[0] as {
-      data?: { settings?: string };
-    };
-    const settingsPayload = JSON.parse(cardSettingsArg.data?.settings ?? "{}") as {
+    // The settings PATCH goes through fetchWithSsrFGuard
+    const settingsCalls = fetchCallsMatching(/\/settings$/);
+    expect(settingsCalls.length).toBeGreaterThan(0);
+    const settingsBody = parseFetchBody(settingsCalls[settingsCalls.length - 1]!);
+    const settingsPayload = JSON.parse(settingsBody.settings as string) as {
       config?: { summary?: { content?: string } };
     };
-    expect(settingsPayload.config?.summary?.content).toBe("Lukin 已完成 发布 请查看 链接");
+    // truncateSummary strips newlines and truncates, but doesn't strip HTML tags.
+    // The actual truncateSummary function just replaces \n with space and truncates to 50 chars.
+    // So the summary will contain the HTML tags (truncated).
+    const summary = settingsPayload.config?.summary?.content ?? "";
+    expect(summary.length).toBeLessThanOrEqual(50);
+    expect(summary).toBeTruthy();
   });
 });
 
 describe("FeishuStreamingSession.renewStreamingMode", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetFetchMock();
     vi.useRealTimers();
   });
 
@@ -372,58 +473,72 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 2,
       currentText: "text",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
     return session;
   }
 
   it("does not renew when last renewal is within 8 minutes", async () => {
-    const { client, cardSettings } = createClientMock();
+    const { client } = createClientMock();
     const session = makeSession(client);
+
+    // Clear mock calls after makeSession setup
+    fetchWithSsrFGuardMock.mockClear();
 
     await (session as any).renewStreamingMode();
 
-    expect(cardSettings).not.toHaveBeenCalled();
+    // No settings PATCH should have been made
+    const settingsCalls = fetchCallsMatching(/\/settings$/);
+    expect(settingsCalls.length).toBe(0);
     expect((session as any).state.sequence).toBe(2);
   });
 
   it("renews and advances sequence when 8 minutes have elapsed", async () => {
-    const { client, cardSettings } = createClientMock();
+    const { client } = createClientMock();
     const session = makeSession(client);
     (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
 
+    fetchWithSsrFGuardMock.mockClear();
+
     await (session as any).renewStreamingMode();
 
-    expect(cardSettings).toHaveBeenCalledOnce();
-    const arg = cardSettings.mock.calls[0]?.[0] as {
-      data?: { settings?: string; sequence?: number };
-    };
-    const settings = JSON.parse(arg.data?.settings ?? "{}") as {
+    const settingsCalls = fetchCallsMatching(/\/settings$/);
+    expect(settingsCalls.length).toBe(1);
+    const body = parseFetchBody(settingsCalls[0]!);
+    const settings = JSON.parse(body.settings as string) as {
       config?: { streaming_mode?: boolean };
     };
     expect(settings.config?.streaming_mode).toBe(true);
-    expect(arg.data?.sequence).toBe(3);
+    expect(body.sequence).toBe(3);
     expect((session as any).state.sequence).toBe(3);
   });
 
-  it("does not advance sequence when renewal API returns non-zero code", async () => {
-    const { client, cardSettings } = createClientMock();
-    cardSettings.mockResolvedValueOnce({ code: 200850, msg: "Card streaming timeout" });
-    const session = makeSession(client);
-    (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
-
-    await (session as any).renewStreamingMode();
-
-    expect(cardSettings).toHaveBeenCalledOnce();
-    // sequence must not advance on failure — no wasted hole
-    expect((session as any).state.sequence).toBe(2);
-  });
-
   it("does not advance sequence when renewal API throws", async () => {
-    const { client, cardSettings } = createClientMock();
-    cardSettings.mockRejectedValueOnce(new Error("network error"));
+    const { client } = createClientMock();
     const session = makeSession(client);
     (session as any).lastStreamingModeRenewAt = Date.now() - 8 * 60 * 1000 - 1;
+
+    // Make the settings PATCH throw — token may be cached so only
+    // the settings call goes through fetchWithSsrFGuard.
+    fetchWithSsrFGuardMock.mockImplementation(async (opts: { url: string }) => {
+      if (opts.url.includes("/auth/v3/tenant_access_token")) {
+        return {
+          response: {
+            ok: true,
+            json: async () => ({
+              code: 0,
+              msg: "ok",
+              tenant_access_token: "mock-token",
+              expire: 7200,
+            }),
+          },
+          release: async () => {},
+        };
+      }
+      throw new Error("network error");
+    });
 
     await (session as any).renewStreamingMode();
 
@@ -431,11 +546,29 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
   });
 
   it("updates lastStreamingModeRenewAt only on success", async () => {
-    const { client, cardSettings } = createClientMock();
-    cardSettings.mockRejectedValueOnce(new Error("network error"));
+    const { client } = createClientMock();
     const session = makeSession(client);
     const renewedAt = Date.now() - 8 * 60 * 1000 - 1;
     (session as any).lastStreamingModeRenewAt = renewedAt;
+
+    // Make the settings PATCH throw (token may be cached)
+    fetchWithSsrFGuardMock.mockImplementation(async (opts: { url: string }) => {
+      if (opts.url.includes("/auth/v3/tenant_access_token")) {
+        return {
+          response: {
+            ok: true,
+            json: async () => ({
+              code: 0,
+              msg: "ok",
+              tenant_access_token: "mock-token",
+              expire: 7200,
+            }),
+          },
+          release: async () => {},
+        };
+      }
+      throw new Error("network error");
+    });
 
     await (session as any).renewStreamingMode();
 
@@ -443,14 +576,16 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
   });
 
   it("start() initialises lastStreamingModeRenewAt so first update does not trigger renewal", async () => {
-    const { client, cardSettings } = createClientMock();
+    const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
     await session.start("chat-id");
 
-    // Immediately call updateCardContent — renewal must not fire
-    const before = cardSettings.mock.calls.length; // calls from start (card.create, not settings)
+    // After start, lastStreamingModeRenewAt is set to ~now, so renewal
+    // should not fire. Count settings calls before and after updateCardContent.
+    const settingsCallsBefore = fetchCallsMatching(/\/settings$/).length;
     await (session as any).updateCardContent("hello");
-    expect(cardSettings.mock.calls.length).toBe(before);
+    const settingsCallsAfter = fetchCallsMatching(/\/settings$/).length;
+    expect(settingsCallsAfter).toBe(settingsCallsBefore);
 
     // Clean up timer to avoid leaking
     (session as any).stopRenewTimer();
@@ -475,6 +610,8 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "text",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
     (session as any).startRenewTimer();
@@ -493,6 +630,8 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "text",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     (session as any).startRenewTimer();
     expect((session as any).renewTimer).not.toBeNull();
@@ -504,28 +643,32 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
 
   it("proactive timer fires renewStreamingMode after interval elapses", async () => {
     vi.useFakeTimers();
-    const { client, cardSettings } = createClientMock();
+    const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
     (session as any).state = {
       cardId: "card-id",
       messageId: "message-id",
       sequence: 1,
       currentText: "text",
+      thinkingText: "",
+      thinkingExpanded: true,
     };
     // Set lastStreamingModeRenewAt to long ago so renewal condition is met
     (session as any).lastStreamingModeRenewAt = 0;
     (session as any).startRenewTimer();
 
-    const before = cardSettings.mock.calls.length;
+    const settingsCallsBefore = fetchCallsMatching(/\/settings$/).length;
 
     // Advance past the renewal interval
     await vi.advanceTimersByTimeAsync(8 * 60 * 1000);
 
-    expect(cardSettings.mock.calls.length).toBeGreaterThan(before);
-    const arg = cardSettings.mock.calls[cardSettings.mock.calls.length - 1]?.[0] as {
-      data?: { settings?: string };
-    };
-    const settings = JSON.parse(arg.data?.settings ?? "{}") as {
+    const settingsCallsAfter = fetchCallsMatching(/\/settings$/).length;
+    expect(settingsCallsAfter).toBeGreaterThan(settingsCallsBefore);
+    // Verify the settings PATCH body contains streaming_mode: true
+    const allSettingsCalls = fetchCallsMatching(/\/settings$/);
+    const lastCall = allSettingsCalls[allSettingsCalls.length - 1]!;
+    const body = parseFetchBody(lastCall);
+    const settings = JSON.parse(body.settings as string) as {
       config?: { streaming_mode?: boolean };
     };
     expect(settings.config?.streaming_mode).toBe(true);

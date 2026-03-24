@@ -305,7 +305,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let lastToolName: string | undefined;
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
-  let stagedStatusLine: string | undefined;
+  let thinkingCollapsed = false;
+  /** Accumulated tool usage lines for thinking panel */
+  let thinkingToolLines: string[] = [];
 
   /**
    * Deliver media files and emit persistence signals for media-only final payloads.
@@ -401,33 +403,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
   };
 
-  const resolveStatusLine = (): string | undefined => {
-    if (streamPhase === "thinking") {
-      return "💭 思考中...";
+  /** Build the full thinking panel content from reasoning text and tool lines. */
+  const composeThinkingContent = (): string => {
+    const parts: string[] = [];
+    if (reasoningText) {
+      const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
+      const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
+      parts.push(plain);
     }
-    if (streamPhase === "tool") {
-      if (toolUseCount >= 2) {
-        return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
-      }
-      const toolName = lastToolName?.trim();
-      return toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
+    if (thinkingToolLines.length > 0) {
+      if (parts.length > 0) parts.push("\n");
+      parts.push(thinkingToolLines.join("\n"));
     }
-    return undefined;
-  };
-
-  const composeStreamingContent = (mode: "live" | "final" = "live"): string => {
-    const assistantText = streamText;
-    if (mode === "final") {
-      return assistantText;
-    }
-    const statusLine = resolveStatusLine();
-    if (!statusLine) {
-      return assistantText;
-    }
-    if (!assistantText) {
-      return statusLine;
-    }
-    return `${statusLine}\n---\n${assistantText}`;
+    return parts.join("") || "Thinking...";
   };
 
   /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
@@ -443,7 +431,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return text.substring(0, lastAtIdx);
   };
 
-  const queueStreamingRender = (renderedSnapshot?: string) => {
+  /** Queue an update to the main content element only. */
+  const queueStreamingRender = () => {
     partialUpdateQueue = partialUpdateQueue.then(async () => {
       if (streamingStartPromise) {
         await streamingStartPromise;
@@ -451,17 +440,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (!streaming?.isActive()) {
         return;
       }
-      const rendered = renderedSnapshot ?? composeStreamingContent("live");
-      const safeRendered = stripIncompleteAtTag(rendered);
+      const safeRendered = stripIncompleteAtTag(streamText);
       const renderedForCard = normalizeMentionTagsForCard(safeRendered);
       if (!renderedForCard || renderedForCard === lastRenderedStreamContent) {
         return;
       }
       lastRenderedStreamContent = renderedForCard;
       await streaming.update(renderedForCard, { replace: true });
-      // Only mark visible when real assistant text exists — status-only renders
-      // (e.g. "💭 思考中...") are discarded by closeStreaming() and should not
-      // suppress media-only final persistence.
       if (streamText.trim()) {
         hasVisibleTextInReply = true;
       }
@@ -476,38 +461,34 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       return false;
     }
     streamPhase = "thinking";
-    stagedStatusLine = resolveStatusLine();
     hasThinkingPrelude = true;
     return true;
   };
 
-  const formatReasoningPrefix = (thinking: string): string => {
-    if (!thinking) return "";
-    const withoutLabel = thinking.replace(/^Reasoning:\n/, "");
-    const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
-    const lines = plain.split("\n").map((line) => `> ${line}`);
-    return `> 💭 **Thinking**\n${lines.join("\n")}`;
-  };
-
-  const buildCombinedStreamText = (thinking: string, answer: string): string => {
-    const parts: string[] = [];
-    if (thinking) parts.push(formatReasoningPrefix(thinking));
-    if (thinking && answer) parts.push("\n\n---\n\n");
-    if (answer) parts.push(answer);
-    return parts.join("");
-  };
-
-  const flushStreamingCardUpdate = (combined: string) => {
+  /** Queue an update to the thinking panel content. */
+  const queueThinkingPanelUpdate = () => {
     partialUpdateQueue = partialUpdateQueue.then(async () => {
       if (streamingStartPromise) {
         await streamingStartPromise;
       }
       if (streaming?.isActive()) {
-        // Replace mode: buildCombinedStreamText produces the full card content
-        // each time (reasoning + answer), so we replace rather than merge to
-        // avoid mergeStreamingText concatenating incompatible formats (e.g.
-        // status line "💭 思考中..." vs blockquote "💭 **Thinking**").
-        await streaming.update(combined, { replace: true });
+        await streaming.updateThinking(composeThinkingContent());
+      }
+    });
+  };
+
+  /** Collapse thinking panel when assistant text starts flowing. */
+  const collapseThinkingIfNeeded = () => {
+    if (thinkingCollapsed) {
+      return;
+    }
+    thinkingCollapsed = true;
+    partialUpdateQueue = partialUpdateQueue.then(async () => {
+      if (streamingStartPromise) {
+        await streamingStartPromise;
+      }
+      if (streaming?.isActive()) {
+        await streaming.collapseThinking(composeThinkingContent());
       }
     });
   };
@@ -529,17 +510,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       options?.dedupeWithLastPartial === true &&
       Boolean(streamText) &&
       !nextText.startsWith(streamText);
+    if (shouldResetAfterTool) {
+      // Post-tool text doesn't continue from existing stream — replace entirely
+      streamText = nextText;
+      replaceNextPartialAfterTool = false;
+    } else {
+      streamText = mergeStreamingText(streamText, nextText);
+    }
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
-    streamText = mergeStreamingText(streamText, nextText);
-    flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+    // Collapse thinking panel when first assistant text arrives
+    collapseThinkingIfNeeded();
+    queueStreamingRender();
   };
 
   const queueReasoningUpdate = (nextThinking: string) => {
     if (!nextThinking) return;
     reasoningText = nextThinking;
-    flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+    queueThinkingPanelUpdate();
   };
 
   const startStreaming = () => {
@@ -585,7 +574,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     await partialUpdateQueue;
     const streamMessageId = streaming?.getMessageId();
     if (streaming?.isActive()) {
-      let text = buildCombinedStreamText(reasoningText, streamText);
+      // Close with assistant text only — thinking is in the collapsible panel
+      let text = streamText;
       const finalText = text;
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
@@ -610,6 +600,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamText = "";
     lastPartial = "";
     reasoningText = "";
+    thinkingToolLines = [];
+    thinkingCollapsed = false;
   };
 
   const sendChunkedTextReply = async (params: {
@@ -655,6 +647,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       onReplyStart: async () => {
         deliveredFinalTexts.clear();
         hasVisibleTextInReply = false;
+        finalTextEmitted = false;
+        hasThinkingPrelude = false;
+        thinkingCollapsed = false;
+        thinkingToolLines = [];
+        streamPhase = "idle";
+        toolUseCount = 0;
+        lastToolName = undefined;
+        lastRenderedStreamContent = "";
+        replaceNextPartialAfterTool = false;
         if (streamingEnabled && renderMode === "card") {
           startStreaming();
         }
@@ -721,7 +722,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           // the final card so thinking is visible even without streaming cards.
           const cardText =
             useCard && info?.kind === "final" && reasoningText
-              ? buildCombinedStreamText(reasoningText, text)
+              ? `> 💭 **Thinking**\n${reasoningText
+                  .replace(/^Reasoning:\n/, "")
+                  .replace(/^_(.*)_$/gm, "$1")
+                  .split("\n")
+                  .map((l: string) => `> ${l}`)
+                  .join("\n")}\n\n---\n\n${text}`
               : text;
 
           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
@@ -823,8 +829,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ? (payload?: { text?: string; mediaUrls?: string[]; isReasoning?: boolean }) => {
             queueThinkingPrelude();
             streamPhase = "thinking";
-            stagedStatusLine = resolveStatusLine();
-            // Update reasoning text if provided
             if (payload?.text) {
               reasoningText = payload.text;
               if (streamingEnabled) {
@@ -832,13 +836,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 queueReasoningUpdate(payload.text);
               }
             }
-            if (!streamingEnabled || !shouldRenderStreamingStatus()) {
-              return;
-            }
-            if (!streaming?.isActive()) {
-              return;
-            }
-            queueStreamingRender();
           }
         : undefined,
       onReasoningEnd: reasoningEnabled
@@ -847,10 +844,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               return;
             }
             streamPhase = streamText ? "streaming" : "idle";
-            if (!streamingEnabled || !shouldRenderStreamingStatus()) {
-              return;
-            }
-            queueStreamingRender();
           }
         : undefined,
       onToolStart: streamingEnabled
@@ -860,17 +853,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               toolUseCount += 1;
               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
               replaceNextPartialAfterTool = Boolean(streamText);
+              // Append tool line to thinking panel
+              const toolName = lastToolName?.trim();
+              const toolLine = toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
+              thinkingToolLines.push(toolLine);
             }
             queueThinkingPrelude();
             streamPhase = "tool";
-            stagedStatusLine = resolveStatusLine();
             if (!shouldRenderStreamingStatus()) {
               return;
             }
-            if (!streaming?.isActive()) {
-              return;
-            }
-            queueStreamingRender();
+            startStreaming();
+            queueThinkingPanelUpdate();
           }
         : undefined,
       onPartialReply: streamingEnabled
@@ -878,13 +872,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             if (!payload.text) {
               return;
             }
-            // Ensure streaming card is started when partial text arrives.
-            // In embedded mode with block streaming, the card is started by the
-            // deliver handler on the first block reply. CLI mode has no block
-            // streaming — text arrives as complete chunks via onPartialReply —
-            // so the card must be started here. startStreaming() is idempotent
-            // (guarded by streamingStartPromise), so calling it here is safe
-            // even when the card was already started by deliver.
             queueThinkingPrelude();
             startStreaming();
             queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });

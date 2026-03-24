@@ -14,7 +14,12 @@ type CardState = {
   sequence: number;
   currentText: string;
   hasNote: boolean;
+  noteText: string;
   header?: StreamingCardHeader;
+  thinkingText: string;
+  thinkingExpanded: boolean;
+  /** Whether the thinking panel has been injected into the card via full update. */
+  thinkingInjected: boolean;
 };
 
 /** Options for customising the initial streaming card appearance. */
@@ -192,7 +197,7 @@ export class FeishuStreamingSession {
 
     const apiBase = resolveApiBase(this.creds.domain);
     const elements: Record<string, unknown>[] = [
-      { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
+      { tag: "markdown", content: "", element_id: "content" },
     ];
     if (options?.note) {
       elements.push({ tag: "hr" });
@@ -293,7 +298,11 @@ export class FeishuStreamingSession {
       sequence: 1,
       currentText: "",
       hasNote: !!options?.note,
+      noteText: options?.note ?? "",
       header: options?.header,
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingInjected: false,
     };
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
@@ -357,8 +366,9 @@ export class FeishuStreamingSession {
     }
   }
 
-  /** Push text via the streaming element API. Returns true on success, false on failure. */
-  private async updateCardContent(
+  /** Push text to any element via the streaming element API. Returns true on success, false on failure. */
+  private async updateElementContent(
+    elementId: string,
     text: string,
     onError?: (error: unknown) => void,
   ): Promise<boolean> {
@@ -371,7 +381,7 @@ export class FeishuStreamingSession {
     const nextSeq = this.state.sequence + 1;
     let ok = true;
     await fetchWithSsrFGuard({
-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
+      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/${elementId}/content`,
       init: {
         method: "PUT",
         headers: {
@@ -385,7 +395,7 @@ export class FeishuStreamingSession {
         }),
       },
       policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
-      auditContext: "feishu.streaming-card.update",
+      auditContext: `feishu.streaming-card.update.${elementId}`,
     })
       .then(async ({ release }) => {
         await release();
@@ -398,22 +408,68 @@ export class FeishuStreamingSession {
     return ok;
   }
 
+  /** Push text via the streaming element API for the main content element. */
+  private async updateCardContent(
+    text: string,
+    onError?: (error: unknown) => void,
+  ): Promise<boolean> {
+    return this.updateElementContent("content", text, onError);
+  }
+
+  /** Build the full elements array for full card updates, including thinking panel. */
+  private buildFullElements(text: string, options?: { note?: string }): Record<string, unknown>[] {
+    const elements: Record<string, unknown>[] = [];
+    // Include thinking panel if there's thinking content
+    if (this.state?.thinkingText) {
+      elements.push({
+        tag: "collapsible_panel",
+        expanded: this.state.thinkingExpanded,
+        element_id: "thinking",
+        header: {
+          title: { tag: "plain_text", content: "💭 Thinking" },
+        },
+        border: { color: "grey" },
+        vertical_spacing: "2px",
+        padding: "4px 12px",
+        elements: [
+          { tag: "markdown", content: this.state.thinkingText, element_id: "thinking_content" },
+        ],
+      });
+    }
+    elements.push({ tag: "markdown", content: text, element_id: "content" });
+    if (this.state?.hasNote) {
+      elements.push({ tag: "hr" });
+      const noteSource = options?.note ?? this.state.noteText;
+      const noteContent = noteSource ? `<font color='grey'>${noteSource}</font>` : "";
+      elements.push({ tag: "markdown", content: noteContent, element_id: "note" });
+    }
+    return elements;
+  }
+
   /**
    * Fallback: full card replacement via card update API.
    * Works regardless of streaming_mode state -- used when the streaming
    * element API fails (e.g. after the 10-minute auto-close).
+   *
+   * When `keepStreaming` is true, the card retains streaming_mode so that
+   * subsequent element-level updates (e.g. content streaming) still work.
    */
-  private async updateCardFull(text: string): Promise<boolean> {
+  private async updateCardFull(
+    text: string,
+    options?: { keepStreaming?: boolean; note?: string },
+  ): Promise<boolean> {
     if (!this.state) {
       return false;
     }
     const apiBase = resolveApiBase(this.creds.domain);
+    const config: Record<string, unknown> = { update_multi: true };
+    if (options?.keepStreaming) {
+      config.streaming_mode = true;
+    }
     const cardJson: Record<string, unknown> = {
       schema: "2.0",
-      config: { update_multi: true },
-      body: {
-        elements: [{ tag: "markdown", content: text, element_id: "content" }],
-      },
+      config,
+      body: { elements: this.buildFullElements(text, { note: options?.note }) },
     };
     if (this.state.header) {
       cardJson.header = {
@@ -490,10 +546,64 @@ export class FeishuStreamingSession {
     await this.queue;
   }
 
+  /** Update thinking panel content (non-streaming, immediate).
+   *  On first call, injects the collapsible_panel via full card update. */
+  async updateThinking(text: string): Promise<void> {
+    if (!this.state || this.closed) {
+      return;
+    }
+    this.state.thinkingText = text;
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) {
+        return;
+      }
+      if (!this.state.thinkingInjected) {
+        // First thinking update — inject the collapsible_panel via full card update
+        const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
+        if (ok) {
+          this.state.thinkingInjected = true;
+        } else {
+          // Injection failed — reset thinkingText so next call retries injection
+          this.state.thinkingText = "";
+          this.log?.("Thinking panel injection failed; will retry on next update");
+        }
+      } else {
+        await this.updateElementContent("thinking_content", text, (e) =>
+          this.log?.(`Thinking update failed: ${String(e)}`),
+        );
+      }
+    });
+    await this.queue;
+  }
+
+  /** Collapse the thinking panel via full card replacement. */
+  async collapseThinking(finalThinkingText?: string): Promise<void> {
+    if (!this.state || this.closed) {
+      return;
+    }
+    if (finalThinkingText !== undefined) {
+      this.state.thinkingText = finalThinkingText;
+    }
+    this.state.thinkingExpanded = false;
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) {
+        return;
+      }
+      // Must use full card update to change the expanded property.
+      // keepStreaming so that subsequent element API updates still work.
+      const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
+      if (ok) {
+        this.state.thinkingInjected = true;
+      }
+    });
+    await this.queue;
+  }
+
   private async updateNoteContent(note: string): Promise<void> {
     if (!this.state || !this.state.hasNote) {
       return;
     }
+    this.state.noteText = note;
     const apiBase = resolveApiBase(this.creds.domain);
     const nextSeq = this.state.sequence + 1;
     await fetchWithSsrFGuard({
@@ -536,21 +646,34 @@ export class FeishuStreamingSession {
     const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
     const apiBase = resolveApiBase(this.creds.domain);
 
-    // Only send final update if content differs from what's already displayed
-    if (text && text !== this.state.currentText) {
-      const streamOk = await this.updateCardContent(text);
-      if (!streamOk) {
-        // Streaming element API failed (likely 10-min auto-close) -- fall back
-        // to a full card replacement which works regardless of streaming state.
-        this.log?.("Streaming content update failed on close; falling back to full card update");
-        await this.updateCardFull(text);
-      }
+    // Ensure thinking panel is collapsed in the final card
+    this.state.thinkingExpanded = false;
+    const previousText = this.state.currentText;
+    if (text) {
       this.state.currentText = text;
     }
 
-    // Update note with final model/provider info
-    if (options?.note) {
-      await this.updateNoteContent(options.note);
+    // When thinking content exists, use a single full card update to collapse
+    // the thinking panel and set final content + note in one shot. This avoids
+    // the issue where a full card update overwrites the note element to empty
+    // and then a subsequent element API note update fails because streaming
+    // mode was disabled by the full card update.
+    if (this.state.thinkingText) {
+      await this.updateCardFull(this.state.currentText, {
+        note: options?.note,
+      });
+    } else {
+      // No thinking panel — use element API for content, then note.
+      if (text && text !== previousText) {
+        const streamOk = await this.updateCardContent(text);
+        if (!streamOk) {
+          this.log?.("Streaming content update failed on close; falling back to full card update");
+          await this.updateCardFull(text);
+        }
+      }
+      if (options?.note) {
+        await this.updateNoteContent(options.note);
+      }
     }
 
     // Close streaming mode
