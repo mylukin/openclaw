@@ -832,10 +832,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       onModelSelected: prefixContext.onModelSelected,
       onAssistantMessageStart: streamingEnabled
         ? () => {
-            if (renderMode !== "card") {
-              return;
-            }
             queueThinkingPrelude();
+            startStreaming();
           }
         : undefined,
       onReasoningStream: reasoningEnabled
