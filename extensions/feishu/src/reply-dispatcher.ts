@@ -302,7 +302,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let replaceNextPartialAfterTool = false;
   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
   let toolUseCount = 0;
+  let activeToolRunCount = 0;
   let lastToolName: string | undefined;
+  const activeToolNames: string[] = [];
+  const toolCallHistory: string[] = [];
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
   let thinkingCollapsed = false;
@@ -401,37 +404,59 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
   };
 
+  const formatToolHistoryLines = (): string[] => {
+    const ordered: Array<{ name: string; count: number }> = [];
+    for (const name of toolCallHistory) {
+      const previous = ordered[ordered.length - 1];
+      if (previous && previous.name === name) {
+        previous.count += 1;
+      } else {
+        ordered.push({ name, count: 1 });
+      }
+    }
+    return ordered.map((entry) => `- ${entry.name}${entry.count > 1 ? ` ×${entry.count}` : ""}`);
+  };
+
+  const resolveThinkingPanelTitle = (): string => {
+    if (!reasoningText.trim() && toolCallHistory.length > 0) {
+      return "🔧 Tool Activity";
+    }
+    return "💭 Thinking";
+  };
+
   /** Build the full thinking panel content from reasoning text and tool status.
    *  When `final` is true, show completed status instead of in-progress status
    *  so the closed card doesn't perpetually display "Using...". */
-  const composeThinkingContent = (options?: { final?: boolean }): string => {
-    const parts: string[] = [];
+  const composeThinkingContent = (options?: {
+    final?: boolean;
+  }): { title: string; text: string } => {
+    const sections: string[] = [];
     if (reasoningText) {
       const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
       const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
-      parts.push(plain);
+      sections.push(plain);
     }
-    if (toolUseCount > 0) {
-      if (options?.final) {
-        // Completed status for the final card
-        if (parts.length > 0) parts.push("\n");
-        const plural = toolUseCount === 1 ? "tool" : "tools";
-        parts.push(`🔧 Used ${toolUseCount} ${plural}`);
-      } else {
-        const toolName = lastToolName?.trim();
-        let toolStatus: string;
-        if (toolUseCount === 1) {
-          toolStatus = toolName ? `🔧 Using ${toolName}...` : "🔧 Using tool...";
-        } else {
-          toolStatus = toolName
-            ? `🔧 Using ${toolName}... (${toolUseCount} tools used)`
-            : `🔧 ${toolUseCount} tools used, processing...`;
-        }
-        if (parts.length > 0) parts.push("\n");
-        parts.push(toolStatus);
-      }
+    if (toolCallHistory.length > 0) {
+      const toolLines = formatToolHistoryLines();
+      const toolStatus = options?.final
+        ? `✅ Completed ${toolCallHistory.length} tool call${toolCallHistory.length === 1 ? "" : "s"}`
+        : activeToolRunCount > 0 && lastToolName?.trim()
+          ? `⏳ Running ${lastToolName.trim()}...`
+          : activeToolRunCount > 0
+            ? "⏳ Running tool..."
+            : "";
+      sections.push(
+        [
+          `🔧 Tool calls (${toolCallHistory.length})`,
+          ...toolLines,
+          ...(toolStatus ? ["", toolStatus] : []),
+        ].join("\n"),
+      );
     }
-    return parts.join("");
+    return {
+      title: resolveThinkingPanelTitle(),
+      text: sections.join("\n\n"),
+    };
   };
 
   /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
@@ -488,7 +513,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await streamingStartPromise;
       }
       if (streaming?.isActive()) {
-        await streaming.updateThinking(composeThinkingContent());
+        const panel = composeThinkingContent();
+        await streaming.updateThinking(panel.text, { title: panel.title });
       }
     });
   };
@@ -583,14 +609,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (streaming?.isActive()) {
       const finalText = streamText;
       const finalThinking = composeThinkingContent({ final: true });
-      if (!finalText.trim() && !finalThinking) {
-        // No visible content and no thinking — discard the card entirely
-        // to avoid leaving a stale "⏳ Thinking..." placeholder.
+      if (!finalText.trim()) {
+        // Thinking/tool panels are only progress UI. If the run produced no
+        // user-visible final text, discard the card entirely instead of
+        // leaving a misleading "thinking-only" terminal message behind.
         await streaming.discard();
       } else {
         // Store thinking content for the collapsed panel in the final card
-        if (finalThinking) {
-          await streaming.updateThinking(finalThinking);
+        if (finalThinking.text) {
+          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
         }
         let text = finalText;
         if (mentionTargets?.length) {
@@ -616,6 +643,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     lastPartial = "";
     reasoningText = "";
     thinkingCollapsed = false;
+    activeToolRunCount = 0;
+    lastToolName = undefined;
+    activeToolNames.length = 0;
+    toolCallHistory.length = 0;
   };
 
   const sendChunkedTextReply = async (params: {
@@ -666,7 +697,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         thinkingCollapsed = false;
         streamPhase = "idle";
         toolUseCount = 0;
+        activeToolRunCount = 0;
         lastToolName = undefined;
+        activeToolNames.length = 0;
+        toolCallHistory.length = 0;
         lastRenderedStreamContent = "";
         replaceNextPartialAfterTool = false;
         if (streamingEnabled && renderMode === "card") {
@@ -862,7 +896,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             const isStartPhase = !payload?.phase || payload.phase === "start";
             if (isStartPhase) {
               toolUseCount += 1;
+              activeToolRunCount += 1;
               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
+              activeToolNames.push(lastToolName ?? "tool");
+              toolCallHistory.push(lastToolName ?? "tool");
               replaceNextPartialAfterTool = Boolean(streamText);
               // Tool status is derived from toolUseCount/lastToolName in composeThinkingContent
             }
@@ -872,6 +909,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               return;
             }
             startStreaming();
+            queueThinkingPanelUpdate();
+          }
+        : undefined,
+      onToolResult: streamingEnabled
+        ? (_payload: ReplyPayload) => {
+            if (activeToolRunCount > 0) {
+              activeToolRunCount -= 1;
+            }
+            if (activeToolNames.length > 0) {
+              activeToolNames.pop();
+            }
+            lastToolName = activeToolNames[activeToolNames.length - 1];
+            if (activeToolRunCount === 0 && streamPhase === "tool") {
+              streamPhase = streamText ? "streaming" : "idle";
+            }
+            if (!shouldRenderStreamingStatus()) {
+              return;
+            }
             queueThinkingPanelUpdate();
           }
         : undefined,

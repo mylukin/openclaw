@@ -127,8 +127,12 @@ describe("FeishuStreamingSession.update", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     const updateCardContentSpy = vi
       .spyOn(session as any, "updateCardContent")
@@ -141,6 +145,131 @@ describe("FeishuStreamingSession.update", () => {
       expect.any(Function),
     );
     expect((session as any).state.currentText).toBe("🔧 正在使用Read工具...");
+  });
+
+  it("stores a custom thinking panel title for tool-only updates", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+      hasNote: false,
+      noteText: "",
+    };
+    const updateCardFullSpy = vi.spyOn(session as any, "updateCardFull").mockResolvedValue(true);
+
+    await session.updateThinking("1. Bash\n\n⏳ Running Bash...", {
+      title: "🔧 Tool Activity",
+    });
+
+    expect(updateCardFullSpy).toHaveBeenCalled();
+    expect((session as any).state.thinkingTitle).toBe("🔧 Tool Activity");
+  });
+
+  it("updates thinking content via element API after the panel is already rendered", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "first thought",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    const updateCardFullSpy = vi.spyOn(session as any, "updateCardFull").mockResolvedValue(true);
+    const updateElementSpy = vi
+      .spyOn(session as any, "updateElementContent")
+      .mockResolvedValue(true);
+
+    await session.updateThinking("second thought", { title: "💭 Thinking" });
+
+    expect(updateCardFullSpy).not.toHaveBeenCalled();
+    expect(updateElementSpy).toHaveBeenCalledWith(
+      "thinking_content",
+      "second thought",
+      expect.any(Function),
+    );
+  });
+
+  it("rolls back thinking state after a failed full-card update so identical retries are still allowed", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "old",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    const updateCardFullSpy = vi
+      .spyOn(session as any, "updateCardFull")
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    await session.updateThinking("new", { title: "🔧 Tool Activity" });
+    expect((session as any).state.thinkingText).toBe("old");
+    expect((session as any).state.thinkingTitle).toBe("💭 Thinking");
+
+    await session.updateThinking("new", { title: "🔧 Tool Activity" });
+    expect(updateCardFullSpy).toHaveBeenCalledTimes(2);
+    expect((session as any).state.thinkingText).toBe("new");
+    expect((session as any).state.thinkingTitle).toBe("🔧 Tool Activity");
+  });
+
+  it("rolls back thinking state after an element update failure so identical retries are still allowed", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "old",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    const updateElementSpy = vi
+      .spyOn(session as any, "updateElementContent")
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    await session.updateThinking("new", { title: "💭 Thinking" });
+    expect((session as any).state.thinkingText).toBe("old");
+
+    await session.updateThinking("new", { title: "💭 Thinking" });
+    expect(updateElementSpy).toHaveBeenCalledTimes(2);
+    expect((session as any).state.thinkingText).toBe("new");
   });
 });
 
@@ -160,8 +289,12 @@ describe("FeishuStreamingSession.discard", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
 
     await session.discard();
@@ -218,8 +351,12 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).pendingText =
       "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。\n我刚";
@@ -246,8 +383,12 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "第一段",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).pendingText = "第一段\n第二段";
     (session as any).lastStreamingModeRenewAt = Date.now();
@@ -271,8 +412,12 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "💭 思考中...",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     // pendingText is a plain string in the current code — mergeStreamingText
     // will merge it with currentText producing the expected result.
@@ -306,8 +451,12 @@ describe("FeishuStreamingSession.close", () => {
       sequence: 1,
       currentText: "旧内容",
       header: { title: "Test", template: "blue" },
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
@@ -339,8 +488,12 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "旧内容",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
@@ -360,8 +513,12 @@ describe("FeishuStreamingSession.close", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
 
@@ -397,8 +554,12 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 2,
       currentText: "text",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
     return session;
@@ -500,8 +661,12 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "text",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).lastStreamingModeRenewAt = Date.now();
     (session as any).startRenewTimer();
@@ -520,8 +685,12 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
       messageId: "message-id",
       sequence: 1,
       currentText: "text",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     (session as any).startRenewTimer();
     expect((session as any).renewTimer).not.toBeNull();

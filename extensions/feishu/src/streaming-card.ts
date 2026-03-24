@@ -15,8 +15,10 @@ type CardState = {
   hasNote: boolean;
   noteText: string;
   header?: StreamingCardHeader;
+  thinkingTitle: string;
   thinkingText: string;
   thinkingExpanded: boolean;
+  thinkingPanelRendered: boolean;
 };
 
 /** Options for customising the initial streaming card appearance. */
@@ -228,8 +230,10 @@ export class FeishuStreamingSession {
       hasNote: !!options?.note,
       noteText: options?.note ?? "",
       header: options?.header,
+      thinkingTitle: "💭 Thinking",
       thinkingText: "",
       thinkingExpanded: true,
+      thinkingPanelRendered: false,
     };
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
@@ -342,7 +346,7 @@ export class FeishuStreamingSession {
         expanded: this.state.thinkingExpanded,
         element_id: "thinking",
         header: {
-          title: { tag: "plain_text", content: "💭 Thinking" },
+          title: { tag: "plain_text", content: this.state.thinkingTitle || "💭 Thinking" },
         },
         border: { color: "grey" },
         vertical_spacing: "2px",
@@ -406,6 +410,7 @@ export class FeishuStreamingSession {
         throw new Error(response.msg || `code ${response.code}`);
       }
       this.state.sequence = nextSeq;
+      this.state.thinkingPanelRendered = Boolean(this.state.thinkingText);
       return true;
     } catch (e) {
       this.log?.(`Full card update failed: ${String(e)}`);
@@ -476,20 +481,51 @@ export class FeishuStreamingSession {
   }
 
   /** Update thinking content — shows in the content element during streaming
-   *  (as inline text), then materialized as a collapsible panel on close(). */
-  async updateThinking(text: string): Promise<void> {
-    if (!this.state || this.closed || !text) {
+   *  via a live collapsible panel, then is collapsed on close(). */
+  async updateThinking(text: string, options?: { title?: string }): Promise<void> {
+    if (!this.state || this.closed) {
       return;
     }
-    this.state.thinkingText = text;
-    // Show thinking in the content element during streaming (no full card update)
+    const normalized = text.trim();
+    const previousText = this.state.thinkingText;
+    const previousTitle = this.state.thinkingTitle;
+    const nextTitle = options?.title?.trim() || this.state.thinkingTitle || "💭 Thinking";
+    if (!normalized || (normalized === previousText && nextTitle === previousTitle)) {
+      return;
+    }
+    const previousPanelRendered = this.state.thinkingPanelRendered;
+    this.state.thinkingTitle = nextTitle;
+    this.state.thinkingText = normalized;
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) return;
-      // Only update content if no assistant text has arrived yet
-      if (!this.state.currentText) {
-        await this.updateCardContent(text, (e) =>
-          this.log?.(`Thinking content update failed: ${String(e)}`),
-        );
+      const requiresFullCardUpdate =
+        !this.state.thinkingPanelRendered || nextTitle !== previousTitle;
+      if (requiresFullCardUpdate) {
+        const fullCardUpdated = await this.updateCardFull(this.state.currentText, {
+          keepStreaming: true,
+        });
+        if (!fullCardUpdated && !this.state.currentText) {
+          const contentUpdated = await this.updateCardContent(normalized, (e) =>
+            this.log?.(`Thinking content update failed: ${String(e)}`),
+          );
+          if (contentUpdated) {
+            return;
+          }
+        }
+        if (!fullCardUpdated) {
+          this.state.thinkingTitle = previousTitle;
+          this.state.thinkingText = previousText;
+          this.state.thinkingPanelRendered = previousPanelRendered;
+        }
+        return;
+      }
+      const updated = await this.updateElementContent("thinking_content", normalized, (e) =>
+        this.log?.(`Thinking content update failed: ${String(e)}`),
+      );
+      if (!updated) {
+        this.state.thinkingTitle = previousTitle;
+        this.state.thinkingText = previousText;
+        this.state.thinkingPanelRendered = previousPanelRendered;
       }
     });
     await this.queue;
