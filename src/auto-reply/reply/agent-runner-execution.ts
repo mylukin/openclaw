@@ -415,6 +415,7 @@ export async function runAgentTurnWithFallback(params: {
                       await params.opts?.onToolStart?.({
                         name: payload.name,
                         phase: "start",
+                        ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
                       });
                     });
                   },
@@ -583,9 +584,11 @@ export async function runAgentTurnWithFallback(params: {
                   if (evt.stream === "tool") {
                     const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
                     const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
+                    const toolCallId =
+                      typeof evt.data.toolUseId === "string" ? evt.data.toolUseId : undefined;
                     if (phase === "start" || phase === "update") {
                       await params.typingSignals.signalToolStart();
-                      await params.opts?.onToolStart?.({ name, phase });
+                      await params.opts?.onToolStart?.({ name, phase, toolCallId });
                     }
                   }
                   // Track auto-compaction and notify higher layers.
