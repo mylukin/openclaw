@@ -538,6 +538,19 @@ export async function sendMessageFeishu(
   params: SendFeishuMessageParams,
 ): Promise<FeishuSendResult> {
   const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId } = params;
+  const account = resolveFeishuAccount({ cfg, accountId });
+  const renderMode = account.config?.renderMode ?? "auto";
+  if (renderMode === "card") {
+    return sendMarkdownCardFeishu({
+      cfg,
+      to,
+      text,
+      replyToMessageId,
+      replyInThread,
+      mentions,
+      accountId,
+    });
+  }
   const mentionMeta = buildMentionMeta(mentions);
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
@@ -631,6 +644,20 @@ export async function editMessageFeishu(params: {
     return { messageId, contentType: "interactive" };
   }
 
+  const renderMode = account.config?.renderMode ?? "auto";
+  if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text!))) {
+    const response = await client.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(buildMarkdownCard(text!)) },
+    });
+
+    if (response.code !== 0) {
+      throw new Error(`Feishu message edit failed: ${response.msg || `code ${response.code}`}`);
+    }
+
+    return { messageId, contentType: "interactive" };
+  }
+
   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
     cfg,
     channel: "feishu",
@@ -672,6 +699,10 @@ export async function updateCardFeishu(params: {
   if (response.code !== 0) {
     throw new Error(`Feishu card update failed: ${response.msg || `code ${response.code}`}`);
   }
+}
+
+export function shouldUseFeishuMarkdownCard(text: string): boolean {
+  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
 /**

@@ -7,6 +7,11 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 const sendMarkdownCardFeishuMock = vi.hoisted(() => vi.fn());
 const sendStructuredCardFeishuMock = vi.hoisted(() => vi.fn());
+const shouldUseFeishuMarkdownCardMock = vi.hoisted(() =>
+  vi.fn((text: string) => {
+    return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+  }),
+);
 
 vi.mock("./media.js", () => ({
   sendMediaFeishu: sendMediaFeishuMock,
@@ -16,6 +21,7 @@ vi.mock("./send.js", () => ({
   sendMessageFeishu: sendMessageFeishuMock,
   sendMarkdownCardFeishu: sendMarkdownCardFeishuMock,
   sendStructuredCardFeishu: sendStructuredCardFeishuMock,
+  shouldUseFeishuMarkdownCard: shouldUseFeishuMarkdownCardMock,
 }));
 
 vi.mock("./runtime.js", () => ({

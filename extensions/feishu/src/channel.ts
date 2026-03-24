@@ -515,14 +515,19 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
                   replyToMessageId,
                   replyInThread: ctx.action === "thread-reply",
                 })
-              : await runtime.sendMessageFeishu({
-                  cfg: ctx.cfg,
-                  to,
-                  text: text!,
-                  accountId: ctx.accountId ?? undefined,
-                  replyToMessageId,
-                  replyInThread: ctx.action === "thread-reply",
-                });
+              : await (async () => {
+                  const sendText = runtime.feishuOutbound.sendText;
+                  if (!sendText) {
+                    throw new Error("Feishu outbound text sender is unavailable.");
+                  }
+                  return sendText({
+                    cfg: ctx.cfg,
+                    to,
+                    text: text!,
+                    accountId: ctx.accountId ?? undefined,
+                    ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
+                  });
+                })();
             return jsonActionResult({
               ok: true,
               channel: "feishu",

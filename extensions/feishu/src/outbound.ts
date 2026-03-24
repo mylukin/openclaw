@@ -6,7 +6,12 @@ import { resolveFeishuAccount } from "./accounts.js";
 import { resolveMediaContentType } from "./media-types.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
-import { sendMarkdownCardFeishu, sendMessageFeishu, sendStructuredCardFeishu } from "./send.js";
+import {
+  sendMarkdownCardFeishu,
+  sendMessageFeishu,
+  sendStructuredCardFeishu,
+  shouldUseFeishuMarkdownCard,
+} from "./send.js";
 
 function normalizePossibleLocalImagePath(text: string | undefined): string | null {
   const raw = text?.trim();
@@ -41,10 +46,6 @@ function normalizePossibleLocalImagePath(text: string | undefined): string | nul
   return raw;
 }
 
-function shouldUseCard(text: string): boolean {
-  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
-}
-
 function resolveReplyToMessageId(params: {
   replyToId?: string | null;
   threadId?: string | number | null;
@@ -71,7 +72,7 @@ async function sendOutboundText(params: {
   const account = resolveFeishuAccount({ cfg, accountId });
   const renderMode = account.config?.renderMode ?? "auto";
 
-  if (renderMode === "card" || (renderMode === "auto" && shouldUseCard(text))) {
+  if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text))) {
     return sendMarkdownCardFeishu({ cfg, to, text, accountId, replyToMessageId });
   }
 
@@ -118,7 +119,8 @@ export const feishuOutbound: ChannelOutboundAdapter = {
 
       const account = resolveFeishuAccount({ cfg, accountId: accountId ?? undefined });
       const renderMode = account.config?.renderMode ?? "auto";
-      const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+      const useCard =
+        renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text));
       if (useCard) {
         const header = identity
           ? {

@@ -7,6 +7,8 @@ import {
   getMessageFeishu,
   listFeishuThreadMessages,
   resolveFeishuCardTemplate,
+  sendMessageFeishu,
+  shouldUseFeishuMarkdownCard,
 } from "./send.js";
 
 const {
@@ -259,6 +261,85 @@ describe("getMessageFeishu", () => {
   });
 });
 
+describe("sendMessageFeishu", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveFeishuAccount.mockImplementation(
+      ({ accountId }: { accountId?: string }) =>
+        ({
+          accountId: accountId ?? "default",
+          configured: true,
+          config: {},
+        }) as never,
+    );
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+          create: vi.fn(),
+          reply: vi.fn(),
+        },
+      },
+    });
+  });
+
+  it("routes text sends through interactive cards when renderMode=card", async () => {
+    const create = vi.fn().mockResolvedValue({
+      code: 0,
+      data: { message_id: "om_card" },
+    });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+        },
+      },
+    });
+    mockResolveFeishuAccount.mockImplementation(
+      ({ accountId }: { accountId?: string }) =>
+        ({
+          accountId: accountId ?? "default",
+          configured: true,
+          appId: "cli_main",
+          appSecret: "secret_main",
+          config: { renderMode: "card" },
+        }) as never,
+    );
+
+    const result = await sendMessageFeishu({
+      cfg: {
+        channels: {
+          feishu: {
+            renderMode: "card",
+          },
+        },
+      } as ClawdbotConfig,
+      to: "chat:oc_group_1",
+      text: "hello",
+    });
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          msg_type: "interactive",
+        }),
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({ messageId: "om_card" }));
+  });
+});
+
+describe("shouldUseFeishuMarkdownCard", () => {
+  it("detects fenced code blocks and tables", () => {
+    expect(shouldUseFeishuMarkdownCard("```ts\nconst x = 1\n```")).toBe(true);
+    expect(shouldUseFeishuMarkdownCard("| a | b |\n| - | - |")).toBe(true);
+    expect(shouldUseFeishuMarkdownCard("plain text")).toBe(false);
+  });
+});
+
 describe("editMessageFeishu", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -320,6 +401,68 @@ describe("editMessageFeishu", () => {
       },
     });
     expect(result).toEqual({ messageId: "om_card", contentType: "interactive" });
+  });
+
+  it("patches interactive content for text edits when renderMode=card", async () => {
+    mockClientPatch.mockResolvedValueOnce({ code: 0 });
+    mockResolveFeishuAccount.mockReturnValue({
+      accountId: "default",
+      configured: true,
+      config: { renderMode: "card" },
+    });
+
+    const result = await editMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_edit_card",
+      text: "updated body",
+    });
+
+    expect(mockClientPatch).toHaveBeenCalledWith({
+      path: { message_id: "om_edit_card" },
+      data: {
+        content: JSON.stringify({
+          schema: "2.0",
+          config: {
+            wide_screen_mode: true,
+          },
+          body: {
+            elements: [{ tag: "markdown", content: "updated body" }],
+          },
+        }),
+      },
+    });
+    expect(result).toEqual({ messageId: "om_edit_card", contentType: "interactive" });
+  });
+
+  it("patches interactive content for text edits in auto mode when markdown needs cards", async () => {
+    mockClientPatch.mockResolvedValueOnce({ code: 0 });
+    mockResolveFeishuAccount.mockReturnValue({
+      accountId: "default",
+      configured: true,
+      config: { renderMode: "auto" },
+    });
+
+    const result = await editMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_edit_auto",
+      text: "| a | b |\n| - | - |",
+    });
+
+    expect(mockClientPatch).toHaveBeenCalledWith({
+      path: { message_id: "om_edit_auto" },
+      data: {
+        content: JSON.stringify({
+          schema: "2.0",
+          config: {
+            wide_screen_mode: true,
+          },
+          body: {
+            elements: [{ tag: "markdown", content: "| a | b |\n| - | - |" }],
+          },
+        }),
+      },
+    });
+    expect(result).toEqual({ messageId: "om_edit_auto", contentType: "interactive" });
   });
 });
 

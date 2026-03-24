@@ -8,6 +8,7 @@ const listReactionsFeishuMock = vi.hoisted(() => vi.fn());
 const removeReactionFeishuMock = vi.hoisted(() => vi.fn());
 const sendCardFeishuMock = vi.hoisted(() => vi.fn());
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
 const getMessageFeishuMock = vi.hoisted(() => vi.fn());
 const editMessageFeishuMock = vi.hoisted(() => vi.fn());
 const createPinFeishuMock = vi.hoisted(() => vi.fn());
@@ -46,7 +47,7 @@ vi.mock("./channel.runtime.js", () => ({
     sendCardFeishu: sendCardFeishuMock,
     sendMessageFeishu: sendMessageFeishuMock,
     feishuOutbound: {
-      sendText: vi.fn(),
+      sendText: feishuOutboundSendTextMock,
       sendMedia: vi.fn(),
     },
   },
@@ -113,6 +114,7 @@ describe("feishuPlugin actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     createFeishuClientMock.mockReturnValue({ tag: "client" });
+    feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
   });
 
   it("advertises the expanded Feishu action surface", () => {
@@ -161,7 +163,11 @@ describe("feishuPlugin actions", () => {
   });
 
   it("sends text messages", async () => {
-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_sent", chatId: "oc_group_1" });
+    feishuOutboundSendTextMock.mockResolvedValueOnce({
+      channel: "feishu",
+      messageId: "om_sent",
+      chatId: "oc_group_1",
+    });
 
     const result = await feishuPlugin.actions?.handleAction?.({
       action: "send",
@@ -171,13 +177,11 @@ describe("feishuPlugin actions", () => {
       toolContext: {},
     } as never);
 
-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
+    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
       cfg,
       to: "chat:oc_group_1",
       text: "hello",
       accountId: undefined,
-      replyToMessageId: undefined,
-      replyInThread: false,
     });
     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
   });
@@ -266,7 +270,11 @@ describe("feishuPlugin actions", () => {
   });
 
   it("sends explicit thread replies with reply_in_thread semantics", async () => {
-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_reply", chatId: "oc_group_1" });
+    feishuOutboundSendTextMock.mockResolvedValueOnce({
+      channel: "feishu",
+      messageId: "om_reply",
+      chatId: "oc_group_1",
+    });
 
     const result = await feishuPlugin.actions?.handleAction?.({
       action: "thread-reply",
@@ -276,19 +284,44 @@ describe("feishuPlugin actions", () => {
       toolContext: {},
     } as never);
 
-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
+    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
       cfg,
       to: "chat:oc_group_1",
       text: "reply body",
       accountId: undefined,
-      replyToMessageId: "om_parent",
-      replyInThread: true,
+      threadId: "om_parent",
     });
     expect(result?.details).toMatchObject({
       ok: true,
       action: "thread-reply",
       messageId: "om_reply",
     });
+  });
+
+  it("routes text sends through the renderMode-aware outbound adapter", async () => {
+    await feishuPlugin.actions?.handleAction?.({
+      action: "send",
+      params: { to: "chat:oc_group_1", text: "| a | b |\n| - | - |" },
+      cfg: {
+        channels: {
+          feishu: {
+            enabled: true,
+            appId: "cli_main",
+            appSecret: "secret_main",
+            renderMode: "auto",
+          },
+        },
+      } as OpenClawConfig,
+      accountId: undefined,
+      toolContext: {},
+    } as never);
+
+    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:oc_group_1",
+        text: "| a | b |\n| - | - |",
+      }),
+    );
   });
 
   it("creates pins", async () => {
