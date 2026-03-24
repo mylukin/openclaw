@@ -197,7 +197,7 @@ export class FeishuStreamingSession {
 
     const apiBase = resolveApiBase(this.creds.domain);
     const elements: Record<string, unknown>[] = [
-      { tag: "markdown", content: "", element_id: "content" },
+      { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
     ];
     if (options?.note) {
       elements.push({ tag: "hr" });
@@ -549,7 +549,7 @@ export class FeishuStreamingSession {
   /** Update thinking panel content (non-streaming, immediate).
    *  On first call, injects the collapsible_panel via full card update. */
   async updateThinking(text: string): Promise<void> {
-    if (!this.state || this.closed) {
+    if (!this.state || this.closed || !text) {
       return;
     }
     this.state.thinkingText = text;

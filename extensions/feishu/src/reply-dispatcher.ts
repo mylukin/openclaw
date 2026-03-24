@@ -422,7 +422,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (parts.length > 0) parts.push("\n");
       parts.push(toolStatus);
     }
-    return parts.join("") || "Thinking...";
+    return parts.join("");
   };
 
   /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
