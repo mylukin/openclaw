@@ -548,7 +548,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await options.onIdle?.();
     expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent",
+      note: "Agent: agent | 🔧 Used 1 tool",
     });
   });
 
@@ -646,6 +646,72 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
       title: "🔧 Tool calls (1)",
+    });
+  });
+
+  it("degrades tool-only final panel into a note summary instead of re-rendering an empty panel", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+
+    const thinkingCallCountBeforeIdle = streamingInstances[0].updateThinking.mock.calls.length;
+    await options.onIdle?.();
+
+    expect(streamingInstances[0].updateThinking).toHaveBeenCalledTimes(thinkingCallCountBeforeIdle);
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
+      note: "Agent: agent | 🔧 Used 1 tool",
+    });
+  });
+
+  it("appends tool-only final summary to body when card note is disabled", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+        cardNote: false,
+      },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+    await options.onIdle?.();
+
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n\n🔧 Used 1 tool", {
+      note: undefined,
     });
   });
 
