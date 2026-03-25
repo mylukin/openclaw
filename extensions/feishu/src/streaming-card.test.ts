@@ -330,14 +330,9 @@ describe("FeishuStreamingSession.close", () => {
       .spyOn(session as any, "updateCardContent")
       .mockResolvedValue(true);
 
-    // close("") — empty string is falsy so text stays as pendingMerged.
-    // pendingMerged = mergeStreamingText("💭 思考中...", "💭 思考中...") = "💭 思考中..."
-    // text equals currentText, so no content update fires.
     await session.close("");
 
-    // The content was not changed (empty string is falsy in the ternary),
-    // so updateCardContent is not called for content — only the settings call fires.
-    expect(updateCardContentSpy).not.toHaveBeenCalled();
+    expect(updateCardContentSpy).toHaveBeenCalledWith("");
   });
 
   it("treats explicit non-empty final text as authoritative", async () => {
@@ -370,6 +365,36 @@ describe("FeishuStreamingSession.close", () => {
     expect(updateCardContentSpy).toHaveBeenCalled();
     const calledText = updateCardContentSpy.mock.calls[0]?.[0] as string;
     expect(calledText).toContain("又确认了一遍");
+  });
+
+  it("replaces stale streamed preview text instead of merging it into explicit final text", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "💭 思考中...\n\n原因就一个：\n- working tree clean",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+    const updateCardContentSpy = vi
+      .spyOn(session as any, "updateCardContent")
+      .mockResolvedValue(true);
+
+    await session.close("能 review。\n\n原因就一个：\n- working tree clean");
+
+    expect(updateCardContentSpy).toHaveBeenCalledWith(
+      "能 review。\n\n原因就一个：\n- working tree clean",
+    );
   });
 
   it("keeps pending merge behavior when final text is omitted", async () => {
@@ -475,8 +500,7 @@ describe("FeishuStreamingSession.close", () => {
       body?: { elements?: Array<{ content?: string }> };
       header?: { title?: { content?: string } };
     };
-    // mergeStreamingText("旧内容", "最终内容") concatenates (no overlap)
-    expect(cardJson.body?.elements?.[0]?.content).toBe("旧内容最终内容");
+    expect(cardJson.body?.elements?.[0]?.content).toBe("最终内容");
     expect(cardJson.header?.title?.content).toBe("Test");
   });
 

@@ -571,7 +571,11 @@ export class FeishuStreamingSession {
     await this.queue;
 
     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
+    // `finalText` is a full final snapshot from the caller, not a delta. When
+    // present, treat it as authoritative instead of merging it with the last
+    // streamed preview, otherwise stale status/preview text can be duplicated
+    // into the terminal card content.
+    const text = finalText !== undefined ? finalText : pendingMerged;
 
     // Ensure thinking panel is collapsed in the final card
     this.state.thinkingExpanded = false;
