@@ -523,7 +523,19 @@ describe("FeishuStreamingSession.close", () => {
 
     await session.close("最终答案", { dropThinkingPanel: true });
 
-    expect(cardUpdate).not.toHaveBeenCalled();
+    expect(cardUpdate).toHaveBeenCalledOnce();
+    const updateArg = (cardUpdate.mock.calls[0] as unknown[])?.[0] as {
+      data?: { card?: { data?: string } };
+    };
+    const cardJson = JSON.parse(updateArg.data?.card?.data ?? "{}") as {
+      body?: { elements?: Array<{ tag?: string; content?: string }> };
+    };
+    expect(cardJson.body?.elements?.some((element) => element.tag === "collapsible_panel")).toBe(
+      false,
+    );
+    expect(cardJson.body?.elements?.find((element) => element.tag === "markdown")?.content).toBe(
+      "最终答案",
+    );
   });
 
   it("does not call full card update when streaming content update succeeds and no thinking", async () => {

@@ -580,6 +580,7 @@ export class FeishuStreamingSession {
     // into the terminal card content.
     const text = finalText !== undefined ? finalText : pendingMerged;
 
+    const hadThinkingPanel = this.state.thinkingPanelRendered || Boolean(this.state.thinkingText);
     if (options?.dropThinkingPanel) {
       this.state.thinkingText = "";
       this.state.thinkingPanelRendered = false;
@@ -596,7 +597,9 @@ export class FeishuStreamingSession {
     // the issue where a full card update overwrites the note element to empty
     // and then a subsequent element API note update fails because streaming
     // mode was disabled by the full card update.
-    if (this.state.thinkingText) {
+    const requiresFullCardUpdate =
+      Boolean(this.state.thinkingText) || Boolean(options?.dropThinkingPanel && hadThinkingPanel);
+    if (requiresFullCardUpdate) {
       await this.updateCardFull(this.state.currentText, {
         note: options?.note,
       });
