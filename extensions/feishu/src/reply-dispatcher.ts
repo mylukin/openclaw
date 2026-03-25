@@ -425,9 +425,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     activeTools.pop();
   };
 
+  const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
+
   const resolveThinkingPanelTitle = (): string => {
-    if (!reasoningText.trim() && toolCallCount > 0) {
-      return "🔧 Tool Activity";
+    if (!hasReasoningText() && toolCallCount > 0) {
+      return `🔧 Tool calls (${toolCallCount})`;
     }
     return "💭 Thinking";
   };
@@ -437,6 +439,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     final?: boolean;
   }): { title: string; text: string } => {
     const sections: string[] = [];
+    const toolOnlyPanel = !hasReasoningText() && toolCallCount > 0;
     if (reasoningText) {
       const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
       const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
@@ -450,9 +453,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : !options?.final && streamPhase === "tool" && activeTools.length > 0
           ? "⏳ Running tool..."
           : "";
-      sections.push(
-        [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
-      );
+      if (toolOnlyPanel) {
+        // Keep the panel rendered after the running label clears while moving
+        // the cumulative count into the panel title.
+        sections.push(toolStatus || "\u200B");
+      } else {
+        sections.push(
+          [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
+        );
+      }
     }
     return {
       title: resolveThinkingPanelTitle(),

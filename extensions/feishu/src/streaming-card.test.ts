@@ -168,11 +168,11 @@ describe("FeishuStreamingSession.update", () => {
     const updateCardFullSpy = vi.spyOn(session as any, "updateCardFull").mockResolvedValue(true);
 
     await session.updateThinking("1. Bash\n\n⏳ Running Bash...", {
-      title: "🔧 Tool Activity",
+      title: "🔧 Tool calls (1)",
     });
 
     expect(updateCardFullSpy).toHaveBeenCalled();
-    expect((session as any).state.thinkingTitle).toBe("🔧 Tool Activity");
+    expect((session as any).state.thinkingTitle).toBe("🔧 Tool calls (1)");
   });
 
   it("updates thinking content via element API after the panel is already rendered", async () => {
@@ -231,14 +231,14 @@ describe("FeishuStreamingSession.update", () => {
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true);
 
-    await session.updateThinking("new", { title: "🔧 Tool Activity" });
+    await session.updateThinking("new", { title: "🔧 Tool calls (1)" });
     expect((session as any).state.thinkingText).toBe("old");
     expect((session as any).state.thinkingTitle).toBe("💭 Thinking");
 
-    await session.updateThinking("new", { title: "🔧 Tool Activity" });
+    await session.updateThinking("new", { title: "🔧 Tool calls (1)" });
     expect(updateCardFullSpy).toHaveBeenCalledTimes(2);
     expect((session as any).state.thinkingText).toBe("new");
-    expect((session as any).state.thinkingTitle).toBe("🔧 Tool Activity");
+    expect((session as any).state.thinkingTitle).toBe("🔧 Tool calls (1)");
   });
 
   it("rolls back thinking state after an element update failure so identical retries are still allowed", async () => {

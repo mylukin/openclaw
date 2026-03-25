@@ -535,10 +535,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances).toHaveLength(1);
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (1)\n\n⏳ Running Read...",
-      { title: "🔧 Tool Activity" },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("⏳ Running Read...", {
+      title: "🔧 Tool calls (1)",
+    });
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
     await flushAsyncTasks();
@@ -579,8 +578,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
-      { title: "🔧 Tool Activity" },
+      expect.stringContaining("⏳ Running exec..."),
+      { title: "🔧 Tool calls (3)" },
     );
   });
 
@@ -607,13 +606,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running memory_search..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (1)" },
     );
 
     await dispatcher.replyOptions.onToolResult?.({});
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
-      title: "🔧 Tool Activity",
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+      title: "🔧 Tool calls (1)",
     });
   });
 
@@ -640,13 +639,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running Bash..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (1)" },
     );
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
-      title: "🔧 Tool Activity",
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+      title: "🔧 Tool calls (1)",
     });
   });
 
@@ -674,13 +673,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running Bash..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (1)" },
     );
 
     await options.deliver({ text: "visible block text" }, { kind: "block" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
-      title: "🔧 Tool Activity",
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+      title: "🔧 Tool calls (1)",
     });
   });
 
@@ -712,8 +711,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (2)"),
-      { title: "🔧 Tool Activity" },
+      expect.stringContaining("⏳ Running Grep..."),
+      { title: "🔧 Tool calls (2)" },
     );
   });
 
@@ -743,12 +742,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
     await flushAsyncTasks();
 
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "🔧 Tool calls (2)\n\n⏳ Running Grep...",
-      {
-        title: "🔧 Tool Activity",
-      },
-    );
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("⏳ Running Grep...", {
+      title: "🔧 Tool calls (2)",
+    });
   });
 
   it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
@@ -775,8 +771,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running tool..."),
-      { title: "🔧 Tool Activity" },
+      expect.stringContaining("⏳ Running tool..."),
+      { title: "🔧 Tool calls (2)" },
     );
   });
 
@@ -812,14 +808,14 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running exec..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (2)" },
     );
 
     await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tool-memory" });
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running exec..."),
-      { title: "🔧 Tool Activity" },
+      expect.stringContaining("⏳ Running exec..."),
+      { title: "🔧 Tool calls (2)" },
     );
   });
 
@@ -847,14 +843,14 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running exec..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (2)" },
     );
 
     await dispatcher.replyOptions.onToolResult?.({});
     await flushAsyncTasks();
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
       expect.stringContaining("⏳ Running memory_search..."),
-      { title: "🔧 Tool Activity" },
+      { title: "🔧 Tool calls (2)" },
     );
   });
 
@@ -883,8 +879,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
-      { title: "🔧 Tool Activity" },
+      expect.stringContaining("⏳ Running exec..."),
+      { title: "🔧 Tool calls (3)" },
     );
   });
 
