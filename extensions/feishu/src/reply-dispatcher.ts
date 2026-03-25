@@ -459,9 +459,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           ? "⏳ Running tool..."
           : "";
       if (toolOnlyPanel) {
-        // Keep the panel rendered after the running label clears while moving
-        // the cumulative count into the panel title.
-        sections.push(toolStatus || "\u200B");
+        // Show a completed summary when no tool is actively running, instead
+        // of a zero-width space that renders as a blank panel.
+        sections.push(toolStatus || `✓ ${toolCallCount} completed`);
       } else {
         sections.push(
           [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),

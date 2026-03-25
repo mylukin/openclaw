@@ -612,7 +612,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await dispatcher.replyOptions.onToolResult?.({});
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
       title: "🔧 Tool calls (1)",
     });
   });
@@ -645,7 +645,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
       title: "🔧 Tool calls (1)",
     });
   });
@@ -746,7 +746,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await options.deliver({ text: "visible block text" }, { kind: "block" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
       title: "🔧 Tool calls (1)",
     });
   });
