@@ -271,6 +271,50 @@ describe("FeishuStreamingSession.update", () => {
     expect(updateElementSpy).toHaveBeenCalledTimes(2);
     expect((session as any).state.thinkingText).toBe("new");
   });
+
+  it("reopens streaming mode and retries once when text streaming times out", async () => {
+    const { client, cardElementContent, cardSettings } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 2,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+    cardElementContent
+      .mockResolvedValueOnce({ code: 200850, msg: "Card streaming timeout" })
+      .mockResolvedValueOnce({ code: 0, msg: "ok" });
+
+    const ok = await (session as any).updateElementContent("content", "updated", vi.fn());
+
+    expect(ok).toBe(true);
+    expect(cardSettings).toHaveBeenCalledOnce();
+    expect(cardElementContent).toHaveBeenCalledTimes(2);
+    const reopenArg = cardSettings.mock.calls[0]?.[0] as {
+      data?: { settings?: string; sequence?: number };
+    };
+    const reopenSettings = JSON.parse(reopenArg.data?.settings ?? "{}") as {
+      config?: { streaming_mode?: boolean };
+    };
+    expect(reopenSettings.config?.streaming_mode).toBe(true);
+    expect(reopenArg.data?.sequence).toBe(3);
+    const retryCalls = cardElementContent.mock.calls as unknown as Array<[unknown]>;
+    const retryArg = retryCalls[1]?.[0] as unknown as {
+      data?: { sequence?: number };
+    };
+    expect(retryArg.data?.sequence).toBe(4);
+    expect((session as any).state.sequence).toBe(4);
+  });
 });
 
 describe("FeishuStreamingSession.discard", () => {
@@ -790,5 +834,48 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
 
     (session as any).stopRenewTimer();
     vi.useRealTimers();
+  });
+
+  it("serializes proactive renewal behind in-flight content updates", async () => {
+    let resolveContentUpdate = () => {};
+    const contentUpdateSettled = new Promise<void>((resolve) => {
+      resolveContentUpdate = () => resolve();
+    });
+    const { client, cardElementContent, cardSettings } = createClientMock();
+    cardElementContent.mockImplementationOnce(
+      async () =>
+        await contentUpdateSettled.then(() => ({
+          code: 0,
+          msg: "ok",
+        })),
+    );
+    const session = makeSession(client);
+    (session as any).lastStreamingModeRenewAt = Date.now();
+
+    const updatePromise = session.update("new text", { replace: true });
+    await Promise.resolve();
+
+    (session as any).lastStreamingModeRenewAt = 0;
+    (session as any).scheduleRenewStreamingMode();
+
+    await Promise.resolve();
+    expect(cardSettings).not.toHaveBeenCalled();
+
+    resolveContentUpdate();
+    await updatePromise;
+    await (session as any).queue;
+
+    expect(cardElementContent).toHaveBeenCalledOnce();
+    expect(cardSettings).toHaveBeenCalledOnce();
+    const contentCalls = cardElementContent.mock.calls as unknown as Array<[unknown]>;
+    const contentArg = contentCalls[0]?.[0] as unknown as {
+      data?: { sequence?: number };
+    };
+    const renewArg = cardSettings.mock.calls[0]?.[0] as {
+      data?: { sequence?: number };
+    };
+    expect(contentArg.data?.sequence).toBe(3);
+    expect(renewArg.data?.sequence).toBe(4);
+    expect((session as any).state.sequence).toBe(4);
   });
 });
