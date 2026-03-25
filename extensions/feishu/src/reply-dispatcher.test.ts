@@ -547,8 +547,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
 
     await options.onIdle?.();
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent | 🔧 Used 1 tool",
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
+      note: "Agent: agent",
+      dropThinkingPanel: true,
     });
   });
 
@@ -649,7 +650,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
-  it("degrades tool-only final panel into a note summary instead of re-rendering an empty panel", async () => {
+  it("degrades tool-only final panel into a top summary instead of re-rendering an empty panel", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -678,12 +679,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.onIdle?.();
 
     expect(streamingInstances[0].updateThinking).toHaveBeenCalledTimes(thinkingCallCountBeforeIdle);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent | 🔧 Used 1 tool",
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
+      note: "Agent: agent",
+      dropThinkingPanel: true,
     });
   });
 
-  it("appends tool-only final summary to body when card note is disabled", async () => {
+  it("keeps tool-only final summary at the top even when card note is disabled", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -710,8 +712,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     await options.onIdle?.();
 
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n\n🔧 Used 1 tool", {
-      note: undefined,
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
+      dropThinkingPanel: true,
     });
   });
 

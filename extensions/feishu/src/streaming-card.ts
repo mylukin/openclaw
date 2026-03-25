@@ -558,7 +558,10 @@ export class FeishuStreamingSession {
       .catch((e) => this.log?.(`Note update failed: ${String(e)}`));
   }
 
-  async close(finalText?: string, options?: { note?: string }): Promise<void> {
+  async close(
+    finalText?: string,
+    options?: { note?: string; dropThinkingPanel?: boolean },
+  ): Promise<void> {
     if (!this.state || this.closed) {
       return;
     }
@@ -577,6 +580,10 @@ export class FeishuStreamingSession {
     // into the terminal card content.
     const text = finalText !== undefined ? finalText : pendingMerged;
 
+    if (options?.dropThinkingPanel) {
+      this.state.thinkingText = "";
+      this.state.thinkingPanelRendered = false;
+    }
     // Ensure thinking panel is collapsed in the final card
     this.state.thinkingExpanded = false;
     const previousText = this.state.currentText;

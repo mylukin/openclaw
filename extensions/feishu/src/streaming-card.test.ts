@@ -504,6 +504,28 @@ describe("FeishuStreamingSession.close", () => {
     expect(cardJson.header?.title?.content).toBe("Test");
   });
 
+  it("drops a previously rendered thinking panel when close is asked to suppress tool-only UI", async () => {
+    const { client, cardUpdate } = createClientMock();
+    const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "最终答案",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "🔧 Tool calls (2)",
+      thinkingText: "\u200B",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+
+    await session.close("最终答案", { dropThinkingPanel: true });
+
+    expect(cardUpdate).not.toHaveBeenCalled();
+  });
+
   it("does not call full card update when streaming content update succeeds and no thinking", async () => {
     const { client, cardUpdate } = createClientMock();
     const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });

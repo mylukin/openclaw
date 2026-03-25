@@ -647,14 +647,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const toolSummary = hasToolOnlyFinalSummary()
           ? resolveToolSummary(toolCallCount)
           : undefined;
+        if (toolSummary) {
+          text = `${toolSummary}\n\n${text}`;
+        }
         const finalNote = showCardNote
           ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
           : undefined;
-        const resolvedNote = finalNote && toolSummary ? `${finalNote} | ${toolSummary}` : finalNote;
-        if (toolSummary && !resolvedNote) {
-          text = `${text}\n\n${toolSummary}`;
-        }
-        await streaming.close(text, { note: resolvedNote });
+        await streaming.close(text, {
+          ...(finalNote !== undefined ? { note: finalNote } : {}),
+          ...(toolSummary ? { dropThinkingPanel: true } : {}),
+        });
         hasVisibleTextInReply = true;
         if (options?.emitFinalText && finalText.trim()) {
           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
