@@ -93,7 +93,7 @@ describe("outbound channel resolution", () => {
     expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
   });
 
-  it("falls back to the active registry when getChannelPlugin misses", async () => {
+  it("skips bootstrap when active registry already has channels", async () => {
     const plugin = { id: "telegram" };
     getChannelPluginMock.mockReturnValue(undefined);
     getActivePluginRegistryMock.mockReturnValue({
@@ -101,12 +101,15 @@ describe("outbound channel resolution", () => {
     });
     const channelResolution = await importChannelResolution("direct-registry");
 
+    // Even though getChannelPlugin returns undefined, bootstrap is skipped
+    // because the active registry already has channels loaded.
     expect(
       channelResolution.resolveOutboundChannelPlugin({
         channel: "telegram",
         cfg: {} as never,
       }),
-    ).toBe(plugin);
+    ).toBeUndefined();
+    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
   });
 
   it("bootstraps plugins once per registry key and returns the newly loaded plugin", async () => {
@@ -123,9 +126,6 @@ describe("outbound channel resolution", () => {
     expect(loadOpenClawPluginsMock).toHaveBeenCalledWith({
       config: { autoEnabled: true },
       workspaceDir: "/tmp/workspace",
-      runtimeOptions: {
-        allowGatewaySubagentBinding: true,
-      },
     });
 
     getChannelPluginMock.mockReturnValue(undefined);
@@ -137,27 +137,25 @@ describe("outbound channel resolution", () => {
     expect(loadOpenClawPluginsMock).toHaveBeenLastCalledWith({
       config: { autoEnabled: true },
       workspaceDir: "/tmp/workspace",
-      runtimeOptions: {
-        allowGatewaySubagentBinding: true,
-      },
     });
   });
 
-  it("bootstraps when the active registry has other channels but not the requested one", async () => {
-    const plugin = { id: "telegram" };
-    getChannelPluginMock.mockReturnValueOnce(undefined).mockReturnValueOnce(plugin);
+  it("skips bootstrap when the active registry has other channels but not the requested one", async () => {
+    getChannelPluginMock.mockReturnValue(undefined);
     getActivePluginRegistryMock.mockReturnValue({
       channels: [{ plugin: { id: "discord" } }],
     });
     const channelResolution = await importChannelResolution("bootstrap-missing-target");
 
+    // Bootstrap is skipped to protect the existing hook runner — gateway
+    // startup should have loaded all needed channel plugins already.
     expect(
       channelResolution.resolveOutboundChannelPlugin({
         channel: "telegram",
         cfg: { channels: {} } as never,
       }),
-    ).toBe(plugin);
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(1);
+    ).toBeUndefined();
+    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
   });
 
   it("retries bootstrap after a transient load failure", async () => {
