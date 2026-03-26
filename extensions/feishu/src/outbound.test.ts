@@ -42,7 +42,10 @@ function resetOutboundMocks() {
   sendMessageFeishuMock.mockResolvedValue({ messageId: "text_msg" });
   sendMarkdownCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
   sendStructuredCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
-  sendMediaFeishuMock.mockResolvedValue({ messageId: "media_msg" });
+  sendMediaFeishuMock.mockResolvedValue({
+    messageId: "media_msg",
+    rawContent: '{"image_key":"img_test_1"}',
+  });
 }
 
 describe("feishuOutbound.sendText local-image auto-convert", () => {
@@ -78,7 +81,14 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
       );
       expect(sendMessageFeishuMock).not.toHaveBeenCalled();
       expect(result).toEqual(
-        expect.objectContaining({ channel: "feishu", messageId: "media_msg" }),
+        expect.objectContaining({
+          channel: "feishu",
+          messageId: "media_msg",
+          meta: {
+            contentType: "image",
+            rawContent: '{"image_key":"img_test_1"}',
+          },
+        }),
       );
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
@@ -298,7 +308,7 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
   });
 
   it("forwards replyToId to sendMediaFeishu", async () => {
-    await feishuOutbound.sendMedia?.({
+    const result = await feishuOutbound.sendMedia?.({
       cfg: {} as any,
       to: "chat_1",
       text: "",
@@ -310,6 +320,16 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
     expect(sendMediaFeishuMock).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_reply_target",
+      }),
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        channel: "feishu",
+        messageId: "media_msg",
+        meta: {
+          contentType: "image",
+          rawContent: '{"image_key":"img_test_1"}',
+        },
       }),
     );
   });
@@ -367,7 +387,16 @@ describe("feishuOutbound.sendMedia renderMode", () => {
       }),
     );
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "media_msg" }));
+    expect(result).toEqual(
+      expect.objectContaining({
+        channel: "feishu",
+        messageId: "media_msg",
+        meta: {
+          contentType: "image",
+          rawContent: '{"image_key":"img_test_1"}',
+        },
+      }),
+    );
   });
 
   it("uses threadId fallback as replyToMessageId on sendMedia", async () => {

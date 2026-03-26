@@ -80,6 +80,20 @@ async function sendOutboundText(params: {
   return sendMessageFeishu({ cfg, to, text, accountId, replyToMessageId });
 }
 
+function attachFeishuMediaMetadata<
+  T extends { rawContent?: string; meta?: Record<string, unknown> },
+>(sent: T, mediaUrl: string) {
+  const contentType = resolveMediaContentType(mediaUrl);
+  return {
+    ...sent,
+    meta: {
+      ...(sent.meta ?? {}),
+      contentType,
+      rawContent: sent.rawContent ?? `[${contentType}: ${mediaUrl}]`,
+    },
+  };
+}
+
 export const feishuOutbound: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   chunker: (text, limit) => getFeishuRuntime().channel.text.chunkMarkdownText(text, limit),
@@ -104,7 +118,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       const localImagePath = normalizePossibleLocalImagePath(text);
       if (localImagePath) {
         try {
-          return await sendMediaFeishu({
+          const sent = await sendMediaFeishu({
             cfg,
             to,
             mediaUrl: localImagePath,
@@ -112,6 +126,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
             replyToMessageId,
             mediaLocalRoots,
           });
+          return attachFeishuMediaMetadata(sent, localImagePath);
         } catch (err) {
           console.error(`[feishu] local image path auto-send failed:`, err);
           // fall through to plain text as last resort
@@ -190,7 +205,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       // Upload and send media if URL or local path provided
       if (mediaUrl) {
         try {
-          return await sendMediaFeishu({
+          const sent = await sendMediaFeishu({
             cfg,
             to,
             mediaUrl,
@@ -198,6 +213,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
             mediaLocalRoots,
             replyToMessageId,
           });
+          return attachFeishuMediaMetadata(sent, mediaUrl);
         } catch (err) {
           // Log the error for debugging
           console.error(`[feishu] sendMediaFeishu failed:`, err);
