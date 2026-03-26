@@ -172,14 +172,17 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       },
     });
 
-    createFeishuReplyDispatcher({
+    const result = createFeishuReplyDispatcher({
       cfg: {} as never,
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
     });
 
-    return createReplyDispatcherWithTypingMock.mock.calls.at(-1)?.[0];
+    return {
+      result,
+      options: createReplyDispatcherWithTypingMock.mock.calls.at(-1)?.[0],
+    };
   }
 
   function createRuntimeLogger() {
@@ -486,13 +489,20 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(emitMessageSentMock).not.toHaveBeenCalled();
   });
 
-  it("disables streaming UI when message_sending hooks are active", async () => {
-    const options = setupHookedAutoDispatcher();
+  it("keeps thinking streaming UI while suppressing partial text when message_sending hooks are active", async () => {
+    const { result, options } = setupHookedAutoDispatcher();
     await options.onReplyStart?.();
+    await result.replyOptions.onReasoningStream?.({ text: "thinking..." });
+    await result.replyOptions.onPartialReply?.({ text: "partial text" });
     await options.deliver({ text: "stream candidate" }, { kind: "final" });
 
-    expect(streamingInstances).toHaveLength(0);
-    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).not.toHaveBeenCalled();
+    expect(streamingInstances[0].updateThinking).toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("stream candidate", {
+      note: "Agent: agent",
+    });
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
   });
 
   it("keeps distinct non-streaming final payloads", async () => {

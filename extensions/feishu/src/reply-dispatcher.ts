@@ -317,9 +317,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const showCardNote = account.config?.cardNote ?? true;
   const renderMode = account.config?.renderMode ?? "auto";
   const hasMessageSendingHooks = core.hooks.hasMessageSendingHooks();
+  const suppressAssistantTextStreaming = hasMessageSendingHooks;
   const streamingEnabled =
     account.config?.streaming !== false &&
-    !hasMessageSendingHooks &&
     renderMode !== "raw" &&
     (!threadReplyMode || streamingInThread === true);
   // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
@@ -815,11 +815,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
           if (streaming?.isActive()) {
             if (info?.kind === "block") {
-              // Some runtimes emit block payloads without onPartial/final callbacks.
-              // Mirror block text into streamText so onIdle close still sends content.
-              // hasVisibleTextInReply is set by queueStreamingRender on successful update.
-              queueThinkingPrelude();
-              queueStreamingUpdate(text);
+              if (!suppressAssistantTextStreaming) {
+                // Some runtimes emit block payloads without onPartial/final callbacks.
+                // Mirror block text into streamText so onIdle close still sends content.
+                // hasVisibleTextInReply is set by queueStreamingRender on successful update.
+                queueThinkingPrelude();
+                queueStreamingUpdate(text);
+              }
             }
             if (info?.kind === "final") {
               streamText = text;
@@ -1001,7 +1003,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            if (!payload.text) {
+            if (!payload.text || suppressAssistantTextStreaming) {
               return;
             }
             queueThinkingPrelude();
