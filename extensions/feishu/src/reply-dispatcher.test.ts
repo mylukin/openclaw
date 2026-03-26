@@ -547,9 +547,8 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
 
     await options.onIdle?.();
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
       note: "Agent: agent",
-      dropThinkingPanel: true,
     });
   });
 
@@ -650,7 +649,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
-  it("degrades tool-only final panel into a top summary instead of re-rendering an empty panel", async () => {
+  it("keeps the tool-only final panel in the closing card", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -675,17 +674,17 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
     await flushAsyncTasks();
 
-    const thinkingCallCountBeforeIdle = streamingInstances[0].updateThinking.mock.calls.length;
     await options.onIdle?.();
 
-    expect(streamingInstances[0].updateThinking).toHaveBeenCalledTimes(thinkingCallCountBeforeIdle);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
+      title: "🔧 Tool calls (1)",
+    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
       note: "Agent: agent",
-      dropThinkingPanel: true,
     });
   });
 
-  it("keeps tool-only final summary at the top even when card note is disabled", async () => {
+  it("keeps the tool-only final panel when card note is disabled", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -712,9 +711,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
     await options.onIdle?.();
 
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("🔧 Used 1 tool\n\n第一段答案", {
-      dropThinkingPanel: true,
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {});
   });
 
   it("clears running tool status when visible assistant text arrives through block delivery", async () => {

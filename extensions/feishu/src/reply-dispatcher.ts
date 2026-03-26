@@ -115,10 +115,6 @@ function resolveCardNote(
   return parts.join(" | ");
 }
 
-function resolveToolSummary(toolCallCount: number): string {
-  return `🔧 Used ${toolCallCount} tool${toolCallCount === 1 ? "" : "s"}`;
-}
-
 export type CreateFeishuReplyDispatcherParams = {
   cfg: ClawdbotConfig;
   agentId: string;
@@ -430,7 +426,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
-  const hasToolOnlyFinalSummary = (): boolean => !hasReasoningText() && toolCallCount > 0;
 
   const resolveThinkingPanelTitle = (): string => {
     if (!hasReasoningText() && toolCallCount > 0) {
@@ -636,26 +631,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       } else {
         // Store thinking content for the collapsed panel in the final card
         if (finalThinking.text) {
-          if (!hasToolOnlyFinalSummary()) {
-            await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
-          }
+          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
         }
         let text = finalText;
         if (mentionTargets?.length) {
           text = buildMentionedCardContent(mentionTargets, text);
-        }
-        const toolSummary = hasToolOnlyFinalSummary()
-          ? resolveToolSummary(toolCallCount)
-          : undefined;
-        if (toolSummary) {
-          text = `${toolSummary}\n\n${text}`;
         }
         const finalNote = showCardNote
           ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
           : undefined;
         await streaming.close(text, {
           ...(finalNote !== undefined ? { note: finalNote } : {}),
-          ...(toolSummary ? { dropThinkingPanel: true } : {}),
         });
         hasVisibleTextInReply = true;
         if (options?.emitFinalText && finalText.trim()) {
