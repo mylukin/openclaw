@@ -67,11 +67,41 @@ function extractFeishuApiErrorCode(error: unknown): number | undefined {
   return undefined;
 }
 
+function extractFeishuApiErrorMessage(error: unknown): string {
+  if (error instanceof Error && typeof error.message === "string") {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null) {
+    const directMessage = (error as { msg?: unknown; message?: unknown }).msg;
+    if (typeof directMessage === "string") {
+      return directMessage;
+    }
+    const fallbackMessage = (error as { message?: unknown }).message;
+    if (typeof fallbackMessage === "string") {
+      return fallbackMessage;
+    }
+    const responseMessage = (
+      error as { response?: { data?: { msg?: unknown; message?: unknown } } }
+    ).response?.data?.msg;
+    if (typeof responseMessage === "string") {
+      return responseMessage;
+    }
+    const responseFallback = (error as { response?: { data?: { message?: unknown } } }).response
+      ?.data?.message;
+    if (typeof responseFallback === "string") {
+      return responseFallback;
+    }
+  }
+  return String(error ?? "");
+}
+
 function isStreamingModeClosedError(error: unknown): boolean {
   const code = extractFeishuApiErrorCode(error);
-  return (
-    code === FEISHU_STREAMING_TIMEOUT_ERROR_CODE || code === FEISHU_STREAMING_CLOSED_ERROR_CODE
-  );
+  if (code === FEISHU_STREAMING_TIMEOUT_ERROR_CODE || code === FEISHU_STREAMING_CLOSED_ERROR_CODE) {
+    return true;
+  }
+  const message = extractFeishuApiErrorMessage(error).toLowerCase();
+  return message.includes("streaming mode is closed") || message.includes("card streaming timeout");
 }
 
 function truncateSummary(text: string, max = 50): string {

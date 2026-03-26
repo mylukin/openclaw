@@ -315,6 +315,37 @@ describe("FeishuStreamingSession.update", () => {
     expect(retryArg.data?.sequence).toBe(4);
     expect((session as any).state.sequence).toBe(4);
   });
+
+  it("reopens streaming mode when the sdk only exposes a closed-streaming error message", async () => {
+    const { client, cardElementContent, cardSettings } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 2,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+    cardElementContent
+      .mockRejectedValueOnce(new Error("ErrMsg: streaming mode is closed;"))
+      .mockResolvedValueOnce({ code: 0, msg: "ok" });
+
+    const ok = await (session as any).updateElementContent("content", "updated", vi.fn());
+
+    expect(ok).toBe(true);
+    expect(cardSettings).toHaveBeenCalledOnce();
+    expect(cardElementContent).toHaveBeenCalledTimes(2);
+    expect((session as any).state.sequence).toBe(4);
+  });
 });
 
 describe("FeishuStreamingSession.discard", () => {
