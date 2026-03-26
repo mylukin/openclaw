@@ -9,6 +9,8 @@ const removeReactionFeishuMock = vi.hoisted(() => vi.fn());
 const sendCardFeishuMock = vi.hoisted(() => vi.fn());
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
+const feishuOutboundSendMediaMock = vi.hoisted(() => vi.fn());
+const emitMessageSentMock = vi.hoisted(() => vi.fn());
 const getMessageFeishuMock = vi.hoisted(() => vi.fn());
 const editMessageFeishuMock = vi.hoisted(() => vi.fn());
 const createPinFeishuMock = vi.hoisted(() => vi.fn());
@@ -48,9 +50,22 @@ vi.mock("./channel.runtime.js", () => ({
     sendMessageFeishu: sendMessageFeishuMock,
     feishuOutbound: {
       sendText: feishuOutboundSendTextMock,
-      sendMedia: vi.fn(),
+      sendMedia: feishuOutboundSendMediaMock,
     },
   },
+}));
+
+vi.mock("./runtime.js", () => ({
+  getFeishuRuntime: () => ({
+    hooks: {
+      emitMessageSent: emitMessageSentMock,
+    },
+    channel: {
+      text: {
+        chunkMarkdownText: (text: string) => [text],
+      },
+    },
+  }),
 }));
 
 import { feishuPlugin } from "./channel.js";
@@ -115,6 +130,15 @@ describe("feishuPlugin actions", () => {
     vi.clearAllMocks();
     createFeishuClientMock.mockReturnValue({ tag: "client" });
     feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
+    feishuOutboundSendMediaMock.mockResolvedValue({
+      channel: "feishu",
+      messageId: "om_media",
+      chatId: "oc_group_1",
+      meta: {
+        contentType: "image",
+        rawContent: '{"image_key":"img_tool_1"}',
+      },
+    });
   });
 
   it("advertises the expanded Feishu action surface", () => {
@@ -183,6 +207,19 @@ describe("feishuPlugin actions", () => {
       text: "hello",
       accountId: undefined,
     });
+    expect(emitMessageSentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:oc_group_1",
+        content: "hello",
+        success: true,
+        messageId: "om_sent",
+        metadata: { chatId: "oc_group_1" },
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_group_1",
+      }),
+    );
     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
   });
 
@@ -205,7 +242,61 @@ describe("feishuPlugin actions", () => {
       replyToMessageId: undefined,
       replyInThread: false,
     });
+    expect(emitMessageSentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:oc_group_1",
+        content: "",
+        success: true,
+        messageId: "om_card",
+        metadata: { chatId: "oc_group_1", contentType: "interactive" },
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_group_1",
+      }),
+    );
     expect(result?.details).toMatchObject({ ok: true, messageId: "om_card", chatId: "oc_group_1" });
+  });
+
+  it("emits message_sent for media-only message tool sends", async () => {
+    const result = await feishuPlugin.actions?.handleAction?.({
+      action: "send",
+      params: { to: "chat:oc_group_1", media: "/tmp/generated.png" },
+      cfg,
+      accountId: undefined,
+      toolContext: {},
+    } as never);
+
+    expect(feishuOutboundSendMediaMock).toHaveBeenCalledWith({
+      cfg,
+      to: "chat:oc_group_1",
+      text: "",
+      mediaUrl: "/tmp/generated.png",
+      accountId: undefined,
+      mediaLocalRoots: undefined,
+    });
+    expect(emitMessageSentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:oc_group_1",
+        content: "",
+        success: true,
+        messageId: "om_media",
+        metadata: {
+          chatId: "oc_group_1",
+          contentType: "image",
+          rawContent: '{"image_key":"img_tool_1"}',
+        },
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_group_1",
+      }),
+    );
+    expect(result?.details).toMatchObject({
+      ok: true,
+      messageId: "om_media",
+      chatId: "oc_group_1",
+    });
   });
 
   it("reads messages", async () => {

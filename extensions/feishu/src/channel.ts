@@ -277,6 +277,35 @@ function jsonActionResult(details: Record<string, unknown>) {
   };
 }
 
+function emitFeishuActionMessageSent(params: {
+  to: string;
+  content: string;
+  accountId?: string;
+  result: { messageId?: string; chatId?: string; meta?: Record<string, unknown> };
+  metadata?: Record<string, unknown>;
+}) {
+  getFeishuRuntime().hooks.emitMessageSent(
+    {
+      to: params.to,
+      content: params.content,
+      success: true,
+      ...(typeof params.result.messageId === "string" && params.result.messageId.trim()
+        ? { messageId: params.result.messageId }
+        : {}),
+      metadata: {
+        ...(params.result.chatId ? { chatId: params.result.chatId } : {}),
+        ...(params.result.meta ?? {}),
+        ...(params.metadata ?? {}),
+      },
+    },
+    {
+      channelId: "feishu",
+      accountId: params.accountId,
+      conversationId: params.result.chatId ?? params.to,
+    },
+  );
+}
+
 function readFirstString(
   params: Record<string, unknown>,
   keys: string[],
@@ -523,33 +552,82 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
                 })
               : mediaUrl
                 ? await (async () => {
+                    const trimmedText = text?.trim() ?? "";
+                    if (trimmedText) {
+                      const sendText = runtime.feishuOutbound.sendText;
+                      if (!sendText) {
+                        throw new Error("Feishu outbound text sender is unavailable.");
+                      }
+                      const textResult = await sendText({
+                        cfg: ctx.cfg,
+                        to,
+                        text: trimmedText,
+                        accountId: ctx.accountId ?? undefined,
+                        ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
+                      });
+                      emitFeishuActionMessageSent({
+                        to,
+                        content: trimmedText,
+                        accountId: ctx.accountId ?? undefined,
+                        result: textResult,
+                        metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                      });
+                    }
                     const sendMedia = runtime.feishuOutbound.sendMedia;
                     if (!sendMedia) {
                       throw new Error("Feishu outbound media sender is unavailable.");
                     }
-                    return sendMedia({
+                    const mediaResult = await sendMedia({
                       cfg: ctx.cfg,
                       to,
-                      text: text ?? "",
+                      text: "",
                       mediaUrl,
                       accountId: ctx.accountId ?? undefined,
                       mediaLocalRoots: ctx.mediaLocalRoots,
                       ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
                     });
+                    emitFeishuActionMessageSent({
+                      to,
+                      content: "",
+                      accountId: ctx.accountId ?? undefined,
+                      result: mediaResult,
+                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                    });
+                    return mediaResult;
                   })()
                 : await (async () => {
                     const sendText = runtime.feishuOutbound.sendText;
                     if (!sendText) {
                       throw new Error("Feishu outbound text sender is unavailable.");
                     }
-                    return sendText({
+                    const textResult = await sendText({
                       cfg: ctx.cfg,
                       to,
                       text: text!,
                       accountId: ctx.accountId ?? undefined,
                       ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
                     });
+                    emitFeishuActionMessageSent({
+                      to,
+                      content: text!,
+                      accountId: ctx.accountId ?? undefined,
+                      result: textResult,
+                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                    });
+                    return textResult;
                   })();
+            if (card) {
+              emitFeishuActionMessageSent({
+                to,
+                content: "",
+                accountId: ctx.accountId ?? undefined,
+                result,
+                metadata: {
+                  contentType: "interactive",
+                  ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
+                },
+              });
+            }
             return jsonActionResult({
               ok: true,
               channel: "feishu",
