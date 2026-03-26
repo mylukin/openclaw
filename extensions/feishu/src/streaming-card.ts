@@ -180,6 +180,7 @@ export class FeishuStreamingSession {
   private state: CardState | null = null;
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
+  private requiresFullCardSync = false;
   private log?: (msg: string) => void;
   private lastUpdateTime = 0;
   private pendingText: string | null = null;
@@ -296,6 +297,7 @@ export class FeishuStreamingSession {
       thinkingExpanded: true,
       thinkingPanelRendered: false,
     };
+    this.requiresFullCardSync = false;
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
@@ -427,11 +429,13 @@ export class FeishuStreamingSession {
             await this.pushElementContent(elementId, text);
             return true;
           } catch (retryError) {
+            this.requiresFullCardSync = true;
             onError?.(retryError);
             return false;
           }
         }
       }
+      this.requiresFullCardSync = true;
       onError?.(error);
       return false;
     }
@@ -520,6 +524,7 @@ export class FeishuStreamingSession {
       }
       this.state.sequence = nextSeq;
       this.state.thinkingPanelRendered = Boolean(this.state.thinkingText);
+      this.requiresFullCardSync = false;
       return true;
     } catch (e) {
       this.log?.(`Full card update failed: ${String(e)}`);
@@ -664,7 +669,10 @@ export class FeishuStreamingSession {
         }
         this.state!.sequence = nextSeq;
       })
-      .catch((e) => this.log?.(`Note update failed: ${String(e)}`));
+      .catch((e) => {
+        this.requiresFullCardSync = true;
+        this.log?.(`Note update failed: ${String(e)}`);
+      });
   }
 
   async close(
@@ -707,7 +715,9 @@ export class FeishuStreamingSession {
     // and then a subsequent element API note update fails because streaming
     // mode was disabled by the full card update.
     const requiresFullCardUpdate =
-      Boolean(this.state.thinkingText) || Boolean(options?.dropThinkingPanel && hadThinkingPanel);
+      this.requiresFullCardSync ||
+      Boolean(this.state.thinkingText) ||
+      Boolean(options?.dropThinkingPanel && hadThinkingPanel);
     if (requiresFullCardUpdate) {
       await this.updateCardFull(this.state.currentText, {
         note: options?.note,

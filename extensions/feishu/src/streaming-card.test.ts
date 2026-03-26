@@ -635,6 +635,29 @@ describe("FeishuStreamingSession.close", () => {
     expect(cardUpdate).not.toHaveBeenCalled();
   });
 
+  it("forces a final full card sync on close after an earlier streaming update failure", async () => {
+    const { client, cardUpdate } = createClientMock();
+    const session = new FeishuStreamingSession(client, { appId: "app", appSecret: "secret" });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "最终内容",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    (session as any).requiresFullCardSync = true;
+    (session as any).lastStreamingModeRenewAt = Date.now();
+
+    await session.close("最终内容");
+
+    expect(cardUpdate).toHaveBeenCalledOnce();
+  });
+
   it("strips html tags when writing summary content on close", async () => {
     const { client, cardSettings } = createClientMock();
     const session = new FeishuStreamingSession(client, {
