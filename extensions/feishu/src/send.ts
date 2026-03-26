@@ -595,7 +595,7 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
   const { cfg, to, card, replyToMessageId, replyInThread, mentions, accountId } = params;
   const mentionMeta = buildMentionMeta(mentions);
   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
-  const content = JSON.stringify(card);
+  const content = JSON.stringify(normalizeCardMentionTags(card));
 
   const directParams = { receiveId, receiveIdType, content, msgType: "interactive" };
   return sendReplyOrFallbackDirect(client, {
@@ -631,7 +631,7 @@ export async function editMessageFeishu(params: {
   const client = createFeishuClient(account);
 
   if (card) {
-    const content = JSON.stringify(card);
+    const content = JSON.stringify(normalizeCardMentionTags(card));
     const response = await client.im.message.patch({
       path: { message_id: messageId },
       data: { content },

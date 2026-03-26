@@ -8,6 +8,7 @@ import {
   getMessageFeishu,
   listFeishuThreadMessages,
   resolveFeishuCardTemplate,
+  sendCardFeishu,
   sendMessageFeishu,
   shouldUseFeishuMarkdownCard,
 } from "./send.js";
@@ -341,6 +342,60 @@ describe("shouldUseFeishuMarkdownCard", () => {
   });
 });
 
+describe("sendCardFeishu", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveFeishuAccount.mockReturnValue({
+      accountId: "default",
+      configured: true,
+      appId: "cli_main",
+      appSecret: "secret_main",
+      config: {},
+    });
+  });
+
+  it("normalizes text-style mentions in raw interactive card payloads before sending", async () => {
+    const create = vi.fn().mockResolvedValue({
+      code: 0,
+      data: { message_id: "om_card_raw" },
+    });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+        },
+      },
+    });
+
+    const result = await sendCardFeishu({
+      cfg: {} as ClawdbotConfig,
+      to: "chat:oc_group_1",
+      card: {
+        schema: "2.0",
+        body: {
+          elements: [{ tag: "markdown", content: '<at user_id="ou_123">Emma</at> hello' }],
+        },
+      },
+    });
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          msg_type: "interactive",
+          content: JSON.stringify({
+            schema: "2.0",
+            body: {
+              elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
+            },
+          }),
+        }),
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({ messageId: "om_card_raw" }));
+  });
+});
+
 describe("editMessageFeishu", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -402,6 +457,34 @@ describe("editMessageFeishu", () => {
       },
     });
     expect(result).toEqual({ messageId: "om_card", contentType: "interactive" });
+  });
+
+  it("normalizes text-style mentions in raw card edits before patching", async () => {
+    mockClientPatch.mockResolvedValueOnce({ code: 0 });
+
+    const result = await editMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_card_raw_mentions",
+      card: {
+        schema: "2.0",
+        body: {
+          elements: [{ tag: "markdown", content: '<at user_id="ou_123">Emma</at> hello' }],
+        },
+      },
+    });
+
+    expect(mockClientPatch).toHaveBeenCalledWith({
+      path: { message_id: "om_card_raw_mentions" },
+      data: {
+        content: JSON.stringify({
+          schema: "2.0",
+          body: {
+            elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
+          },
+        }),
+      },
+    });
+    expect(result).toEqual({ messageId: "om_card_raw_mentions", contentType: "interactive" });
   });
 
   it("patches interactive content for text edits when renderMode=card", async () => {
