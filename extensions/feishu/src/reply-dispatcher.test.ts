@@ -10,6 +10,7 @@ const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
 const emitMessageSentMock = vi.hoisted(() => vi.fn());
+const runMessageSendingMock = vi.hoisted(() => vi.fn());
 const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
 const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
 const streamingInstances = vi.hoisted(() => [] as any[]);
@@ -109,9 +110,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         },
       },
       hooks: {
+        hasMessageSendingHooks: () => false,
+        runMessageSending: runMessageSendingMock,
         emitMessageSent: emitMessageSentMock,
       },
     });
+    runMessageSendingMock.mockResolvedValue(undefined);
   });
 
   function setupNonStreamingAutoDispatcher() {
@@ -134,6 +138,48 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
 
     return createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+  }
+
+  function setupHookedAutoDispatcher() {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "auto",
+        streaming: true,
+      },
+    });
+    getFeishuRuntimeMock.mockReturnValue({
+      channel: {
+        text: {
+          resolveTextChunkLimit: vi.fn(() => 4000),
+          resolveChunkMode: vi.fn(() => "line"),
+          resolveMarkdownTableMode: vi.fn(() => "preserve"),
+          convertMarkdownTables: vi.fn((text) => text),
+          chunkTextWithMode: vi.fn((text) => [text]),
+        },
+        reply: {
+          createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
+          resolveHumanDelayConfig: vi.fn(() => undefined),
+        },
+      },
+      hooks: {
+        hasMessageSendingHooks: () => true,
+        runMessageSending: runMessageSendingMock,
+        emitMessageSent: emitMessageSentMock,
+      },
+    });
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    return createReplyDispatcherWithTypingMock.mock.calls.at(-1)?.[0];
   }
 
   function createRuntimeLogger() {
@@ -404,6 +450,49 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         mediaUrl: "https://example.com/a.png",
       }),
     );
+  });
+
+  it("applies message_sending rewrites before non-streaming final sends", async () => {
+    runMessageSendingMock.mockResolvedValueOnce({ content: "rewritten final" });
+
+    const options = setupNonStreamingAutoDispatcher();
+    await options.deliver({ text: "plain final" }, { kind: "final" });
+
+    expect(runMessageSendingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "oc_chat",
+        content: "plain final",
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "oc_chat",
+      }),
+    );
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "rewritten final",
+      }),
+    );
+  });
+
+  it("honors message_sending cancellation for media-only final sends", async () => {
+    runMessageSendingMock.mockResolvedValueOnce({ cancel: true });
+
+    const options = setupNonStreamingAutoDispatcher();
+    await options.deliver({ mediaUrl: "https://example.com/a.png" }, { kind: "final" });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(emitMessageSentMock).not.toHaveBeenCalled();
+  });
+
+  it("disables streaming UI when message_sending hooks are active", async () => {
+    const options = setupHookedAutoDispatcher();
+    await options.onReplyStart?.();
+    await options.deliver({ text: "stream candidate" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(0);
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps distinct non-streaming final payloads", async () => {

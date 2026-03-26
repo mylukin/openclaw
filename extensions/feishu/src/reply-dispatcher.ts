@@ -131,6 +131,8 @@ export type CreateFeishuReplyDispatcherParams = {
   rootId?: string;
   mentionTargets?: MentionTarget[];
   accountId?: string;
+  sessionKey?: string;
+  isGroup?: boolean;
   identity?: OutboundIdentity;
   /** Epoch ms when the inbound message was created. Used to suppress typing
    *  indicators on old/replayed messages after context compaction (#30418). */
@@ -159,6 +161,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     rootId,
     mentionTargets,
     accountId,
+    sessionKey,
+    isGroup,
     identity,
   } = params;
   const sendReplyToMessageId = skipReplyToInMessages ? undefined : replyToMessageId;
@@ -198,8 +202,43 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         channelId: "feishu",
         accountId: accountId ?? account.accountId,
         conversationId: chatId,
+        sessionKey,
+        isGroup,
+        groupId: isGroup ? chatId : undefined,
       },
     );
+  };
+  const runMessageSending = async (params: {
+    content: string;
+    mediaUrls?: string[];
+  }): Promise<{ cancelled: boolean; content: string }> => {
+    const hookResult = await core.hooks.runMessageSending(
+      {
+        to: chatId,
+        content: params.content,
+        metadata: {
+          channel: "feishu",
+          accountId: accountId ?? account.accountId,
+          ...(params.mediaUrls?.length ? { mediaUrls: params.mediaUrls } : {}),
+          ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
+          ...(effectiveReplyInThread && (rootId ?? sendReplyToMessageId)
+            ? { threadId: rootId ?? sendReplyToMessageId }
+            : {}),
+        },
+      },
+      {
+        channelId: "feishu",
+        accountId: accountId ?? account.accountId,
+        conversationId: chatId,
+      },
+    );
+    if (hookResult?.cancel) {
+      return { cancelled: true, content: params.content };
+    }
+    return {
+      cancelled: false,
+      content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
+    };
   };
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
 
@@ -277,8 +316,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const showCardHeader = account.config?.cardHeader ?? true;
   const showCardNote = account.config?.cardNote ?? true;
   const renderMode = account.config?.renderMode ?? "auto";
+  const hasMessageSendingHooks = core.hooks.hasMessageSendingHooks();
   const streamingEnabled =
     account.config?.streaming !== false &&
+    !hasMessageSendingHooks &&
     renderMode !== "raw" &&
     (!threadReplyMode || streamingInThread === true);
   // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
@@ -722,10 +763,26 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await typingCallbacks?.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
-        const reply = resolveSendableOutboundReplyParts(payload);
-        const text = reply.text;
-        const hasText = reply.hasText;
-        const hasMedia = reply.hasMedia;
+        const originalReply = resolveSendableOutboundReplyParts(payload);
+        const shouldRunSendingHook =
+          originalReply.hasMedia || !streaming?.isActive() || info?.kind === "final";
+        let text = originalReply.text;
+        if (shouldRunSendingHook) {
+          const hookResult = await runMessageSending({
+            content: text,
+            mediaUrls: originalReply.mediaUrls,
+          });
+          if (hookResult.cancelled) {
+            if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
+              streamText = "";
+              await closeStreaming({ emitFinalText: false });
+            }
+            return;
+          }
+          text = hookResult.content;
+        }
+        const hasText = text.trim().length > 0;
+        const hasMedia = originalReply.hasMedia;
         const skipTextForDuplicateFinal =
           info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
@@ -773,7 +830,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             // Send media even when streaming handled the text
             if (hasMedia) {
-              await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
+              await deliverMediaAndEmitIfNeeded(originalReply.mediaUrls, text, info, hasText);
             }
             return;
           }
@@ -858,7 +915,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         }
 
         if (hasMedia) {
-          await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
+          await deliverMediaAndEmitIfNeeded(originalReply.mediaUrls, text, info, hasText);
         }
       },
       onError: async (error, info) => {

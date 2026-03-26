@@ -1,5 +1,10 @@
 import { createRequire } from "node:module";
 import { resolveStateDir } from "../../config/paths.js";
+import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
+import {
+  buildCanonicalSentMessageHookContext,
+  toInternalMessageSentContext,
+} from "../../hooks/message-hook-mappers.js";
 import {
   listRuntimeImageGenerationProviders,
   generateImage,
@@ -239,12 +244,50 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): 
     channel: createRuntimeChannel(),
     events: createRuntimeEvents(),
     hooks: {
+      hasMessageSendingHooks: () => {
+        const hookRunner = getGlobalHookRunner();
+        return hookRunner?.hasHooks("message_sending") ?? false;
+      },
+      runMessageSending: async (event, context) => {
+        const hookRunner = getGlobalHookRunner();
+        if (!hookRunner?.hasHooks("message_sending")) {
+          return undefined;
+        }
+        return await hookRunner.runMessageSending(event, context);
+      },
       emitMessageSent: (event, context) => {
         const hookRunner = getGlobalHookRunner();
         if (!hookRunner?.hasHooks("message_sent")) {
+          if (!context.sessionKey) {
+            return;
+          }
+        } else {
+          void hookRunner.runMessageSent(event, context);
+        }
+        if (!context.sessionKey) {
           return;
         }
-        void hookRunner.runMessageSent(event, context);
+        const canonical = buildCanonicalSentMessageHookContext({
+          to: event.to,
+          content: event.content,
+          success: event.success,
+          error: event.error,
+          channelId: context.channelId,
+          accountId: context.accountId,
+          conversationId: context.conversationId ?? event.to,
+          messageId: event.messageId,
+          metadata: event.metadata,
+          isGroup: context.isGroup,
+          groupId: context.groupId,
+        });
+        void triggerInternalHook(
+          createInternalHookEvent(
+            "message",
+            "sent",
+            context.sessionKey,
+            toInternalMessageSentContext(canonical),
+          ),
+        ).catch(() => {});
       },
     },
     logging: createRuntimeLogging(),

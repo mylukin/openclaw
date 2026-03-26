@@ -41,6 +41,12 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = 
       runModelAwareAgent: vi.fn() as unknown as PluginRuntime["agents"]["runModelAwareAgent"],
     },
     hooks: {
+      hasMessageSendingHooks: vi.fn(
+        () => false,
+      ) as unknown as PluginRuntime["hooks"]["hasMessageSendingHooks"],
+      runMessageSending: vi.fn(
+        async () => undefined,
+      ) as unknown as PluginRuntime["hooks"]["runMessageSending"],
       emitMessageSent: vi.fn() as unknown as PluginRuntime["hooks"]["emitMessageSent"],
     },
     config: {

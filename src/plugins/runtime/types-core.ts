@@ -92,6 +92,30 @@ export type PluginRuntimeCore = {
     ) => RuntimeLogger;
   };
   hooks: {
+    hasMessageSendingHooks: () => boolean;
+    /**
+     * Run a message_sending plugin hook event.
+     * Use this from extensions that bypass the core deliverOutboundPayloads pipeline
+     * when they need the same pre-send modify/cancel behavior as standard outbound.
+     */
+    runMessageSending: (
+      event: {
+        to: string;
+        content: string;
+        metadata?: Record<string, unknown>;
+      },
+      context: {
+        channelId: string;
+        accountId?: string;
+        conversationId?: string;
+      },
+    ) => Promise<
+      | {
+          content?: string;
+          cancel?: boolean;
+        }
+      | undefined
+    >;
     /**
      * Emit a message_sent plugin hook event.
      * Use this from extensions that bypass the core deliverOutboundPayloads pipeline
@@ -111,6 +135,9 @@ export type PluginRuntimeCore = {
         channelId: string;
         accountId?: string;
         conversationId?: string;
+        sessionKey?: string;
+        isGroup?: boolean;
+        groupId?: string;
       },
     ) => void;
   };

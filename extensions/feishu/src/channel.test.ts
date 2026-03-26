@@ -11,6 +11,7 @@ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
 const feishuOutboundSendMediaMock = vi.hoisted(() => vi.fn());
 const emitMessageSentMock = vi.hoisted(() => vi.fn());
+const runMessageSendingMock = vi.hoisted(() => vi.fn());
 const getMessageFeishuMock = vi.hoisted(() => vi.fn());
 const editMessageFeishuMock = vi.hoisted(() => vi.fn());
 const createPinFeishuMock = vi.hoisted(() => vi.fn());
@@ -58,6 +59,8 @@ vi.mock("./channel.runtime.js", () => ({
 vi.mock("./runtime.js", () => ({
   getFeishuRuntime: () => ({
     hooks: {
+      hasMessageSendingHooks: () => true,
+      runMessageSending: runMessageSendingMock,
       emitMessageSent: emitMessageSentMock,
     },
     channel: {
@@ -129,6 +132,7 @@ describe("feishuPlugin actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     createFeishuClientMock.mockReturnValue({ tag: "client" });
+    runMessageSendingMock.mockResolvedValue(undefined);
     feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
     feishuOutboundSendMediaMock.mockResolvedValue({
       channel: "feishu",
@@ -223,6 +227,34 @@ describe("feishuPlugin actions", () => {
     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
   });
 
+  it("applies message_sending rewrites before sending text", async () => {
+    runMessageSendingMock.mockResolvedValueOnce({ content: "hello rewritten" });
+
+    await feishuPlugin.actions?.handleAction?.({
+      action: "send",
+      params: { to: "chat:oc_group_1", message: "hello" },
+      cfg,
+      accountId: undefined,
+      toolContext: {},
+    } as never);
+
+    expect(runMessageSendingMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:oc_group_1",
+        content: "hello",
+      }),
+      expect.objectContaining({
+        channelId: "feishu",
+        conversationId: "chat:oc_group_1",
+      }),
+    );
+    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "hello rewritten",
+      }),
+    );
+  });
+
   it("sends card messages", async () => {
     sendCardFeishuMock.mockResolvedValueOnce({ messageId: "om_card", chatId: "oc_group_1" });
 
@@ -296,6 +328,28 @@ describe("feishuPlugin actions", () => {
       ok: true,
       messageId: "om_media",
       chatId: "oc_group_1",
+    });
+  });
+
+  it("cancels sends when message_sending requests cancellation", async () => {
+    runMessageSendingMock.mockResolvedValueOnce({ cancel: true });
+
+    const result = await feishuPlugin.actions?.handleAction?.({
+      action: "send",
+      params: { to: "chat:oc_group_1", media: "/tmp/generated.png" },
+      cfg,
+      accountId: undefined,
+      toolContext: {},
+    } as never);
+
+    expect(feishuOutboundSendTextMock).not.toHaveBeenCalled();
+    expect(feishuOutboundSendMediaMock).not.toHaveBeenCalled();
+    expect(emitMessageSentMock).not.toHaveBeenCalled();
+    expect(result?.details).toMatchObject({
+      ok: true,
+      channel: "feishu",
+      action: "send",
+      cancelled: true,
     });
   });
 
