@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
 import {
+  buildMarkdownCard,
   buildStructuredCard,
   editMessageFeishu,
   enrichMentionPlaceholders,
@@ -434,6 +435,37 @@ describe("editMessageFeishu", () => {
     expect(result).toEqual({ messageId: "om_edit_card", contentType: "interactive" });
   });
 
+  it("normalizes text-style mentions before patching card markdown content", async () => {
+    mockClientPatch.mockResolvedValueOnce({ code: 0 });
+    mockResolveFeishuAccount.mockReturnValue({
+      accountId: "default",
+      configured: true,
+      config: { renderMode: "card" },
+    });
+
+    const result = await editMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_edit_card_mentions",
+      text: '<at user_id="ou_123">Emma</at> updated body',
+    });
+
+    expect(mockClientPatch).toHaveBeenCalledWith({
+      path: { message_id: "om_edit_card_mentions" },
+      data: {
+        content: JSON.stringify({
+          schema: "2.0",
+          config: {
+            wide_screen_mode: true,
+          },
+          body: {
+            elements: [{ tag: "markdown", content: "<at id=ou_123></at> updated body" }],
+          },
+        }),
+      },
+    });
+    expect(result).toEqual({ messageId: "om_edit_card_mentions", contentType: "interactive" });
+  });
+
   it("patches interactive content for text edits in auto mode when markdown needs cards", async () => {
     mockClientPatch.mockResolvedValueOnce({ code: 0 });
     mockResolveFeishuAccount.mockReturnValue({
@@ -493,6 +525,34 @@ describe("buildStructuredCard", () => {
         },
       }),
     );
+  });
+
+  it("normalizes text-style mentions in markdown body content", () => {
+    const card = buildStructuredCard('<at user_id="ou_123">Emma</at> hello');
+
+    expect(card).toEqual(
+      expect.objectContaining({
+        body: {
+          elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
+        },
+      }),
+    );
+  });
+});
+
+describe("buildMarkdownCard", () => {
+  it("normalizes text-style mentions before building markdown cards", () => {
+    const card = buildMarkdownCard('<at user_id="ou_123">Emma</at> hello');
+
+    expect(card).toEqual({
+      schema: "2.0",
+      config: {
+        wide_screen_mode: true,
+      },
+      body: {
+        elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
+      },
+    });
   });
 });
 

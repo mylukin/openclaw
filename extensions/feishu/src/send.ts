@@ -646,9 +646,10 @@ export async function editMessageFeishu(params: {
 
   const renderMode = account.config?.renderMode ?? "auto";
   if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text!))) {
+    const normalizedCardText = normalizeMentionTagsForCard(text!);
     const response = await client.im.message.patch({
       path: { message_id: messageId },
-      data: { content: JSON.stringify(buildMarkdownCard(text!)) },
+      data: { content: JSON.stringify(buildMarkdownCard(normalizedCardText)) },
     });
 
     if (response.code !== 0) {
@@ -711,6 +712,7 @@ export function shouldUseFeishuMarkdownCard(text: string): boolean {
  * Uses schema 2.0 format for proper markdown rendering.
  */
 export function buildMarkdownCard(text: string): Record<string, unknown> {
+  const normalizedText = normalizeMentionTagsForCard(text);
   return {
     schema: "2.0",
     config: {
@@ -720,7 +722,7 @@ export function buildMarkdownCard(text: string): Record<string, unknown> {
       elements: [
         {
           tag: "markdown",
-          content: text,
+          content: normalizedText,
         },
       ],
     },
@@ -754,7 +756,8 @@ export function buildStructuredCard(
     note?: string;
   },
 ): Record<string, unknown> {
-  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: text }];
+  const normalizedText = normalizeMentionTagsForCard(text);
+  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: normalizedText }];
   if (options?.note) {
     elements.push({ tag: "hr" });
     elements.push({ tag: "markdown", content: `<font color='grey'>${options.note}</font>` });
