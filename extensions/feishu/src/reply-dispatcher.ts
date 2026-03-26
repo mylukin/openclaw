@@ -838,10 +838,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             hasVisibleTextInReply = true;
           }
           if (info?.kind === "final") {
+            const deliveredContent = useCard ? normalizeMentionTagsForCard(cardText) : text;
             emitMessageSent({
-              content: text,
+              content: deliveredContent,
               success: true,
               messageId: chunkResult.lastMessageId,
+              metadata: {
+                finalContent: deliveredContent,
+                contentType: useCard ? "interactive" : "post",
+              },
             });
             await emitFinalTextIfNeeded(text, {
               ...(chunkResult.lastMessageId ? { messageId: chunkResult.lastMessageId } : {}),

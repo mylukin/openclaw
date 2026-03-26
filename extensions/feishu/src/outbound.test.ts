@@ -149,7 +149,42 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
       }),
     );
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "card_msg" }));
+    expect(result).toEqual(
+      expect.objectContaining({
+        channel: "feishu",
+        messageId: "card_msg",
+        meta: {
+          contentType: "interactive",
+          finalContent: "| a | b |\n| - | - |",
+        },
+      }),
+    );
+  });
+
+  it("stores normalized finalContent metadata for card mentions", async () => {
+    const result = await sendText({
+      cfg: {
+        channels: {
+          feishu: {
+            renderMode: "card",
+          },
+        },
+      } as any,
+      to: "chat_1",
+      text: '<at user_id="ou_123">Emma</at> hello',
+      accountId: "main",
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        channel: "feishu",
+        messageId: "card_msg",
+        meta: {
+          contentType: "interactive",
+          finalContent: "<at id=ou_123></at> hello",
+        },
+      }),
+    );
   });
 
   it("forwards replyToId as replyToMessageId on sendText", async () => {

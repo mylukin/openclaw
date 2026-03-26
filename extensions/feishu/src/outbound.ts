@@ -5,6 +5,7 @@ import type { ChannelOutboundAdapter } from "../runtime-api.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { resolveMediaContentType } from "./media-types.js";
 import { sendMediaFeishu } from "./media.js";
+import { normalizeMentionTagsForCard } from "./mention.js";
 import { getFeishuRuntime } from "./runtime.js";
 import {
   sendMarkdownCardFeishu,
@@ -130,7 +131,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
               template: "blue" as const,
             }
           : undefined;
-        return await sendStructuredCardFeishu({
+        const sent = await sendStructuredCardFeishu({
           cfg,
           to,
           text,
@@ -139,14 +140,30 @@ export const feishuOutbound: ChannelOutboundAdapter = {
           accountId: accountId ?? undefined,
           header: header?.title ? header : undefined,
         });
+        return {
+          ...sent,
+          meta: {
+            ...(sent.meta ?? {}),
+            contentType: "interactive",
+            finalContent: normalizeMentionTagsForCard(text),
+          },
+        };
       }
-      return await sendOutboundText({
+      const sent = await sendOutboundText({
         cfg,
         to,
         text,
         accountId: accountId ?? undefined,
         replyToMessageId,
       });
+      return {
+        ...sent,
+        meta: {
+          ...(sent.meta ?? {}),
+          contentType: "post",
+          finalContent: text,
+        },
+      };
     },
     sendMedia: async ({
       cfg,
