@@ -149,7 +149,11 @@ async function sendReplyOrFallbackDirect(
     replyErrorPrefix: string;
   },
 ): Promise<FeishuSendResult> {
+  const runtimeLog = (getFeishuRuntime() as unknown as { log?: (message: string) => void }).log;
   if (!params.replyToMessageId) {
+    runtimeLog?.(
+      `feishu send direct-create msgType=${params.msgType} receiveId=${params.directParams.receiveId} receiveIdType=${params.directParams.receiveIdType}`,
+    );
     return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
   }
 
@@ -161,6 +165,9 @@ async function sendReplyOrFallbackDirect(
 
   let response: { code?: number; msg?: string; data?: { message_id?: string } };
   try {
+    runtimeLog?.(
+      `feishu send reply-attempt msgType=${params.msgType} replyTo=${params.replyToMessageId} replyInThread=${params.replyInThread ? "true" : "false"} receiveId=${params.directParams.receiveId}`,
+    );
     response = await client.im.message.reply({
       path: { message_id: params.replyToMessageId },
       data: {
@@ -173,18 +180,27 @@ async function sendReplyOrFallbackDirect(
     if (!isWithdrawnReplyError(err)) {
       throw err;
     }
+    runtimeLog?.(
+      `feishu send reply-fallback-on-throw msgType=${params.msgType} replyTo=${params.replyToMessageId} replyInThread=${params.replyInThread ? "true" : "false"}`,
+    );
     if (threadReplyFallbackError) {
       throw threadReplyFallbackError;
     }
     return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
   }
   if (shouldFallbackFromReplyTarget(response)) {
+    runtimeLog?.(
+      `feishu send reply-fallback-on-response msgType=${params.msgType} replyTo=${params.replyToMessageId} replyInThread=${params.replyInThread ? "true" : "false"} code=${response.code ?? "unknown"}`,
+    );
     if (threadReplyFallbackError) {
       throw threadReplyFallbackError;
     }
     return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
   }
   assertFeishuMessageApiSuccess(response, params.replyErrorPrefix);
+  runtimeLog?.(
+    `feishu send reply-ok msgType=${params.msgType} replyTo=${params.replyToMessageId} replyInThread=${params.replyInThread ? "true" : "false"} messageId=${response.data?.message_id ?? "unknown"}`,
+  );
   return toFeishuSendResult(response, params.directParams.receiveId);
 }
 

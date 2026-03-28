@@ -24,6 +24,8 @@ import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js"
 import { resolveReceiveIdType } from "./targets.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
 
+let replyDispatcherDebugSeq = 0;
+
 /** Detect if text contains markdown elements that benefit from card rendering */
 function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
@@ -169,6 +171,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const threadReplyMode = threadReply === true;
   const effectiveReplyInThread = threadReplyMode ? true : replyInThread;
   const account = resolveFeishuAccount({ cfg, accountId });
+  const dispatcherDebugId = `fd-${++replyDispatcherDebugSeq}`;
+  const logDispatcher = (message: string) => {
+    params.runtime.log?.(`feishu[${account.accountId}] ${dispatcherDebugId} ${message}`);
+  };
+  logDispatcher(
+    `create chat=${chatId} replyTo=${sendReplyToMessageId ?? "none"} root=${rootId ?? "none"} threadReply=${threadReplyMode ? "true" : "false"} replyInThread=${replyInThread === true ? "true" : "false"} effectiveReplyInThread=${effectiveReplyInThread === true ? "true" : "false"} streamingInThread=${streamingInThread === true ? "true" : "false"} sessionKey=${sessionKey ?? "none"}`,
+  );
 
   // Emit message_sent plugin hooks via the runtime SDK so downstream consumers
   // (e.g. bot-company journal) can record outbound messages. The feishu reply
@@ -654,6 +663,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (!streamingEnabled || streamingStartPromise || streaming) {
       return;
     }
+    logDispatcher(
+      `startStreaming requested replyTo=${replyToMessageId ?? "none"} effectiveReplyInThread=${effectiveReplyInThread ? "true" : "false"} root=${rootId ?? "none"}`,
+    );
     streamingStartPromise = (async () => {
       const creds =
         account.appId && account.appSecret
@@ -678,6 +690,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           header: cardHeader,
           note: cardNote,
         });
+        logDispatcher(`startStreaming active messageId=${streaming.getMessageId() ?? "unknown"}`);
       } catch (error) {
         params.runtime.error?.(`feishu: streaming start failed: ${String(error)}`);
         streaming = null;
@@ -743,6 +756,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           emitFinalText: options?.emitFinalText,
           messageId: streamMessageId,
         });
+        logDispatcher(
+          `closeStreaming final path streamMessageId=${streamMessageId ?? "unknown"} finalChars=${finalText.trim().length} thinkingChars=${finalThinking.text.trim().length}`,
+        );
         // Store thinking content for the collapsed panel in the final card
         if (finalThinking.text) {
           await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
@@ -881,6 +897,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           params.runtime.log?.(
             `feishu[${account.accountId}] final deliver candidate: chars=${text.trim().length} useCard=${useCard ? "true" : "false"} key=${finalDeliveryKey.slice(0, 120)} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"}`,
           );
+          logDispatcher(
+            `deliver final hasText=true useCard=${useCard ? "true" : "false"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"} streamingActive=${streaming?.isActive() ? "true" : "false"} streamMessageId=${streaming?.getMessageId() ?? "none"} hookTextChanged=${text !== originalReply.text ? "true" : "false"} originalChars=${originalReply.text.trim().length} finalChars=${text.trim().length}`,
+          );
         }
 
         if (!shouldDeliverText && !hasMedia) {
@@ -918,6 +937,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               }
             }
             if (info?.kind === "final") {
+              logDispatcher(
+                `deliver final -> streaming close streamMessageId=${streaming.getMessageId() ?? "unknown"} finalChars=${text.trim().length}`,
+              );
               streamText = text;
               await closeStreaming({ emitFinalText: true, reason: "idle" });
               // Mark visible only after closeStreaming succeeds — text is now delivered.
@@ -940,6 +962,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
           if (useCard) {
+            if (info?.kind === "final") {
+              logDispatcher(
+                `deliver final -> sendStructuredCardFeishu non-streaming finalChars=${cardText.trim().length} replyTo=${sendReplyToMessageId ?? "none"} effectiveReplyInThread=${effectiveReplyInThread ? "true" : "false"}`,
+              );
+            }
             const cardHeader = showCardHeader ? resolveCardHeader(agentId, identity) : undefined;
             const cardNote = showCardNote
               ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
