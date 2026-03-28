@@ -1409,6 +1409,56 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
   });
 
+  it("deduplicates a post-idle final that only differs by an auto-appended reply mention", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+    getFeishuRuntimeMock.mockReturnValue({
+      channel: {
+        text: {
+          resolveTextChunkLimit: vi.fn(() => 4000),
+          resolveChunkMode: vi.fn(() => "line"),
+          resolveMarkdownTableMode: vi.fn(() => "preserve"),
+          convertMarkdownTables: vi.fn((text) => text),
+          chunkTextWithMode: vi.fn((text) => [text]),
+        },
+        reply: {
+          createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
+          resolveHumanDelayConfig: vi.fn(() => undefined),
+        },
+      },
+      hooks: {
+        hasMessageSendingHooks: () => true,
+        runMessageSending: runMessageSendingMock,
+        emitMessageSent: emitMessageSentMock,
+      },
+    });
+    runMessageSendingMock.mockResolvedValueOnce({
+      content: 'same final text <at user_id="ou_lukin">Lukin</at>',
+    });
+
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_parent",
+    });
+
+    await options.onReplyStart?.();
+    await result.replyOptions.onPartialReply?.({ text: "same final text" });
+    await options.onIdle?.();
+    await options.deliver({ text: "same final text" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
+    expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+  });
+
   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",

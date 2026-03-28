@@ -31,6 +31,17 @@ function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
+function stripTrailingMentionSuffix(text: string): string {
+  let normalized = text.trimEnd();
+  while (true) {
+    const next = normalized.replace(/\s*<at\b[^>]*>[^<]*<\/at>\s*$/i, "").trimEnd();
+    if (next === normalized) {
+      return normalized;
+    }
+    normalized = next;
+  }
+}
+
 /** Maximum age (ms) for a message to receive a typing indicator reaction.
  * Messages older than this are likely replays after context compaction (#30418). */
 const TYPING_INDICATOR_MAX_AGE_MS = 2 * 60_000;
@@ -886,11 +897,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
         const finalDeliveryKey =
           info?.kind === "final" && hasText ? buildFinalDeliveryContentKey({ text, useCard }) : "";
+        const finalDeliveryKeyWithoutTrailingMention =
+          info?.kind === "final" && hasText && sendReplyToMessageId
+            ? stripTrailingMentionSuffix(finalDeliveryKey)
+            : "";
         const skipTextForDuplicateFinal =
           info?.kind === "final" &&
           hasText &&
           (deliveredFinalTexts.has(text) ||
-            (finalDeliveryKey.length > 0 && deliveredFinalContentKeys.has(finalDeliveryKey)));
+            (finalDeliveryKey.length > 0 && deliveredFinalContentKeys.has(finalDeliveryKey)) ||
+            (finalDeliveryKeyWithoutTrailingMention.length > 0 &&
+              deliveredFinalContentKeys.has(finalDeliveryKeyWithoutTrailingMention)));
         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
 
         if (info?.kind === "final" && hasText) {
