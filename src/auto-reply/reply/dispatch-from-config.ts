@@ -74,51 +74,6 @@ function loadDispatchAcpRuntime() {
   return dispatchAcpRuntimePromise;
 }
 
-const FEISHU_AT_USER_ID_TAG_RE =
-  /<at\s+user_id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))\s*>[\s\S]*?<\/at>/gi;
-const FEISHU_AT_ID_TAG_RE =
-  /<at\s+id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>/]+))\s*(?:\/>|>\s*<\/at>)/gi;
-
-function pickFeishuMentionId(
-  quotedDouble?: string,
-  quotedSingle?: string,
-  unquoted?: string,
-): string | null {
-  const value = (quotedDouble ?? quotedSingle ?? unquoted ?? "").trim();
-  return value ? value : null;
-}
-
-function normalizeFeishuFinalReplyText(text: string): string {
-  if (!text.includes("<at")) {
-    return text.trim();
-  }
-  return text
-    .replace(FEISHU_AT_USER_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
-      const id = pickFeishuMentionId(quotedDouble, quotedSingle, unquoted);
-      return id ? `<at:${id}>` : full;
-    })
-    .replace(FEISHU_AT_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
-      const id = pickFeishuMentionId(quotedDouble, quotedSingle, unquoted);
-      return id ? `<at:${id}>` : full;
-    })
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function resolveFinalReplyDedupeKey(
-  channel: string | undefined,
-  payload: ReplyPayload,
-): string | null {
-  const text = payload.text?.trim();
-  if (!text) {
-    return null;
-  }
-  if (channel === "feishu") {
-    return normalizeFeishuFinalReplyText(text);
-  }
-  return text;
-}
-
 function loadTtsRuntime() {
   ttsRuntimePromise ??= import("../../tts/tts.runtime.js");
   return ttsRuntimePromise;
@@ -717,9 +672,6 @@ export async function dispatchReplyFromConfig(params: {
     }
 
     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
-    const deliveredFinalReplyKeys = new Set<string>();
-    const finalReplyChannel = shouldRouteToOriginating ? originatingChannel : currentSurface;
-
     let queuedFinal = false;
     let routedFinalCount = 0;
     for (const reply of replies) {
@@ -736,13 +688,6 @@ export async function dispatchReplyFromConfig(params: {
         inboundAudio,
         ttsAuto: sessionTtsAuto,
       });
-      const dedupeKey = resolveFinalReplyDedupeKey(finalReplyChannel, ttsReply);
-      if (dedupeKey && deliveredFinalReplyKeys.has(dedupeKey)) {
-        logVerbose(
-          `dispatch-from-config: suppress duplicate final reply channel=${finalReplyChannel ?? "unknown"} key=${dedupeKey.slice(0, 160)}`,
-        );
-        continue;
-      }
       if (shouldRouteToOriginating && originatingChannel && originatingTo) {
         // Route final reply to originating channel.
         const result = await routeReplyRuntime.routeReply({
@@ -763,17 +708,11 @@ export async function dispatchReplyFromConfig(params: {
         }
         queuedFinal = result.ok || queuedFinal;
         if (result.ok) {
-          if (dedupeKey) {
-            deliveredFinalReplyKeys.add(dedupeKey);
-          }
           routedFinalCount += 1;
         }
       } else {
         const didQueue = dispatcher.sendFinalReply(ttsReply);
         queuedFinal = didQueue || queuedFinal;
-        if (didQueue && dedupeKey) {
-          deliveredFinalReplyKeys.add(dedupeKey);
-        }
       }
     }
 

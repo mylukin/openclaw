@@ -31,17 +31,6 @@ function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
-function stripTrailingMentionSuffix(text: string): string {
-  let normalized = text.trimEnd();
-  while (true) {
-    const next = normalized.replace(/\s*<at\b[^>]*>[^<]*<\/at>\s*$/i, "").trimEnd();
-    if (next === normalized) {
-      return normalized;
-    }
-    normalized = next;
-  }
-}
-
 /** Maximum age (ms) for a message to receive a typing indicator reaction.
  * Messages older than this are likely replays after context compaction (#30418). */
 const TYPING_INDICATOR_MAX_AGE_MS = 2 * 60_000;
@@ -377,8 +366,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let hasThinkingPrelude = false;
   let thinkingCollapsed = false;
   let replyCycleInitialized = false;
-  const deliveredFinalContentKeys = new Set<string>();
-
   /**
    * Deliver media files and emit persistence signals for media-only final payloads.
    * Extracted to avoid duplicating this logic across streaming/non-streaming paths.
@@ -471,11 +458,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     params.runtime.log?.(
       `feishu[${account.accountId}] streaming ${stage}: action=${details.action ?? "unknown"} finalTextChars=${details.finalText?.trim().length ?? 0} thinkingChars=${details.thinkingText?.trim().length ?? 0} toolCalls=${details.toolCalls ?? toolCallCount} emitFinalText=${details.emitFinalText === true ? "true" : "false"}${details.messageId ? ` messageId=${details.messageId}` : ""}`,
     );
-  };
-
-  const buildFinalDeliveryContentKey = (params: { text: string; useCard: boolean }): string => {
-    const normalized = params.useCard ? normalizeMentionTagsForCard(params.text) : params.text;
-    return normalized.trim();
   };
 
   const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -723,8 +705,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
     await partialUpdateQueue;
     const streamMessageId = streaming?.getMessageId();
-    console.log(
-      `[feishu-dedupe] closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
+    logDispatcher(
+      `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
     );
     if (streaming?.isActive()) {
       const finalText = streamText;
@@ -797,13 +779,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         });
         hasVisibleTextInReply = true;
         deliveredFinalTexts.add(finalText);
-        const deliveredKey = buildFinalDeliveryContentKey({
-          text: finalText,
-          useCard: true,
-        });
-        if (deliveredKey) {
-          deliveredFinalContentKeys.add(deliveredKey);
-        }
         if (options?.emitFinalText && finalText.trim()) {
           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
           await emitFinalTextIfNeeded(
@@ -863,7 +838,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (!replyCycleInitialized) {
           replyCycleInitialized = true;
           deliveredFinalTexts.clear();
-          deliveredFinalContentKeys.clear();
           hasVisibleTextInReply = false;
           finalTextEmitted = false;
           hasThinkingPrelude = false;
@@ -888,8 +862,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         // Capture streaming state BEFORE the async hook call — onIdle may race
         // and null-out `streaming` while the hook is awaited.
         const streamingWasActive = streaming?.isActive() ?? false;
-        console.log(
-          `[feishu-dedupe] deliver ENTRY kind=${info?.kind ?? "unknown"} streamingActive=${streamingWasActive ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} originalChars=${originalReply.text.trim().length} shouldRunHook=${shouldRunSendingHook ? "true" : "false"} deliveredFinals=[${[...deliveredFinalTexts].map((t) => t.slice(0, 40)).join("|")}] deliveredKeys=[${[...deliveredFinalContentKeys].map((k) => k.slice(0, 40)).join("|")}]`,
+        logDispatcher(
+          `deliver ENTRY kind=${info?.kind ?? "unknown"} streamingActive=${streamingWasActive ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} originalChars=${originalReply.text.trim().length} shouldRunHook=${shouldRunSendingHook ? "true" : "false"}`,
         );
         if (shouldRunSendingHook) {
           deliverInFlight = true;
@@ -918,24 +892,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const hasText = text.trim().length > 0;
         const hasMedia = originalReply.hasMedia;
         const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
-        const finalDeliveryKey =
-          info?.kind === "final" && hasText ? buildFinalDeliveryContentKey({ text, useCard }) : "";
-        const finalDeliveryKeyWithoutTrailingMention =
-          info?.kind === "final" && hasText && sendReplyToMessageId
-            ? stripTrailingMentionSuffix(finalDeliveryKey)
-            : "";
         const skipTextForDuplicateFinal =
-          info?.kind === "final" &&
-          hasText &&
-          (deliveredFinalTexts.has(text) ||
-            (finalDeliveryKey.length > 0 && deliveredFinalContentKeys.has(finalDeliveryKey)) ||
-            (finalDeliveryKeyWithoutTrailingMention.length > 0 &&
-              deliveredFinalContentKeys.has(finalDeliveryKeyWithoutTrailingMention)));
+          info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
 
         if (info?.kind === "final" && hasText) {
           params.runtime.log?.(
-            `feishu[${account.accountId}] final deliver candidate: chars=${text.trim().length} useCard=${useCard ? "true" : "false"} key=${finalDeliveryKey.slice(0, 120)} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"}`,
+            `feishu[${account.accountId}] final deliver candidate: chars=${text.trim().length} useCard=${useCard ? "true" : "false"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"}`,
           );
           logDispatcher(
             `deliver final hasText=true useCard=${useCard ? "true" : "false"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"} streamingActive=${streaming?.isActive() ? "true" : "false"} streamMessageId=${streaming?.getMessageId() ?? "none"} hookTextChanged=${text !== originalReply.text ? "true" : "false"} originalChars=${originalReply.text.trim().length} finalChars=${text.trim().length}`,
@@ -943,8 +906,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         }
 
         if (!shouldDeliverText && !hasMedia) {
-          console.log(
-            `[feishu-dedupe] deliver SKIPPED kind=${info?.kind ?? "unknown"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"} hasText=${hasText ? "true" : "false"} hasMedia=${hasMedia ? "true" : "false"}`,
+          logDispatcher(
+            `deliver SKIPPED kind=${info?.kind ?? "unknown"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"} hasText=${hasText ? "true" : "false"} hasMedia=${hasMedia ? "true" : "false"}`,
           );
           return;
         }
@@ -974,8 +937,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           // If streaming was active when deliver started, treat it as the
           // streaming path even if onIdle snuck in between.
           if (streaming?.isActive() || (streamingWasActive && info?.kind === "final")) {
-            console.log(
-              `[feishu-dedupe] deliver PATH=streaming kind=${info?.kind ?? "unknown"} streamMsgId=${streaming?.getMessageId() ?? "raced-null"}`,
+            logDispatcher(
+              `deliver PATH=streaming kind=${info?.kind ?? "unknown"} streamMsgId=${streaming?.getMessageId() ?? "raced-null"}`,
             );
             if (info?.kind === "block") {
               if (!suppressAssistantTextStreaming) {
@@ -996,17 +959,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               } else {
                 // Streaming was already closed (by a raced onIdle). The card is
                 // already delivered — just record the text for dedup and emit hooks.
-                console.log(
-                  `[feishu-dedupe] deliver final: streaming already closed by onIdle, skipping duplicate send`,
+                logDispatcher(
+                  `deliver final: streaming already closed by onIdle, skipping duplicate send`,
                 );
                 hasVisibleTextInReply = true;
               }
               // Mark visible only after closeStreaming succeeds — text is now delivered.
               hasVisibleTextInReply = true;
               deliveredFinalTexts.add(text);
-              if (finalDeliveryKey) {
-                deliveredFinalContentKeys.add(finalDeliveryKey);
-              }
             }
             // Send media even when streaming handled the text
             if (hasMedia) {
@@ -1015,8 +975,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
 
-          console.log(
-            `[feishu-dedupe] deliver PATH=non-streaming kind=${info?.kind ?? "unknown"} useCard=${useCard ? "true" : "false"} chars=${text.trim().length} hookChanged=${text !== originalReply.text ? "true" : "false"}`,
+          logDispatcher(
+            `deliver PATH=non-streaming kind=${info?.kind ?? "unknown"} useCard=${useCard ? "true" : "false"} chars=${text.trim().length} hookChanged=${text !== originalReply.text ? "true" : "false"}`,
           );
           const finalThinking =
             useCard && info?.kind === "final" ? composeThinkingContent({ final: true }) : undefined;
@@ -1083,14 +1043,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
           if (info?.kind === "final") {
             const deliveredContent = useCard ? normalizeMentionTagsForCard(cardText) : text;
-            const deliveredKey = buildFinalDeliveryContentKey({
-              text: deliveredContent,
-              useCard,
-            });
             deliveredFinalTexts.add(text);
-            if (deliveredKey) {
-              deliveredFinalContentKeys.add(deliveredKey);
-            }
             emitMessageSent({
               content: deliveredContent,
               success: true,
@@ -1123,14 +1076,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         typingCallbacks?.onIdle?.();
       },
       onIdle: async () => {
-        console.log(
-          `[feishu-dedupe] onIdle fired streamingActive=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} streamTextChars=${streamText.trim().length} deliveredFinals=${deliveredFinalTexts.size} deliveredKeys=${deliveredFinalContentKeys.size} deliverInFlight=${deliverInFlight ? "true" : "false"}`,
+        logDispatcher(
+          `onIdle fired streamingActive=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} streamTextChars=${streamText.trim().length} deliveredFinals=${deliveredFinalTexts.size} deliverInFlight=${deliverInFlight ? "true" : "false"}`,
         );
         if (deliverInFlight) {
           // A deliver callback is currently awaiting the message_sending hook.
           // It will close the streaming card itself once the hook resolves.
           // Closing here would race and cause a duplicate non-streaming send.
-          console.log(`[feishu-dedupe] onIdle DEFERRED — deliver in flight`);
+          logDispatcher(`onIdle DEFERRED — deliver in flight`);
         } else {
           await closeStreaming({ emitFinalText: true, reason: "idle" });
         }
