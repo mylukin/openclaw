@@ -674,11 +674,26 @@ export async function dispatchReplyFromConfig(params: {
     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
     let queuedFinal = false;
     let routedFinalCount = 0;
+    /** Dedup equivalent finals — normalizes mention tag formats before comparison. */
+    const deliveredFinalTexts = new Set<string>();
+    const normalizeMentionsForDedup = (t: string): string =>
+      t
+        .replace(/<at\s+user_id="([^"]+)">[^<]*<\/at>/g, "<at:$1>")
+        .replace(/<at\s+id=([^>]+)><\/at>/g, "<at:$1>")
+        .trim();
     for (const reply of replies) {
       // Suppress reasoning payloads from channel delivery — channels using this
       // generic dispatch path do not have a dedicated reasoning lane.
       if (reply.isReasoning === true) {
         continue;
+      }
+      // Dedup equivalent final replies (e.g. same text with different mention tag formats).
+      if (reply.text) {
+        const normalizedText = normalizeMentionsForDedup(reply.text);
+        if (deliveredFinalTexts.has(normalizedText)) {
+          continue;
+        }
+        deliveredFinalTexts.add(normalizedText);
       }
       const ttsReply = await maybeApplyTtsToPayload({
         payload: reply,

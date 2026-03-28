@@ -26,6 +26,16 @@ import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } 
 
 let replyDispatcherDebugSeq = 0;
 
+/** Strip all Feishu mention tags (both `<at user_id="x">Name</at>` and `<at id=x></at>`)
+ *  and collapse whitespace. Used for dedup comparison when hooks may append mentions. */
+function stripMentionTags(text: string): string {
+  return text
+    .replace(/<at\s+user_id\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)\s*>[\s\S]*?<\/at>/gi, "")
+    .replace(/<at\s+id\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>/]+)\s*(?:\/>|>\s*<\/at>)/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** Detect if text contains markdown elements that benefit from card rendering */
 function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
@@ -779,6 +789,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         });
         hasVisibleTextInReply = true;
         deliveredFinalTexts.add(finalText);
+        deliveredFinalTexts.add(normalizeMentionTagsForCard(finalText));
+        deliveredFinalTexts.add(stripMentionTags(finalText));
         if (options?.emitFinalText && finalText.trim()) {
           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
           await emitFinalTextIfNeeded(
@@ -893,7 +905,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const hasMedia = originalReply.hasMedia;
         const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
         const skipTextForDuplicateFinal =
-          info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
+          info?.kind === "final" &&
+          hasText &&
+          (deliveredFinalTexts.has(text) ||
+            deliveredFinalTexts.has(normalizeMentionTagsForCard(text)) ||
+            deliveredFinalTexts.has(stripMentionTags(text)));
         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
 
         if (info?.kind === "final" && hasText) {
@@ -967,6 +983,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               // Mark visible only after closeStreaming succeeds — text is now delivered.
               hasVisibleTextInReply = true;
               deliveredFinalTexts.add(text);
+              deliveredFinalTexts.add(normalizeMentionTagsForCard(text));
+              deliveredFinalTexts.add(stripMentionTags(text));
             }
             // Send media even when streaming handled the text
             if (hasMedia) {
@@ -1044,6 +1062,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           if (info?.kind === "final") {
             const deliveredContent = useCard ? normalizeMentionTagsForCard(cardText) : text;
             deliveredFinalTexts.add(text);
+            deliveredFinalTexts.add(normalizeMentionTagsForCard(text));
+            deliveredFinalTexts.add(stripMentionTags(text));
             emitMessageSent({
               content: deliveredContent,
               success: true,
