@@ -1327,6 +1327,60 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("deduplicates identical final card sends in non-streaming mode", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: false,
+      },
+    });
+
+    const { options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_msg",
+      replyInThread: false,
+      threadReply: true,
+      rootId: "om_root_topic",
+    });
+
+    await options.deliver({ text: "same final text" }, { kind: "final" });
+    await options.deliver({ text: "same final text" }, { kind: "final" });
+
+    expect(sendStructuredCardFeishuMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates streaming final card sends when mention tag syntax differs", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: true,
+      },
+    });
+
+    const { options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_msg",
+      replyInThread: false,
+    });
+
+    await options.deliver(
+      { text: '<at user_id="ou_trent">Trent</at> same final text' },
+      { kind: "final" },
+    );
+    await options.deliver({ text: "<at id=ou_trent></at> same final text" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
