@@ -140,7 +140,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     return createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
   }
 
-  function setupHookedAutoDispatcher() {
+  function setupHookedAutoDispatcher(overrides: Partial<ReplyDispatcherArgs> = {}) {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -177,6 +177,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      ...overrides,
     });
 
     return {
@@ -503,6 +504,23 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       note: "Agent: agent",
     });
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("suppresses assistant partial streaming for reply targets when message_sending hooks are active", async () => {
+    const { result, options } = setupHookedAutoDispatcher({
+      replyToMessageId: "om_parent",
+    });
+    await options.onReplyStart?.();
+    await result.replyOptions.onReasoningStream?.({ text: "thinking..." });
+    await result.replyOptions.onPartialReply?.({ text: "partial text" });
+    await options.deliver({ text: "final text" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    const updateArgs = streamingInstances[0].update.mock.calls.map((call: unknown[]) => call[0]);
+    expect(updateArgs).not.toContain("partial text");
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("final text", {
+      note: "Agent: agent",
+    });
   });
 
   it("keeps distinct non-streaming final payloads", async () => {

@@ -330,12 +330,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const showCardNote = account.config?.cardNote ?? true;
   const renderMode = account.config?.renderMode ?? "auto";
   const hasMessageSendingHooks = core.hooks.hasMessageSendingHooks();
-  // Do not globally suppress assistant text streaming just because a final-send
-  // hook exists. Many hooks only tweak the terminal send (e.g. append a mention)
-  // and suppressing partials degrades Feishu UX into "thinking first, one-shot
-  // final text later". The final delivery path still runs message_sending and
-  // can overwrite the closing content if needed.
-  const suppressAssistantTextStreaming = false;
+  // Keep assistant text streaming enabled by default, but suppress it for
+  // reply-targeted turns when message_sending hooks are active. Those hooks may
+  // rewrite the final visible content (for example appending an @mention to the
+  // replied sender), and streaming the pre-rewrite body can leave an old card
+  // alive while the rewritten final reply creates a second card.
+  const suppressAssistantTextStreaming = hasMessageSendingHooks && Boolean(sendReplyToMessageId);
   const streamingEnabled =
     account.config?.streaming !== false &&
     renderMode !== "raw" &&
