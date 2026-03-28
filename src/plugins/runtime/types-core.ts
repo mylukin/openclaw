@@ -112,6 +112,7 @@ export type PluginRuntimeCore = {
     ) => Promise<
       | {
           content?: string;
+          metadata?: Record<string, unknown>;
           cancel?: boolean;
         }
       | undefined

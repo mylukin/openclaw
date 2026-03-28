@@ -318,7 +318,7 @@ async function applyFeishuActionMessageSending(params: {
   replyToId?: string;
   threadId?: string;
   mediaUrls?: string[];
-}): Promise<{ cancelled: boolean; content: string }> {
+}): Promise<{ cancelled: boolean; content: string; metadata?: Record<string, unknown> }> {
   const hookResult = await getFeishuRuntime().hooks.runMessageSending(
     {
       to: params.to,
@@ -343,6 +343,10 @@ async function applyFeishuActionMessageSending(params: {
   return {
     cancelled: false,
     content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
+    metadata:
+      hookResult?.metadata && typeof hookResult.metadata === "object"
+        ? hookResult.metadata
+        : undefined,
   };
 }
 
@@ -633,7 +637,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
                         sessionKey: ctx.sessionKey,
                         isGroup: isGroupTarget,
                         result: textResult,
-                        metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                        metadata: {
+                          ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
+                          ...(lifecycleResult.metadata ?? {}),
+                        },
                       });
                     }
                     const sendMedia = runtime.feishuOutbound.sendMedia;
@@ -656,7 +663,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
                       sessionKey: ctx.sessionKey,
                       isGroup: isGroupTarget,
                       result: mediaResult,
-                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                      metadata: {
+                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
+                        ...(lifecycleResult.metadata ?? {}),
+                      },
                     });
                     return mediaResult;
                   })()
@@ -679,7 +689,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
                       sessionKey: ctx.sessionKey,
                       isGroup: isGroupTarget,
                       result: textResult,
-                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                      metadata: {
+                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
+                        ...(lifecycleResult.metadata ?? {}),
+                      },
                     });
                     return textResult;
                   })();

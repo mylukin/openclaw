@@ -754,10 +754,32 @@ export function buildStructuredCard(
   options?: {
     header?: CardHeaderConfig;
     note?: string;
+    thinkingTitle?: string;
+    thinkingText?: string;
+    thinkingExpanded?: boolean;
   },
 ): Record<string, unknown> {
   const normalizedText = normalizeMentionTagsForCard(text);
-  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: normalizedText }];
+  const elements: Record<string, unknown>[] = [];
+  const thinkingText = options?.thinkingText?.trim();
+  if (thinkingText) {
+    elements.push({
+      tag: "collapsible_panel",
+      expanded: options?.thinkingExpanded ?? false,
+      element_id: "thinking",
+      header: {
+        title: {
+          tag: "plain_text",
+          content: options?.thinkingTitle?.trim() || "💭 Thinking",
+        },
+      },
+      border: { color: "grey" },
+      vertical_spacing: "2px",
+      padding: "4px 12px",
+      elements: [{ tag: "markdown", content: thinkingText, element_id: "thinking_content" }],
+    });
+  }
+  elements.push({ tag: "markdown", content: normalizedText });
   if (options?.note) {
     elements.push({ tag: "hr" });
     elements.push({ tag: "markdown", content: `<font color='grey'>${options.note}</font>` });
@@ -790,14 +812,35 @@ export async function sendStructuredCardFeishu(params: {
   accountId?: string;
   header?: CardHeaderConfig;
   note?: string;
+  thinkingTitle?: string;
+  thinkingText?: string;
+  thinkingExpanded?: boolean;
 }): Promise<FeishuSendResult> {
-  const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId, header, note } =
-    params;
+  const {
+    cfg,
+    to,
+    text,
+    replyToMessageId,
+    replyInThread,
+    mentions,
+    accountId,
+    header,
+    note,
+    thinkingTitle,
+    thinkingText,
+    thinkingExpanded,
+  } = params;
   let cardText = normalizeMentionTagsForCard(text);
   if (mentions && mentions.length > 0) {
     cardText = buildMentionedCardContent(mentions, cardText);
   }
-  const card = buildStructuredCard(cardText, { header, note });
+  const card = buildStructuredCard(cardText, {
+    header,
+    note,
+    thinkingTitle,
+    thinkingText,
+    thinkingExpanded,
+  });
   return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, accountId });
 }
 

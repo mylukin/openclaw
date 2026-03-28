@@ -1703,6 +1703,7 @@ export type PluginHookMessageSendingEvent = {
 
 export type PluginHookMessageSendingResult = {
   content?: string;
+  metadata?: Record<string, unknown>;
   cancel?: boolean;
 };
 

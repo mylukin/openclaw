@@ -610,6 +610,13 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
       ctx,
       (acc, next) => ({
         content: next.content ?? acc?.content,
+        metadata:
+          next.metadata || acc?.metadata
+            ? {
+                ...acc?.metadata,
+                ...next.metadata,
+              }
+            : undefined,
         cancel: next.cancel ?? acc?.cancel,
       }),
     );

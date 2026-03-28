@@ -1292,6 +1292,41 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("keeps thinking as a collapsible panel for non-streaming card replies", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: false,
+      },
+    });
+
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_msg",
+      replyInThread: false,
+      threadReply: true,
+      rootId: "om_root_topic",
+    });
+
+    await result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_\n_step two_" });
+    await result.replyOptions.onReasoningEnd?.();
+    await options.deliver({ text: "final answer" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(0);
+    expect(sendStructuredCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "final answer",
+        thinkingTitle: "💭 Thinking",
+        thinkingText: "step one\nstep two",
+        thinkingExpanded: false,
+      }),
+    );
+  });
+
   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",

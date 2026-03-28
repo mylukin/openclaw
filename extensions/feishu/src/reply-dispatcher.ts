@@ -211,7 +211,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const runMessageSending = async (params: {
     content: string;
     mediaUrls?: string[];
-  }): Promise<{ cancelled: boolean; content: string }> => {
+  }): Promise<{ cancelled: boolean; content: string; metadata?: Record<string, unknown> }> => {
     const hookResult = await core.hooks.runMessageSending(
       {
         to: chatId,
@@ -238,6 +238,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return {
       cancelled: false,
       content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
+      metadata:
+        hookResult?.metadata && typeof hookResult.metadata === "object"
+          ? hookResult.metadata
+          : undefined,
     };
   };
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
@@ -830,6 +834,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const shouldRunSendingHook =
           originalReply.hasMedia || !streaming?.isActive() || info?.kind === "final";
         let text = originalReply.text;
+        let hookMetadata: Record<string, unknown> | undefined;
         if (shouldRunSendingHook) {
           const hookResult = await runMessageSending({
             content: text,
@@ -843,6 +848,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
           text = hookResult.content;
+          hookMetadata =
+            hookResult.metadata && typeof hookResult.metadata === "object"
+              ? hookResult.metadata
+              : undefined;
         }
         const hasText = text.trim().length > 0;
         const hasMedia = originalReply.hasMedia;
@@ -900,17 +909,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
 
-          // When streaming is off but reasoning was collected, prepend it to
-          // the final card so thinking is visible even without streaming cards.
-          const cardText =
-            useCard && info?.kind === "final" && reasoningText
-              ? `> 💭 **Thinking**\n${reasoningText
-                  .replace(/^Reasoning:\n/, "")
-                  .replace(/^_(.*)_$/gm, "$1")
-                  .split("\n")
-                  .map((l: string) => `> ${l}`)
-                  .join("\n")}\n\n---\n\n${text}`
-              : text;
+          const finalThinking =
+            useCard && info?.kind === "final" ? composeThinkingContent({ final: true }) : undefined;
+          const cardText = text;
 
           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
           if (useCard) {
@@ -933,6 +934,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   accountId,
                   header: cardHeader,
                   note: cardNote,
+                  ...(isFirst && finalThinking?.text
+                    ? {
+                        thinkingTitle: finalThinking.title,
+                        thinkingText: finalThinking.text,
+                        thinkingExpanded: false,
+                      }
+                    : {}),
                 });
                 return { messageId: sent?.messageId };
               },
@@ -968,6 +976,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               metadata: {
                 finalContent: deliveredContent,
                 contentType: useCard ? "interactive" : "post",
+                ...(hookMetadata ?? {}),
               },
             });
             await emitFinalTextIfNeeded(text, {

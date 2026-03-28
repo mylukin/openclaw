@@ -621,6 +621,38 @@ describe("buildStructuredCard", () => {
       }),
     );
   });
+
+  it("renders thinking as a collapsible panel instead of blockquote markdown", () => {
+    const card = buildStructuredCard("final answer", {
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "first line\nsecond line",
+      thinkingExpanded: false,
+    });
+
+    expect(card).toEqual(
+      expect.objectContaining({
+        body: {
+          elements: [
+            expect.objectContaining({
+              tag: "collapsible_panel",
+              expanded: false,
+              header: {
+                title: { tag: "plain_text", content: "💭 Thinking" },
+              },
+              elements: [
+                {
+                  tag: "markdown",
+                  content: "first line\nsecond line",
+                  element_id: "thinking_content",
+                },
+              ],
+            }),
+            { tag: "markdown", content: "final answer" },
+          ],
+        },
+      }),
+    );
+  });
 });
 
 describe("buildMarkdownCard", () => {
