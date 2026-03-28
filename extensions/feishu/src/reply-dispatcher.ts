@@ -758,6 +758,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           ...(finalNote !== undefined ? { note: finalNote } : {}),
         });
         hasVisibleTextInReply = true;
+        deliveredFinalTexts.add(finalText);
+        const deliveredKey = buildFinalDeliveryContentKey({
+          text: finalText,
+          useCard: true,
+        });
+        if (deliveredKey) {
+          deliveredFinalContentKeys.add(deliveredKey);
+        }
         if (options?.emitFinalText && finalText.trim()) {
           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
           await emitFinalTextIfNeeded(
