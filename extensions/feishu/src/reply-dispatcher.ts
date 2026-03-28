@@ -710,6 +710,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     })();
   };
 
+  // Guard: when true, onIdle must skip closeStreaming to avoid racing with
+  // an in-flight deliver callback that is awaiting the message_sending hook.
+  let deliverInFlight = false;
+
   const closeStreaming = async (options?: {
     emitFinalText?: boolean;
     reason?: "idle" | "error";
@@ -719,6 +723,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
     await partialUpdateQueue;
     const streamMessageId = streaming?.getMessageId();
+    console.log(
+      `[feishu-dedupe] closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
+    );
     if (streaming?.isActive()) {
       const finalText = streamText;
       const finalThinking = composeThinkingContent({ final: true });
@@ -778,6 +785,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (mentionTargets?.length) {
           text = buildMentionedCardContent(mentionTargets, text);
         }
+        // Normalize any <at user_id="xxx"> tags (e.g. appended by message_sending
+        // hooks) into the card-compatible <at id=xxx></at> format so they render
+        // as blue mention links in the streaming card.
+        text = normalizeMentionTagsForCard(text);
         const finalNote = showCardNote
           ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
           : undefined;
@@ -874,11 +885,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           originalReply.hasMedia || !streaming?.isActive() || info?.kind === "final";
         let text = originalReply.text;
         let hookMetadata: Record<string, unknown> | undefined;
+        // Capture streaming state BEFORE the async hook call — onIdle may race
+        // and null-out `streaming` while the hook is awaited.
+        const streamingWasActive = streaming?.isActive() ?? false;
+        console.log(
+          `[feishu-dedupe] deliver ENTRY kind=${info?.kind ?? "unknown"} streamingActive=${streamingWasActive ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} originalChars=${originalReply.text.trim().length} shouldRunHook=${shouldRunSendingHook ? "true" : "false"} deliveredFinals=[${[...deliveredFinalTexts].map((t) => t.slice(0, 40)).join("|")}] deliveredKeys=[${[...deliveredFinalContentKeys].map((k) => k.slice(0, 40)).join("|")}]`,
+        );
         if (shouldRunSendingHook) {
-          const hookResult = await runMessageSending({
-            content: text,
-            mediaUrls: originalReply.mediaUrls,
-          });
+          deliverInFlight = true;
+          let hookResult: Awaited<ReturnType<typeof runMessageSending>>;
+          try {
+            hookResult = await runMessageSending({
+              content: text,
+              mediaUrls: originalReply.mediaUrls,
+            });
+          } finally {
+            deliverInFlight = false;
+          }
           if (hookResult.cancelled) {
             if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
               streamText = "";
@@ -920,6 +943,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         }
 
         if (!shouldDeliverText && !hasMedia) {
+          console.log(
+            `[feishu-dedupe] deliver SKIPPED kind=${info?.kind ?? "unknown"} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"} hasText=${hasText ? "true" : "false"} hasMedia=${hasMedia ? "true" : "false"}`,
+          );
           return;
         }
 
@@ -943,7 +969,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
           }
 
-          if (streaming?.isActive()) {
+          // Use streamingWasActive (captured before hook await) to handle the
+          // race where onIdle fired and nulled streaming during the hook call.
+          // If streaming was active when deliver started, treat it as the
+          // streaming path even if onIdle snuck in between.
+          if (streaming?.isActive() || (streamingWasActive && info?.kind === "final")) {
+            console.log(
+              `[feishu-dedupe] deliver PATH=streaming kind=${info?.kind ?? "unknown"} streamMsgId=${streaming?.getMessageId() ?? "raced-null"}`,
+            );
             if (info?.kind === "block") {
               if (!suppressAssistantTextStreaming) {
                 // Some runtimes emit block payloads without onPartial/final callbacks.
@@ -955,10 +988,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             if (info?.kind === "final") {
               logDispatcher(
-                `deliver final -> streaming close streamMessageId=${streaming.getMessageId() ?? "unknown"} finalChars=${text.trim().length}`,
+                `deliver final -> streaming close streamMessageId=${streaming?.getMessageId() ?? "raced-null"} finalChars=${text.trim().length}`,
               );
               streamText = text;
-              await closeStreaming({ emitFinalText: true, reason: "idle" });
+              if (streaming?.isActive()) {
+                await closeStreaming({ emitFinalText: true, reason: "idle" });
+              } else {
+                // Streaming was already closed (by a raced onIdle). The card is
+                // already delivered — just record the text for dedup and emit hooks.
+                console.log(
+                  `[feishu-dedupe] deliver final: streaming already closed by onIdle, skipping duplicate send`,
+                );
+                hasVisibleTextInReply = true;
+              }
               // Mark visible only after closeStreaming succeeds — text is now delivered.
               hasVisibleTextInReply = true;
               deliveredFinalTexts.add(text);
@@ -973,6 +1015,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             return;
           }
 
+          console.log(
+            `[feishu-dedupe] deliver PATH=non-streaming kind=${info?.kind ?? "unknown"} useCard=${useCard ? "true" : "false"} chars=${text.trim().length} hookChanged=${text !== originalReply.text ? "true" : "false"}`,
+          );
           const finalThinking =
             useCard && info?.kind === "final" ? composeThinkingContent({ final: true }) : undefined;
           const cardText = text;
@@ -1078,7 +1123,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         typingCallbacks?.onIdle?.();
       },
       onIdle: async () => {
-        await closeStreaming({ emitFinalText: true, reason: "idle" });
+        console.log(
+          `[feishu-dedupe] onIdle fired streamingActive=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streaming?.getMessageId() ?? "none"} streamTextChars=${streamText.trim().length} deliveredFinals=${deliveredFinalTexts.size} deliveredKeys=${deliveredFinalContentKeys.size} deliverInFlight=${deliverInFlight ? "true" : "false"}`,
+        );
+        if (deliverInFlight) {
+          // A deliver callback is currently awaiting the message_sending hook.
+          // It will close the streaming card itself once the hook resolves.
+          // Closing here would race and cause a duplicate non-streaming send.
+          console.log(`[feishu-dedupe] onIdle DEFERRED — deliver in flight`);
+        } else {
+          await closeStreaming({ emitFinalText: true, reason: "idle" });
+        }
         replyCycleInitialized = false;
         typingCallbacks?.onIdle?.();
       },
