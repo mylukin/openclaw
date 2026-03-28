@@ -2208,6 +2208,50 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
+  it("deduplicates equivalent Feishu final replies that only differ by mention tag format", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      OriginatingChannel: "feishu",
+      OriginatingTo: "chat:oc_group_1",
+      To: "chat:oc_group_1",
+      AccountId: "default",
+      SenderId: "user-9",
+      SenderUsername: "ada",
+      CommandAuthorized: true,
+      WasMentioned: true,
+      CommandBody: "reply",
+      RawBody: "reply",
+      Body: "reply",
+      MessageSid: "msg-feishu-final-dedupe",
+      SessionKey: "agent:main:feishu:group:oc_group_1",
+    });
+    const replyResolver = vi.fn(
+      async () =>
+        [
+          {
+            text: '<at user_id="ou_lukin">Lukin</at> <at user_id="ou_cody">Cody</at> 确认，可以进 Human Gate。',
+          },
+          {
+            text: "<at id=ou_lukin></at> <at id=ou_cody></at> 确认，可以进 Human Gate。",
+          },
+        ] satisfies ReplyPayload[],
+    );
+
+    const result = await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(result.queuedFinal).toBe(true);
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: '<at user_id="ou_lukin">Lukin</at> <at user_id="ou_cody">Cody</at> 确认，可以进 Human Gate。',
+      }),
+    );
+  });
+
   it("routes plugin-owned bindings to the owning plugin before generic inbound claim broadcast", async () => {
     setNoAbort();
     hookMocks.runner.hasHooks.mockImplementation(
