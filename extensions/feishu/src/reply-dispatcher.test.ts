@@ -489,7 +489,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(emitMessageSentMock).not.toHaveBeenCalled();
   });
 
-  it("keeps thinking streaming UI while suppressing partial text when message_sending hooks are active", async () => {
+  it("keeps streaming partial text even when message_sending hooks are active", async () => {
     const { result, options } = setupHookedAutoDispatcher();
     await options.onReplyStart?.();
     await result.replyOptions.onReasoningStream?.({ text: "thinking..." });
@@ -497,7 +497,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.deliver({ text: "stream candidate" }, { kind: "final" });
 
     expect(streamingInstances).toHaveLength(1);
-    expect(streamingInstances[0].update).not.toHaveBeenCalled();
+    expect(streamingInstances[0].update).toHaveBeenCalled();
     expect(streamingInstances[0].updateThinking).toHaveBeenCalled();
     expect(streamingInstances[0].close).toHaveBeenCalledWith("stream candidate", {
       note: "Agent: agent",
@@ -1196,7 +1196,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(result.replyOptions.onReasoningEnd).toBeTypeOf("function");
   });
 
-  it("discards reasoning-only streaming cards when no answer text arrives", async () => {
+  it("preserves reasoning-only streaming cards when no answer text arrives", async () => {
     const { result, options } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
     });
@@ -1210,8 +1210,10 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances[0].updateThinking).toHaveBeenCalledWith("deep thought", {
       title: "💭 Thinking",
     });
-    expect(streamingInstances[0].discard).toHaveBeenCalledTimes(1);
-    expect(streamingInstances[0].close).not.toHaveBeenCalled();
+    expect(streamingInstances[0].discard).not.toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("", {
+      note: "Agent: agent",
+    });
   });
 
   it("ignores empty reasoning payloads", async () => {
@@ -1290,7 +1292,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
-  it("discards reasoning/tool cards when no final assistant text arrives", async () => {
+  it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -1319,9 +1321,28 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
-      "thinking\n\n🔧 Tool calls (1)\n\n⏳ Running Read...",
+      "thinking\n\n🔧 Tool calls (1)",
       { title: "💭 Thinking" },
     );
+    expect(streamingInstances[0].discard).not.toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("", {
+      note: "Agent: agent",
+    });
+  });
+
+  it("discards reasoning/tool cards on error when no final assistant text arrives", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+    });
+
+    await options.onReplyStart?.();
+    await result.replyOptions.onReasoningStream?.({ text: "thinking", isReasoning: true });
+    await flushAsyncTasks();
+    await result.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+    await options.onError?.(new Error("boom"), { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].discard).toHaveBeenCalledTimes(1);
     expect(streamingInstances[0].close).not.toHaveBeenCalled();
   });

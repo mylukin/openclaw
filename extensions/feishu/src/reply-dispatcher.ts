@@ -317,7 +317,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const showCardNote = account.config?.cardNote ?? true;
   const renderMode = account.config?.renderMode ?? "auto";
   const hasMessageSendingHooks = core.hooks.hasMessageSendingHooks();
-  const suppressAssistantTextStreaming = hasMessageSendingHooks;
+  // Do not globally suppress assistant text streaming just because a final-send
+  // hook exists. Many hooks only tweak the terminal send (e.g. append a mention)
+  // and suppressing partials degrades Feishu UX into "thinking first, one-shot
+  // final text later". The final delivery path still runs message_sending and
+  // can overwrite the closing content if needed.
+  const suppressAssistantTextStreaming = false;
   const streamingEnabled =
     account.config?.streaming !== false &&
     renderMode !== "raw" &&
@@ -425,6 +430,22 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         `feishu[${account.accountId}] onFinalTextDelivered failed: ${String(error)}`,
       );
     }
+  };
+
+  const logStreamingDecision = (
+    stage: string,
+    details: {
+      finalText?: string;
+      thinkingText?: string;
+      toolCalls?: number;
+      emitFinalText?: boolean;
+      action?: string;
+      messageId?: string;
+    },
+  ) => {
+    params.runtime.log?.(
+      `feishu[${account.accountId}] streaming ${stage}: action=${details.action ?? "unknown"} finalTextChars=${details.finalText?.trim().length ?? 0} thinkingChars=${details.thinkingText?.trim().length ?? 0} toolCalls=${details.toolCalls ?? toolCallCount} emitFinalText=${details.emitFinalText === true ? "true" : "false"}${details.messageId ? ` messageId=${details.messageId}` : ""}`,
+    );
   };
 
   const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -655,7 +676,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     })();
   };
 
-  const closeStreaming = async (options?: { emitFinalText?: boolean }) => {
+  const closeStreaming = async (options?: {
+    emitFinalText?: boolean;
+    reason?: "idle" | "error";
+  }) => {
     if (streamingStartPromise) {
       await streamingStartPromise;
     }
@@ -664,12 +688,51 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (streaming?.isActive()) {
       const finalText = streamText;
       const finalThinking = composeThinkingContent({ final: true });
-      if (!finalText.trim()) {
-        // Thinking/tool panels are only progress UI. If the run produced no
-        // user-visible final text, discard the card entirely instead of
-        // leaving a misleading "thinking-only" terminal message behind.
-        await streaming.discard();
+      const hasFinalText = finalText.trim().length > 0;
+      const hasFinalThinking = finalThinking.text.trim().length > 0;
+      const closeReason = options?.reason ?? "idle";
+      if (!hasFinalText) {
+        if (hasFinalThinking && closeReason === "idle") {
+          logStreamingDecision("close", {
+            action: "preserve-thinking-only-card",
+            finalText,
+            thinkingText: finalThinking.text,
+            emitFinalText: options?.emitFinalText,
+            messageId: streamMessageId,
+          });
+          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
+          const finalNote = showCardNote
+            ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+            : undefined;
+          await streaming.close("", {
+            ...(finalNote !== undefined ? { note: finalNote } : {}),
+          });
+        } else {
+          // No final user-visible text and no reasoning/tool content left to preserve.
+          logStreamingDecision("close", {
+            action:
+              hasFinalThinking && closeReason === "error"
+                ? "discard-error-thinking-only-card"
+                : "discard-empty-card",
+            finalText,
+            thinkingText: finalThinking.text,
+            emitFinalText: options?.emitFinalText,
+            messageId: streamMessageId,
+          });
+          await streaming.discard(
+            hasFinalThinking && closeReason === "error"
+              ? "error-without-final-text"
+              : "empty-final-and-empty-thinking",
+          );
+        }
       } else {
+        logStreamingDecision("close", {
+          action: "close-final-card",
+          finalText,
+          thinkingText: finalThinking.text,
+          emitFinalText: options?.emitFinalText,
+          messageId: streamMessageId,
+        });
         // Store thinking content for the collapsed panel in the final card
         if (finalThinking.text) {
           await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
@@ -775,7 +838,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           if (hookResult.cancelled) {
             if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
               streamText = "";
-              await closeStreaming({ emitFinalText: false });
+              await closeStreaming({ emitFinalText: false, reason: "error" });
             }
             return;
           }
@@ -825,7 +888,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             if (info?.kind === "final") {
               streamText = text;
-              await closeStreaming({ emitFinalText: true });
+              await closeStreaming({ emitFinalText: true, reason: "idle" });
               // Mark visible only after closeStreaming succeeds — text is now delivered.
               hasVisibleTextInReply = true;
               deliveredFinalTexts.add(text);
@@ -924,11 +987,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         params.runtime.error?.(
           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
         );
-        await closeStreaming({ emitFinalText: false });
+        await closeStreaming({ emitFinalText: false, reason: "error" });
         typingCallbacks?.onIdle?.();
       },
       onIdle: async () => {
-        await closeStreaming({ emitFinalText: true });
+        await closeStreaming({ emitFinalText: true, reason: "idle" });
         typingCallbacks?.onIdle?.();
       },
       onCleanup: () => {
@@ -1003,7 +1066,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            if (!payload.text || suppressAssistantTextStreaming) {
+            if (!payload.text) {
+              return;
+            }
+            if (suppressAssistantTextStreaming) {
+              params.runtime.log?.(
+                `feishu[${account.accountId}] streaming partial suppressed by message_sending hooks: textChars=${payload.text.trim().length}`,
+              );
               return;
             }
             queueThinkingPrelude();

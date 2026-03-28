@@ -763,7 +763,7 @@ export class FeishuStreamingSession {
   }
 
   /** Discard the streaming card by deleting the message entirely. */
-  async discard(): Promise<void> {
+  async discard(reason?: string): Promise<void> {
     if (!this.state || this.closed) {
       return;
     }
@@ -783,7 +783,7 @@ export class FeishuStreamingSession {
       await this.client.im.message.delete({
         path: { message_id: messageId },
       });
-      this.log?.(`Discarded streaming message: ${messageId}`);
+      this.log?.(`Discarded streaming message: ${messageId}${reason ? `, reason=${reason}` : ""}`);
     } catch (e) {
       this.log?.(`Discard failed: ${String(e)}`);
     }
