@@ -7,7 +7,7 @@ function normalizeConversationId(value: unknown): string | undefined {
 }
 
 function resolveExplicitConversationTargetId(target: string): string | undefined {
-  for (const prefix of ["channel:", "conversation:", "group:", "room:", "dm:"]) {
+  for (const prefix of ["channel:", "conversation:", "group:", "room:", "dm:", "chat:"]) {
     if (target.toLowerCase().startsWith(prefix)) {
       return normalizeConversationId(target.slice(prefix.length));
     }
@@ -35,13 +35,6 @@ export function resolveConversationIdFromTargets(params: {
       return explicitConversationId;
     }
     if (target.includes(":") && explicitConversationId === undefined) {
-      continue;
-    }
-    if (target.startsWith("chat:")) {
-      const chatId = normalizeConversationId(target.slice("chat:".length));
-      if (chatId) {
-        return chatId;
-      }
       continue;
     }
     const mentionMatch = target.match(/^<#(\d+)>$/);
