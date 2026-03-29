@@ -10,6 +10,7 @@ import {
 import { createPluginRuntimeMock } from "../../../test/helpers/extensions/plugin-runtime-mock.js";
 import { createRuntimeEnv } from "../../../test/helpers/extensions/runtime-env.js";
 import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
+import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
 import type { FeishuMessageEvent } from "./bot.js";
 import {
   buildBroadcastSessionKey,
@@ -494,11 +495,15 @@ describe("handleFeishuMessage command authorization", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetLiveSessionTranscriptRegistryForTests();
+    resetFeishuSenderNameCacheForTests();
     mockShouldComputeCommandAuthorized.mockReset().mockReturnValue(true);
+    mockResolveCommandAuthorizedFromAuthorizers.mockReset().mockReturnValue(false);
     mockGetMessageFeishu.mockReset().mockResolvedValue(null);
     mockListFeishuThreadMessages.mockReset().mockResolvedValue([]);
     mockReadSessionUpdatedAt.mockReturnValue(undefined);
-    mockResolveStorePath.mockReturnValue("/tmp/feishu-sessions.json");
+    mockResolveStorePath.mockImplementation(
+      (store?: string) => store ?? "/tmp/feishu-sessions.json",
+    );
     mockResolveConfiguredBindingRoute.mockReset().mockImplementation(
       ({ route }) =>
         ({
@@ -635,7 +640,10 @@ describe("handleFeishuMessage command authorization", () => {
 
     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
       useAccessGroups: true,
-      authorizers: [{ configured: true, allowed: false }],
+      authorizers: [
+        { configured: true, allowed: false },
+        { configured: false, allowed: false },
+      ],
     });
     expect(mockFinalizeInboundContext).toHaveBeenCalledTimes(1);
     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
@@ -643,6 +651,53 @@ describe("handleFeishuMessage command authorization", () => {
         CommandAuthorized: false,
         SenderId: "ou-attacker",
         Surface: "feishu",
+      }),
+    );
+  });
+
+  it("authorizes /stop in open DMs without an explicit allowlist", async () => {
+    mockResolveCommandAuthorizedFromAuthorizers.mockReturnValue(true);
+
+    const cfg: ClawdbotConfig = {
+      commands: { useAccessGroups: true },
+      channels: {
+        feishu: {
+          dmPolicy: "open",
+          allowFrom: [],
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-attacker",
+        },
+      },
+      message: {
+        message_id: "msg-open-dm-stop",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
+      useAccessGroups: true,
+      authorizers: [
+        { configured: false, allowed: false },
+        { configured: true, allowed: true },
+      ],
+    });
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ChatType: "direct",
+        CommandAuthorized: true,
+        CommandBody: "/stop",
+        SenderId: "ou-attacker",
       }),
     );
   });
@@ -1179,7 +1234,10 @@ describe("handleFeishuMessage command authorization", () => {
 
     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
       useAccessGroups: true,
-      authorizers: [{ configured: false, allowed: false }],
+      authorizers: [
+        { configured: false, allowed: false },
+        { configured: false, allowed: false },
+      ],
     });
     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1263,7 +1321,10 @@ describe("handleFeishuMessage command authorization", () => {
 
     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
       useAccessGroups: true,
-      authorizers: [{ configured: true, allowed: true }],
+      authorizers: [
+        { configured: true, allowed: true },
+        { configured: false, allowed: false },
+      ],
     });
     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -2442,7 +2503,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_topic_root",
-        rootId: undefined,
+        rootId: "om_topic_root",
       }),
     );
   });
@@ -2480,7 +2541,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: "om_topic_sender_root",
-        rootId: undefined,
+        rootId: "om_topic_sender_root",
       }),
     );
   });

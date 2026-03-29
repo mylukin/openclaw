@@ -43,6 +43,7 @@ import {
   resolveFeishuAllowlistMatch,
   isFeishuGroupAllowed,
 } from "./policy.js";
+import { resolveQuotedFeishuMessageContent } from "./quoted-message.js";
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
@@ -624,7 +625,6 @@ export async function handleFeishuMessage(params: {
     const feishuTo = isGroup ? `chat:${ctx.chatId}` : `user:${ctx.senderOpenId}`;
     const peerId = isGroup ? (groupSession?.peerId ?? ctx.chatId) : ctx.senderOpenId;
     const parentPeer = isGroup ? (groupSession?.parentPeer ?? null) : null;
-    const replyInThread = isGroup ? (groupSession?.replyInThread ?? false) : false;
     const feishuAcpConversationSupported =
       !isGroup ||
       groupSession?.groupSessionScope === "group_topic" ||
@@ -740,7 +740,11 @@ export async function handleFeishuMessage(params: {
           to: `chat:${ctx.chatId}`,
           text: `⚠️ Failed to initialize the configured ACP session for this Feishu conversation: ${ensured.error}`,
           replyToMessageId: replyTargetMessageId,
-          replyInThread: isGroup ? (groupSession?.replyInThread ?? false) : false,
+          replyInThread:
+            isGroup &&
+            (groupSession?.groupSessionScope === "group_topic" ||
+              groupSession?.groupSessionScope === "group_topic_sender" ||
+              (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled"),
           accountId: account.accountId,
         }).catch((err) => {
           log(`feishu[${account.accountId}]: failed to send ACP init error reply: ${String(err)}`);
@@ -772,20 +776,37 @@ export async function handleFeishuMessage(params: {
     });
     const mediaPayload = buildAgentMediaPayload(mediaList);
 
-    // Fetch quoted/replied message content if parentId exists
+    // Fetch quoted/replied message content if parentId exists.
+    // DMs prefer session-backed reconstruction so reply targets survive even
+    // when Feishu's quoted-message API data is unavailable or incomplete.
     let quotedMessageInfo: Awaited<ReturnType<typeof getMessageFeishu>> = null;
     let quotedContent: string | undefined;
     if (ctx.parentId) {
       try {
-        quotedMessageInfo = await getMessageFeishu({
-          cfg,
-          messageId: ctx.parentId,
-          accountId: account.accountId,
-        });
-        if (quotedMessageInfo) {
-          quotedContent = quotedMessageInfo.content;
+        if (isGroup) {
+          quotedMessageInfo = await getMessageFeishu({
+            cfg: effectiveCfg,
+            messageId: ctx.parentId,
+            accountId: account.accountId,
+          });
+          if (quotedMessageInfo) {
+            quotedContent = quotedMessageInfo.content;
+          }
+        } else {
+          const resolvedQuoted = await resolveQuotedFeishuMessageContent({
+            cfg: effectiveCfg,
+            accountId: account.accountId,
+            agentId: route.agentId,
+            sessionKey: boundSessionKey ?? route.sessionKey,
+            chatId: ctx.chatId,
+            parentId: ctx.parentId,
+            isGroup: false,
+          });
+          quotedContent = resolvedQuoted.content;
+        }
+        if (quotedContent) {
           log(
-            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent?.slice(0, 100)}`,
+            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent.slice(0, 100)}`,
           );
         }
       } catch (err) {
@@ -1071,9 +1092,12 @@ export async function handleFeishuMessage(params: {
     const configReplyInThread =
       isGroup &&
       (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
-    const replyTargetMessageId =
-      isTopicSession || configReplyInThread ? (ctx.rootId ?? ctx.messageId) : ctx.messageId;
+    const dispatchReplyInThread = isTopicSession || configReplyInThread;
+    const replyTargetMessageId = dispatchReplyInThread
+      ? (ctx.rootId ?? ctx.messageId)
+      : ctx.messageId;
     const threadReply = isGroup ? (groupSession?.threadReply ?? false) : false;
+    const dispatcherThreadReply = dispatchReplyInThread && threadReply;
     const streamingInThread =
       isGroup &&
       (groupConfig?.streamingInThread ?? feishuCfg?.streamingInThread ?? "disabled") === "enabled";
@@ -1141,10 +1165,10 @@ export async function handleFeishuMessage(params: {
             chatId: ctx.chatId,
             replyToMessageId: replyTargetMessageId,
             skipReplyToInMessages: !isGroup,
-            replyInThread,
+            replyInThread: dispatchReplyInThread,
             streamingInThread,
-            rootId: replyInThread ? ctx.rootId : undefined,
-            threadReply: replyInThread && threadReply,
+            rootId: dispatchReplyInThread ? ctx.rootId : undefined,
+            threadReply: dispatcherThreadReply,
             mentionTargets: ctx.mentionTargets,
             accountId: account.accountId,
             sessionKey: agentSessionKey,
@@ -1312,10 +1336,10 @@ export async function handleFeishuMessage(params: {
           ? (ctx.rootId ?? replyTargetMessageId)
           : replyTargetMessageId,
         skipReplyToInMessages: !isGroup,
-        replyInThread: boundSessionKey ? true : replyInThread,
+        replyInThread: boundSessionKey ? true : dispatchReplyInThread,
         streamingInThread: boundSessionKey ? true : streamingInThread,
-        rootId: boundSessionKey ? ctx.rootId : replyInThread ? ctx.rootId : undefined,
-        threadReply: boundSessionKey ? true : replyInThread && threadReply,
+        rootId: boundSessionKey ? ctx.rootId : dispatchReplyInThread ? ctx.rootId : undefined,
+        threadReply: boundSessionKey ? true : dispatcherThreadReply,
         mentionTargets: ctx.mentionTargets,
         accountId: account.accountId,
         sessionKey: effectiveSessionKey,
