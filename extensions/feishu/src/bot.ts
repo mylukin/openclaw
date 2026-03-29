@@ -597,6 +597,11 @@ export async function handleFeishuMessage(params: {
     const commandAllowFrom = isGroup
       ? (groupConfig?.allowFrom ?? configAllowFrom)
       : effectiveDmAllowFrom;
+    // Open DMs are already scoped to the sender's own conversation. When no
+    // explicit allowlist is configured, treat control commands in that DM as
+    // authorized so /stop and similar commands can abort the active direct run.
+    const openDirectCommandsAllowed =
+      isDirect && dmPolicy === "open" && commandAllowFrom.length === 0;
     const senderAllowedForCommands = resolveFeishuAllowlistMatch({
       allowFrom: commandAllowFrom,
       senderId: ctx.senderOpenId,
@@ -608,6 +613,7 @@ export async function handleFeishuMessage(params: {
           useAccessGroups,
           authorizers: [
             { configured: commandAllowFrom.length > 0, allowed: senderAllowedForCommands },
+            { configured: openDirectCommandsAllowed, allowed: openDirectCommandsAllowed },
           ],
         })
       : undefined;
