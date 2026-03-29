@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CliBackendConfig } from "../config/types.js";
-import { createStreamJsonProcessor } from "./cli-runner/helpers.js";
+import { createStreamJsonProcessor, summarizeCliFailure } from "./cli-runner/helpers.js";
 
 function createBackend(overrides: Partial<CliBackendConfig> = {}): CliBackendConfig {
   return {
@@ -492,5 +492,43 @@ describe("createStreamJsonProcessor", () => {
     expect(onAssistantTurn).toHaveBeenNthCalledWith(1, "part 1");
     expect(onAssistantTurn).toHaveBeenNthCalledWith(2, "part 2");
     expect(output.text).toBe("part 2");
+  });
+});
+
+describe("summarizeCliFailure", () => {
+  it("treats init-only stream-json resume failures as stale sessions", () => {
+    const result = summarizeCliFailure({
+      stdout:
+        '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}\n',
+      stderr: "",
+      outputMode: "stream-json",
+      useResume: true,
+      cliSessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
+      parsedStreamOutput: { text: "", sessionId: "480007d1-b916-417c-b504-71d76bf35f7e" },
+    });
+
+    expect(result).toEqual({
+      message: "CLI resumed session but produced no assistant response before exit.",
+      reason: "session_expired",
+    });
+  });
+
+  it("uses parsed stream text instead of raw transcript history", () => {
+    const result = summarizeCliFailure({
+      stdout: [
+        '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}',
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still building"}]}}',
+      ].join("\n"),
+      stderr: "",
+      outputMode: "stream-json",
+      useResume: true,
+      cliSessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
+      parsedStreamOutput: {
+        text: "still building",
+        sessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
+      },
+    });
+
+    expect(result).toEqual({ message: "still building" });
   });
 });

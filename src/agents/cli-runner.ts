@@ -48,6 +48,7 @@ import {
   resolveCliNoOutputTimeoutMs,
   resolvePromptInput,
   resolveSessionIdToSend,
+  summarizeCliFailure,
   resolveSystemPromptUsage,
   writeCliImages,
 } from "./cli-runner/helpers.js";
@@ -1218,6 +1219,32 @@ export async function runCliAgent(params: {
         }
 
         if (result.exitCode !== 0 || result.reason !== "exit") {
+          const parsedStreamOutput =
+            !stderr && streamProcessor
+              ? (() => {
+                  try {
+                    return streamProcessor.finish();
+                  } catch {
+                    return null;
+                  }
+                })()
+              : null;
+          const cliFailure = summarizeCliFailure({
+            stdout,
+            stderr,
+            outputMode,
+            useResume,
+            cliSessionId: params.cliSessionId,
+            parsedStreamOutput,
+          });
+          if (cliFailure.reason === "session_expired") {
+            throw new FailoverError(cliFailure.message, {
+              reason: cliFailure.reason,
+              provider: params.provider,
+              model: modelId,
+              status: resolveFailoverStatus(cliFailure.reason),
+            });
+          }
           if (result.reason === "no-output-timeout" || result.noOutputTimedOut) {
             const timeoutReason = `CLI produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`;
             log.warn(
@@ -1250,7 +1277,7 @@ export async function runCliAgent(params: {
               status: resolveFailoverStatus("timeout"),
             });
           }
-          const err = stderr || stdout || "CLI failed.";
+          const err = cliFailure.message;
           const reason = classifyFailoverReason(err) ?? "unknown";
           const status = resolveFailoverStatus(reason);
           throw new FailoverError(err, {

@@ -484,6 +484,17 @@ describe("isLikelyContextOverflowError", () => {
       expect(isLikelyContextOverflowError(sample)).toBe(false);
     }
   });
+
+  it("excludes raw CLI stream transcripts even when they mention historical overflow text", () => {
+    const sample = [
+      '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."}]}}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Command running in background with ID: bm4efo1mn."}]}}',
+    ].join("\n");
+
+    expect(isContextOverflowError(sample)).toBe(false);
+    expect(isLikelyContextOverflowError(sample)).toBe(false);
+  });
 });
 
 describe("extractObservedOverflowTokenCount", () => {

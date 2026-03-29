@@ -4,6 +4,7 @@ import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-pay
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { runCliAgent } from "../../agents/cli-runner.js";
 import { getCliSessionId } from "../../agents/cli-session.js";
+import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import {
@@ -737,8 +738,10 @@ export async function runAgentTurnWithFallback(params: {
       break;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const isBilling = isBillingErrorMessage(message);
-      const isContextOverflow = !isBilling && isLikelyContextOverflowError(message);
+      const failoverReason = resolveFailoverReasonFromError(err);
+      const isBilling = failoverReason === "billing" || isBillingErrorMessage(message);
+      const isContextOverflow =
+        !isBilling && !failoverReason && isLikelyContextOverflowError(message);
       const isCompactionFailure = !isBilling && isCompactionFailureError(message);
       const isSessionCorruption = /function call turn comes immediately after/i.test(message);
       const isRoleOrderingError = /incorrect role information|roles must alternate/i.test(message);
@@ -838,9 +841,13 @@ export async function runAgentTurnWithFallback(params: {
         ? BILLING_ERROR_USER_MESSAGE
         : isContextOverflow
           ? "⚠️ Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."
-          : isRoleOrderingError
-            ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
-            : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
+          : failoverReason === "session_expired"
+            ? "⚠️ Agent session expired before reply. Please try again."
+            : failoverReason === "format"
+              ? "⚠️ Agent returned malformed output before reply. Please try again."
+              : isRoleOrderingError
+                ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
+                : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
 
       return {
         kind: "final",

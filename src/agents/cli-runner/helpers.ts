@@ -40,6 +40,58 @@ export type CliOutput = {
   usage?: CliUsage;
 };
 
+export function summarizeCliFailure(params: {
+  stdout: string;
+  stderr: string;
+  outputMode: CliBackendConfig["output"];
+  useResume: boolean;
+  cliSessionId?: string;
+  parsedStreamOutput?: CliOutput | null;
+}): {
+  message: string;
+  reason?: "session_expired";
+} {
+  const stderr = params.stderr.trim();
+  if (stderr) {
+    return { message: stderr };
+  }
+
+  const stdout = params.stdout.trim();
+  const parsedStreamText = params.parsedStreamOutput?.text?.trim();
+  const hasStreamInit =
+    params.outputMode === "stream-json" &&
+    stdout.includes('"type":"system"') &&
+    stdout.includes('"subtype":"init"');
+
+  // Claude CLI can sometimes resume a stale session, replay init/history
+  // frames, then exit before producing a new assistant turn. Treat that as a
+  // stale session so callers can retry with a fresh session.
+  if (
+    params.useResume &&
+    params.cliSessionId &&
+    params.outputMode === "stream-json" &&
+    hasStreamInit
+  ) {
+    if (!parsedStreamText) {
+      return {
+        message: "CLI resumed session but produced no assistant response before exit.",
+        reason: "session_expired",
+      };
+    }
+    return { message: parsedStreamText };
+  }
+
+  if (parsedStreamText) {
+    return { message: parsedStreamText };
+  }
+
+  if (params.outputMode === "stream-json" && hasStreamInit) {
+    return { message: "CLI exited unexpectedly after resuming a prior session." };
+  }
+
+  return { message: stdout || "CLI failed." };
+}
+
 export function buildSystemPrompt(params: {
   workspaceDir: string;
   config?: OpenClawConfig;
