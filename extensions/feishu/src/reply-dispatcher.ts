@@ -511,6 +511,50 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
 
+  const normalizeReasoningDisplayText = (text: string | undefined): string => {
+    const trimmed = text?.trim() ?? "";
+    if (!trimmed) {
+      return "";
+    }
+    return trimmed
+      .replace(/^Reasoning:\n/, "")
+      .replace(/^_(.*)_$/gm, "$1")
+      .trim();
+  };
+
+  const mergeReasoningDisplayText = (
+    previousText: string | undefined,
+    nextText: string | undefined,
+  ): string => {
+    const previous = normalizeReasoningDisplayText(previousText);
+    const next = normalizeReasoningDisplayText(nextText);
+    if (!next) {
+      return previous;
+    }
+    if (!previous || next === previous) {
+      return next;
+    }
+    if (next.startsWith(previous)) {
+      return next;
+    }
+    if (previous.startsWith(next)) {
+      return previous;
+    }
+    if (next.includes(previous)) {
+      return next;
+    }
+    if (previous.includes(next)) {
+      return previous;
+    }
+    const maxOverlap = Math.min(previous.length, next.length);
+    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+      if (previous.slice(-overlap) === next.slice(0, overlap)) {
+        return `${previous}${next.slice(overlap)}`;
+      }
+    }
+    return `${previous}\n\n${next}`;
+  };
+
   const resolveThinkingPanelTitle = (): string => {
     if (!hasReasoningText() && toolCallCount > 0) {
       return `🔧 Tool calls (${toolCallCount})`;
@@ -525,9 +569,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     const sections: string[] = [];
     const toolOnlyPanel = !hasReasoningText() && toolCallCount > 0;
     if (reasoningText) {
-      const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
-      const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
-      sections.push(plain);
+      sections.push(reasoningText);
     }
     if (toolCallCount > 0) {
       const currentRunningTool =
@@ -658,7 +700,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   const queueReasoningUpdate = (nextThinking: string) => {
     if (!nextThinking) return;
-    reasoningText = nextThinking;
+    reasoningText = mergeReasoningDisplayText(reasoningText, nextThinking);
     queueThinkingPanelUpdate();
   };
 
@@ -1131,10 +1173,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             queueThinkingPrelude();
             streamPhase = "thinking";
             if (payload?.text) {
-              reasoningText = payload.text;
               if (streamingEnabled) {
                 startStreaming();
                 queueReasoningUpdate(payload.text);
+              } else {
+                reasoningText = mergeReasoningDisplayText(reasoningText, payload.text);
               }
             }
           }

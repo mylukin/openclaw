@@ -1167,6 +1167,28 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
+  it("accumulates fragmented reasoning payloads in the live thinking panel", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_" });
+    result.replyOptions.onReasoningStream?.({ text: "step two" });
+    result.replyOptions.onReasoningStream?.({ text: "step three" });
+    result.replyOptions.onPartialReply?.({ text: "answer part" });
+    result.replyOptions.onReasoningEnd?.();
+    await options.deliver({ text: "answer part final" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    const thinkingCalls = streamingInstances[0].updateThinking.mock.calls.map(
+      (call: unknown[]) => call[0] as string,
+    );
+    expect(thinkingCalls.at(-1)).toContain("step one");
+    expect(thinkingCalls.at(-1)).toContain("step two");
+    expect(thinkingCalls.at(-1)).toContain("step three");
+  });
+
   it("provides onReasoningStream and onReasoningEnd when streaming is enabled", () => {
     const { result } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
@@ -1322,6 +1344,42 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         text: "final answer",
         thinkingTitle: "💭 Thinking",
         thinkingText: "step one\nstep two",
+        thinkingExpanded: false,
+      }),
+    );
+  });
+
+  it("accumulates fragmented reasoning payloads for non-streaming card replies", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: false,
+      },
+    });
+
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_msg",
+      replyInThread: false,
+      threadReply: true,
+      rootId: "om_root_topic",
+    });
+
+    await result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_" });
+    await result.replyOptions.onReasoningStream?.({ text: "step two" });
+    await result.replyOptions.onReasoningStream?.({ text: "step three" });
+    await result.replyOptions.onReasoningEnd?.();
+    await options.deliver({ text: "final answer" }, { kind: "final" });
+
+    expect(sendStructuredCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "final answer",
+        thinkingTitle: "💭 Thinking",
+        thinkingText: "step one\n\nstep two\n\nstep three",
         thinkingExpanded: false,
       }),
     );
