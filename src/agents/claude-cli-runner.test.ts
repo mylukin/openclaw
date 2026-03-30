@@ -10,6 +10,7 @@ vi.mock("../process/supervisor/index.js", () => ({
     spawn: (...args: unknown[]) => mocks.spawn(...args),
     cancel: vi.fn(),
     cancelScope: vi.fn(),
+    cancelSession: vi.fn(() => 0),
     reconcileOrphans: async () => {},
     getRecord: vi.fn(),
   }),

@@ -17,6 +17,7 @@ const log = createSubsystemLogger("process/supervisor");
 
 type ActiveRun = {
   run: ManagedRun;
+  sessionId: string;
   scopeKey?: string;
 };
 
@@ -56,6 +57,25 @@ export function createProcessSupervisor(): ProcessSupervisor {
       }
       cancel(runId, reason);
     }
+  };
+
+  const cancelSession = (
+    sessionId: string,
+    reason: TerminationReason = "manual-cancel",
+  ): number => {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) {
+      return 0;
+    }
+    let cancelled = 0;
+    for (const [runId, run] of active.entries()) {
+      if (run.sessionId !== normalizedSessionId) {
+        continue;
+      }
+      cancel(runId, reason);
+      cancelled += 1;
+    }
+    return cancelled;
   };
 
   const spawn = async (input: SpawnInput): Promise<ManagedRun> => {
@@ -255,6 +275,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
 
       active.set(runId, {
         run: managedRun,
+        sessionId: input.sessionId,
         scopeKey: input.scopeKey?.trim() || undefined,
       });
       return managedRun;
@@ -273,6 +294,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
     spawn,
     cancel,
     cancelScope,
+    cancelSession,
     reconcileOrphans: async () => {
       // Deliberate no-op: this supervisor uses in-memory ownership only.
       // Active runs are not recovered after process restart in the current model.

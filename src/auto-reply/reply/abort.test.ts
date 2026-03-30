@@ -59,6 +59,10 @@ const acpManagerMocks = vi.hoisted(() => ({
   cancelSession: vi.fn(async () => {}),
 }));
 
+const processSupervisorMocks = vi.hoisted(() => ({
+  cancelSession: vi.fn(() => 0),
+}));
+
 vi.mock("../../acp/control-plane/manager.js", () => ({
   getAcpSessionManager: () => ({
     resolveSession: acpManagerMocks.resolveSession,
@@ -172,6 +176,10 @@ describe("abort detection", () => {
           cancelSession: acpManagerMocks.cancelSession,
         }) as never) as never,
       abortEmbeddedPiRun: () => true,
+      getProcessSupervisor: (() =>
+        ({
+          cancelSession: processSupervisorMocks.cancelSession,
+        }) as never) as never,
       listSubagentRunsForController: subagentRegistryMocks.listSubagentRunsForRequester,
       markSubagentRunTerminated: subagentRegistryMocks.markSubagentRunTerminated,
     });
@@ -189,6 +197,7 @@ describe("abort detection", () => {
     commandQueueMocks.clearCommandLane.mockClear().mockReturnValue(1);
     acpManagerMocks.resolveSession.mockReset().mockReturnValue({ kind: "none" });
     acpManagerMocks.cancelSession.mockReset().mockResolvedValue(undefined);
+    processSupervisorMocks.cancelSession.mockReset().mockReturnValue(0);
   });
 
   it("triggerBodyNormalized extracts /stop from RawBody for abort detection", async () => {
@@ -426,6 +435,40 @@ describe("abort detection", () => {
     expect(result.handled).toBe(true);
     expect(getFollowupQueueDepth(sessionKey)).toBe(0);
     expectSessionLaneCleared(sessionKey);
+  });
+
+  it("fast-abort cancels active CLI supervisor runs for the target session", async () => {
+    const sessionKey = "telegram:cli";
+    const sessionId = "session-cli";
+    const { cfg } = await createAbortConfig({
+      sessionIdsByKey: { [sessionKey]: sessionId },
+    });
+    processSupervisorMocks.cancelSession.mockReturnValueOnce(1);
+    abortTesting.setDepsForTests({
+      getAcpSessionManager: (() =>
+        ({
+          resolveSession: acpManagerMocks.resolveSession,
+          cancelSession: acpManagerMocks.cancelSession,
+        }) as never) as never,
+      abortEmbeddedPiRun: () => false,
+      getProcessSupervisor: (() =>
+        ({
+          cancelSession: processSupervisorMocks.cancelSession,
+        }) as never) as never,
+      listSubagentRunsForController: subagentRegistryMocks.listSubagentRunsForRequester,
+      markSubagentRunTerminated: subagentRegistryMocks.markSubagentRunTerminated,
+    });
+
+    const result = await runStopCommand({
+      cfg,
+      sessionKey,
+      from: "telegram:123",
+      to: "telegram:123",
+    });
+
+    expect(result.handled).toBe(true);
+    expect(result.aborted).toBe(true);
+    expect(processSupervisorMocks.cancelSession).toHaveBeenCalledWith(sessionId, "manual-cancel");
   });
 
   it("plain-language stop on ACP-bound session triggers ACP cancel", async () => {
