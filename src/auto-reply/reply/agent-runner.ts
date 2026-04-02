@@ -390,6 +390,10 @@ export async function runReplyAgent(params: {
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
+    if (runOutcome.kind === "aborted") {
+      return undefined;
+    }
+
     const {
       runId,
       runResult,

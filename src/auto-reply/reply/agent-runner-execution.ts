@@ -75,6 +75,7 @@ export type AgentRunLoopResult =
       /** Payload keys sent directly (not via pipeline) during tool flush. */
       directlySentBlockKeys?: Set<string>;
     }
+  | { kind: "aborted" }
   | { kind: "final"; payload: ReplyPayload };
 
 export async function runAgentTurnWithFallback(params: {
@@ -739,6 +740,8 @@ export async function runAgentTurnWithFallback(params: {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const failoverReason = resolveFailoverReasonFromError(err);
+      const isExpectedAbort =
+        err instanceof Error && err.name === "AbortError" && failoverReason == null;
       const isBilling = failoverReason === "billing" || isBillingErrorMessage(message);
       const isContextOverflow =
         !isBilling && !failoverReason && isLikelyContextOverflowError(message);
@@ -830,6 +833,14 @@ export async function runAgentTurnWithFallback(params: {
           setTimeout(resolve, TRANSIENT_HTTP_RETRY_DELAY_MS);
         });
         continue;
+      }
+
+      if (isExpectedAbort) {
+        // A plain AbortError here means the run was intentionally cancelled
+        // (for example by a newer inbound turn or session control), not that
+        // the user needs an extra failure message in chat.
+        logVerbose(`Embedded agent aborted before reply (suppressed): ${message}`);
+        return { kind: "aborted" };
       }
 
       defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
