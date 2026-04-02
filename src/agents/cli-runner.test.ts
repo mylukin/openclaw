@@ -1454,6 +1454,34 @@ describe("runCliAgent with process supervisor", () => {
     await expect(runPromise).rejects.toMatchObject({ name: "AbortError" });
     expect(managedRun.cancel).toHaveBeenCalledWith("manual-cancel");
   });
+
+  it("treats supervisor-driven manual session cancels as aborts", async () => {
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "manual-cancel",
+        exitCode: null,
+        exitSignal: "SIGTERM",
+        durationMs: 25,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    await expect(
+      runCliAgent({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.jsonl",
+        workspaceDir: "/tmp",
+        prompt: "hi",
+        provider: "codex-cli",
+        model: "gpt-5.2-codex",
+        timeoutMs: 1_000,
+        runId: "run-session-cancel",
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 describe("resolveCliNoOutputTimeoutMs", () => {

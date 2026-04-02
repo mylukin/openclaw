@@ -1195,7 +1195,10 @@ export async function runCliAgent(params: {
         } finally {
           params.abortSignal?.removeEventListener("abort", onAbort);
         }
-        if (result.reason === "manual-cancel" && params.abortSignal?.aborted) {
+        if (result.reason === "manual-cancel") {
+          // Manual cancels can originate from this run's AbortSignal or from
+          // external session control (/stop, scope replacement, etc.). Treat
+          // both as terminal aborts so model fallback does not restart them.
           throw createAbortError(params.abortSignal);
         }
 
