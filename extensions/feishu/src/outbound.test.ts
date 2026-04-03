@@ -427,3 +427,86 @@ describe("feishuOutbound.sendMedia renderMode", () => {
     );
   });
 });
+
+describe("feishuOutbound HEARTBEAT_TOKEN filtering (AC1-4)", () => {
+  beforeEach(() => {
+    resetOutboundMocks();
+  });
+
+  it("AC1: sendText(HEARTBEAT_OK) returns empty result and does not call sendMessageFeishu or sendStructuredCardFeishu", async () => {
+    const result = await sendText({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      accountId: "main",
+    });
+
+    expect(result).toEqual({ channel: "feishu", messageId: "" });
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("AC2: sendText('HEARTBEAT_OK hello') sends only 'hello'", async () => {
+    await sendText({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK hello",
+      accountId: "main",
+    });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        text: "hello",
+        accountId: "main",
+      }),
+    );
+    expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("AC3: sendMedia with HEARTBEAT_OK caption and mediaUrl sends only media, no empty caption", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      mediaUrl: "https://example.com/image.png",
+      accountId: "main",
+    });
+
+    // Should send media
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat_1",
+        mediaUrl: "https://example.com/image.png",
+        accountId: "main",
+      }),
+    );
+    // Should NOT send any text message (empty caption after stripping)
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(result).toEqual(
+      expect.objectContaining({
+        channel: "feishu",
+        messageId: "media_msg",
+        meta: {
+          contentType: "image",
+          rawContent: '{"image_key":"img_test_1"}',
+        },
+      }),
+    );
+  });
+
+  it("AC4: sendMedia with only HEARTBEAT_OK text (no mediaUrl) returns empty result", async () => {
+    const result = await feishuOutbound.sendMedia?.({
+      cfg: {} as any,
+      to: "chat_1",
+      text: "HEARTBEAT_OK",
+      accountId: "main",
+    });
+
+    expect(result).toEqual({ channel: "feishu", messageId: "" });
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+  });
+});
