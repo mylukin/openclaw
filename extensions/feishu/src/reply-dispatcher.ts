@@ -888,6 +888,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       responsePrefix: prefixContext.responsePrefix,
       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
+      onHeartbeatStrip: () => {
+        params.runtime.log?.(`feishu[${account.accountId}] stripped stray HEARTBEAT_OK from reply`);
+      },
       onReplyStart: async () => {
         if (!replyCycleInitialized) {
           replyCycleInitialized = true;

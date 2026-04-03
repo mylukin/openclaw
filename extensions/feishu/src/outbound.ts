@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { createAttachedChannelResultAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import { HEARTBEAT_TOKEN, stripHeartbeatToken } from "openclaw/plugin-sdk/feishu";
 import type { ChannelOutboundAdapter } from "../runtime-api.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { resolveMediaContentType } from "./media-types.js";
@@ -45,6 +46,21 @@ function normalizePossibleLocalImagePath(text: string | undefined): string | nul
   }
 
   return raw;
+}
+
+/**
+ * Strip HEARTBEAT_TOKEN from outbound text before sending to Feishu.
+ * Returns the cleaned text, or null if nothing remains (pure heartbeat ack).
+ */
+function normalizeOutboundText(text: string): string | null {
+  if (!text.includes(HEARTBEAT_TOKEN)) {
+    return text;
+  }
+  const stripped = stripHeartbeatToken(text, { mode: "message" });
+  if (stripped.shouldSkip || !stripped.text) {
+    return null;
+  }
+  return stripped.text;
 }
 
 function resolveReplyToMessageId(params: {
@@ -112,10 +128,18 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       identity,
     }) => {
       const replyToMessageId = resolveReplyToMessageId({ replyToId, threadId });
+
+      // Filter HEARTBEAT_TOKEN before sending. The token is an internal ack signal
+      // and must never appear as a visible message in Feishu group chats or DMs.
+      const effectiveText = normalizeOutboundText(text);
+      if (effectiveText === null) {
+        return { channel: "feishu" as const, messageId: "" };
+      }
+
       // Scheme A compatibility shim:
       // when upstream accidentally returns a local image path as plain text,
       // auto-upload and send as Feishu image message instead of leaking path text.
-      const localImagePath = normalizePossibleLocalImagePath(text);
+      const localImagePath = normalizePossibleLocalImagePath(effectiveText);
       if (localImagePath) {
         try {
           const sent = await sendMediaFeishu({
@@ -136,7 +160,8 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       const account = resolveFeishuAccount({ cfg, accountId: accountId ?? undefined });
       const renderMode = account.config?.renderMode ?? "auto";
       const useCard =
-        renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text));
+        renderMode === "card" ||
+        (renderMode === "auto" && shouldUseFeishuMarkdownCard(effectiveText));
       if (useCard) {
         const header = identity
           ? {
@@ -149,7 +174,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         const sent = await sendStructuredCardFeishu({
           cfg,
           to,
-          text,
+          text: effectiveText,
           replyToMessageId,
           replyInThread: threadId != null && !replyToId,
           accountId: accountId ?? undefined,
@@ -160,14 +185,14 @@ export const feishuOutbound: ChannelOutboundAdapter = {
           meta: {
             ...(sent.meta ?? {}),
             contentType: "interactive",
-            finalContent: normalizeMentionTagsForCard(text),
+            finalContent: normalizeMentionTagsForCard(effectiveText),
           },
         };
       }
       const sent = await sendOutboundText({
         cfg,
         to,
-        text,
+        text: effectiveText,
         accountId: accountId ?? undefined,
         replyToMessageId,
       });
@@ -176,7 +201,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         meta: {
           ...(sent.meta ?? {}),
           contentType: "post",
-          finalContent: text,
+          finalContent: effectiveText,
         },
       };
     },
@@ -191,12 +216,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       threadId,
     }) => {
       const replyToMessageId = resolveReplyToMessageId({ replyToId, threadId });
-      // Send text first if provided
-      if (text?.trim()) {
+      // Send text first if provided (after stripping any HEARTBEAT_TOKEN)
+      const effectiveCaption = text ? normalizeOutboundText(text) : null;
+      if (effectiveCaption) {
         await sendOutboundText({
           cfg,
           to,
-          text,
+          text: effectiveCaption,
           accountId: accountId ?? undefined,
           replyToMessageId,
         });
@@ -228,11 +254,15 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         }
       }
 
-      // No media URL, just return text result
+      // No media URL — use the already-normalized caption; drop stray HEARTBEAT_OK
+      const fallbackText = effectiveCaption ?? "";
+      if (!fallbackText) {
+        return { channel: "feishu" as const, messageId: "" };
+      }
       return await sendOutboundText({
         cfg,
         to,
-        text: text ?? "",
+        text: fallbackText,
         accountId: accountId ?? undefined,
         replyToMessageId,
       });
