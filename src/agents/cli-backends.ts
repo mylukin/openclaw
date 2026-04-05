@@ -39,17 +39,25 @@ const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
 
 const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
   command: "claude",
-  args: ["-p", "--output-format", "json", "--permission-mode", "bypassPermissions"],
+  args: [
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--permission-mode",
+    "bypassPermissions",
+  ],
   resumeArgs: [
     "-p",
+    "--verbose",
     "--output-format",
-    "json",
+    "stream-json",
     "--permission-mode",
     "bypassPermissions",
     "--resume",
     "{sessionId}",
   ],
-  output: "json",
+  output: "stream-json",
   input: "arg",
   modelArg: "--model",
   modelAliases: CLAUDE_MODEL_ALIASES,
@@ -58,13 +66,17 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
   sessionIdFields: ["session_id", "sessionId", "conversation_id", "conversationId"],
   systemPromptArg: "--append-system-prompt",
   systemPromptMode: "append",
-  systemPromptWhen: "first",
+  systemPromptWhen: "always",
   clearEnv: ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_OLD"],
   reliability: {
     watchdog: {
       fresh: { ...CLI_FRESH_WATCHDOG_DEFAULTS },
       resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
     },
+  },
+  mcp: {
+    enabled: true,
+    strict: true,
   },
   serialize: true,
 };
@@ -131,6 +143,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
   const baseResume = base.reliability?.watchdog?.resume ?? {};
   const overrideFresh = override.reliability?.watchdog?.fresh ?? {};
   const overrideResume = override.reliability?.watchdog?.resume ?? {};
+  const baseMcp = base.mcp ?? {};
+  const overrideMcp = override.mcp ?? {};
+  const mergedMcp = (() => {
+    const mergedServers = {
+      ...baseMcp.servers,
+      ...overrideMcp.servers,
+    };
+    const next = {
+      ...baseMcp,
+      ...overrideMcp,
+      ...(Object.keys(mergedServers).length ? { servers: mergedServers } : {}),
+    };
+    return Object.keys(next).length ? next : undefined;
+  })();
   return {
     ...base,
     ...override,
@@ -157,6 +183,7 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
         },
       },
     },
+    mcp: mergedMcp,
   };
 }
 

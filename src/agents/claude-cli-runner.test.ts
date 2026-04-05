@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { runClaudeCliAgent } from "./claude-cli-runner.js";
+
+let runClaudeCliAgent: typeof import("./claude-cli-runner.js").runClaudeCliAgent;
 
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
@@ -7,9 +8,29 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({
-    spawn: (...args: unknown[]) => mocks.spawn(...args),
+    spawn: async (...args: unknown[]) => {
+      const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
+      const managedRun = (await mocks.spawn(...args)) as
+        | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
+        | undefined;
+      if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
+        input.onStdout(managedRun.__stdoutForStreaming);
+      }
+      if (input?.onStdout && managedRun?.wait) {
+        const originalWait = managedRun.wait.bind(managedRun);
+        managedRun.wait = async () => {
+          const result = await originalWait();
+          if (typeof result?.stdout === "string") {
+            input.onStdout?.(result.stdout);
+          }
+          return result;
+        };
+      }
+      return managedRun;
+    },
     cancel: vi.fn(),
     cancelScope: vi.fn(),
+    cancelSession: vi.fn(() => 0),
     reconcileOrphans: async () => {},
     getRecord: vi.fn(),
   }),
@@ -45,6 +66,7 @@ function createManagedRun(
     runId: "run-test",
     pid: 12345,
     startedAtMs: Date.now(),
+    __stdoutForStreaming: undefined as string | undefined,
     wait: async () => await exit,
     cancel: vi.fn(),
   };
@@ -56,7 +78,46 @@ function successExit(payload: { message: string; session_id: string }) {
     exitCode: 0,
     exitSignal: null,
     durationMs: 1,
-    stdout: JSON.stringify(payload),
+    stdout: [
+      JSON.stringify({ type: "system", subtype: "init", session_id: payload.session_id }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: payload.session_id,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_test_read",
+              name: "Read",
+              input: { file_path: "/tmp/session.claude-system-prompt.txt" },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        session_id: payload.session_id,
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_test_read", content: "prompt file" },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: payload.session_id,
+        message: { role: "assistant", content: [{ type: "text", text: payload.message }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: payload.message,
+        session_id: payload.session_id,
+      }),
+    ].join("\n"),
     stderr: "",
     timedOut: false,
     noOutputTimedOut: false,
@@ -73,7 +134,38 @@ async function waitForCalls(mockFn: { mock: { calls: unknown[][] } }, count: num
 }
 
 describe("runClaudeCliAgent", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.doMock("../process/supervisor/index.js", () => ({
+      getProcessSupervisor: () => ({
+        spawn: async (...args: unknown[]) => {
+          const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
+          const managedRun = (await mocks.spawn(...args)) as
+            | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
+            | undefined;
+          if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
+            input.onStdout(managedRun.__stdoutForStreaming);
+          }
+          if (input?.onStdout && managedRun?.wait) {
+            const originalWait = managedRun.wait.bind(managedRun);
+            managedRun.wait = async () => {
+              const result = await originalWait();
+              if (typeof result?.stdout === "string") {
+                input.onStdout?.(result.stdout);
+              }
+              return result;
+            };
+          }
+          return managedRun;
+        },
+        cancel: vi.fn(),
+        cancelScope: vi.fn(),
+        cancelSession: vi.fn(() => 0),
+        reconcileOrphans: async () => {},
+        getRecord: vi.fn(),
+      }),
+    }));
+    ({ runClaudeCliAgent } = await import("./claude-cli-runner.js"));
     mocks.spawn.mockClear();
   });
 
