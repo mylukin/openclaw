@@ -93,6 +93,30 @@ describe("buildStatusMessage", () => {
     expect(normalized).toContain("Queue: collect");
   });
 
+  it("shows cli prompt loader status when present", () => {
+    const text = buildStatusMessage({
+      agent: {
+        model: "claude-cli/sonnet",
+      },
+      sessionEntry: {
+        sessionId: "abc",
+        updatedAt: 0,
+        cliPromptLoad: {
+          sessionPromptFile: "/tmp/abc.claude-system-prompt.txt",
+          loaderMode: "strict",
+          verifiedRead: false,
+          fallbackReason: "verification_retry",
+        },
+      },
+      sessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      now: 10 * 60_000,
+    });
+    const normalized = normalizeTestText(text);
+    expect(normalized).toContain("CLI prompt: file/strict");
+    expect(normalized).toContain("fallback=verification_retry");
+  });
+
   it("falls back to sessionEntry levels when resolved levels are not passed", () => {
     const text = buildStatusMessage({
       agent: {

@@ -429,6 +429,10 @@ export async function runReplyAgent(params: {
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
+    if (runOutcome.kind === "aborted") {
+      return undefined;
+    }
+
     const {
       runId,
       runResult,
@@ -537,7 +541,8 @@ export async function runReplyAgent(params: {
       contextTokensUsed,
       systemPromptReport: runResult.meta?.systemPromptReport,
       cliSessionId,
-      cliSessionBinding,
+      cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding ?? cliSessionBinding,
+      cliPromptLoad: runResult.meta?.agentMeta?.cliPromptLoad,
       usageIsContextSnapshot: isCliProvider(providerUsed, cfg),
     });
 

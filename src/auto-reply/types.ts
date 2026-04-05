@@ -63,7 +63,7 @@ export type GetReplyOptions = {
   onBlockReply?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
   onToolResult?: (payload: ReplyPayload) => Promise<void> | void;
   /** Called when a tool phase starts/updates, before summary payloads are emitted. */
-  onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
+  onToolStart?: (payload: { name?: string; phase?: string; toolCallId?: string }) => Promise<void> | void;
   /** Called when a concrete work item starts, updates, or completes. */
   onItemEvent?: (payload: {
     itemId?: string;
@@ -145,6 +145,7 @@ export type GetReplyOptions = {
 
 export type ReplyPayload = {
   text?: string;
+  toolCallId?: string;
   mediaUrl?: string;
   mediaUrls?: string[];
   interactive?: InteractiveReply;
