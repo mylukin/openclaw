@@ -390,6 +390,10 @@ export async function runReplyAgent(params: {
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
+    if (runOutcome.kind === "aborted") {
+      return undefined;
+    }
+
     const {
       runId,
       runResult,
@@ -495,6 +499,8 @@ export async function runReplyAgent(params: {
       contextTokensUsed,
       systemPromptReport: runResult.meta?.systemPromptReport,
       cliSessionId,
+      cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding,
+      cliPromptLoad: runResult.meta?.agentMeta?.cliPromptLoad,
     });
 
     // Drain any late tool/block deliveries before deciding there's "nothing to send".
