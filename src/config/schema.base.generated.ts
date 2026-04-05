@@ -3269,6 +3269,10 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                           type: "string",
                           const: "jsonl",
                         },
+                        {
+                          type: "string",
+                          const: "stream-json",
+                        },
                       ],
                     },
                     resumeOutput: {
@@ -3284,6 +3288,10 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                         {
                           type: "string",
                           const: "jsonl",
+                        },
+                        {
+                          type: "string",
+                          const: "stream-json",
                         },
                       ],
                     },
@@ -3477,6 +3485,31 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                             },
                           },
                           additionalProperties: false,
+                        },
+                      },
+                      additionalProperties: false,
+                    },
+                    mcp: {
+                      type: "object",
+                      properties: {
+                        enabled: {
+                          type: "boolean",
+                        },
+                        strict: {
+                          type: "boolean",
+                        },
+                        configPath: {
+                          type: "string",
+                        },
+                        mergeConfigPath: {
+                          type: "string",
+                        },
+                        servers: {
+                          type: "object",
+                          propertyNames: {
+                            type: "string",
+                          },
+                          additionalProperties: {},
                         },
                       },
                       additionalProperties: false,
@@ -4159,6 +4192,11 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
               compaction: {
                 type: "object",
                 properties: {
+                  timeoutMs: {
+                    type: "integer",
+                    exclusiveMinimum: 0,
+                    maximum: 9007199254740991,
+                  },
                   mode: {
                     anyOf: [
                       {
@@ -6766,6 +6804,9 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                       type: "object",
                       properties: {
                         workspaceOnly: {
+                          type: "boolean",
+                        },
+                        allowReadOutsideWorkspace: {
                           type: "boolean",
                         },
                       },
@@ -16984,6 +17025,9 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                 description:
                   "Restrict filesystem tools (read/write/edit/apply_patch) to the workspace directory (default: false).",
               },
+              allowReadOutsideWorkspace: {
+                type: "boolean",
+              },
             },
             additionalProperties: false,
           },
@@ -21348,6 +21392,30 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                 description:
                   "Node command names to block even if present in node claims or default allowlist (exact command-name matching only, e.g. `system.run`; does not inspect shell text inside that command).",
               },
+              overrides: {
+                type: "object",
+                propertyNames: {
+                  type: "string",
+                },
+                additionalProperties: {
+                  type: "object",
+                  properties: {
+                    allowCommands: {
+                      type: "array",
+                      items: {
+                        type: "string",
+                      },
+                    },
+                    denyCommands: {
+                      type: "array",
+                      items: {
+                        type: "string",
+                      },
+                    },
+                  },
+                  additionalProperties: false,
+                },
+              },
             },
             additionalProperties: false,
           },
@@ -21808,6 +21876,9 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                 title: "Skills Watch Debounce (ms)",
                 description:
                   "Debounce window in milliseconds for coalescing rapid skill file changes before reload logic runs. Increase to reduce reload churn on frequent writes, or lower for faster edit feedback.",
+              },
+              allowSymlinksOutsideRoot: {
+                type: "boolean",
               },
             },
             additionalProperties: false,
@@ -23935,6 +24006,11 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
       help: "Node command names to block even if present in node claims or default allowlist (exact command-name matching only, e.g. `system.run`; does not inspect shell text inside that command).",
       tags: ["access", "network"],
     },
+    "gateway.nodes.overrides": {
+      label: "Per-Node Command Overrides",
+      help: "Per-node command policy overrides, keyed by node displayName, nodeId, or nodeId prefix. Each entry may specify allowCommands and denyCommands that merge with the global lists. Match precedence is nodeId exact, then displayName exact, then longest nodeId prefix.",
+      tags: ["network"],
+    },
     "gateway.webchat.chatHistoryMaxChars": {
       label: "WebChat History Max Chars",
       help: "Max characters per text field in chat.history responses before truncation (default: 12000).",
@@ -24975,6 +25051,36 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
     "agents.defaults.cliBackends": {
       label: "CLI Backends",
       help: "Optional CLI backends for text-only fallback (claude-cli, etc.).",
+      tags: ["advanced"],
+    },
+    "agents.defaults.cliBackends.*.mcp": {
+      label: "CLI Backend MCP",
+      help: "MCP wiring options for CLI backends. Useful for merging custom MCP servers with OpenClaw's built-in MCP server in claude-cli sessions.",
+      tags: ["advanced"],
+    },
+    "agents.defaults.cliBackends.*.mcp.enabled": {
+      label: "CLI Backend MCP Enabled",
+      help: "Enables MCP config injection for this CLI backend (default on for claude-cli). Disable to run without MCP tools.",
+      tags: ["advanced"],
+    },
+    "agents.defaults.cliBackends.*.mcp.strict": {
+      label: "CLI Backend MCP Strict Mode",
+      help: "When true, passes --strict-mcp-config to the CLI. Set false only when you intentionally allow unknown MCP config references.",
+      tags: ["advanced"],
+    },
+    "agents.defaults.cliBackends.*.mcp.configPath": {
+      label: "CLI Backend MCP Config Path",
+      help: "Optional primary MCP config path. When set for claude-cli, OpenClaw merges this config with its own MCP server entry.",
+      tags: ["storage"],
+    },
+    "agents.defaults.cliBackends.*.mcp.mergeConfigPath": {
+      label: "CLI Backend MCP Merge Config Path",
+      help: "Optional additional MCP config path merged on top of the primary config for this backend.",
+      tags: ["storage"],
+    },
+    "agents.defaults.cliBackends.*.mcp.servers": {
+      label: "CLI Backend MCP Inline Servers",
+      help: "Inline MCP servers merged into the effective backend MCP config (map of server name to server config object).",
       tags: ["advanced"],
     },
     "agents.defaults.compaction": {

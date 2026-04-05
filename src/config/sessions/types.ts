@@ -71,6 +71,20 @@ export type CliSessionBinding = {
   authEpoch?: string;
   extraSystemPromptHash?: string;
   mcpConfigHash?: string;
+  systemPromptFile?: string;
+  systemPromptHash?: string;
+  systemPromptCompactionCount?: number;
+};
+
+export type CliPromptLoadStatus = {
+  sessionPromptFile?: string;
+  loaderMode: "normal" | "strict" | "disabled";
+  verifiedRead: boolean;
+  fallbackReason?:
+    | "write_failed"
+    | "verification_retry"
+    | "direct_injection_fallback"
+    | "direct_fallback_disabled";
 };
 
 export type SessionEntry = {
@@ -183,9 +197,10 @@ export type SessionEntry = {
   memoryFlushAt?: number;
   memoryFlushCompactionCount?: number;
   memoryFlushContextHash?: string;
-  cliSessionIds?: Record<string, string>;
   cliSessionBindings?: Record<string, CliSessionBinding>;
+  cliSessionIds?: Record<string, string>;
   claudeCliSessionId?: string;
+  cliPromptLoad?: CliPromptLoadStatus;
   label?: string;
   displayName?: string;
   channel?: string;

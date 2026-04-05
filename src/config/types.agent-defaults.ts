@@ -50,9 +50,9 @@ export type CliBackendConfig = {
   /** Base args applied to every invocation. */
   args?: string[];
   /** Output parsing mode (default: json). */
-  output?: "json" | "text" | "jsonl";
+  output?: "json" | "text" | "jsonl" | "stream-json";
   /** Output parsing mode when resuming a CLI session. */
-  resumeOutput?: "json" | "text" | "jsonl";
+  resumeOutput?: "json" | "text" | "jsonl" | "stream-json";
   /** Prompt input mode (default: arg). */
   input?: "arg" | "stdin";
   /** Max prompt length for arg mode (if exceeded, stdin is used). */
@@ -114,6 +114,19 @@ export type CliBackendConfig = {
         maxMs?: number;
       };
     };
+  };
+  /** MCP wiring controls (primarily for Claude CLI backends). */
+  mcp?: {
+    /** Enable MCP config injection for this backend (default: true for claude-cli). */
+    enabled?: boolean;
+    /** Add `--strict-mcp-config` when true (default: true). */
+    strict?: boolean;
+    /** Optional primary MCP config path (merged with OpenClaw MCP server when provided). */
+    configPath?: string;
+    /** Optional extra MCP config path whose servers are merged into the effective config. */
+    mergeConfigPath?: string;
+    /** Optional inline MCP servers merged into the effective config. */
+    servers?: Record<string, unknown>;
   };
 };
 
