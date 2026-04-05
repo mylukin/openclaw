@@ -1,5 +1,10 @@
 import { createRequire } from "node:module";
 import { resolveStateDir } from "../../config/paths.js";
+import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
+import {
+  buildCanonicalSentMessageHookContext,
+  toInternalMessageSentContext,
+} from "../../hooks/message-hook-mappers.js";
 import {
   listRuntimeImageGenerationProviders,
   generateImage,
@@ -11,6 +16,7 @@ import {
   createLazyRuntimeModule,
 } from "../../shared/lazy-runtime.js";
 import { listWebSearchProviders, runWebSearch } from "../../web-search/runtime.js";
+import { getGlobalHookRunner } from "../hook-runner-global.js";
 import { createRuntimeAgent } from "./runtime-agent.js";
 import { createRuntimeChannel } from "./runtime-channel.js";
 import { createRuntimeConfig } from "./runtime-config.js";
@@ -48,6 +54,12 @@ const loadMediaUnderstandingRuntime = createLazyRuntimeModule(
 const loadModelAuthRuntime = createLazyRuntimeModule(
   () => import("./runtime-model-auth.runtime.js"),
 );
+const loadEmbeddedPiRuntime = createLazyRuntimeModule(
+  () => import("./runtime-embedded-pi.runtime.js"),
+);
+const loadModelAwareRuntime = createLazyRuntimeModule(
+  () => import("./runtime-model-aware.runtime.js"),
+);
 
 function createRuntimeTts(): PluginRuntime["tts"] {
   const bindTtsRuntime = createLazyRuntimeMethodBinder(loadTtsRuntime);
@@ -70,6 +82,15 @@ function createRuntimeMediaUnderstandingFacade(): PluginRuntime["mediaUnderstand
     ),
     describeVideoFile: bindMediaUnderstandingRuntime((runtime) => runtime.describeVideoFile),
     transcribeAudioFile: bindMediaUnderstandingRuntime((runtime) => runtime.transcribeAudioFile),
+  };
+}
+
+function createRuntimeAgents(): PluginRuntime["agents"] {
+  const bindEmbeddedPi = createLazyRuntimeMethodBinder(loadEmbeddedPiRuntime);
+  const bindModelAware = createLazyRuntimeMethodBinder(loadModelAwareRuntime);
+  return {
+    runEmbeddedPiAgent: bindEmbeddedPi((runtime) => runtime.runEmbeddedPiAgent),
+    runModelAwareAgent: bindModelAware((runtime) => runtime.runModelAwareAgent),
   };
 }
 
@@ -202,6 +223,7 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): 
   const mediaUnderstanding = createRuntimeMediaUnderstandingFacade();
   const runtime = {
     version: resolveVersion(),
+    agents: createRuntimeAgents(),
     config: createRuntimeConfig(),
     agent: createRuntimeAgent(),
     subagent: createLateBindingSubagent(
@@ -221,6 +243,53 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): 
     tools: createRuntimeTools(),
     channel: createRuntimeChannel(),
     events: createRuntimeEvents(),
+    hooks: {
+      hasMessageSendingHooks: () => {
+        const hookRunner = getGlobalHookRunner();
+        return hookRunner?.hasHooks("message_sending") ?? false;
+      },
+      runMessageSending: async (event, context) => {
+        const hookRunner = getGlobalHookRunner();
+        if (!hookRunner?.hasHooks("message_sending")) {
+          return undefined;
+        }
+        return await hookRunner.runMessageSending(event, context);
+      },
+      emitMessageSent: (event, context) => {
+        const hookRunner = getGlobalHookRunner();
+        if (!hookRunner?.hasHooks("message_sent")) {
+          if (!context.sessionKey) {
+            return;
+          }
+        } else {
+          void hookRunner.runMessageSent(event, context);
+        }
+        if (!context.sessionKey) {
+          return;
+        }
+        const canonical = buildCanonicalSentMessageHookContext({
+          to: event.to,
+          content: event.content,
+          success: event.success,
+          error: event.error,
+          channelId: context.channelId,
+          accountId: context.accountId,
+          conversationId: context.conversationId ?? event.to,
+          messageId: event.messageId,
+          metadata: event.metadata,
+          isGroup: context.isGroup,
+          groupId: context.groupId,
+        });
+        void triggerInternalHook(
+          createInternalHookEvent(
+            "message",
+            "sent",
+            context.sessionKey,
+            toInternalMessageSentContext(canonical),
+          ),
+        ).catch(() => {});
+      },
+    },
     logging: createRuntimeLogging(),
     state: { resolveStateDir },
   } satisfies Omit<PluginRuntime, "tts" | "mediaUnderstanding" | "stt" | "modelAuth"> &

@@ -38,9 +38,10 @@ let executePollAction: OutboundSendServiceModule["executePollAction"];
 let executeSendAction: OutboundSendServiceModule["executeSendAction"];
 
 describe("executeSendAction", () => {
-  function pluginActionResult(messageId: string) {
+  function pluginActionResult(messageId: string, details?: Record<string, unknown>) {
     return {
       ok: true,
+      ...(details ? { details } : {}),
       value: { messageId },
       continuePrompt: "",
       output: "",
@@ -216,6 +217,28 @@ describe("executeSendAction", () => {
       text: "hello",
       idempotencyKey: "idem-plugin-send-1",
     });
+  });
+
+  it("does not mirror cancelled plugin-handled sends", async () => {
+    mocks.dispatchChannelMessageAction.mockResolvedValue(
+      pluginActionResult("msg-plugin-cancelled", { ok: true, cancelled: true }),
+    );
+
+    await executeSendAction({
+      ctx: {
+        cfg: {},
+        channel: "discord",
+        params: { to: "channel:123", message: "hello" },
+        dryRun: false,
+        mirror: {
+          sessionKey: "agent:main:discord:channel:123",
+        },
+      },
+      to: "channel:123",
+      message: "hello",
+    });
+
+    expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
   });
 
   it("falls back to message and media params for plugin-handled mirror writes", async () => {

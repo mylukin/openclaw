@@ -26,9 +26,47 @@ const state = resolveGlobalSingleton<HookRunnerGlobalState>(hookRunnerGlobalStat
 
 /**
  * Initialize the global hook runner with a plugin registry.
- * Called once when plugins are loaded during gateway startup.
+ * Called when plugins are loaded during gateway startup and potentially
+ * again by runtime provider registries or channel bootstrap paths.
+ *
+ * When the new registry lacks plugin hooks that were present in the
+ * previous registry, those hooks are carried forward so that late
+ * plugin reloads (e.g. provider resolution, channel bootstrap) do not
+ * silently drop hooks registered during gateway startup.
  */
 export function initializeGlobalHookRunner(registry: PluginRegistry): void {
+  const prev = state.registry;
+  if (prev && prev !== registry && prev.typedHooks.length > 0) {
+    const newPluginIds = new Set(registry.typedHooks.map((h) => h.pluginId));
+    const missingPluginIds = new Set<string>();
+    for (const hook of prev.typedHooks) {
+      if (!newPluginIds.has(hook.pluginId)) {
+        missingPluginIds.add(hook.pluginId);
+      }
+    }
+    if (missingPluginIds.size > 0) {
+      // Build a merged registry instead of mutating the (potentially cached)
+      // new registry in place.  This avoids polluting the plugin-loader cache.
+      const mergedTypedHooks = [
+        ...registry.typedHooks,
+        ...prev.typedHooks.filter((h) => missingPluginIds.has(h.pluginId)),
+      ];
+      const existingPluginIds = new Set(registry.plugins.map((p) => p.id));
+      const mergedPlugins = [
+        ...registry.plugins,
+        ...prev.plugins.filter((p) => missingPluginIds.has(p.id) && !existingPluginIds.has(p.id)),
+      ];
+      registry = {
+        ...registry,
+        typedHooks: mergedTypedHooks,
+        plugins: mergedPlugins,
+      };
+      log.info(
+        `hook runner: carried forward hooks from ${missingPluginIds.size} plugin(s) missing in the new registry: ${[...missingPluginIds].join(", ")}`,
+      );
+    }
+  }
+
   state.registry = registry;
   state.hookRunner = createHookRunner(registry, {
     logger: {
@@ -39,7 +77,7 @@ export function initializeGlobalHookRunner(registry: PluginRegistry): void {
     catchErrors: true,
   });
 
-  const hookCount = registry.hooks.length;
+  const hookCount = registry.typedHooks.length;
   if (hookCount > 0) {
     log.info(`hook runner initialized with ${hookCount} registered hooks`);
   }

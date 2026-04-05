@@ -33,10 +33,11 @@ function maybeBootstrapChannelPlugin(params: {
   }
 
   const activeRegistry = getActivePluginRegistry();
-  const activeHasRequestedChannel = activeRegistry?.channels?.some(
-    (entry) => entry?.plugin?.id === params.channel,
-  );
-  if (activeHasRequestedChannel) {
+  // If any channel plugins are already loaded (from gateway startup), do not
+  // attempt a full plugin reload.  A reload builds a new registry with a
+  // different cache key, which replaces the global hook runner and silently
+  // drops hooks registered during startup (e.g. message_received).
+  if ((activeRegistry?.channels?.length ?? 0) > 0) {
     return;
   }
 
@@ -54,30 +55,11 @@ function maybeBootstrapChannelPlugin(params: {
     loadOpenClawPlugins({
       config: autoEnabled,
       workspaceDir,
-      runtimeOptions: {
-        allowGatewaySubagentBinding: true,
-      },
     });
   } catch {
     // Allow a follow-up resolution attempt if bootstrap failed transiently.
     bootstrapAttempts.delete(attemptKey);
   }
-}
-
-function resolveDirectFromActiveRegistry(
-  channel: DeliverableMessageChannel,
-): ChannelPlugin | undefined {
-  const activeRegistry = getActivePluginRegistry();
-  if (!activeRegistry) {
-    return undefined;
-  }
-  for (const entry of activeRegistry.channels) {
-    const plugin = entry?.plugin;
-    if (plugin?.id === channel) {
-      return plugin;
-    }
-  }
-  return undefined;
 }
 
 export function resolveOutboundChannelPlugin(params: {
@@ -94,11 +76,7 @@ export function resolveOutboundChannelPlugin(params: {
   if (current) {
     return current;
   }
-  const directCurrent = resolveDirectFromActiveRegistry(normalized);
-  if (directCurrent) {
-    return directCurrent;
-  }
 
   maybeBootstrapChannelPlugin({ channel: normalized, cfg: params.cfg });
-  return resolve() ?? resolveDirectFromActiveRegistry(normalized);
+  return resolve();
 }
