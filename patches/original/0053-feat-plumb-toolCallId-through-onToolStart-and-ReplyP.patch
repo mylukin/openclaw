@@ -1,0 +1,77 @@
+From 36bc80d7b397cb1d3cc7711cea89dd749500a0fe Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 22:50:28 +0800
+Subject: [PATCH 53/98] feat: plumb toolCallId through onToolStart and
+ ReplyPayload
+
+---
+ src/agents/model-aware-runner.ts               | 1 +
+ src/auto-reply/reply/agent-runner-execution.ts | 5 ++++-
+ src/auto-reply/types.ts                        | 7 ++++++-
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/agents/model-aware-runner.ts b/src/agents/model-aware-runner.ts
+index 2276f516d5..b109b5afd0 100644
+--- a/src/agents/model-aware-runner.ts
++++ b/src/agents/model-aware-runner.ts
+@@ -96,6 +96,7 @@ export async function runModelAwareAgent(
+       if (payload.text || payload.isError) {
+         void params.onToolResult?.({
+           text: payload.text,
++          ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
+         });
+       }
+       emitAgentEvent(params.onAgentEvent, {
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index 4784b433ea..2c8d30a90a 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -415,6 +415,7 @@ export async function runAgentTurnWithFallback(params: {
+                       await params.opts?.onToolStart?.({
+                         name: payload.name,
+                         phase: "start",
++                        ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
+                       });
+                     });
+                   },
+@@ -583,9 +584,11 @@ export async function runAgentTurnWithFallback(params: {
+                   if (evt.stream === "tool") {
+                     const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
+                     const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
++                    const toolCallId =
++                      typeof evt.data.toolUseId === "string" ? evt.data.toolUseId : undefined;
+                     if (phase === "start" || phase === "update") {
+                       await params.typingSignals.signalToolStart();
+-                      await params.opts?.onToolStart?.({ name, phase });
++                      await params.opts?.onToolStart?.({ name, phase, toolCallId });
+                     }
+                   }
+                   // Track auto-compaction and notify higher layers.
+diff --git a/src/auto-reply/types.ts b/src/auto-reply/types.ts
+index 638dda42d8..d3fd42778d 100644
+--- a/src/auto-reply/types.ts
++++ b/src/auto-reply/types.ts
+@@ -54,7 +54,11 @@ export type GetReplyOptions = {
+   onBlockReply?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
+   onToolResult?: (payload: ReplyPayload) => Promise<void> | void;
+   /** Called when a tool phase starts/updates, before summary payloads are emitted. */
+-  onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
++  onToolStart?: (payload: {
++    name?: string;
++    phase?: string;
++    toolCallId?: string;
++  }) => Promise<void> | void;
+   /** Called when context auto-compaction starts (allows UX feedback during the pause). */
+   onCompactionStart?: () => Promise<void> | void;
+   /** Called when context auto-compaction completes. */
+@@ -75,6 +79,7 @@ export type GetReplyOptions = {
+ 
+ export type ReplyPayload = {
+   text?: string;
++  toolCallId?: string;
+   mediaUrl?: string;
+   mediaUrls?: string[];
+   interactive?: InteractiveReply;
+-- 
+2.50.1 (Apple Git-155)
+

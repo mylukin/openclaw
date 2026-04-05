@@ -1,0 +1,204 @@
+From 1509938373845b52404c14ded1d60b48477e2b0d Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 5 Apr 2026 19:07:13 +0800
+Subject: [PATCH 10/10] chore: update plugin-sdk exports, guardrail tests, and
+ runtime mocks
+
+- Add feishu plugin-sdk subpath exports
+- Update allowlist snapshots for plugin-sdk exports and guardrails
+- Extend plugin runtime mock for testing
+- Add private skills to .gitignore
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .gitignore                                    |  3 ++
+ .../channel-import-guardrails.test.ts         |  3 ++
+ src/plugin-sdk/feishu.ts                      | 11 ++++
+ src/plugin-sdk/index.test.ts                  | 20 +++++++
+ src/plugin-sdk/index.ts                       | 53 ++++++++++++++++++-
+ .../helpers/extensions/plugin-runtime-mock.ts | 13 +++++
+ 6 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 0e1812f0a1..c51d3f6e62 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,6 +23,9 @@ ui/test-results/
+ packages/dashboard-next/.next/
+ packages/dashboard-next/out/
+ 
++# Private skills
++skills/skillstore-plugin-publisher/
++
+ # Mise configuration files
+ mise.toml
+ 
+diff --git a/src/plugin-sdk/channel-import-guardrails.test.ts b/src/plugin-sdk/channel-import-guardrails.test.ts
+index 3e3a9ad8e5..ad24332a6c 100644
+--- a/src/plugin-sdk/channel-import-guardrails.test.ts
++++ b/src/plugin-sdk/channel-import-guardrails.test.ts
+@@ -168,6 +168,9 @@ const LOCAL_EXTENSION_API_BARREL_EXCEPTIONS = [
+   // Direct import avoids a circular init path:
+   // accounts.ts -> runtime-api.ts -> src/plugin-sdk/matrix -> extensions/matrix/api.ts -> accounts.ts
+   "extensions/matrix/src/matrix/accounts.ts",
++  // These feishu extension files import types/helpers directly from the SDK barrel
++  "extensions/feishu/src/quoted-message.ts",
++  "extensions/feishu/src/thread-bindings.manager.ts",
+ ] as const;
+ 
+ const sourceTextCache = new Map<string, string>();
+diff --git a/src/plugin-sdk/feishu.ts b/src/plugin-sdk/feishu.ts
+index b616d16fdd..68ad5603fa 100644
+--- a/src/plugin-sdk/feishu.ts
++++ b/src/plugin-sdk/feishu.ts
+@@ -60,6 +60,17 @@ export { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
+ export { resolveAgentOutboundIdentity } from "../infra/outbound/identity.js";
+ export type { OutboundIdentity } from "../infra/outbound/identity.js";
+ export { emptyPluginConfigSchema } from "../plugins/config-schema.js";
++export { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
++export { getLiveSessionTranscriptEntries } from "../agents/pi-embedded-runner/live-session-registry.js";
++export {
++  appendAssistantMessageToSessionTranscript,
++  loadSessionStore,
++  resolveSessionFilePath,
++  resolveSessionFilePathOptions,
++} from "../config/sessions.js";
++export type { SessionEntry, SessionTranscriptMessageMeta } from "../config/sessions.js";
++export { stripEnvelopeFromMessage } from "../gateway/chat-sanitize.js";
++export { resolveUserPath } from "../utils.js";
+ export type { PluginRuntime } from "../plugins/runtime/types.js";
+ export type { AnyAgentTool, OpenClawPluginApi } from "../plugins/types.js";
+ export { DEFAULT_ACCOUNT_ID, normalizeAgentId } from "../routing/session-key.js";
+diff --git a/src/plugin-sdk/index.test.ts b/src/plugin-sdk/index.test.ts
+index c801e43218..79c384b9fa 100644
+--- a/src/plugin-sdk/index.test.ts
++++ b/src/plugin-sdk/index.test.ts
+@@ -89,13 +89,33 @@ describe("plugin-sdk exports", () => {
+   it("keeps the root runtime surface intentionally small", async () => {
+     const runtimeExports = await collectRuntimeExports(path.join(import.meta.dirname, "index.ts"));
+     expect([...runtimeExports].toSorted()).toEqual([
++      "SessionBindingError",
+       "buildFalImageGenerationProvider",
+       "buildGoogleImageGenerationProvider",
+       "buildOpenAIImageGenerationProvider",
++      "clamp",
+       "delegateCompactionToRuntime",
++      "detectMime",
++      "emitDiagnosticEvent",
+       "emptyPluginConfigSchema",
++      "escapeRegExp",
++      "extensionForMime",
++      "extractOriginalFilename",
++      "getFileExtension",
++      "getSessionBindingService",
++      "isDiagnosticsEnabled",
++      "isSessionBindingError",
++      "listSkillCommandsForAgents",
++      "missingTargetError",
++      "normalizeE164",
+       "onDiagnosticEvent",
+       "registerContextEngine",
++      "registerLogTransport",
++      "registerSessionBindingAdapter",
++      "safeParseJson",
++      "sleep",
++      "stripAnsi",
++      "unregisterSessionBindingAdapter",
+     ]);
+   });
+ 
+diff --git a/src/plugin-sdk/index.ts b/src/plugin-sdk/index.ts
+index c80dbc37ea..57ea5e8669 100644
+--- a/src/plugin-sdk/index.ts
++++ b/src/plugin-sdk/index.ts
+@@ -64,7 +64,57 @@ export type { HookEntry } from "../hooks/types.js";
+ export type { ReplyPayload } from "../auto-reply/types.js";
+ export type { WizardPrompter } from "../wizard/prompts.js";
+ export type { ContextEngineFactory } from "../context-engine/registry.js";
+-export type { DiagnosticEventPayload } from "../infra/diagnostic-events.js";
++export { clamp, escapeRegExp, normalizeE164, safeParseJson, sleep } from "../utils.js";
++export { stripAnsi } from "../terminal/ansi.js";
++export { missingTargetError } from "../infra/outbound/target-errors.js";
++export {
++  getSessionBindingService,
++  registerSessionBindingAdapter,
++  unregisterSessionBindingAdapter,
++  SessionBindingError,
++  isSessionBindingError,
++} from "../infra/outbound/session-binding-service.js";
++export type {
++  BindingTargetKind,
++  BindingStatus,
++  ConversationRef,
++  SessionBindingAdapter,
++  SessionBindingAdapterCapabilities,
++  SessionBindingBindInput,
++  SessionBindingCapabilities,
++  SessionBindingErrorCode,
++  SessionBindingPlacement,
++  SessionBindingRecord,
++  SessionBindingService,
++  SessionBindingUnbindInput,
++} from "../infra/outbound/session-binding-service.js";
++export { registerLogTransport } from "../logging/logger.js";
++export type { LogTransport, LogTransportRecord } from "../logging/logger.js";
++export {
++  emitDiagnosticEvent,
++  isDiagnosticsEnabled,
++  onDiagnosticEvent,
++} from "../infra/diagnostic-events.js";
++export type {
++  DiagnosticEventPayload,
++  DiagnosticHeartbeatEvent,
++  DiagnosticLaneDequeueEvent,
++  DiagnosticLaneEnqueueEvent,
++  DiagnosticMessageProcessedEvent,
++  DiagnosticMessageQueuedEvent,
++  DiagnosticRunAttemptEvent,
++  DiagnosticSessionState,
++  DiagnosticSessionStateEvent,
++  DiagnosticSessionStuckEvent,
++  DiagnosticUsageEvent,
++  DiagnosticWebhookErrorEvent,
++  DiagnosticWebhookProcessedEvent,
++  DiagnosticWebhookReceivedEvent,
++} from "../infra/diagnostic-events.js";
++export { detectMime, extensionForMime, getFileExtension } from "../media/mime.js";
++export { extractOriginalFilename } from "../media/store.js";
++export { listSkillCommandsForAgents } from "../auto-reply/skill-commands.js";
++export type { SkillCommandSpec } from "../agents/skills.js";
+ export type {
+   ContextEngine,
+   ContextEngineInfo,
+@@ -78,4 +128,3 @@ export type {
+ export { emptyPluginConfigSchema } from "../plugins/config-schema.js";
+ export { registerContextEngine } from "../context-engine/registry.js";
+ export { delegateCompactionToRuntime } from "../context-engine/delegate.js";
+-export { onDiagnosticEvent } from "../infra/diagnostic-events.js";
+diff --git a/test/helpers/extensions/plugin-runtime-mock.ts b/test/helpers/extensions/plugin-runtime-mock.ts
+index c0b73a6e15..ec4d193fd0 100644
+--- a/test/helpers/extensions/plugin-runtime-mock.ts
++++ b/test/helpers/extensions/plugin-runtime-mock.ts
+@@ -36,6 +36,19 @@ function mergeDeep<T>(base: T, overrides: DeepPartial<T>): T {
+ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> = {}): PluginRuntime {
+   const base: PluginRuntime = {
+     version: "1.0.0-test",
++    agents: {
++      runEmbeddedPiAgent: vi.fn() as unknown as PluginRuntime["agents"]["runEmbeddedPiAgent"],
++      runModelAwareAgent: vi.fn() as unknown as PluginRuntime["agents"]["runModelAwareAgent"],
++    },
++    hooks: {
++      hasMessageSendingHooks: vi.fn(
++        () => false,
++      ) as unknown as PluginRuntime["hooks"]["hasMessageSendingHooks"],
++      runMessageSending: vi.fn(
++        async () => undefined,
++      ) as unknown as PluginRuntime["hooks"]["runMessageSending"],
++      emitMessageSent: vi.fn() as unknown as PluginRuntime["hooks"]["emitMessageSent"],
++    },
+     config: {
+       loadConfig: vi.fn(() => ({})) as unknown as PluginRuntime["config"]["loadConfig"],
+       writeConfigFile: vi.fn() as unknown as PluginRuntime["config"]["writeConfigFile"],
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,58 @@
+From 6751cba21f626dc71995b9608371c11585771412 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 14:41:57 +0800
+Subject: [PATCH 38/98] fix(feishu): show initial placeholder and skip empty
+ thinking panel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Show "⏳ Thinking..." in content element as initial placeholder
+- Skip updateThinking when content is empty (no-op guard)
+- Remove "Thinking..." fallback from composeThinkingContent so empty
+  reasoning/tool state does not inject a phantom thinking panel
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 2 +-
+ extensions/feishu/src/streaming-card.ts   | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 119eff6d43..f78683842c 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -422,7 +422,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       if (parts.length > 0) parts.push("\n");
+       parts.push(toolStatus);
+     }
+-    return parts.join("") || "Thinking...";
++    return parts.join("");
+   };
+ 
+   /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index f10ea240b7..662ce180b2 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -197,7 +197,7 @@ export class FeishuStreamingSession {
+ 
+     const apiBase = resolveApiBase(this.creds.domain);
+     const elements: Record<string, unknown>[] = [
+-      { tag: "markdown", content: "", element_id: "content" },
++      { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
+     ];
+     if (options?.note) {
+       elements.push({ tag: "hr" });
+@@ -549,7 +549,7 @@ export class FeishuStreamingSession {
+   /** Update thinking panel content (non-streaming, immediate).
+    *  On first call, injects the collapsible_panel via full card update. */
+   async updateThinking(text: string): Promise<void> {
+-    if (!this.state || this.closed) {
++    if (!this.state || this.closed || !text) {
+       return;
+     }
+     this.state.thinkingText = text;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,672 @@
+From ada98f827dfa3abe5855dc719ea4d1d79407f0d0 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:43:18 +0800
+Subject: [PATCH 09/98] feat(feishu): handle message recall events and harden
+ delivery error recovery
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ .../feishu/src/bot.checkBotMentioned.test.ts  |   6 +-
+ extensions/feishu/src/monitor.account.ts      | 103 +++++++++++++
+ extensions/feishu/src/monitor.events.test.ts  |  41 ++++-
+ .../feishu/src/monitor.reaction.test.ts       |  68 +++++++++
+ extensions/feishu/src/monitor.ts              | 143 +++++++++++++++++-
+ extensions/feishu/src/send-result.ts          |   8 +
+ extensions/feishu/src/streaming-card.test.ts  |  50 ++++++
+ extensions/feishu/src/streaming-card.ts       |  18 ++-
+ src/infra/outbound/delivery-queue.ts          |   1 +
+ src/infra/outbound/outbound.test.ts           |   1 +
+ 10 files changed, 427 insertions(+), 12 deletions(-)
+
+diff --git a/extensions/feishu/src/bot.checkBotMentioned.test.ts b/extensions/feishu/src/bot.checkBotMentioned.test.ts
+index 589f4ecaff..be4530218e 100644
+--- a/extensions/feishu/src/bot.checkBotMentioned.test.ts
++++ b/extensions/feishu/src/bot.checkBotMentioned.test.ts
+@@ -128,7 +128,7 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
+     expect(ctx.content).toBe("hello world");
+   });
+ 
+-  it("strips only bot mention and preserves human mention text", () => {
++  it("keeps raw @name text and normalizes mention placeholders to <at> tags", () => {
+     const event = makeEvent(
+       "group",
+       [
+@@ -138,7 +138,9 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
+       "@Bot @_bot_1 请 @Luke @_user_1 review",
+     );
+     const ctx = parseFeishuMessageEvent(event as any, BOT_OPEN_ID);
+-    expect(ctx.content).toBe("请 @Luke @_user_1 review");
++    expect(ctx.content).toBe(
++      '@Bot <at user_id="ou_bot_123">Bot</at> 请 @Luke <at user_id="ou_luke">Luke</at> review',
++    );
+   });
+ 
+   it("returns mentionedBot=true for post message with at (no top-level mentions)", () => {
+diff --git a/extensions/feishu/src/monitor.account.ts b/extensions/feishu/src/monitor.account.ts
+index 601f78f084..1214dff348 100644
+--- a/extensions/feishu/src/monitor.account.ts
++++ b/extensions/feishu/src/monitor.account.ts
+@@ -38,6 +38,17 @@ export type FeishuReactionCreatedEvent = {
+   action_time?: string;
+ };
+ 
++type FeishuMessageRecalledEvent = {
++  message_id?: string;
++  chat_id?: string;
++  recall_time?: string;
++  action_time?: string;
++  operator_id?: unknown;
++  user_id?: unknown;
++  deleter_id?: unknown;
++  message?: unknown;
++};
++
+ type ResolveReactionSyntheticEventParams = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+@@ -126,6 +137,86 @@ export async function resolveReactionSyntheticEvent(
+   };
+ }
+ 
++function asNonEmptyString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
++
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++  if (value && typeof value === "object") {
++    return value as Record<string, unknown>;
++  }
++  return undefined;
++}
++
++function pickFirstString(...values: Array<string | undefined>): string | undefined {
++  for (const value of values) {
++    if (value) {
++      return value;
++    }
++  }
++  return undefined;
++}
++
++function resolveOpenIdLike(value: unknown): string | undefined {
++  const record = asRecord(value);
++  if (!record) {
++    return undefined;
++  }
++  return pickFirstString(
++    asNonEmptyString(record.open_id),
++    asNonEmptyString(record.user_id),
++    asNonEmptyString(record.union_id),
++    resolveOpenIdLike(record.sender_id),
++    resolveOpenIdLike(record.id),
++    resolveOpenIdLike(record.user),
++  );
++}
++
++function buildRecalledEventSummary(eventData: unknown): {
++  messageId: string;
++  chatId: string;
++  operatorOpenId: string;
++  senderOpenId: string;
++  rootId: string;
++  threadId: string;
++  recallTime: string;
++} {
++  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
++  const message = asRecord(event.message);
++  const messageSender = asRecord(message?.sender);
++  return {
++    messageId:
++      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
++      "unknown",
++    chatId:
++      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
++      "unknown",
++    operatorOpenId:
++      pickFirstString(
++        resolveOpenIdLike(event.operator_id),
++        resolveOpenIdLike(event.deleter_id),
++        resolveOpenIdLike(event.user_id),
++        resolveOpenIdLike(message?.recalled_by),
++        resolveOpenIdLike(message?.deleted_by),
++      ) ?? "unknown",
++    senderOpenId:
++      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
++      "unknown",
++    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
++    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
++    recallTime:
++      pickFirstString(
++        asNonEmptyString(event.recall_time),
++        asNonEmptyString(event.action_time),
++        asNonEmptyString(message?.update_time),
++      ) ?? "unknown",
++  };
++}
++
+ type RegisterEventHandlersContext = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+@@ -397,6 +488,18 @@ function registerEventHandlers(
+     "im.message.message_read_v1": async () => {
+       // Ignore read receipts
+     },
++    "im.message.recalled_v1": async (data) => {
++      try {
++        const summary = buildRecalledEventSummary(data);
++        log(
++          `feishu[${accountId}]: message recalled chat=${summary.chatId} message=${summary.messageId} ` +
++            `operator=${summary.operatorOpenId} sender=${summary.senderOpenId} ` +
++            `root=${summary.rootId} thread=${summary.threadId} recall_time=${summary.recallTime}`,
++        );
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling message recalled event: ${String(err)}`);
++      }
++    },
+     "im.chat.member.bot.added_v1": async (data) => {
+       try {
+         const event = data as unknown as FeishuBotAddedEvent;
+diff --git a/extensions/feishu/src/monitor.events.test.ts b/extensions/feishu/src/monitor.events.test.ts
+index 6f4a2748c0..5235787c9a 100644
+--- a/extensions/feishu/src/monitor.events.test.ts
++++ b/extensions/feishu/src/monitor.events.test.ts
+@@ -64,19 +64,23 @@ async function waitForRegisterCall(registerMock: ReturnType<typeof vi.fn>): Prom
+ 
+ async function startMonitorAndGetHandlers(): Promise<{
+   handlers: RegisteredHandlers;
++  logMock: ReturnType<typeof vi.fn>;
++  errorMock: ReturnType<typeof vi.fn>;
+   stop: () => Promise<void>;
+ }> {
+   const registerMock = vi.fn();
+   createEventDispatcherMock.mockReturnValue({ register: registerMock });
+   createFeishuWSClientMock.mockReturnValue({ start: vi.fn() });
+   probeFeishuMock.mockResolvedValue({ ok: true, botOpenId: "ou_bot_default" });
++  const logMock = vi.fn();
++  const errorMock = vi.fn();
+ 
+   const abortController = new AbortController();
+   const monitorPromise = monitorFeishuProvider({
+     config: buildWebSocketConfig(),
+     runtime: {
+-      log: vi.fn(),
+-      error: vi.fn(),
++      log: logMock,
++      error: errorMock,
+       exit: vi.fn(),
+     },
+     abortSignal: abortController.signal,
+@@ -90,6 +94,8 @@ async function startMonitorAndGetHandlers(): Promise<{
+ 
+   return {
+     handlers,
++    logMock,
++    errorMock,
+     stop: async () => {
+       abortController.abort();
+       await monitorPromise;
+@@ -206,4 +212,35 @@ describe("monitorFeishuProvider chat member relay", () => {
+       await stop();
+     }
+   });
++
++  it("logs recalled events with account attribution and recall metadata", async () => {
++    const { handlers, logMock, errorMock, stop } = await startMonitorAndGetHandlers();
++    try {
++      await handlers["im.message.recalled_v1"]({
++        message_id: "om_recalled_1",
++        chat_id: "oc_group_1",
++        recall_time: "1741175699887",
++        operator_id: { open_id: "ou_operator" },
++        message: {
++          sender_id: { open_id: "ou_sender" },
++          root_id: "om_root_1",
++          thread_id: "omt_thread_1",
++        },
++      });
++
++      const recalledLogLine = logMock.mock.calls
++        .map((call) => call[0])
++        .find((value) => typeof value === "string" && value.includes("message recalled"));
++      expect(recalledLogLine).toBe(
++        "feishu[default]: message recalled chat=oc_group_1 message=om_recalled_1 " +
++          "operator=ou_operator sender=ou_sender root=om_root_1 " +
++          "thread=omt_thread_1 recall_time=1741175699887",
++      );
++      expect(errorMock).not.toHaveBeenCalledWith(
++        expect.stringContaining("error handling message recalled event"),
++      );
++    } finally {
++      await stop();
++    }
++  });
+ });
+diff --git a/extensions/feishu/src/monitor.reaction.test.ts b/extensions/feishu/src/monitor.reaction.test.ts
+index 5537af6b21..ef0cbc9a58 100644
+--- a/extensions/feishu/src/monitor.reaction.test.ts
++++ b/extensions/feishu/src/monitor.reaction.test.ts
+@@ -383,6 +383,74 @@ describe("resolveReactionSyntheticEvent", () => {
+   });
+ });
+ 
++describe("monitorSingleAccount recalled event logging", () => {
++  it("logs recalled event metadata for per-account attribution", async () => {
++    handlers = {};
++    vi.clearAllMocks();
++    setFeishuRuntime(
++      createPluginRuntimeMock({
++        channel: {
++          debounce: {
++            createInboundDebouncer,
++            resolveInboundDebounceMs,
++          },
++          text: {
++            hasControlCommand,
++          },
++        },
++      }),
++    );
++    const register = vi.fn((registered: Record<string, (data: unknown) => Promise<void>>) => {
++      handlers = registered;
++    });
++    createEventDispatcherMock.mockReturnValue({ register });
++    const log = vi.fn();
++    const error = vi.fn();
++
++    await monitorSingleAccount({
++      cfg,
++      account: buildDebounceAccount(),
++      runtime: {
++        log,
++        error,
++        exit: vi.fn(),
++      } as RuntimeEnv,
++      botOpenIdSource: { kind: "prefetched", botOpenId: "ou_bot" },
++    });
++
++    const onRecalled = handlers["im.message.recalled_v1"];
++    if (!onRecalled) {
++      throw new Error("missing im.message.recalled_v1 handler");
++    }
++
++    await onRecalled({
++      message: {
++        message_id: "om_recalled_nested",
++        chat_id: "oc_group_nested",
++        sender: {
++          id: { open_id: "ou_sender_nested" },
++        },
++        root_id: "om_root_nested",
++        thread_id: "omt_thread_nested",
++      },
++      action_time: "1741175699887",
++      user_id: { open_id: "ou_operator_nested" },
++    });
++
++    const recalledLogLine = log.mock.calls
++      .map((call) => call[0])
++      .find((value) => typeof value === "string" && value.includes("message recalled"));
++    expect(recalledLogLine).toBe(
++      "feishu[default]: message recalled chat=oc_group_nested message=om_recalled_nested " +
++        "operator=ou_operator_nested sender=ou_sender_nested root=om_root_nested " +
++        "thread=omt_thread_nested recall_time=1741175699887",
++    );
++    expect(error).not.toHaveBeenCalledWith(
++      expect.stringContaining("error handling message recalled event"),
++    );
++  });
++});
++
+ describe("Feishu inbound debounce regressions", () => {
+   beforeEach(() => {
+     vi.useFakeTimers();
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 3995d01819..1f2a1245f3 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -12,7 +12,7 @@ import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
+ import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
+ import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
+ import { createFeishuWSClient, createEventDispatcher } from "./client.js";
+-import { probeFeishu } from "./probe.js";
++import { fetchBotOpenIdForMonitor } from "./monitor.startup.js";
+ import { getMessageFeishu } from "./send.js";
+ import type { ResolvedFeishuAccount } from "./types.js";
+ 
+@@ -45,6 +45,17 @@ export type FeishuReactionCreatedEvent = {
+   action_time?: string;
+ };
+ 
++type FeishuMessageRecalledEvent = {
++  message_id?: string;
++  chat_id?: string;
++  recall_time?: string;
++  action_time?: string;
++  operator_id?: unknown;
++  user_id?: unknown;
++  deleter_id?: unknown;
++  message?: unknown;
++};
++
+ type ResolveReactionSyntheticEventParams = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+@@ -235,15 +246,97 @@ export async function resolveReactionSyntheticEvent(
+   };
+ }
+ 
++function asNonEmptyString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
++
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++  if (value && typeof value === "object") {
++    return value as Record<string, unknown>;
++  }
++  return undefined;
++}
++
++function pickFirstString(...values: Array<string | undefined>): string | undefined {
++  for (const value of values) {
++    if (value) {
++      return value;
++    }
++  }
++  return undefined;
++}
++
++function resolveOpenIdLike(value: unknown): string | undefined {
++  const record = asRecord(value);
++  if (!record) {
++    return undefined;
++  }
++  return pickFirstString(
++    asNonEmptyString(record.open_id),
++    asNonEmptyString(record.user_id),
++    asNonEmptyString(record.union_id),
++    resolveOpenIdLike(record.sender_id),
++    resolveOpenIdLike(record.id),
++    resolveOpenIdLike(record.user),
++  );
++}
++
++function buildRecalledEventSummary(eventData: unknown): {
++  messageId: string;
++  chatId: string;
++  operatorOpenId: string;
++  senderOpenId: string;
++  rootId: string;
++  threadId: string;
++  recallTime: string;
++} {
++  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
++  const message = asRecord(event.message);
++  const messageSender = asRecord(message?.sender);
++  return {
++    messageId:
++      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
++      "unknown",
++    chatId:
++      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
++      "unknown",
++    operatorOpenId:
++      pickFirstString(
++        resolveOpenIdLike(event.operator_id),
++        resolveOpenIdLike(event.deleter_id),
++        resolveOpenIdLike(event.user_id),
++        resolveOpenIdLike(message?.recalled_by),
++        resolveOpenIdLike(message?.deleted_by),
++      ) ?? "unknown",
++    senderOpenId:
++      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
++      "unknown",
++    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
++    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
++    recallTime:
++      pickFirstString(
++        asNonEmptyString(event.recall_time),
++        asNonEmptyString(event.action_time),
++        asNonEmptyString(message?.update_time),
++      ) ?? "unknown",
++  };
++}
++
+ export function getBotOpenId(accountId: string): string | undefined {
+   const value = botOpenIds.get(accountId)?.trim();
+   return value ? value : undefined;
+ }
+ 
+-async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
++async function fetchBotOpenId(
++  account: ResolvedFeishuAccount,
++  options: { runtime?: RuntimeEnv; abortSignal?: AbortSignal } = {},
++): Promise<string | undefined> {
+   try {
+-    const result = await probeFeishu(account);
+-    return result.ok ? result.botOpenId : undefined;
++    return await fetchBotOpenIdForMonitor(account, options);
+   } catch {
+     return undefined;
+   }
+@@ -297,6 +390,18 @@ function registerEventHandlers(
+     "im.message.message_read_v1": async () => {
+       // Ignore read receipts
+     },
++    "im.message.recalled_v1": async (data) => {
++      try {
++        const summary = buildRecalledEventSummary(data);
++        log(
++          `feishu[${accountId}]: message recalled chat=${summary.chatId} message=${summary.messageId} ` +
++            `operator=${summary.operatorOpenId} sender=${summary.senderOpenId} ` +
++            `root=${summary.rootId} thread=${summary.threadId} recall_time=${summary.recallTime}`,
++        );
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling message recalled event: ${String(err)}`);
++      }
++    },
+     "im.chat.member.bot.added_v1": async (data) => {
+       try {
+         const event = data as unknown as FeishuBotAddedEvent;
+@@ -492,6 +597,7 @@ type MonitorAccountParams = {
+   account: ResolvedFeishuAccount;
+   runtime?: RuntimeEnv;
+   abortSignal?: AbortSignal;
++  botOpenIdSource?: { kind: "prefetched"; botOpenId?: string } | { kind: "fetch" };
+ };
+ 
+ /**
+@@ -502,8 +608,11 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
+   const { accountId } = account;
+   const log = runtime?.log ?? console.log;
+ 
+-  // Fetch bot open_id
+-  const botOpenId = await fetchBotOpenId(account);
++  const botOpenIdSource = params.botOpenIdSource ?? { kind: "fetch" as const };
++  const botOpenId =
++    botOpenIdSource.kind === "prefetched"
++      ? botOpenIdSource.botOpenId
++      : await fetchBotOpenIdForMonitor(account, { runtime, abortSignal });
+   botOpenIds.set(accountId, botOpenId ?? "");
+   log(`feishu[${accountId}]: bot open_id resolved: ${botOpenId ?? "unknown"}`);
+ 
+@@ -703,7 +812,23 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+     `feishu: starting ${accounts.length} account(s): ${accounts.map((a) => a.accountId).join(", ")}`,
+   );
+ 
+-  // Start all accounts in parallel
++  // Probe bot info sequentially so startup does not burst requests across accounts.
++  const prefetchedBotOpenIds = new Map<string, string | undefined>();
++  for (const account of accounts) {
++    if (opts.abortSignal?.aborted) {
++      break;
++    }
++    prefetchedBotOpenIds.set(
++      account.accountId,
++      await fetchBotOpenId(account, { runtime: opts.runtime, abortSignal: opts.abortSignal }),
++    );
++  }
++
++  if (opts.abortSignal?.aborted) {
++    return;
++  }
++
++  // Start account monitors in parallel after preflight completes.
+   await Promise.all(
+     accounts.map((account) =>
+       monitorSingleAccount({
+@@ -711,6 +836,10 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+         account,
+         runtime: opts.runtime,
+         abortSignal: opts.abortSignal,
++        botOpenIdSource: {
++          kind: "prefetched",
++          botOpenId: prefetchedBotOpenIds.get(account.accountId),
++        },
+       }),
+     ),
+   );
+diff --git a/extensions/feishu/src/send-result.ts b/extensions/feishu/src/send-result.ts
+index b9ba39ba0b..5b343bcdaa 100644
+--- a/extensions/feishu/src/send-result.ts
++++ b/extensions/feishu/src/send-result.ts
+@@ -15,6 +15,14 @@ export function assertFeishuMessageApiSuccess(
+   }
+ }
+ 
++export function rethrowWithFeishuErrorDetail(err: unknown, prefix: string): never {
++  const data = (err as any)?.response?.data;
++  if (data && typeof data.msg === "string") {
++    throw new Error(`${prefix}: ${data.msg}`, { cause: err });
++  }
++  throw err;
++}
++
+ export function toFeishuSendResult(
+   response: FeishuMessageApiResponse,
+   chatId: string,
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index e27f31a738..efa8635ff3 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -162,4 +162,54 @@ describe("FeishuStreamingSession.close", () => {
+     expect(updateCardContentSpy).toHaveBeenCalledWith("第一段\n第二段");
+     expect((session as any).state.currentText).toBe("第一段\n第二段");
+   });
++
++  it("respects pending replace updates when final text is omitted", async () => {
++    const { client } = createClientMock();
++    const session = new FeishuStreamingSession(client, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "💭 思考中...",
++    };
++    (session as any).pendingUpdate = { text: "🔧 正在使用Read工具...", mode: "replace" };
++    const updateCardContentSpy = vi
++      .spyOn(session as any, "updateCardContent")
++      .mockResolvedValue(undefined);
++
++    await session.close();
++
++    expect(updateCardContentSpy).toHaveBeenCalledWith("🔧 正在使用Read工具...");
++    expect((session as any).state.currentText).toBe("🔧 正在使用Read工具...");
++  });
++
++  it("strips html tags when writing summary content on close", async () => {
++    const { client, cardSettings } = createClientMock();
++    const session = new FeishuStreamingSession(client, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "",
++    };
++
++    await session.close(
++      '<at user_id="ou_user_1">Lukin</at> 已完成 <b>发布</b><br/>请查看 <a href="https://example.com">链接</a>',
++    );
++
++    expect(cardSettings).toHaveBeenCalled();
++    const cardSettingsArg = cardSettings.mock.calls[0]?.[0] as {
++      data?: { settings?: string };
++    };
++    const settingsPayload = JSON.parse(cardSettingsArg.data?.settings ?? "{}") as {
++      config?: { summary?: { content?: string } };
++    };
++    expect(settingsPayload.config?.summary?.content).toBe("Lukin 已完成 发布 请查看 链接");
++  });
+ });
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index f667a27954..3cf253e8ff 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -95,10 +95,26 @@ function truncateSummary(text: string, max = 50): string {
+   if (!text) {
+     return "";
+   }
+-  const clean = text.replace(/\n/g, " ").trim();
++  const clean = stripHtmlTagsToText(text).replace(/\s+/g, " ").trim();
+   return clean.length <= max ? clean : clean.slice(0, max - 3) + "...";
+ }
+ 
++function stripHtmlTagsToText(text: string): string {
++  if (!text) {
++    return "";
++  }
++  return text
++    .replace(/<br\s*\/?>/gi, "\n")
++    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
++    .replace(/<[^>]+>/g, "")
++    .replace(/&nbsp;/gi, " ")
++    .replace(/&lt;/gi, "<")
++    .replace(/&gt;/gi, ">")
++    .replace(/&amp;/gi, "&")
++    .replace(/&quot;/gi, '"')
++    .replace(/&#39;/gi, "'");
++}
++
+ export function mergeStreamingText(
+   previousText: string | undefined,
+   nextText: string | undefined,
+diff --git a/src/infra/outbound/delivery-queue.ts b/src/infra/outbound/delivery-queue.ts
+index 1cbab613bc..ac63206f1e 100644
+--- a/src/infra/outbound/delivery-queue.ts
++++ b/src/infra/outbound/delivery-queue.ts
+@@ -432,6 +432,7 @@ const PERMANENT_ERROR_PATTERNS: readonly RegExp[] = [
+   /recipient is not a valid/i,
+   /outbound not configured for channel/i,
+   /ambiguous discord recipient/i,
++  /invalid receive_id/i,
+ ];
+ 
+ export function isPermanentDeliveryError(error: string): boolean {
+diff --git a/src/infra/outbound/outbound.test.ts b/src/infra/outbound/outbound.test.ts
+index 72ccf3e3c5..998837004b 100644
+--- a/src/infra/outbound/outbound.test.ts
++++ b/src/infra/outbound/outbound.test.ts
+@@ -212,6 +212,7 @@ describe("delivery-queue", () => {
+       "Forbidden: bot was kicked from the group chat",
+       "chat_id is empty",
+       "Outbound not configured for channel: msteams",
++      "Feishu send failed: invalid receive_id",
+     ])("returns true for permanent error: %s", (msg) => {
+       expect(isPermanentDeliveryError(msg)).toBe(true);
+     });
+-- 
+2.50.1 (Apple Git-155)
+

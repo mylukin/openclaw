@@ -1,0 +1,98 @@
+From 9fd009b110b8726e9c248f6b78239a8b6ce765e1 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 09:42:03 +0800
+Subject: [PATCH 59/98] fix(feishu): treat final streaming card text as
+ authoritative
+
+---
+ extensions/feishu/src/streaming-card.test.ts | 40 ++++++++++++++++----
+ extensions/feishu/src/streaming-card.ts      |  6 ++-
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index e681550842..a997f5229b 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -330,14 +330,9 @@ describe("FeishuStreamingSession.close", () => {
+       .spyOn(session as any, "updateCardContent")
+       .mockResolvedValue(true);
+ 
+-    // close("") — empty string is falsy so text stays as pendingMerged.
+-    // pendingMerged = mergeStreamingText("💭 思考中...", "💭 思考中...") = "💭 思考中..."
+-    // text equals currentText, so no content update fires.
+     await session.close("");
+ 
+-    // The content was not changed (empty string is falsy in the ternary),
+-    // so updateCardContent is not called for content — only the settings call fires.
+-    expect(updateCardContentSpy).not.toHaveBeenCalled();
++    expect(updateCardContentSpy).toHaveBeenCalledWith("");
+   });
+ 
+   it("treats explicit non-empty final text as authoritative", async () => {
+@@ -372,6 +367,36 @@ describe("FeishuStreamingSession.close", () => {
+     expect(calledText).toContain("又确认了一遍");
+   });
+ 
++  it("replaces stale streamed preview text instead of merging it into explicit final text", async () => {
++    const { client } = createClientMock();
++    const session = new FeishuStreamingSession(client, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "💭 思考中...\n\n原因就一个：\n- working tree clean",
++      hasNote: false,
++      noteText: "",
++      thinkingTitle: "💭 Thinking",
++      thinkingText: "",
++      thinkingExpanded: true,
++      thinkingPanelRendered: false,
++    };
++    (session as any).lastStreamingModeRenewAt = Date.now();
++    const updateCardContentSpy = vi
++      .spyOn(session as any, "updateCardContent")
++      .mockResolvedValue(true);
++
++    await session.close("能 review。\n\n原因就一个：\n- working tree clean");
++
++    expect(updateCardContentSpy).toHaveBeenCalledWith(
++      "能 review。\n\n原因就一个：\n- working tree clean",
++    );
++  });
++
+   it("keeps pending merge behavior when final text is omitted", async () => {
+     const { client } = createClientMock();
+     const session = new FeishuStreamingSession(client, {
+@@ -475,8 +500,7 @@ describe("FeishuStreamingSession.close", () => {
+       body?: { elements?: Array<{ content?: string }> };
+       header?: { title?: { content?: string } };
+     };
+-    // mergeStreamingText("旧内容", "最终内容") concatenates (no overlap)
+-    expect(cardJson.body?.elements?.[0]?.content).toBe("旧内容最终内容");
++    expect(cardJson.body?.elements?.[0]?.content).toBe("最终内容");
+     expect(cardJson.header?.title?.content).toBe("Test");
+   });
+ 
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 5635b3e723..0ae1cfa951 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -571,7 +571,11 @@ export class FeishuStreamingSession {
+     await this.queue;
+ 
+     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
+-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
++    // `finalText` is a full final snapshot from the caller, not a delta. When
++    // present, treat it as authoritative instead of merging it with the last
++    // streamed preview, otherwise stale status/preview text can be duplicated
++    // into the terminal card content.
++    const text = finalText !== undefined ? finalText : pendingMerged;
+ 
+     // Ensure thinking panel is collapsed in the final card
+     this.state.thinkingExpanded = false;
+-- 
+2.50.1 (Apple Git-155)
+

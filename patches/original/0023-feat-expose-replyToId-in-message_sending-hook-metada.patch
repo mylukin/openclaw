@@ -1,0 +1,29 @@
+From 293334e4687f2f614ff6139ca2e953e1d37f5b36 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 11 Mar 2026 13:07:14 +0800
+Subject: [PATCH 23/98] feat: expose replyToId in message_sending hook metadata
+
+Plugins that intercept messages before delivery now receive the
+feishu/channel message ID being replied to via metadata.replyToId,
+enabling automatic mention injection and other reply-aware transforms.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ src/infra/outbound/deliver.ts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index 0f4138ce8f..f8eb24a68c 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -517,6 +517,7 @@ async function applyMessageSendingHook(params: {
+           channel: params.channel,
+           accountId: params.accountId,
+           mediaUrls: params.payloadSummary.mediaUrls,
++          replyToId: params.payload.replyToId,
+         },
+       },
+       {
+-- 
+2.50.1 (Apple Git-155)
+

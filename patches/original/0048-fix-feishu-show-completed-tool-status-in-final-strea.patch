@@ -1,0 +1,93 @@
+From 03e2e59e79980e68ab9360bbf94dd0ec815cb148 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 19:29:13 +0800
+Subject: [PATCH 48/98] fix(feishu): show completed tool status in final
+ streaming card
+
+The thinking panel was displaying in-progress status ("Using X...") in
+the final card after streaming closed. Switch to completed status
+("Used N tools") on close and use English for all tool status strings.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 41 ++++++++++++++---------
+ 1 file changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 2f6c1cc7be..20bfe49ba2 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -386,10 +386,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   };
+ 
+   const TOOL_DISPLAY_NAMES: Record<string, string> = {
+-    feishu_chat_history: "聊天记录",
+-    feishu_chat_info: "群信息",
+-    feishu_chat_members: "群成员",
+-    feishu_member_chats: "成员群列表",
++    feishu_chat_history: "Chat History",
++    feishu_chat_info: "Chat Info",
++    feishu_chat_members: "Chat Members",
++    feishu_member_chats: "Member Chats",
+   };
+ 
+   const normalizeToolName = (name: string | undefined): string | undefined => {
+@@ -401,8 +401,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
+   };
+ 
+-  /** Build the full thinking panel content from reasoning text and tool status. */
+-  const composeThinkingContent = (): string => {
++  /** Build the full thinking panel content from reasoning text and tool status.
++   *  When `final` is true, show completed status instead of in-progress status
++   *  so the closed card doesn't perpetually display "Using...". */
++  const composeThinkingContent = (options?: { final?: boolean }): string => {
+     const parts: string[] = [];
+     if (reasoningText) {
+       const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
+@@ -410,17 +412,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       parts.push(plain);
+     }
+     if (toolUseCount > 0) {
+-      const toolName = lastToolName?.trim();
+-      let toolStatus: string;
+-      if (toolUseCount === 1) {
+-        toolStatus = toolName ? `🔧 正在使用${toolName}...` : "🔧 正在使用工具...";
++      if (options?.final) {
++        // Completed status for the final card
++        if (parts.length > 0) parts.push("\n");
++        const plural = toolUseCount === 1 ? "tool" : "tools";
++        parts.push(`🔧 Used ${toolUseCount} ${plural}`);
+       } else {
+-        toolStatus = toolName
+-          ? `🔧 正在使用${toolName}...（已使用 ${toolUseCount} 个工具）`
+-          : `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
++        const toolName = lastToolName?.trim();
++        let toolStatus: string;
++        if (toolUseCount === 1) {
++          toolStatus = toolName ? `🔧 Using ${toolName}...` : "🔧 Using tool...";
++        } else {
++          toolStatus = toolName
++            ? `🔧 Using ${toolName}... (${toolUseCount} tools used)`
++            : `🔧 ${toolUseCount} tools used, processing...`;
++        }
++        if (parts.length > 0) parts.push("\n");
++        parts.push(toolStatus);
+       }
+-      if (parts.length > 0) parts.push("\n");
+-      parts.push(toolStatus);
+     }
+     return parts.join("");
+   };
+@@ -573,7 +582,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     const streamMessageId = streaming?.getMessageId();
+     if (streaming?.isActive()) {
+       const finalText = streamText;
+-      const finalThinking = composeThinkingContent();
++      const finalThinking = composeThinkingContent({ final: true });
+       if (!finalText.trim() && !finalThinking) {
+         // No visible content and no thinking — discard the card entirely
+         // to avoid leaving a stale "⏳ Thinking..." placeholder.
+-- 
+2.50.1 (Apple Git-155)
+

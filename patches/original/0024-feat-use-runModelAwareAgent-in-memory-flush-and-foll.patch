@@ -1,0 +1,117 @@
+From 6a3bf6985ede52280e7081207189bbac10af42ac Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 18 Mar 2026 01:17:13 +0800
+Subject: [PATCH 24/98] feat: use runModelAwareAgent in memory flush and
+ followup runner
+
+---
+ src/agents/cli-backends.ts                               | 9 ++++++++-
+ src/auto-reply/reply/agent-runner-memory.ts              | 4 ++--
+ src/auto-reply/reply/followup-runner.ts                  | 6 +++---
+ .../reply/get-reply.reset-hooks-fallback.test.ts         | 1 -
+ src/config/sessions/transcript.ts                        | 1 -
+ 5 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/agents/cli-backends.ts b/src/agents/cli-backends.ts
+index f4fee2207c..94f87e9910 100644
+--- a/src/agents/cli-backends.ts
++++ b/src/agents/cli-backends.ts
+@@ -39,7 +39,14 @@ const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
+ 
+ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
+   command: "claude",
+-  args: ["-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "bypassPermissions"],
++  args: [
++    "-p",
++    "--verbose",
++    "--output-format",
++    "stream-json",
++    "--permission-mode",
++    "bypassPermissions",
++  ],
+   resumeArgs: [
+     "-p",
+     "--verbose",
+diff --git a/src/auto-reply/reply/agent-runner-memory.ts b/src/auto-reply/reply/agent-runner-memory.ts
+index 623bb9c149..c85b9a8d05 100644
+--- a/src/auto-reply/reply/agent-runner-memory.ts
++++ b/src/auto-reply/reply/agent-runner-memory.ts
+@@ -3,9 +3,9 @@ import fs from "node:fs";
+ import type { AgentMessage } from "@mariozechner/pi-agent-core";
+ import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
+ import { estimateMessagesTokens } from "../../agents/compaction.js";
++import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
+ import { runWithModelFallback } from "../../agents/model-fallback.js";
+ import { isCliProvider } from "../../agents/model-selection.js";
+-import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+ import { resolveSandboxConfigForAgent, resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
+ import {
+   derivePromptTokens,
+@@ -496,7 +496,7 @@ export async function runMemoryFlushIfNeeded(params: {
+           authProfile,
+           allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
+         });
+-        const result = await runEmbeddedPiAgent({
++        const result = await runModelAwareAgent({
+           ...embeddedContext,
+           ...senderContext,
+           ...runBaseParams,
+diff --git a/src/auto-reply/reply/followup-runner.ts b/src/auto-reply/reply/followup-runner.ts
+index 8c7eccb5f0..a5f3688c58 100644
+--- a/src/auto-reply/reply/followup-runner.ts
++++ b/src/auto-reply/reply/followup-runner.ts
+@@ -3,8 +3,8 @@ import { resolveRunModelFallbacksOverride } from "../../agents/agent-scope.js";
+ import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
+ import { lookupContextTokens } from "../../agents/context.js";
+ import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
++import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
+ import { runWithModelFallback } from "../../agents/model-fallback.js";
+-import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+ import type { SessionEntry } from "../../config/sessions.js";
+ import type { TypingMode } from "../../config/types.js";
+ import { logVerbose } from "../../globals.js";
+@@ -146,7 +146,7 @@ export function createFollowupRunner(params: {
+         });
+       }
+       let autoCompactionCompleted = false;
+-      let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
++      let runResult: Awaited<ReturnType<typeof runModelAwareAgent>>;
+       let fallbackProvider = queued.run.provider;
+       let fallbackModel = queued.run.model;
+       const activeSessionEntry =
+@@ -168,7 +168,7 @@ export function createFollowupRunner(params: {
+           }),
+           run: async (provider, model, runOptions) => {
+             const authProfile = resolveRunAuthProfile(queued.run, provider);
+-            const result = await runEmbeddedPiAgent({
++            const result = await runModelAwareAgent({
+               sessionId: queued.run.sessionId,
+               sessionKey: queued.run.sessionKey,
+               agentId: queued.run.agentId,
+diff --git a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+index 740432d57b..afd6a36982 100644
+--- a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
++++ b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+@@ -11,7 +11,6 @@ const mocks = vi.hoisted(() => ({
+ 
+ registerGetReplyCommonMocks();
+ 
+-
+ vi.mock("../../link-understanding/apply.js", () => ({
+   applyLinkUnderstanding: vi.fn(async () => undefined),
+ }));
+diff --git a/src/config/sessions/transcript.ts b/src/config/sessions/transcript.ts
+index 3b1c648b6f..f81c57a0a5 100644
+--- a/src/config/sessions/transcript.ts
++++ b/src/config/sessions/transcript.ts
+@@ -265,7 +265,6 @@ export async function appendCliTurnToSessionTranscript(params: {
+   return { ok: true };
+ }
+ 
+-
+ export async function appendAssistantMessageToSessionTranscript(params: {
+   agentId?: string;
+   sessionKey: string;
+-- 
+2.50.1 (Apple Git-155)
+

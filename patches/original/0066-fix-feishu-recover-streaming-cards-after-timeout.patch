@@ -1,0 +1,318 @@
+From 6629b60b3dbd9acbca2d2bb1b603ff76b324a579 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Thu, 26 Mar 2026 06:33:09 +0800
+Subject: [PATCH 66/98] fix(feishu): recover streaming cards after timeout
+
+---
+ extensions/feishu/src/streaming-card.test.ts |  87 +++++++++++
+ extensions/feishu/src/streaming-card.ts      | 151 ++++++++++++++-----
+ 2 files changed, 202 insertions(+), 36 deletions(-)
+
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index 948020ed80..43ac494108 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -271,6 +271,50 @@ describe("FeishuStreamingSession.update", () => {
+     expect(updateElementSpy).toHaveBeenCalledTimes(2);
+     expect((session as any).state.thinkingText).toBe("new");
+   });
++
++  it("reopens streaming mode and retries once when text streaming times out", async () => {
++    const { client, cardElementContent, cardSettings } = createClientMock();
++    const session = new FeishuStreamingSession(client, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 2,
++      currentText: "answer",
++      hasNote: false,
++      noteText: "",
++      thinkingTitle: "💭 Thinking",
++      thinkingText: "",
++      thinkingExpanded: true,
++      thinkingPanelRendered: false,
++    };
++    (session as any).lastStreamingModeRenewAt = Date.now();
++    cardElementContent
++      .mockResolvedValueOnce({ code: 200850, msg: "Card streaming timeout" })
++      .mockResolvedValueOnce({ code: 0, msg: "ok" });
++
++    const ok = await (session as any).updateElementContent("content", "updated", vi.fn());
++
++    expect(ok).toBe(true);
++    expect(cardSettings).toHaveBeenCalledOnce();
++    expect(cardElementContent).toHaveBeenCalledTimes(2);
++    const reopenArg = cardSettings.mock.calls[0]?.[0] as {
++      data?: { settings?: string; sequence?: number };
++    };
++    const reopenSettings = JSON.parse(reopenArg.data?.settings ?? "{}") as {
++      config?: { streaming_mode?: boolean };
++    };
++    expect(reopenSettings.config?.streaming_mode).toBe(true);
++    expect(reopenArg.data?.sequence).toBe(3);
++    const retryCalls = cardElementContent.mock.calls as unknown as Array<[unknown]>;
++    const retryArg = retryCalls[1]?.[0] as unknown as {
++      data?: { sequence?: number };
++    };
++    expect(retryArg.data?.sequence).toBe(4);
++    expect((session as any).state.sequence).toBe(4);
++  });
+ });
+ 
+ describe("FeishuStreamingSession.discard", () => {
+@@ -791,4 +835,47 @@ describe("FeishuStreamingSession.renewStreamingMode", () => {
+     (session as any).stopRenewTimer();
+     vi.useRealTimers();
+   });
++
++  it("serializes proactive renewal behind in-flight content updates", async () => {
++    let resolveContentUpdate = () => {};
++    const contentUpdateSettled = new Promise<void>((resolve) => {
++      resolveContentUpdate = () => resolve();
++    });
++    const { client, cardElementContent, cardSettings } = createClientMock();
++    cardElementContent.mockImplementationOnce(
++      async () =>
++        await contentUpdateSettled.then(() => ({
++          code: 0,
++          msg: "ok",
++        })),
++    );
++    const session = makeSession(client);
++    (session as any).lastStreamingModeRenewAt = Date.now();
++
++    const updatePromise = session.update("new text", { replace: true });
++    await Promise.resolve();
++
++    (session as any).lastStreamingModeRenewAt = 0;
++    (session as any).scheduleRenewStreamingMode();
++
++    await Promise.resolve();
++    expect(cardSettings).not.toHaveBeenCalled();
++
++    resolveContentUpdate();
++    await updatePromise;
++    await (session as any).queue;
++
++    expect(cardElementContent).toHaveBeenCalledOnce();
++    expect(cardSettings).toHaveBeenCalledOnce();
++    const contentCalls = cardElementContent.mock.calls as unknown as Array<[unknown]>;
++    const contentArg = contentCalls[0]?.[0] as unknown as {
++      data?: { sequence?: number };
++    };
++    const renewArg = cardSettings.mock.calls[0]?.[0] as {
++      data?: { sequence?: number };
++    };
++    expect(contentArg.data?.sequence).toBe(3);
++    expect(renewArg.data?.sequence).toBe(4);
++    expect((session as any).state.sequence).toBe(4);
++  });
+ });
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 996864dc14..7a7bdbee50 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -43,6 +43,37 @@ type StreamingStartOptions = {
+   header?: StreamingCardHeader;
+ };
+ 
++const FEISHU_STREAMING_TIMEOUT_ERROR_CODE = 200850;
++const FEISHU_STREAMING_CLOSED_ERROR_CODE = 300309;
++
++function buildFeishuApiError(response: { code?: number; msg?: string }): Error & { code?: number } {
++  const error = new Error(response.msg || `code ${response.code}`) as Error & { code?: number };
++  error.code = response.code;
++  return error;
++}
++
++function extractFeishuApiErrorCode(error: unknown): number | undefined {
++  if (typeof error !== "object" || error === null) {
++    return undefined;
++  }
++  const directCode = (error as { code?: unknown }).code;
++  if (typeof directCode === "number" && Number.isFinite(directCode)) {
++    return directCode;
++  }
++  const responseCode = (error as { response?: { data?: { code?: unknown } } }).response?.data?.code;
++  if (typeof responseCode === "number" && Number.isFinite(responseCode)) {
++    return responseCode;
++  }
++  return undefined;
++}
++
++function isStreamingModeClosedError(error: unknown): boolean {
++  const code = extractFeishuApiErrorCode(error);
++  return (
++    code === FEISHU_STREAMING_TIMEOUT_ERROR_CODE || code === FEISHU_STREAMING_CLOSED_ERROR_CODE
++  );
++}
++
+ function truncateSummary(text: string, max = 50): string {
+   if (!text) {
+     return "";
+@@ -244,7 +275,7 @@ export class FeishuStreamingSession {
+   private startRenewTimer(): void {
+     this.stopRenewTimer();
+     this.renewTimer = setInterval(() => {
+-      this.renewStreamingMode().catch(() => {});
++      this.scheduleRenewStreamingMode();
+     }, FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS);
+     this.renewTimer.unref();
+   }
+@@ -256,18 +287,32 @@ export class FeishuStreamingSession {
+     }
+   }
+ 
+-  private async renewStreamingMode(): Promise<void> {
+-    if (!this.state) {
++  private scheduleRenewStreamingMode(): void {
++    if (!this.state || this.closed) {
+       return;
+     }
++    this.queue = this.queue.then(async () => {
++      if (!this.state || this.closed) {
++        return;
++      }
++      await this.renewStreamingMode();
++    });
++  }
++
++  private async setStreamingModeEnabled(options?: {
++    force?: boolean;
++    reason?: "renew" | "reopen";
++  }): Promise<boolean> {
++    if (!this.state) {
++      return false;
++    }
+     if (
++      !options?.force &&
+       Date.now() - this.lastStreamingModeRenewAt <
+-      FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS
++        FeishuStreamingSession.STREAMING_MODE_RENEW_INTERVAL_MS
+     ) {
+-      return;
++      return false;
+     }
+-    // Snapshot the candidate sequence but only commit it to state on success,
+-    // so a failed renewal does not leave a permanent hole in the sequence.
+     const nextSeq = this.state.sequence + 1;
+     try {
+       const response = await this.client.cardkit.v1.card.settings({
+@@ -279,14 +324,50 @@ export class FeishuStreamingSession {
+         },
+       });
+       if ((response.code ?? 0) !== 0) {
+-        throw new Error(response.msg || `code ${response.code}`);
++        throw buildFeishuApiError(response);
+       }
+       this.state.sequence = nextSeq;
+       this.lastStreamingModeRenewAt = Date.now();
+-      this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
++      if (options?.reason === "reopen") {
++        this.log?.(`Reopened streaming mode: cardId=${this.state.cardId}`);
++      } else {
++        this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
++      }
++      return true;
+     } catch (e) {
+-      this.log?.(`Renew streaming mode failed: ${String(e)}`);
++      if (options?.reason === "reopen") {
++        this.log?.(`Reopen streaming mode failed: ${String(e)}`);
++      } else {
++        this.log?.(`Renew streaming mode failed: ${String(e)}`);
++      }
++      return false;
++    }
++  }
++
++  private async renewStreamingMode(): Promise<void> {
++    await this.setStreamingModeEnabled({ reason: "renew" });
++  }
++
++  private async pushElementContent(elementId: string, text: string): Promise<void> {
++    if (!this.state) {
++      throw new Error("streaming session is inactive");
+     }
++    const nextSeq = this.state.sequence + 1;
++    const response = await this.client.cardkit.v1.cardElement.content({
++      path: {
++        card_id: this.state.cardId,
++        element_id: elementId,
++      },
++      data: {
++        content: text,
++        sequence: nextSeq,
++        uuid: `s_${this.state.cardId}_${nextSeq}`,
++      },
++    });
++    if ((response.code ?? 0) !== 0) {
++      throw buildFeishuApiError(response);
++    }
++    this.state.sequence = nextSeq;
+   }
+ 
+   /** Push text to any element via the streaming element API. Returns true on success, false on failure. */
+@@ -299,33 +380,31 @@ export class FeishuStreamingSession {
+       return false;
+     }
+     await this.renewStreamingMode();
+-    // Snapshot the candidate sequence but only commit it to state on success,
+-    // so a failed update does not leave a permanent hole in the sequence.
+-    const nextSeq = this.state.sequence + 1;
+-    let ok = true;
+-    await this.client.cardkit.v1.cardElement
+-      .content({
+-        path: {
+-          card_id: this.state.cardId,
+-          element_id: elementId,
+-        },
+-        data: {
+-          content: text,
+-          sequence: nextSeq,
+-          uuid: `s_${this.state.cardId}_${nextSeq}`,
+-        },
+-      })
+-      .then((response) => {
+-        if ((response.code ?? 0) !== 0) {
+-          throw new Error(response.msg || `code ${response.code}`);
++    try {
++      await this.pushElementContent(elementId, text);
++      return true;
++    } catch (error) {
++      if (isStreamingModeClosedError(error)) {
++        this.log?.(
++          `Streaming mode closed while updating ${elementId}; reopening and retrying once`,
++        );
++        const reopened = await this.setStreamingModeEnabled({
++          force: true,
++          reason: "reopen",
++        });
++        if (reopened) {
++          try {
++            await this.pushElementContent(elementId, text);
++            return true;
++          } catch (retryError) {
++            onError?.(retryError);
++            return false;
++          }
+         }
+-        this.state!.sequence = nextSeq;
+-      })
+-      .catch((error) => {
+-        ok = false;
+-        onError?.(error);
+-      });
+-    return ok;
++      }
++      onError?.(error);
++      return false;
++    }
+   }
+ 
+   /** Push text via the streaming element API for the main content element. */
+-- 
+2.50.1 (Apple Git-155)
+

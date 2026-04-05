@@ -1,0 +1,138 @@
+From e23572e3fbb097bcc3549b0e702570ea5c6265fe Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 22:27:26 +0800
+Subject: [PATCH 52/98] fix(feishu): use visibility flag for running tool
+ status instead of clearing state
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 32 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     | 18 +++++------
+ 2 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index f1d32eb5d3..bbd2f26c83 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -652,6 +652,38 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("preserves prior tool history and count without restoring running status after text streaming", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      "🔧 Tool calls (2)\n- Read\n- Grep",
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
+   it("restores the previous running tool when nested tool activity unwinds", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index b0e4a7e61c..401d17cb17 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -301,9 +301,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let hasVisibleTextInReply = false;
+   let replaceNextPartialAfterTool = false;
+   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
+-  let toolUseCount = 0;
+   let activeToolRunCount = 0;
+   let lastToolName: string | undefined;
++  let runningToolStatusVisible = false;
+   const activeToolNames: string[] = [];
+   const toolCallHistory: string[] = [];
+   let lastRenderedStreamContent = "";
+@@ -440,9 +440,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       const toolLines = formatToolHistoryLines();
+       const toolStatus = options?.final
+         ? `✅ Completed ${toolCallHistory.length} tool call${toolCallHistory.length === 1 ? "" : "s"}`
+-        : activeToolRunCount > 0 && lastToolName?.trim()
++        : runningToolStatusVisible && activeToolRunCount > 0 && lastToolName?.trim()
+           ? `⏳ Running ${lastToolName.trim()}...`
+-          : activeToolRunCount > 0
++          : runningToolStatusVisible && activeToolRunCount > 0
+             ? "⏳ Running tool..."
+             : "";
+       sections.push(
+@@ -554,9 +554,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       lastPartial = nextText;
+     }
+     if (activeToolRunCount > 0) {
+-      activeToolRunCount = 0;
+-      lastToolName = undefined;
+-      activeToolNames.length = 0;
++      runningToolStatusVisible = false;
+       streamPhase = "streaming";
+       queueThinkingPanelUpdate();
+     }
+@@ -652,6 +650,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     thinkingCollapsed = false;
+     activeToolRunCount = 0;
+     lastToolName = undefined;
++    runningToolStatusVisible = false;
+     activeToolNames.length = 0;
+     toolCallHistory.length = 0;
+   };
+@@ -703,9 +702,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         hasThinkingPrelude = false;
+         thinkingCollapsed = false;
+         streamPhase = "idle";
+-        toolUseCount = 0;
+         activeToolRunCount = 0;
+         lastToolName = undefined;
++        runningToolStatusVisible = false;
+         activeToolNames.length = 0;
+         toolCallHistory.length = 0;
+         lastRenderedStreamContent = "";
+@@ -902,13 +901,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         ? (payload: { name?: string; phase?: string }) => {
+             const isStartPhase = !payload?.phase || payload.phase === "start";
+             if (isStartPhase) {
+-              toolUseCount += 1;
+               activeToolRunCount += 1;
+               lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
++              runningToolStatusVisible = !streamText.trim();
+               activeToolNames.push(lastToolName ?? "tool");
+               toolCallHistory.push(lastToolName ?? "tool");
+               replaceNextPartialAfterTool = Boolean(streamText);
+-              // Tool status is derived from toolUseCount/lastToolName in composeThinkingContent
+             }
+             queueThinkingPrelude();
+             streamPhase = "tool";
+@@ -928,6 +926,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               activeToolNames.pop();
+             }
+             lastToolName = activeToolNames[activeToolNames.length - 1];
++            runningToolStatusVisible =
++              runningToolStatusVisible && activeToolRunCount > 0 && Boolean(lastToolName?.trim());
+             if (activeToolRunCount === 0 && streamPhase === "tool") {
+               streamPhase = streamText ? "streaming" : "idle";
+             }
+-- 
+2.50.1 (Apple Git-155)
+

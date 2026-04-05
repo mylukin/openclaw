@@ -1,0 +1,189 @@
+From 77f0f8268740ef5f8d7b7b4e72189473d6797a70 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 28 Mar 2026 15:09:15 +0800
+Subject: [PATCH 79/98] fix(feishu): dedupe normalized final card replies
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 54 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     | 39 +++++++++++---
+ 2 files changed, 87 insertions(+), 6 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 83b210a5f5..b06624abfc 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -1327,6 +1327,60 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("deduplicates identical final card sends in non-streaming mode", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: false,
++      },
++    });
++
++    const { options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++      threadReply: true,
++      rootId: "om_root_topic",
++    });
++
++    await options.deliver({ text: "same final text" }, { kind: "final" });
++    await options.deliver({ text: "same final text" }, { kind: "final" });
++
++    expect(sendStructuredCardFeishuMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("deduplicates streaming final card sends when mention tag syntax differs", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const { options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++    });
++
++    await options.deliver(
++      { text: '<at user_id="ou_trent">Trent</at> same final text' },
++      { kind: "final" },
++    );
++    await options.deliver({ text: "<at id=ou_trent></at> same final text" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
++  });
++
+   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index b7a5688cdf..d88f309192 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -357,6 +357,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let hasThinkingPrelude = false;
+   let thinkingCollapsed = false;
+   let replyCycleInitialized = false;
++  const deliveredFinalContentKeys = new Set<string>();
+ 
+   /**
+    * Deliver media files and emit persistence signals for media-only final payloads.
+@@ -452,6 +453,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     );
+   };
+ 
++  const buildFinalDeliveryContentKey = (params: { text: string; useCard: boolean }): string => {
++    const normalized = params.useCard ? normalizeMentionTagsForCard(params.text) : params.text;
++    return normalized.trim();
++  };
++
+   const TOOL_DISPLAY_NAMES: Record<string, string> = {
+     feishu_chat_history: "Chat History",
+     feishu_chat_info: "Chat Info",
+@@ -799,9 +805,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         deliveredMessageIds.push(sentId);
+       }
+     }
+-    if (params.infoKind === "final") {
+-      deliveredFinalTexts.add(params.text);
+-    }
+     return { lastMessageId, deliveredMessageIds };
+   };
+ 
+@@ -814,6 +817,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         if (!replyCycleInitialized) {
+           replyCycleInitialized = true;
+           deliveredFinalTexts.clear();
++          deliveredFinalContentKeys.clear();
+           hasVisibleTextInReply = false;
+           finalTextEmitted = false;
+           hasThinkingPrelude = false;
+@@ -855,17 +859,27 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         }
+         const hasText = text.trim().length > 0;
+         const hasMedia = originalReply.hasMedia;
++        const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
++        const finalDeliveryKey =
++          info?.kind === "final" && hasText ? buildFinalDeliveryContentKey({ text, useCard }) : "";
+         const skipTextForDuplicateFinal =
+-          info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
++          info?.kind === "final" &&
++          hasText &&
++          (deliveredFinalTexts.has(text) ||
++            (finalDeliveryKey.length > 0 && deliveredFinalContentKeys.has(finalDeliveryKey)));
+         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
+ 
++        if (info?.kind === "final" && hasText) {
++          params.runtime.log?.(
++            `feishu[${account.accountId}] final deliver candidate: chars=${text.trim().length} useCard=${useCard ? "true" : "false"} key=${finalDeliveryKey.slice(0, 120)} skipDuplicate=${skipTextForDuplicateFinal ? "true" : "false"}`,
++          );
++        }
++
+         if (!shouldDeliverText && !hasMedia) {
+           return;
+         }
+ 
+         if (shouldDeliverText) {
+-          const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+-
+           if (info?.kind === "block") {
+             // Drop internal block chunks unless we can safely consume them as
+             // streaming-card fallback content.
+@@ -901,6 +915,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               // Mark visible only after closeStreaming succeeds — text is now delivered.
+               hasVisibleTextInReply = true;
+               deliveredFinalTexts.add(text);
++              if (finalDeliveryKey) {
++                deliveredFinalContentKeys.add(finalDeliveryKey);
++              }
+             }
+             // Send media even when streaming handled the text
+             if (hasMedia) {
+@@ -969,6 +986,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           }
+           if (info?.kind === "final") {
+             const deliveredContent = useCard ? normalizeMentionTagsForCard(cardText) : text;
++            const deliveredKey = buildFinalDeliveryContentKey({
++              text: deliveredContent,
++              useCard,
++            });
++            deliveredFinalTexts.add(text);
++            if (deliveredKey) {
++              deliveredFinalContentKeys.add(deliveredKey);
++            }
+             emitMessageSent({
+               content: deliveredContent,
+               success: true,
+@@ -997,10 +1022,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
+         );
+         await closeStreaming({ emitFinalText: false, reason: "error" });
++        replyCycleInitialized = false;
+         typingCallbacks?.onIdle?.();
+       },
+       onIdle: async () => {
+         await closeStreaming({ emitFinalText: true, reason: "idle" });
++        replyCycleInitialized = false;
+         typingCallbacks?.onIdle?.();
+       },
+       onCleanup: () => {
+-- 
+2.50.1 (Apple Git-155)
+

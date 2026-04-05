@@ -1,0 +1,355 @@
+From 4a51b682d483a32eee5a6ebf0e5e3fe86f07b5ef Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 10 Mar 2026 20:54:31 +0800
+Subject: [PATCH 19/98] feat(security): add opt-in toggles to bypass skill
+ symlink and workspace read restrictions
+
+- skills.load.allowSymlinksOutsideRoot: allow symlinks in skill dirs to resolve
+  outside the configured root (e.g. shared skill libraries across agents)
+- tools.fs.allowReadOutsideWorkspace: allow direct-API agents to read files
+  outside their workspaceDir (e.g. ~/AgentData/shared/) via the read tool
+- workspaceOnly and sandbox always win over allowReadOutsideWorkspace
+- log warn when allowReadOutsideWorkspace is active so the grant is visible
+- fix: add allowSymlinksOutsideRoot to Zod schema (strict() would reject config)
+- fix: filterLoadedSkillsInsideRoot propagates allowSymlinksOutsideRoot at all call sites
+---
+ src/agents/pi-tools.read.ts            | 31 ++++++++++++++++++++++++++
+ src/agents/pi-tools.ts                 | 27 +++++++++++++++++++---
+ src/agents/skills/workspace.ts         | 16 +++++++++++++
+ src/agents/tool-fs-policy.ts           | 10 ++++++++-
+ src/config/types.skills.ts             |  8 +++++++
+ src/config/types.tools.ts              |  9 ++++++++
+ src/config/zod-schema.agent-runtime.ts |  1 +
+ src/config/zod-schema.ts               |  1 +
+ 8 files changed, 99 insertions(+), 4 deletions(-)
+
+diff --git a/src/agents/pi-tools.read.ts b/src/agents/pi-tools.read.ts
+index 5ea48b01fa..9f1682bf59 100644
+--- a/src/agents/pi-tools.read.ts
++++ b/src/agents/pi-tools.read.ts
+@@ -686,6 +686,37 @@ function createSandboxReadOperations(params: SandboxToolParams) {
+   } as const;
+ }
+ 
++/** Unrestricted host read operations — no workspace boundary enforced. */
++function createHostReadOperations() {
++  return {
++    readFile: async (absolutePath: string) => {
++      const resolved = path.resolve(absolutePath);
++      return fs.readFile(resolved);
++    },
++    access: async (absolutePath: string) => {
++      const resolved = path.resolve(absolutePath);
++      await fs.access(resolved);
++    },
++    detectImageMimeType: async (absolutePath: string) => {
++      const resolved = path.resolve(absolutePath);
++      const buffer = await fs.readFile(resolved);
++      const mime = await detectMime({ buffer, filePath: absolutePath });
++      return mime && mime.startsWith("image/") ? mime : undefined;
++    },
++  } as const;
++}
++
++/**
++ * Create a host read tool with no workspace boundary restriction.
++ * Used when tools.fs.allowReadOutsideWorkspace is true.
++ */
++export function createHostReadTool(root: string, options?: OpenClawReadToolOptions): AnyAgentTool {
++  const base = createReadTool(root, {
++    operations: createHostReadOperations(),
++  }) as unknown as AnyAgentTool;
++  return createOpenClawReadTool(base, options);
++}
++
+ function createSandboxWriteOperations(params: SandboxToolParams) {
+   return {
+     mkdir: async (dir: string) => {
+diff --git a/src/agents/pi-tools.ts b/src/agents/pi-tools.ts
+index ff71b53baf..b0d91604ab 100644
+--- a/src/agents/pi-tools.ts
++++ b/src/agents/pi-tools.ts
+@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../config/config.js";
+ import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
+ import { resolveMergedSafeBinProfileFixtures } from "../infra/exec-safe-bin-runtime-policy.js";
+ import { logWarn } from "../logger.js";
++import { createSubsystemLogger } from "../logging/subsystem.js";
+ import { getPluginToolMeta } from "../plugins/tools.js";
+ import { isSubagentSessionKey } from "../routing/session-key.js";
+ import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
+@@ -28,6 +29,7 @@ import {
+ } from "./pi-tools.policy.js";
+ import {
+   assertRequiredParams,
++  createHostReadTool,
+   createHostWorkspaceEditTool,
+   createHostWorkspaceWriteTool,
+   createOpenClawReadTool,
+@@ -59,6 +61,8 @@ import {
+ } from "./tool-policy.js";
+ import { resolveWorkspaceRoot } from "./workspace-dir.js";
+ 
++const piToolsLogger = createSubsystemLogger("pi-tools");
++
+ function isOpenAIProvider(provider?: string) {
+   const normalized = provider?.trim().toLowerCase();
+   return normalized === "openai" || normalized === "openai-codex";
+@@ -341,12 +345,15 @@ export function createOpenClawCodingTools(options?: {
+   const fsConfig = resolveToolFsConfig({ cfg: options?.config, agentId });
+   const fsPolicy = createToolFsPolicy({
+     workspaceOnly: isMemoryFlushRun || fsConfig.workspaceOnly,
++    allowReadOutsideWorkspace: fsConfig.allowReadOutsideWorkspace,
+   });
+   const sandboxRoot = sandbox?.workspaceDir;
+   const sandboxFsBridge = sandbox?.fsBridge;
+   const allowWorkspaceWrites = sandbox?.workspaceAccess !== "ro";
+   const workspaceRoot = resolveWorkspaceRoot(options?.workspaceDir);
+   const workspaceOnly = fsPolicy.workspaceOnly;
++  // allowReadOutsideWorkspace has no effect when workspaceOnly is active (workspaceOnly wins).
++  const allowReadOutsideWorkspace = !workspaceOnly && fsPolicy.allowReadOutsideWorkspace;
+   const applyPatchConfig = execConfig.applyPatch;
+   // Secure by default: apply_patch is workspace-contained unless explicitly disabled.
+   // (tools.fs.workspaceOnly is a separate umbrella flag for read/write/edit/apply_patch.)
+@@ -368,6 +375,7 @@ export function createOpenClawCodingTools(options?: {
+   const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
+     if (tool.name === readTool.name) {
+       if (sandboxRoot) {
++        // Sandbox boundary takes precedence over allowReadOutsideWorkspace.
+         const sandboxed = createSandboxedReadTool({
+           root: sandboxRoot,
+           bridge: sandboxFsBridge!,
+@@ -382,11 +390,24 @@ export function createOpenClawCodingTools(options?: {
+             : sandboxed,
+         ];
+       }
+-      const freshReadTool = createReadTool(workspaceRoot);
+-      const wrapped = createOpenClawReadTool(freshReadTool, {
++      const readToolOptions = {
+         modelContextWindowTokens: options?.modelContextWindowTokens,
+         imageSanitization,
+-      });
++      };
++      if (allowReadOutsideWorkspace) {
++        // Unrestricted: bypass pi-coding-agent's internal root boundary entirely.
++        // tools.fs.allowReadOutsideWorkspace=true grants full host read access to the model.
++        piToolsLogger.debug(
++          "tools.fs.allowReadOutsideWorkspace is enabled — read tool has no workspace boundary",
++          {
++            agentId,
++            workspaceRoot,
++          },
++        );
++        return [createHostReadTool(workspaceRoot, readToolOptions)];
++      }
++      const freshReadTool = createReadTool(workspaceRoot);
++      const wrapped = createOpenClawReadTool(freshReadTool, readToolOptions);
+       return [workspaceOnly ? wrapToolWorkspaceRootGuard(wrapped, workspaceRoot) : wrapped];
+     }
+     if (tool.name === "bash" || tool.name === execToolName) {
+diff --git a/src/agents/skills/workspace.ts b/src/agents/skills/workspace.ts
+index 84c8ea78df..a9e1e65195 100644
+--- a/src/agents/skills/workspace.ts
++++ b/src/agents/skills/workspace.ts
+@@ -203,6 +203,8 @@ function resolveContainedSkillPath(params: {
+   rootDir: string;
+   rootRealPath: string;
+   candidatePath: string;
++  /** When true, allow symlinks that resolve outside the root (opt-in). */
++  allowSymlinksOutsideRoot?: boolean;
+ }): string | null {
+   const candidateRealPath = tryRealpath(params.candidatePath);
+   if (!candidateRealPath) {
+@@ -211,6 +213,10 @@ function resolveContainedSkillPath(params: {
+   if (isPathInside(params.rootRealPath, candidateRealPath)) {
+     return candidateRealPath;
+   }
++  if (params.allowSymlinksOutsideRoot) {
++    // Opted in: accept the resolved real path even though it escapes the root.
++    return candidateRealPath;
++  }
+   warnEscapedSkillPath({
+     source: params.source,
+     rootDir: params.rootDir,
+@@ -225,6 +231,7 @@ function filterLoadedSkillsInsideRoot(params: {
+   source: string;
+   rootDir: string;
+   rootRealPath: string;
++  allowSymlinksOutsideRoot?: boolean;
+ }): Skill[] {
+   return params.skills.filter((skill) => {
+     const baseDirRealPath = resolveContainedSkillPath({
+@@ -232,6 +239,7 @@ function filterLoadedSkillsInsideRoot(params: {
+       rootDir: params.rootDir,
+       rootRealPath: params.rootRealPath,
+       candidatePath: skill.baseDir,
++      allowSymlinksOutsideRoot: params.allowSymlinksOutsideRoot,
+     });
+     if (!baseDirRealPath) {
+       return false;
+@@ -241,6 +249,7 @@ function filterLoadedSkillsInsideRoot(params: {
+       rootDir: params.rootDir,
+       rootRealPath: params.rootRealPath,
+       candidatePath: skill.filePath,
++      allowSymlinksOutsideRoot: params.allowSymlinksOutsideRoot,
+     });
+     return Boolean(skillFileRealPath);
+   });
+@@ -298,6 +307,7 @@ function loadSkillEntries(
+   },
+ ): SkillEntry[] {
+   const limits = resolveSkillsLimits(opts?.config);
++  const allowSymlinksOutsideRoot = opts?.config?.skills?.load?.allowSymlinksOutsideRoot ?? false;
+ 
+   const loadSkills = (params: { dir: string; source: string }): Skill[] => {
+     const rootDir = path.resolve(params.dir);
+@@ -311,6 +321,7 @@ function loadSkillEntries(
+       rootDir,
+       rootRealPath,
+       candidatePath: baseDir,
++      allowSymlinksOutsideRoot,
+     });
+     if (!baseDirRealPath) {
+       return [];
+@@ -324,6 +335,7 @@ function loadSkillEntries(
+         rootDir,
+         rootRealPath: baseDirRealPath,
+         candidatePath: rootSkillMd,
++        allowSymlinksOutsideRoot,
+       });
+       if (!rootSkillRealPath) {
+         return [];
+@@ -349,6 +361,7 @@ function loadSkillEntries(
+         source: params.source,
+         rootDir,
+         rootRealPath: baseDirRealPath,
++        allowSymlinksOutsideRoot,
+       });
+     }
+ 
+@@ -385,6 +398,7 @@ function loadSkillEntries(
+         rootDir,
+         rootRealPath: baseDirRealPath,
+         candidatePath: skillDir,
++        allowSymlinksOutsideRoot,
+       });
+       if (!skillDirRealPath) {
+         continue;
+@@ -398,6 +412,7 @@ function loadSkillEntries(
+         rootDir,
+         rootRealPath: baseDirRealPath,
+         candidatePath: skillMd,
++        allowSymlinksOutsideRoot,
+       });
+       if (!skillMdRealPath) {
+         continue;
+@@ -424,6 +439,7 @@ function loadSkillEntries(
+           source: params.source,
+           rootDir,
+           rootRealPath: baseDirRealPath,
++          allowSymlinksOutsideRoot,
+         }),
+       );
+ 
+diff --git a/src/agents/tool-fs-policy.ts b/src/agents/tool-fs-policy.ts
+index 59d04c56e6..1e0bc1e3ed 100644
+--- a/src/agents/tool-fs-policy.ts
++++ b/src/agents/tool-fs-policy.ts
+@@ -3,16 +3,22 @@ import { resolveAgentConfig } from "./agent-scope.js";
+ 
+ export type ToolFsPolicy = {
+   workspaceOnly: boolean;
++  allowReadOutsideWorkspace?: boolean;
+ };
+ 
+-export function createToolFsPolicy(params: { workspaceOnly?: boolean }): ToolFsPolicy {
++export function createToolFsPolicy(params: {
++  workspaceOnly?: boolean;
++  allowReadOutsideWorkspace?: boolean;
++}): ToolFsPolicy {
+   return {
+     workspaceOnly: params.workspaceOnly === true,
++    allowReadOutsideWorkspace: params.allowReadOutsideWorkspace === true,
+   };
+ }
+ 
+ export function resolveToolFsConfig(params: { cfg?: OpenClawConfig; agentId?: string }): {
+   workspaceOnly?: boolean;
++  allowReadOutsideWorkspace?: boolean;
+ } {
+   const cfg = params.cfg;
+   const globalFs = cfg?.tools?.fs;
+@@ -20,6 +26,8 @@ export function resolveToolFsConfig(params: { cfg?: OpenClawConfig; agentId?: st
+     cfg && params.agentId ? resolveAgentConfig(cfg, params.agentId)?.tools?.fs : undefined;
+   return {
+     workspaceOnly: agentFs?.workspaceOnly ?? globalFs?.workspaceOnly,
++    allowReadOutsideWorkspace:
++      agentFs?.allowReadOutsideWorkspace ?? globalFs?.allowReadOutsideWorkspace,
+   };
+ }
+ 
+diff --git a/src/config/types.skills.ts b/src/config/types.skills.ts
+index c09523ba45..6df6512313 100644
+--- a/src/config/types.skills.ts
++++ b/src/config/types.skills.ts
+@@ -17,6 +17,14 @@ export type SkillsLoadConfig = {
+   watch?: boolean;
+   /** Debounce for the skills watcher (ms). */
+   watchDebounceMs?: number;
++  /**
++   * Allow symlinks inside skill directories to point outside the configured
++   * skill root. By default, skill paths that resolve (via symlink) to a
++   * location outside their root are skipped as a safety measure. Set this
++   * to `true` if you intentionally use cross-root symlinks (e.g. a shared
++   * skills library linked into multiple workspace skill dirs).
++   */
++  allowSymlinksOutsideRoot?: boolean;
+ };
+ 
+ export type SkillsInstallConfig = {
+diff --git a/src/config/types.tools.ts b/src/config/types.tools.ts
+index e352f858c3..5b2d941195 100644
+--- a/src/config/types.tools.ts
++++ b/src/config/types.tools.ts
+@@ -280,6 +280,15 @@ export type FsToolsConfig = {
+    * Default: false (unrestricted, matches legacy behavior).
+    */
+   workspaceOnly?: boolean;
++  /**
++   * Allow the read tool to access files outside the agent workspace directory when using
++   * direct API backends (non-claude-cli). By default, relative paths resolve against
++   * workspaceDir and the workspace-root guard blocks paths that escape it. Set to `true`
++   * when agents need to read shared files outside their workspace (e.g. ~/AgentData/shared/).
++   * Has no effect when workspaceOnly is true (workspaceOnly takes precedence).
++   * Has no effect when a container sandbox is active (sandbox boundary takes precedence).
++   */
++  allowReadOutsideWorkspace?: boolean;
+ };
+ 
+ export type AgentToolsConfig = {
+diff --git a/src/config/zod-schema.agent-runtime.ts b/src/config/zod-schema.agent-runtime.ts
+index 3ede7218b8..c86609bdaa 100644
+--- a/src/config/zod-schema.agent-runtime.ts
++++ b/src/config/zod-schema.agent-runtime.ts
+@@ -430,6 +430,7 @@ const ToolExecSchema = z.object(ToolExecBaseShape).strict().optional();
+ const ToolFsSchema = z
+   .object({
+     workspaceOnly: z.boolean().optional(),
++    allowReadOutsideWorkspace: z.boolean().optional(),
+   })
+   .strict()
+   .optional();
+diff --git a/src/config/zod-schema.ts b/src/config/zod-schema.ts
+index d43105949a..7f2d0c9f3d 100644
+--- a/src/config/zod-schema.ts
++++ b/src/config/zod-schema.ts
+@@ -828,6 +828,7 @@ export const OpenClawSchema = z
+             extraDirs: z.array(z.string()).optional(),
+             watch: z.boolean().optional(),
+             watchDebounceMs: z.number().int().min(0).optional(),
++            allowSymlinksOutsideRoot: z.boolean().optional(),
+           })
+           .strict()
+           .optional(),
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,182 @@
+From 809f3dc110a5119b36a4724c2ad5eb39d6ca0adf Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 7 Mar 2026 02:01:11 +0800
+Subject: [PATCH 12/98] feat(plugins): support embedded plugins from Bun
+ compiled binary
+
+Add infrastructure for loading plugins embedded in Bun-compiled binaries:
+- manifest-registry: inject embedded plugin manifests from globalThis.__OPENCLAW_EMBEDDED_PLUGINS__
+- loader: unshift embedded candidates for precedence over disk, load modules from memory (skip file I/O)
+- loader: bypass jiti in Bun runtime (use require() directly since jiti's babel.cjs fails in virtual FS)
+
+When DEBUG_EXTENSIONS=1, bun-entry.ts skips setting __OPENCLAW_EMBEDDED_PLUGINS__,
+so disk-based plugins load normally as fallback.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/plugins/loader.ts            | 95 ++++++++++++++++++++++----------
+ src/plugins/manifest-registry.ts | 26 +++++++++
+ 2 files changed, 92 insertions(+), 29 deletions(-)
+
+diff --git a/src/plugins/loader.ts b/src/plugins/loader.ts
+index 41a2f0fa3f..473180290f 100644
+--- a/src/plugins/loader.ts
++++ b/src/plugins/loader.ts
+@@ -519,6 +519,24 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
+     diagnostics: discovery.diagnostics,
+   });
+   pushDiagnostics(registry.diagnostics, manifestRegistry.diagnostics);
++
++  // Embedded plugins (from Bun binary): manifests are injected by manifest-registry.ts.
++  // Add matching discovery candidates so the loader loop can find them.
++  const embeddedPlugins = (globalThis as Record<string, unknown>).__OPENCLAW_EMBEDDED_PLUGINS__ as
++    | Array<{ id: string; module: unknown; manifest: Record<string, unknown> }>
++    | undefined;
++  if (Array.isArray(embeddedPlugins)) {
++    for (const ep of embeddedPlugins) {
++      const rootDir = `__embedded__:${ep.id}`;
++      discovery.candidates.unshift({
++        idHint: ep.id,
++        source: rootDir,
++        rootDir,
++        origin: "bundled",
++      });
++    }
++  }
++
+   warnWhenAllowlistIsOpen({
+     logger,
+     pluginsEnabled: normalized.enabled,
+@@ -540,6 +558,15 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
+     if (jitiLoader) {
+       return jitiLoader;
+     }
++    // Bun compiled binaries cannot resolve jiti's babel.cjs from the virtual
++    // filesystem.  Bypass jiti entirely and use require() which is synchronous
++    // and Bun handles ESM→CJS interop automatically for .js files.
++    if (typeof (globalThis as Record<string, unknown>).Bun !== "undefined") {
++      jitiLoader = ((specifier: string) => {
++        return require(specifier);
++      }) as unknown as ReturnType<typeof createJiti>;
++      return jitiLoader;
++    }
+     const pluginSdkAlias = resolvePluginSdkAlias();
+     const aliasMap = {
+       ...(pluginSdkAlias ? { "openclaw/plugin-sdk": pluginSdkAlias } : {}),
+@@ -657,37 +684,47 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
+       continue;
+     }
+ 
+-    const pluginRoot = safeRealpathOrResolve(candidate.rootDir);
+-    const opened = openBoundaryFileSync({
+-      absolutePath: candidate.source,
+-      rootPath: pluginRoot,
+-      boundaryLabel: "plugin root",
+-      rejectHardlinks: candidate.origin !== "bundled",
+-      skipLexicalRootCheck: true,
+-    });
+-    if (!opened.ok) {
+-      pushPluginLoadError("plugin entry path escapes plugin root or fails alias checks");
+-      continue;
+-    }
+-    const safeSource = opened.path;
+-    fs.closeSync(opened.fd);
+-
+     let mod: OpenClawPluginModule | null = null;
+-    try {
+-      mod = getJiti()(safeSource) as OpenClawPluginModule;
+-    } catch (err) {
+-      recordPluginError({
+-        logger,
+-        registry,
+-        record,
+-        seenIds,
+-        pluginId,
+-        origin: candidate.origin,
+-        error: err,
+-        logPrefix: `[plugins] ${record.id} failed to load from ${record.source}: `,
+-        diagnosticMessagePrefix: "failed to load plugin: ",
++
++    // Embedded plugins: module is already loaded in memory, skip file I/O.
++    const embeddedEntry = candidate.source.startsWith("__embedded__:")
++      ? embeddedPlugins?.find((e) => `__embedded__:${e.id}` === candidate.source)
++      : undefined;
++
++    if (embeddedEntry) {
++      mod = embeddedEntry.module as OpenClawPluginModule;
++    } else {
++      const pluginRoot = safeRealpathOrResolve(candidate.rootDir);
++      const opened = openBoundaryFileSync({
++        absolutePath: candidate.source,
++        rootPath: pluginRoot,
++        boundaryLabel: "plugin root",
++        rejectHardlinks: candidate.origin !== "bundled",
++        skipLexicalRootCheck: true,
+       });
+-      continue;
++      if (!opened.ok) {
++        pushPluginLoadError("plugin entry path escapes plugin root or fails alias checks");
++        continue;
++      }
++      const safeSource = opened.path;
++      fs.closeSync(opened.fd);
++
++      try {
++        mod = getJiti()(safeSource) as OpenClawPluginModule;
++      } catch (err) {
++        recordPluginError({
++          logger,
++          registry,
++          record,
++          seenIds,
++          pluginId,
++          origin: candidate.origin,
++          error: err,
++          logPrefix: `[plugins] ${record.id} failed to load from ${record.source}: `,
++          diagnosticMessagePrefix: "failed to load plugin: ",
++        });
++        continue;
++      }
+     }
+ 
+     const resolved = resolvePluginModuleExport(mod);
+diff --git a/src/plugins/manifest-registry.ts b/src/plugins/manifest-registry.ts
+index d392144f92..70d3219599 100644
+--- a/src/plugins/manifest-registry.ts
++++ b/src/plugins/manifest-registry.ts
+@@ -250,6 +250,32 @@ export function loadPluginManifestRegistry(params: {
+     );
+   }
+ 
++  // Inject embedded plugins from Bun compiled binary so they are visible
++  // to both the config validator and the plugin loader.
++  const embeddedPlugins = (globalThis as Record<string, unknown>).__OPENCLAW_EMBEDDED_PLUGINS__ as
++    | Array<{ id: string; manifest: Record<string, unknown> }>
++    | undefined;
++  if (Array.isArray(embeddedPlugins)) {
++    for (const ep of embeddedPlugins) {
++      const rootDir = `__embedded__:${ep.id}`;
++      records.push({
++        id: ep.manifest.id as string,
++        rootDir,
++        source: rootDir,
++        manifestPath: `${rootDir}/openclaw.plugin.json`,
++        origin: "bundled",
++        configSchema: ep.manifest.configSchema as Record<string, unknown> | undefined,
++        kind: ep.manifest.kind as PluginKind | undefined,
++        channels: (ep.manifest.channels as string[]) ?? [],
++        providers: (ep.manifest.providers as string[]) ?? [],
++        skills: [],
++        name: ep.manifest.name as string | undefined,
++        description: ep.manifest.description as string | undefined,
++        version: ep.manifest.version as string | undefined,
++      });
++    }
++  }
++
+   const registry = { plugins: records, diagnostics };
+   if (cacheEnabled) {
+     const ttl = resolveManifestCacheMs(env);
+-- 
+2.50.1 (Apple Git-155)
+

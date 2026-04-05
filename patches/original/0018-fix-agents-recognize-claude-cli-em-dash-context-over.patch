@@ -1,0 +1,269 @@
+From 05373aeb1f0b79a230568b63b80b7d6f017d1d82 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 10 Mar 2026 16:52:52 +0800
+Subject: [PATCH 18/98] fix(agents): recognize claude-cli em-dash context
+ overflow format in isContextOverflowError
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+claude-cli outputs "⚠️ Context overflow — prompt too large for this model." using
+an em-dash (—), but isContextOverflowError only matched "context overflow:" (colon).
+This caused Layer 2 retry (minimal bootstrap profile) to never trigger for cli-runner
+overflow errors, and model-fallback to skip fallbacks without recovery.
+
+Add em-dash and ascii double-dash variants to the match list.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot.ts                 |  2 +-
+ extensions/feishu/src/quoted-message.ts      |  8 ++++----
+ extensions/feishu/src/reply-dispatcher.ts    |  2 +-
+ extensions/feishu/src/send.ts                |  5 +++++
+ extensions/test-utils/plugin-runtime-mock.ts |  4 ++++
+ src/agents/cli-runner.ts                     |  2 +-
+ src/agents/pi-embedded-helpers/errors.ts     |  2 ++
+ src/config/zod-schema.agent-defaults.ts      |  1 -
+ src/entry.ts                                 |  2 +-
+ src/gateway/mcp-http.ts                      | 17 +++++++++++++++--
+ src/infra/outbound/deliver.ts                |  3 ---
+ src/plugin-sdk/feishu.ts                     | 11 +++++++++++
+ src/plugins/loader.ts                        | 12 ++++++++----
+ 13 files changed, 53 insertions(+), 18 deletions(-)
+
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index ea2c974677..c709f72790 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -14,7 +14,7 @@ import {
+   resolveDefaultGroupPolicy,
+   warnMissingProviderGroupPolicyFallbackOnce,
+ } from "openclaw/plugin-sdk/feishu";
+-import { appendAssistantMessageToSessionTranscript } from "../../../src/config/sessions.js";
++import { appendAssistantMessageToSessionTranscript } from "openclaw/plugin-sdk/feishu";
+ import { resolveFeishuAccount } from "./accounts.js";
+ import { createFeishuClient } from "./client.js";
+ import { tryRecordMessage, tryRecordMessagePersistent } from "./dedup.js";
+diff --git a/extensions/feishu/src/quoted-message.ts b/extensions/feishu/src/quoted-message.ts
+index 65878ceb91..ffa49c3c47 100644
+--- a/extensions/feishu/src/quoted-message.ts
++++ b/extensions/feishu/src/quoted-message.ts
+@@ -1,16 +1,16 @@
+ import fs from "node:fs";
+ import { DatabaseSync } from "node:sqlite";
+ import type { ClawdbotConfig } from "openclaw/plugin-sdk";
+-import { getLiveSessionTranscriptEntries } from "../../../src/agents/pi-embedded-runner/live-session-registry.js";
+ import {
++  getLiveSessionTranscriptEntries,
+   loadSessionStore,
+   resolveSessionFilePath,
+   resolveSessionFilePathOptions,
+   type SessionEntry,
+   type SessionTranscriptMessageMeta,
+-} from "../../../src/config/sessions.js";
+-import { stripEnvelopeFromMessage } from "../../../src/gateway/chat-sanitize.js";
+-import { resolveUserPath } from "../../../src/utils.js";
++  stripEnvelopeFromMessage,
++  resolveUserPath,
++} from "openclaw/plugin-sdk/feishu";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { getMessageFeishu, type FeishuMessageInfo } from "./send.js";
+ 
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 74cf592a11..d778082132 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -748,7 +748,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           }
+         : undefined,
+       onReasoningStream: streamingEnabled
+-        ? () => {
++        ? (_payload?: { text?: string; mediaUrls?: string[]; isReasoning?: boolean }) => {
+             queueThinkingPrelude();
+             streamPhase = "thinking";
+             stagedStatusLine = resolveStatusLine();
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index d2c0353dc9..e556a4b3ed 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -242,6 +242,11 @@ export async function getMessageFeishu(params: {
+           id_type?: string;
+           sender_type?: string;
+         };
++        mentions?: Array<{
++          key?: string;
++          name?: string;
++          id?: { open_id?: string; user_id?: string; union_id?: string };
++        }>;
+         create_time?: string;
+       };
+     };
+diff --git a/extensions/test-utils/plugin-runtime-mock.ts b/extensions/test-utils/plugin-runtime-mock.ts
+index fc3f1e74b3..095b3f17f9 100644
+--- a/extensions/test-utils/plugin-runtime-mock.ts
++++ b/extensions/test-utils/plugin-runtime-mock.ts
+@@ -37,6 +37,10 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> =
+     version: "1.0.0-test",
+     agents: {
+       runEmbeddedPiAgent: vi.fn() as unknown as PluginRuntime["agents"]["runEmbeddedPiAgent"],
++      runModelAwareAgent: vi.fn() as unknown as PluginRuntime["agents"]["runModelAwareAgent"],
++    },
++    hooks: {
++      emitMessageSent: vi.fn() as unknown as PluginRuntime["hooks"]["emitMessageSent"],
+     },
+     config: {
+       loadConfig: vi.fn(() => ({})) as unknown as PluginRuntime["config"]["loadConfig"],
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index c34631758b..9e9d8954bf 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -1389,7 +1389,7 @@ export async function runCliAgent(params: {
+                 estimatePromptTokens(promptForRun) +
+                 imageTokenEstimate;
+               throw new FailoverError(
+-                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). 建议改走 pi-embedded runtime 或拆任务。`,
++                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). Consider switching to the pi-embedded runtime or splitting the task.`,
+                 {
+                   reason: "unknown",
+                   provider: params.provider,
+diff --git a/src/agents/pi-embedded-helpers/errors.ts b/src/agents/pi-embedded-helpers/errors.ts
+index 9ab52c0435..bf9a8c318d 100644
+--- a/src/agents/pi-embedded-helpers/errors.ts
++++ b/src/agents/pi-embedded-helpers/errors.ts
+@@ -101,6 +101,8 @@ export function isContextOverflowError(errorMessage?: string): boolean {
+     lower.includes("model token limit") ||
+     (hasRequestSizeExceeds && hasContextWindow) ||
+     lower.includes("context overflow:") ||
++    lower.includes("context overflow \u2014") || // claude-cli uses em-dash: "Context overflow — prompt too large"
++    lower.includes("context overflow --") || // ascii fallback variant
+     lower.includes("exceed context limit") ||
+     lower.includes("exceeds the model's maximum context") ||
+     (lower.includes("max_tokens") && lower.includes("exceed") && lower.includes("context")) ||
+diff --git a/src/config/zod-schema.agent-defaults.ts b/src/config/zod-schema.agent-defaults.ts
+index 0da61d3869..55f059f065 100644
+--- a/src/config/zod-schema.agent-defaults.ts
++++ b/src/config/zod-schema.agent-defaults.ts
+@@ -108,7 +108,6 @@ export const AgentDefaultsSchema = z
+           .strict()
+           .optional(),
+         postCompactionSections: z.array(z.string()).optional(),
+-        model: z.string().optional(),
+         memoryFlush: z
+           .object({
+             enabled: z.boolean().optional(),
+diff --git a/src/entry.ts b/src/entry.ts
+index ed43e79c57..c3d7923685 100644
+--- a/src/entry.ts
++++ b/src/entry.ts
+@@ -79,7 +79,7 @@ if (
+ 
+   function ensureExperimentalWarningSuppressed(): boolean {
+     // Bun-compiled binaries cannot respawn through the Node-only warning flag.
+-    if (typeof Bun !== "undefined") {
++    if ((globalThis as Record<string, unknown>).Bun !== undefined) {
+       return false;
+     }
+     if (shouldSkipRespawnForArgv(process.argv)) {
+diff --git a/src/gateway/mcp-http.ts b/src/gateway/mcp-http.ts
+index 8ccfd5783c..ef91afa3ca 100644
+--- a/src/gateway/mcp-http.ts
++++ b/src/gateway/mcp-http.ts
+@@ -286,21 +286,34 @@ async function handleJsonRpc(
+ 
+ const MAX_BODY_BYTES = 1_048_576; // 1 MB
+ 
++const READ_BODY_TIMEOUT_MS = 10_000; // 10 s — guards against slow-loris on loopback
++
+ function readBody(req: IncomingMessage): Promise<string> {
+   return new Promise((resolve, reject) => {
+     const chunks: Buffer[] = [];
+     let received = 0;
++    const timer = setTimeout(() => {
++      req.destroy();
++      reject(new Error("Request body read timed out"));
++    }, READ_BODY_TIMEOUT_MS);
+     req.on("data", (chunk: Buffer) => {
+       received += chunk.length;
+       if (received > MAX_BODY_BYTES) {
++        clearTimeout(timer);
+         req.destroy();
+         reject(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`));
+         return;
+       }
+       chunks.push(chunk);
+     });
+-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+-    req.on("error", reject);
++    req.on("end", () => {
++      clearTimeout(timer);
++      resolve(Buffer.concat(chunks).toString("utf-8"));
++    });
++    req.on("error", (err) => {
++      clearTimeout(timer);
++      reject(err);
++    });
+   });
+ }
+ 
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index 75629bc95f..0f4138ce8f 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -376,9 +376,6 @@ function normalizePayloadForChannelDelivery(
+ function normalizePayloadsForChannelDelivery(
+   payloads: ReplyPayload[],
+   channel: Exclude<OutboundChannel, "none">,
+-  _cfg: OpenClawConfig,
+-  _to: string,
+-  _accountId?: string,
+ ): ReplyPayload[] {
+   const normalizedPayloads: ReplyPayload[] = [];
+   for (const payload of normalizeReplyPayloadsForDelivery(payloads)) {
+diff --git a/src/plugin-sdk/feishu.ts b/src/plugin-sdk/feishu.ts
+index 88703e6adc..9834c0d979 100644
+--- a/src/plugin-sdk/feishu.ts
++++ b/src/plugin-sdk/feishu.ts
+@@ -54,6 +54,17 @@ export { createDedupeCache } from "../infra/dedupe.js";
+ export { installRequestBodyLimitGuard } from "../infra/http-body.js";
+ export { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
+ export { emptyPluginConfigSchema } from "../plugins/config-schema.js";
++export { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
++export { getLiveSessionTranscriptEntries } from "../agents/pi-embedded-runner/live-session-registry.js";
++export {
++  appendAssistantMessageToSessionTranscript,
++  loadSessionStore,
++  resolveSessionFilePath,
++  resolveSessionFilePathOptions,
++} from "../config/sessions.js";
++export type { SessionEntry, SessionTranscriptMessageMeta } from "../config/sessions.js";
++export { stripEnvelopeFromMessage } from "../gateway/chat-sanitize.js";
++export { resolveUserPath } from "../utils.js";
+ export type { PluginRuntime } from "../plugins/runtime/types.js";
+ export type { AnyAgentTool, OpenClawPluginApi } from "../plugins/types.js";
+ export { DEFAULT_ACCOUNT_ID, normalizeAgentId } from "../routing/session-key.js";
+diff --git a/src/plugins/loader.ts b/src/plugins/loader.ts
+index 473180290f..be00a3f267 100644
+--- a/src/plugins/loader.ts
++++ b/src/plugins/loader.ts
+@@ -558,10 +558,14 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
+     if (jitiLoader) {
+       return jitiLoader;
+     }
+-    // Bun compiled binaries cannot resolve jiti's babel.cjs from the virtual
+-    // filesystem.  Bypass jiti entirely and use require() which is synchronous
+-    // and Bun handles ESM→CJS interop automatically for .js files.
+-    if (typeof (globalThis as Record<string, unknown>).Bun !== "undefined") {
++    // Compiled Bun binaries cannot resolve jiti's babel.cjs from the virtual
++    // filesystem.  Bypass jiti and use require() only for compiled binaries
++    // (detected via the embedded-plugins marker injected at build time).
++    // Plain `bun run` (non-compiled) supports jiti normally.
++    const isCompiledBunBinary = Array.isArray(
++      (globalThis as Record<string, unknown>).__OPENCLAW_EMBEDDED_PLUGINS__,
++    );
++    if (isCompiledBunBinary) {
+       jitiLoader = ((specifier: string) => {
+         return require(specifier);
+       }) as unknown as ReturnType<typeof createJiti>;
+-- 
+2.50.1 (Apple Git-155)
+

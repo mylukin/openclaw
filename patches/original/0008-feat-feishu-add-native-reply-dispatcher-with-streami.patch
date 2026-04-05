@@ -1,0 +1,3361 @@
+From 80005dc160c1687a81e9ed2da6cd9516b8fd65d9 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:43:18 +0800
+Subject: [PATCH 08/98] feat(feishu): add native reply dispatcher with
+ streaming card updates
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/index.ts                    |  12 +
+ extensions/feishu/src/bot.test.ts             |  48 +-
+ extensions/feishu/src/bot.ts                  |  16 +-
+ extensions/feishu/src/channel.test.ts         |  76 ++
+ extensions/feishu/src/channel.ts              |  10 +
+ extensions/feishu/src/config-schema.test.ts   |  31 +
+ extensions/feishu/src/config-schema.ts        |   3 +
+ extensions/feishu/src/drive.ts                |  15 +-
+ extensions/feishu/src/exports.test.ts         |  31 +
+ extensions/feishu/src/media.test.ts           |  19 +-
+ extensions/feishu/src/media.ts                |   4 +-
+ extensions/feishu/src/monitor.ts              |   6 +-
+ .../feishu/src/reply-dispatcher.test.ts       | 367 +++++++-
+ extensions/feishu/src/reply-dispatcher.ts     | 337 ++++++-
+ .../feishu/src/send.reply-fallback.test.ts    |   3 +
+ extensions/feishu/src/streaming-card.test.ts  | 115 ++-
+ extensions/feishu/src/streaming-card.ts       | 149 +--
+ src/agents/cli-backends.ts                    |   2 +-
+ .../cli-runner.helpers.stream-json.test.ts    |  59 ++
+ src/agents/cli-runner.test.ts                 | 867 ++++++++++++++++++
+ src/agents/cli-runner.ts                      |   4 +
+ src/agents/cli-runner/helpers.ts              |  56 +-
+ .../reply/agent-runner-execution.ts           |  30 +-
+ .../agent-runner.misc.runreplyagent.test.ts   |  85 ++
+ src/hooks/llm-slug-generator.test.ts          |  31 +-
+ src/hooks/llm-slug-generator.ts               |  54 +-
+ 26 files changed, 2220 insertions(+), 210 deletions(-)
+ create mode 100644 extensions/feishu/src/exports.test.ts
+
+diff --git a/extensions/feishu/index.ts b/extensions/feishu/index.ts
+index bd26346c8e..723b355817 100644
+--- a/extensions/feishu/index.ts
++++ b/extensions/feishu/index.ts
+@@ -6,10 +6,13 @@ import { registerFeishuChatTools } from "./src/chat.js";
+ import { registerFeishuDocTools } from "./src/docx.js";
+ import { registerFeishuDriveTools } from "./src/drive.js";
+ import { registerFeishuPermTools } from "./src/perm.js";
++import { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
+ import { setFeishuRuntime } from "./src/runtime.js";
+ import { registerFeishuWikiTools } from "./src/wiki.js";
+ 
+ export { monitorFeishuProvider } from "./src/monitor.js";
++export { getBotOpenId } from "./src/monitor.js";
++export { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
+ export {
+   sendMessageFeishu,
+   sendCardFeishu,
+@@ -51,6 +54,15 @@ const plugin = {
+   description: "Feishu/Lark channel plugin",
+   configSchema: emptyPluginConfigSchema(),
+   register(api: OpenClawPluginApi) {
++    // Expose Feishu-native reply dispatcher factory for other plugins
++    // (e.g. bot-company group dispatch) to reuse streaming card behavior.
++    const replyRuntime =
++      (api.runtime as unknown as { channel?: { reply?: Record<string, unknown> } })?.channel
++        ?.reply ?? null;
++    if (replyRuntime && typeof replyRuntime.createFeishuReplyDispatcher !== "function") {
++      replyRuntime.createFeishuReplyDispatcher = createFeishuReplyDispatcher as unknown;
++    }
++
+     setFeishuRuntime(api.runtime);
+     api.registerChannel({ plugin: feishuPlugin });
+     registerFeishuDocTools(api);
+diff --git a/extensions/feishu/src/bot.test.ts b/extensions/feishu/src/bot.test.ts
+index 50a6db9aed..58b1e6c980 100644
+--- a/extensions/feishu/src/bot.test.ts
++++ b/extensions/feishu/src/bot.test.ts
+@@ -1774,7 +1774,7 @@ describe("handleFeishuMessage command authorization", () => {
+     );
+   });
+ 
+-  it("forces thread replies when inbound message contains thread_id", async () => {
++  it("respects replyInThread=disabled even when thread_id is present", async () => {
+     mockShouldComputeCommandAuthorized.mockReturnValue(false);
+ 
+     const cfg: ClawdbotConfig = {
+@@ -1807,8 +1807,50 @@ describe("handleFeishuMessage command authorization", () => {
+ 
+     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
+       expect.objectContaining({
+-        replyInThread: true,
+-        threadReply: true,
++        replyInThread: false,
++        streamingInThread: false,
++        threadReply: false,
++      }),
++    );
++  });
++
++  it("gates threadReply and rootId when replyInThread is disabled", async () => {
++    mockShouldComputeCommandAuthorized.mockReturnValue(false);
++
++    const cfg: ClawdbotConfig = {
++      channels: {
++        feishu: {
++          groups: {
++            "oc-group": {
++              requireMention: false,
++              groupSessionScope: "group",
++              replyInThread: "disabled",
++              streamingInThread: "disabled",
++            },
++          },
++        },
++      },
++    } as ClawdbotConfig;
++
++    const event: FeishuMessageEvent = {
++      sender: { sender_id: { open_id: "ou-thread-stream-off" } },
++      message: {
++        message_id: "msg-thread-stream-off",
++        chat_id: "oc-group",
++        chat_type: "group",
++        thread_id: "omt_topic_stream_off",
++        message_type: "text",
++        content: JSON.stringify({ text: "thread content" }),
++      },
++    };
++
++    await dispatchMessage({ cfg, event });
++
++    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
++      expect.objectContaining({
++        replyInThread: false,
++        streamingInThread: false,
++        threadReply: false,
+       }),
+     );
+   });
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index b08388c634..e9f722732b 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -276,6 +276,7 @@ type ResolvedFeishuGroupSession = {
+   parentPeer: { kind: "group"; id: string } | null;
+   groupSessionScope: GroupSessionScope;
+   replyInThread: boolean;
++  streamingInThread: boolean;
+   threadReply: boolean;
+ };
+ 
+@@ -289,11 +290,13 @@ function resolveFeishuGroupSession(params: {
+     groupSessionScope?: GroupSessionScope;
+     topicSessionMode?: "enabled" | "disabled";
+     replyInThread?: "enabled" | "disabled";
++    streamingInThread?: "enabled" | "disabled";
+   };
+   feishuCfg?: {
+     groupSessionScope?: GroupSessionScope;
+     topicSessionMode?: "enabled" | "disabled";
+     replyInThread?: "enabled" | "disabled";
++    streamingInThread?: "enabled" | "disabled";
+   };
+ }): ResolvedFeishuGroupSession {
+   const { chatId, senderOpenId, messageId, rootId, threadId, groupConfig, feishuCfg } = params;
+@@ -302,7 +305,8 @@ function resolveFeishuGroupSession(params: {
+   const normalizedRootId = rootId?.trim();
+   const threadReply = Boolean(normalizedThreadId || normalizedRootId);
+   const replyInThread =
+-    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
++    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled" ||
++    threadReply;
+   const streamingInThread =
+     (groupConfig?.streamingInThread ?? feishuCfg?.streamingInThread ?? "disabled") === "enabled";
+ 
+@@ -354,6 +358,7 @@ function resolveFeishuGroupSession(params: {
+     parentPeer,
+     groupSessionScope,
+     replyInThread,
++    streamingInThread,
+     threadReply,
+   };
+ }
+@@ -1222,6 +1227,7 @@ export async function handleFeishuMessage(params: {
+     const peerId = isGroup ? (groupSession?.peerId ?? ctx.chatId) : ctx.senderOpenId;
+     const parentPeer = isGroup ? (groupSession?.parentPeer ?? null) : null;
+     const replyInThread = isGroup ? (groupSession?.replyInThread ?? false) : false;
++    const streamingInThread = isGroup ? (groupSession?.streamingInThread ?? false) : true;
+ 
+     if (isGroup && groupSession) {
+       log(
+@@ -1498,8 +1504,8 @@ export async function handleFeishuMessage(params: {
+             skipReplyToInMessages: !isGroup,
+             replyInThread,
+             streamingInThread,
+-            rootId: replyInThread ? ctx.rootId : undefined,
+-            threadReply: replyInThread && threadReply,
++            rootId: ctx.rootId,
++            threadReply,
+             mentionTargets: ctx.mentionTargets,
+             accountId: account.accountId,
+             botOpenId,
+@@ -1598,8 +1604,8 @@ export async function handleFeishuMessage(params: {
+         skipReplyToInMessages: !isGroup,
+         replyInThread,
+         streamingInThread,
+-        rootId: replyInThread ? ctx.rootId : undefined,
+-        threadReply: replyInThread && threadReply,
++        rootId: ctx.rootId,
++        threadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
+         botOpenId,
+diff --git a/extensions/feishu/src/channel.test.ts b/extensions/feishu/src/channel.test.ts
+index 936ba4c005..acfa3d4286 100644
+--- a/extensions/feishu/src/channel.test.ts
++++ b/extensions/feishu/src/channel.test.ts
+@@ -46,3 +46,79 @@ describe("feishuPlugin.status.probeAccount", () => {
+     expect(result).toMatchObject({ ok: true, appId: "cli_main" });
+   });
+ });
++
++describe("feishuPlugin.configSchema", () => {
++  it("exposes top-level streamingInThread in channel schema", () => {
++    const schema = feishuPlugin.configSchema?.schema as
++      | {
++          properties?: Record<string, unknown>;
++        }
++      | undefined;
++    const streamingInThread = schema?.properties?.streamingInThread as
++      | { enum?: string[] }
++      | undefined;
++    expect(streamingInThread?.enum).toEqual(["disabled", "enabled"]);
++  });
++
++  it("exposes account-level dispatchMode in channel schema", () => {
++    const schema = feishuPlugin.configSchema?.schema as
++      | {
++          properties?: {
++            accounts?: {
++              additionalProperties?: {
++                properties?: Record<string, unknown>;
++              };
++            };
++          };
++        }
++      | undefined;
++
++    const dispatchMode = schema?.properties?.accounts?.additionalProperties?.properties
++      ?.dispatchMode as { enum?: string[] } | undefined;
++
++    expect(dispatchMode?.enum).toEqual(["auto", "plugin"]);
++  });
++
++  it("exposes account-level streamingInThread in channel schema", () => {
++    const schema = feishuPlugin.configSchema?.schema as
++      | {
++          properties?: {
++            accounts?: {
++              additionalProperties?: {
++                properties?: Record<string, unknown>;
++              };
++            };
++          };
++        }
++      | undefined;
++    const streamingInThread = schema?.properties?.accounts?.additionalProperties?.properties
++      ?.streamingInThread as { enum?: string[] } | undefined;
++    expect(streamingInThread?.enum).toEqual(["disabled", "enabled"]);
++  });
++
++  it("exposes account-level pluginMode.forwardControlCommands in channel schema", () => {
++    const schema = feishuPlugin.configSchema?.schema as
++      | {
++          properties?: {
++            accounts?: {
++              additionalProperties?: {
++                properties?: Record<string, unknown>;
++              };
++            };
++          };
++        }
++      | undefined;
++
++    const pluginMode = schema?.properties?.accounts?.additionalProperties?.properties?.pluginMode as
++      | {
++          properties?: Record<string, unknown>;
++        }
++      | undefined;
++
++    const forwardControlCommands = pluginMode?.properties?.forwardControlCommands as
++      | { type?: string }
++      | undefined;
++
++    expect(forwardControlCommands?.type).toBe("boolean");
++  });
++});
+diff --git a/extensions/feishu/src/channel.ts b/extensions/feishu/src/channel.ts
+index 7c90136e70..31b4ab866b 100644
+--- a/extensions/feishu/src/channel.ts
++++ b/extensions/feishu/src/channel.ts
+@@ -155,6 +155,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
+         },
+         topicSessionMode: { type: "string", enum: ["disabled", "enabled"] },
+         replyInThread: { type: "string", enum: ["disabled", "enabled"] },
++        streamingInThread: { type: "string", enum: ["disabled", "enabled"] },
+         historyLimit: { type: "integer", minimum: 0 },
+         dmHistoryLimit: { type: "integer", minimum: 0 },
+         textChunkLimit: { type: "integer", minimum: 1 },
+@@ -177,6 +178,15 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
+               webhookHost: { type: "string" },
+               webhookPath: { type: "string" },
+               webhookPort: { type: "integer", minimum: 1 },
++              dispatchMode: { type: "string", enum: ["auto", "plugin"] },
++              streamingInThread: { type: "string", enum: ["disabled", "enabled"] },
++              pluginMode: {
++                type: "object",
++                additionalProperties: false,
++                properties: {
++                  forwardControlCommands: { type: "boolean" },
++                },
++              },
+             },
+           },
+         },
+diff --git a/extensions/feishu/src/config-schema.test.ts b/extensions/feishu/src/config-schema.test.ts
+index cdd4724d3f..ee239433d8 100644
+--- a/extensions/feishu/src/config-schema.test.ts
++++ b/extensions/feishu/src/config-schema.test.ts
+@@ -145,6 +145,37 @@ describe("FeishuConfigSchema replyInThread", () => {
+   });
+ });
+ 
++describe("FeishuConfigSchema streamingInThread", () => {
++  it("accepts streamingInThread at top level", () => {
++    const result = FeishuConfigSchema.parse({ streamingInThread: "disabled" });
++    expect(result.streamingInThread).toBe("disabled");
++  });
++
++  it("defaults streamingInThread to undefined when not set", () => {
++    const result = FeishuConfigSchema.parse({});
++    expect(result.streamingInThread).toBeUndefined();
++  });
++
++  it("rejects invalid streamingInThread value", () => {
++    const result = FeishuConfigSchema.safeParse({ streamingInThread: "always" });
++    expect(result.success).toBe(false);
++  });
++
++  it("accepts streamingInThread in group config", () => {
++    const result = FeishuGroupSchema.parse({ streamingInThread: "disabled" });
++    expect(result.streamingInThread).toBe("disabled");
++  });
++
++  it("accepts streamingInThread in account config", () => {
++    const result = FeishuConfigSchema.parse({
++      accounts: {
++        main: { streamingInThread: "disabled" },
++      },
++    });
++    expect(result.accounts?.main?.streamingInThread).toBe("disabled");
++  });
++});
++
+ describe("FeishuConfigSchema optimization flags", () => {
+   it("defaults top-level typingIndicator and resolveSenderNames to true", () => {
+     const result = FeishuConfigSchema.parse({});
+diff --git a/extensions/feishu/src/config-schema.ts b/extensions/feishu/src/config-schema.ts
+index 4060e6e2cb..5ca02cb4e9 100644
+--- a/extensions/feishu/src/config-schema.ts
++++ b/extensions/feishu/src/config-schema.ts
+@@ -130,6 +130,7 @@ const ReactionNotificationModeSchema = z.enum(["off", "own", "all"]).optional();
+  * causing the reply to appear as a topic (话题) under the original message.
+  */
+ const ReplyInThreadSchema = z.enum(["disabled", "enabled"]).optional();
++const StreamingInThreadSchema = z.enum(["disabled", "enabled"]).optional();
+ 
+ export const FeishuGroupSchema = z
+   .object({
+@@ -142,6 +143,7 @@ export const FeishuGroupSchema = z
+     groupSessionScope: GroupSessionScopeSchema,
+     topicSessionMode: TopicSessionModeSchema,
+     replyInThread: ReplyInThreadSchema,
++    streamingInThread: StreamingInThreadSchema,
+   })
+   .strict();
+ 
+@@ -171,6 +173,7 @@ const FeishuSharedConfigShape = {
+   streaming: StreamingModeSchema,
+   tools: FeishuToolsConfigSchema,
+   replyInThread: ReplyInThreadSchema,
++  streamingInThread: StreamingInThreadSchema,
+   reactionNotifications: ReactionNotificationModeSchema,
+   typingIndicator: z.boolean().optional(),
+   resolveSenderNames: z.boolean().optional(),
+diff --git a/extensions/feishu/src/drive.ts b/extensions/feishu/src/drive.ts
+index 227c30fbbb..b34ce424ea 100644
+--- a/extensions/feishu/src/drive.ts
++++ b/extensions/feishu/src/drive.ts
+@@ -12,14 +12,13 @@ import {
+ // ============ Actions ============
+ 
+ async function getRootFolderToken(client: Lark.Client): Promise<string> {
+-  // Use generic HTTP client to call the root folder meta API
+-  // as it's not directly exposed in the SDK
+-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- accessing internal SDK property
+-  const domain = (client as any).domain ?? "https://open.feishu.cn";
+-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- accessing internal SDK property
+-  const res = (await (client as any).httpInstance.get(
+-    `${domain}/open-apis/drive/explorer/v2/root_folder/meta`,
+-  )) as { code: number; msg?: string; data?: { token?: string } };
++  // Use SDK generic request for endpoints not exposed as typed methods.
++  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK generic request method
++  const res = (await (client as any).request({
++    method: "GET",
++    url: "/open-apis/drive/explorer/v2/root_folder/meta",
++    data: {},
++  })) as { code: number; msg?: string; data?: { token?: string } };
+   if (res.code !== 0) {
+     throw new Error(res.msg ?? "Failed to get root folder");
+   }
+diff --git a/extensions/feishu/src/exports.test.ts b/extensions/feishu/src/exports.test.ts
+new file mode 100644
+index 0000000000..b50b0eba36
+--- /dev/null
++++ b/extensions/feishu/src/exports.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it, vi } from "vitest";
++
++describe("feishu extension exports", () => {
++  it("exports createFeishuReplyDispatcher and getBotOpenId", async () => {
++    const mod = await import("../index.js");
++
++    expect(typeof mod.createFeishuReplyDispatcher).toBe("function");
++    expect(typeof mod.getBotOpenId).toBe("function");
++  });
++
++  it("register() exposes native feishu dispatcher on runtime.channel.reply", async () => {
++    const mod = await import("../index.js");
++    const register = mod.default.register as (api: unknown) => void;
++    const runtime = {
++      channel: {
++        reply: {},
++      },
++    };
++    register({
++      config: {},
++      logger: {},
++      runtime,
++      registerChannel: vi.fn(),
++      registerTool: vi.fn(),
++    });
++    expect(
++      typeof (runtime as { channel: { reply: { createFeishuReplyDispatcher?: unknown } } }).channel
++        .reply.createFeishuReplyDispatcher,
++    ).toBe("function");
++  });
++});
+diff --git a/extensions/feishu/src/media.test.ts b/extensions/feishu/src/media.test.ts
+index 813e509029..242bbea035 100644
+--- a/extensions/feishu/src/media.test.ts
++++ b/extensions/feishu/src/media.test.ts
+@@ -208,7 +208,7 @@ describe("sendMediaFeishu msg_type routing", () => {
+     );
+   });
+ 
+-  it("uses msg_type=media when replying with mp4", async () => {
++  it("uses message.create when replying with mp4 without replyInThread", async () => {
+     await sendMediaFeishu({
+       cfg: {} as any,
+       to: "user:ou_target",
+@@ -217,14 +217,13 @@ describe("sendMediaFeishu msg_type routing", () => {
+       replyToMessageId: "om_parent",
+     });
+ 
+-    expect(messageReplyMock).toHaveBeenCalledWith(
++    expect(messageCreateMock).toHaveBeenCalledWith(
+       expect.objectContaining({
+-        path: { message_id: "om_parent" },
+-        data: expect.objectContaining({ msg_type: "media" }),
++        data: expect.objectContaining({ msg_type: "file" }),
+       }),
+     );
+ 
+-    expect(messageCreateMock).not.toHaveBeenCalled();
++    expect(messageReplyMock).not.toHaveBeenCalled();
+   });
+ 
+   it("passes reply_in_thread when replyInThread is true", async () => {
+@@ -248,7 +247,7 @@ describe("sendMediaFeishu msg_type routing", () => {
+     );
+   });
+ 
+-  it("omits reply_in_thread when replyInThread is false", async () => {
++  it("uses message.create when replyInThread is false", async () => {
+     await sendMediaFeishu({
+       cfg: {} as any,
+       to: "user:ou_target",
+@@ -258,8 +257,12 @@ describe("sendMediaFeishu msg_type routing", () => {
+       replyInThread: false,
+     });
+ 
+-    const callData = messageReplyMock.mock.calls[0][0].data;
+-    expect(callData).not.toHaveProperty("reply_in_thread");
++    expect(messageCreateMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        data: expect.objectContaining({ msg_type: "file" }),
++      }),
++    );
++    expect(messageReplyMock).not.toHaveBeenCalled();
+   });
+ 
+   it("passes mediaLocalRoots as localRoots to loadWebMedia for local paths (#27884)", async () => {
+diff --git a/extensions/feishu/src/media.ts b/extensions/feishu/src/media.ts
+index 4aba038b4a..09f764957a 100644
+--- a/extensions/feishu/src/media.ts
++++ b/extensions/feishu/src/media.ts
+@@ -310,7 +310,7 @@ export async function sendImageFeishu(params: {
+   });
+   const content = JSON.stringify({ image_key: imageKey });
+ 
+-  if (replyToMessageId) {
++  if (replyToMessageId && replyInThread) {
+     const response = await client.im.message.reply({
+       path: { message_id: replyToMessageId },
+       data: {
+@@ -357,7 +357,7 @@ export async function sendFileFeishu(params: {
+   });
+   const content = JSON.stringify({ file_key: fileKey });
+ 
+-  if (replyToMessageId) {
++  if (replyToMessageId && replyInThread) {
+     const response = await client.im.message.reply({
+       path: { message_id: replyToMessageId },
+       data: {
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 8410ebd60d..3995d01819 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -7,7 +7,6 @@ import {
+   type HistoryEntry,
+   getGlobalHookRunner,
+   installRequestBodyLimitGuard,
+-  getGlobalHookRunner,
+ } from "openclaw/plugin-sdk";
+ import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
+ import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
+@@ -236,6 +235,11 @@ export async function resolveReactionSyntheticEvent(
+   };
+ }
+ 
++export function getBotOpenId(accountId: string): string | undefined {
++  const value = botOpenIds.get(accountId)?.trim();
++  return value ? value : undefined;
++}
++
+ async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
+   try {
+     const result = await probeFeishu(account);
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 744532320d..761fa2fb02 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -45,6 +45,7 @@ vi.mock("./streaming-card.js", () => ({
+   },
+   FeishuStreamingSession: class {
+     active = false;
++    messageId = "om_stream_1";
+     start = vi.fn(async () => {
+       this.active = true;
+     });
+@@ -52,7 +53,11 @@ vi.mock("./streaming-card.js", () => ({
+     close = vi.fn(async () => {
+       this.active = false;
+     });
++    discard = vi.fn(async () => {
++      this.active = false;
++    });
+     isActive = vi.fn(() => this.active);
++    getMessageId = vi.fn(() => this.messageId);
+ 
+     constructor() {
+       streamingInstances.push(this);
+@@ -62,6 +67,12 @@ vi.mock("./streaming-card.js", () => ({
+ 
+ import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
+ 
++async function flushAsyncTasks(): Promise<void> {
++  await Promise.resolve();
++  await Promise.resolve();
++  await Promise.resolve();
++}
++
+ describe("createFeishuReplyDispatcher streaming behavior", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+@@ -241,15 +252,55 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+   });
+ 
+-  it("sets disableBlockStreaming in replyOptions to prevent silent reply drops", async () => {
+-    const result = createFeishuReplyDispatcher({
++  it("does not force streaming in auto mode for reasoning/tool events without card content", async () => {
++    const dispatcher = createFeishuReplyDispatcher({
+       cfg: {} as never,
+       agentId: "agent",
+-      runtime: {} as never,
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
+       chatId: "oc_chat",
+     });
+ 
+-    expect(result.replyOptions).toHaveProperty("disableBlockStreaming", true);
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await dispatcher.replyOptions.onReasoningStream?.({ text: "reasoning...", isReasoning: true });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(0);
++
++    await options.deliver({ text: "plain text" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(0);
++    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
++    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
++  });
++
++  it("renders staged thinking status with first partial text chunk in auto mode", async () => {
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(
++      1,
++      "💭 思考中...\n---\n第一段答案",
++      {
++        mode: "replace",
++      },
++    );
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(2, "第一段答案", {
++      mode: "replace",
++    });
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.onIdle?.();
++    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案");
+   });
+ 
+   it("uses streaming session for auto mode markdown payloads", async () => {
+@@ -371,7 +422,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
+-  it("treats block updates as delta chunks", async () => {
++  it("stages thinking prelude on assistant message start without opening a card", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+       appId: "app_id",
+@@ -383,22 +434,169 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+       },
+     });
+ 
+-    const result = createFeishuReplyDispatcher({
++    const dispatcher = createFeishuReplyDispatcher({
+       cfg: {} as never,
+       agentId: "agent",
+       runtime: { log: vi.fn(), error: vi.fn() } as never,
+       chatId: "oc_chat",
+     });
+ 
++    await dispatcher.replyOptions.onAssistantMessageStart?.();
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(0);
++
+     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+-    await options.onReplyStart?.();
+-    await result.replyOptions.onPartialReply?.({ text: "hello" });
+-    await options.deliver({ text: "lo world" }, { kind: "block" });
+     await options.onIdle?.();
++    expect(streamingInstances).toHaveLength(0);
++  });
++
++  it("stages thinking/tool status lines until first text chunk and keeps final close content text-only", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++
++    await dispatcher.replyOptions.onReasoningStream?.({
++      text: "Reasoning:\n_step_",
++      isReasoning: true,
++    });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(0);
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(0);
+ 
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
+     expect(streamingInstances).toHaveLength(1);
+-    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
+-    expect(streamingInstances[0].close).toHaveBeenCalledWith("hellolo world");
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(
++      1,
++      "🔧 正在使用Read工具...\n---\n第一段答案",
++      {
++        mode: "replace",
++      },
++    );
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(2, "第一段答案", {
++      mode: "replace",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].update).toHaveBeenLastCalledWith(
++      "🔧 已使用 2 个工具，正在处理...\n---\n第一段答案",
++    );
++
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案\n第二段答案" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案\n第二段答案");
++
++    await options.onIdle?.();
++    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n第二段答案");
++  });
++
++  it("stages tool status when tool event is first and renders with first text", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(0);
++
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(
++      1,
++      "🔧 正在使用Read工具...\n---\n第一段答案",
++      {
++        mode: "replace",
++      },
++    );
++    expect(streamingInstances[0].update).toHaveBeenNthCalledWith(2, "第一段答案", {
++      mode: "replace",
++    });
++  });
++
++  it("replaces pre-tool status text when the first post-tool partial restarts the answer", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onPartialReply?.({ text: "**Checking SEO JSON-LD in PR #16**" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onPartialReply?.({
++      text: '<at user_id="ou_luke">Luke</at> 加了。',
++    });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onPartialReply?.({
++      text: '<at user_id="ou_luke">Luke</at> 加了。\n我刚又确认了一遍',
++    });
++    await flushAsyncTasks();
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].update).toHaveBeenLastCalledWith(
++      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
++      {
++        mode: "replace",
++      },
++    );
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.onIdle?.();
++    expect(streamingInstances[0].close).toHaveBeenCalledWith(
++      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
++    );
+   });
+ 
+   it("sends media-only payloads as attachments", async () => {
+@@ -544,7 +742,33 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     });
+   });
+ 
+-  it("disables streaming for thread replies and keeps reply metadata", async () => {
++  it("uses streaming for thread replies and keeps reply metadata when streamingInThread is enabled", async () => {
++    createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++      streamingInThread: true,
++      threadReply: true,
++      rootId: "om_root_topic",
++    });
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.deliver({ text: "```ts\nconst x = 1\n```" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].start).toHaveBeenCalledWith("oc_chat", "chat_id", {
++      replyToMessageId: "om_msg",
++      replyInThread: true,
++      rootId: "om_root_topic",
++    });
++    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
++    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
++  });
++
++  it("disables streaming for thread replies by default", async () => {
+     createFeishuReplyDispatcher({
+       cfg: {} as never,
+       agentId: "agent",
+@@ -568,6 +792,36 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("does not create streaming card when final content is empty", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onReasoningStream?.({ text: "thinking", isReasoning: true });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.onIdle?.();
++
++    expect(streamingInstances).toHaveLength(0);
++  });
++
+   it("passes replyInThread to media attachments", async () => {
+     createFeishuReplyDispatcher({
+       cfg: {} as never,
+@@ -588,4 +842,93 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+       }),
+     );
+   });
++
++  it("emits onFinalTextDelivered for non-streaming final text replies", async () => {
++    const onFinalTextDelivered = vi.fn(async () => {});
++    sendMessageFeishuMock.mockResolvedValue({ messageId: "om_final_1", chatId: "oc_chat" });
++
++    createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: {} as never,
++      chatId: "oc_chat",
++      onFinalTextDelivered,
++    });
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.deliver({ text: "@Trent 请继续" }, { kind: "final" });
++
++    expect(onFinalTextDelivered).toHaveBeenCalledTimes(1);
++    expect(onFinalTextDelivered).toHaveBeenCalledWith({
++      text: "@Trent 请继续",
++      messageId: "om_final_1",
++      chatId: "oc_chat",
++      accountId: "main",
++    });
++  });
++
++  it("emits onFinalTextDelivered when streaming closes with final text", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++    const onFinalTextDelivered = vi.fn(async () => {});
++
++    createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++      onFinalTextDelivered,
++    });
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.deliver({ text: "最终回复内容" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(onFinalTextDelivered).toHaveBeenCalledTimes(1);
++    expect(onFinalTextDelivered).toHaveBeenCalledWith({
++      text: "最终回复内容",
++      messageId: "om_stream_1",
++      chatId: "oc_chat",
++      accountId: "main",
++    });
++  });
++
++  it("normalizes user_id mention tags before closing streaming card", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++    await options.deliver(
++      { text: '是 <at user_id="ou_vivi">Vivi（薇薇）</at> 的回合，不是我' },
++      { kind: "final" },
++    );
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].close).toHaveBeenCalledWith(
++      "是 <at id=ou_vivi></at> 的回合，不是我",
++    );
++  });
+ });
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index a6f7fbdf5d..fe95dcff51 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -5,15 +5,15 @@ import {
+   type ClawdbotConfig,
+   type ReplyPayload,
+   type RuntimeEnv,
+-} from "openclaw/plugin-sdk/feishu";
++} from "openclaw/plugin-sdk";
+ import { resolveFeishuAccount } from "./accounts.js";
+ import { createFeishuClient } from "./client.js";
+ import { sendMediaFeishu } from "./media.js";
+ import type { MentionTarget } from "./mention.js";
+-import { buildMentionedCardContent } from "./mention.js";
++import { buildMentionedCardContent, normalizeMentionTagsForCard } from "./mention.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
+-import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js";
++import { FeishuStreamingSession } from "./streaming-card.js";
+ import { resolveReceiveIdType } from "./targets.js";
+ import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
+ 
+@@ -45,6 +45,8 @@ export type CreateFeishuReplyDispatcherParams = {
+   /** When true, preserve typing indicator on reply target but send messages without reply metadata */
+   skipReplyToInMessages?: boolean;
+   replyInThread?: boolean;
++  /** Whether card streaming status is allowed in thread/topic replies (default: false). */
++  streamingInThread?: boolean;
+   /** True when inbound message is already inside a thread/topic context */
+   threadReply?: boolean;
+   rootId?: string;
+@@ -55,6 +57,13 @@ export type CreateFeishuReplyDispatcherParams = {
+   /** Epoch ms when the inbound message was created. Used to suppress typing
+    *  indicators on old/replayed messages after context compaction (#30418). */
+   messageCreateTimeMs?: number;
++  /** Callback fired when a final visible text reply has been delivered. */
++  onFinalTextDelivered?: (params: {
++    text: string;
++    messageId?: string;
++    chatId: string;
++    accountId?: string;
++  }) => Promise<void> | void;
+ };
+ 
+ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams) {
+@@ -66,6 +75,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     replyToMessageId,
+     skipReplyToInMessages,
+     replyInThread,
++    streamingInThread,
+     threadReply,
+     rootId,
+     mentionTargets,
+@@ -139,23 +149,169 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   const chunkMode = core.channel.text.resolveChunkMode(cfg, "feishu");
+   const tableMode = core.channel.text.resolveMarkdownTableMode({ cfg, channel: "feishu" });
+   const renderMode = account.config?.renderMode ?? "auto";
+-  // Card streaming may miss thread affinity in topic contexts; use direct replies there.
+   const streamingEnabled =
+-    !threadReplyMode && account.config?.streaming !== false && renderMode !== "raw";
++    account.config?.streaming !== false &&
++    renderMode !== "raw" &&
++    (!threadReplyMode || streamingInThread === true);
+ 
+   let streaming: FeishuStreamingSession | null = null;
+   let streamText = "";
+   let lastPartial = "";
+-  const deliveredFinalTexts = new Set<string>();
++  let lastRenderedStreamContent = "";
++  let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
++  let toolUseCount = 0;
++  let lastToolName: string | undefined;
++  let hasThinkingPrelude = false;
++  let stagedStatusLine: string | undefined;
+   let partialUpdateQueue: Promise<void> = Promise.resolve();
+   let streamingStartPromise: Promise<void> | null = null;
+-  type StreamTextUpdateMode = "snapshot" | "delta";
++  let finalTextEmitted = false;
++  let replaceNextPartialAfterTool = false;
++
++  const emitFinalTextIfNeeded = async (text: string, messageId?: string) => {
++    const normalized = text.trim();
++    if (!normalized || finalTextEmitted || typeof params.onFinalTextDelivered !== "function") {
++      return;
++    }
++    finalTextEmitted = true;
++    try {
++      await params.onFinalTextDelivered({
++        text: normalized,
++        messageId,
++        chatId,
++        accountId: accountId ?? account.accountId,
++      });
++    } catch (error) {
++      params.runtime.error?.(
++        `feishu[${account.accountId}] onFinalTextDelivered failed: ${String(error)}`,
++      );
++    }
++    if (streamPhase === "tool") {
++      if (toolUseCount >= 2) {
++        return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
++      }
++      const toolName = lastToolName?.trim();
++      return toolName ? `🔧 正在使用${toolName}工具...` : "🔧 正在使用工具...";
++    }
++    return undefined;
++  };
++
++  const composeStreamingContent = (mode: "live" | "final" = "live"): string => {
++    const assistantText = streamText;
++    if (mode === "final") {
++      return assistantText;
++    }
++    const statusLine = resolveStatusLine();
++    if (!statusLine) {
++      return assistantText;
++    }
++    if (!assistantText) {
++      return statusLine;
++    }
++    return `${statusLine}\n---\n${assistantText}`;
++  };
++
++  const normalizeToolName = (name: string | undefined): string | undefined => {
++    const trimmed = name?.trim();
++    if (!trimmed) {
++      return undefined;
++    }
++    return trimmed.replace(/\s+/g, " ");
++  };
++
++  const resolveStatusLine = (): string | undefined => {
++    if (streamPhase === "thinking") {
++      return "💭 思考中...";
++    }
++    if (streamPhase === "tool") {
++      if (toolUseCount >= 2) {
++        return `🔧 已使用 ${toolUseCount} 个工具，正在处理...`;
++      }
++      return `🔧 正在使用 ${lastToolName ?? "工具"}...`;
++    }
++    return undefined;
++  };
++
++  const composeStreamingContent = (mode: "live" | "final" = "live"): string => {
++    const assistantText = streamText;
++    if (mode === "final") {
++      return assistantText;
++    }
++    const statusLine = resolveStatusLine();
++    if (!statusLine) {
++      return assistantText;
++    }
++    if (!assistantText) {
++      return statusLine;
++    }
++    return `${statusLine}\n---\n${assistantText}`;
++  };
++
++  const mergeStreamingText = (nextText: string) => {
++    if (!streamText) {
++      streamText = nextText;
++      return;
++    }
++    if (nextText.startsWith(streamText)) {
++      // Handle cumulative partial payloads where nextText already includes prior text.
++      streamText = nextText;
++      return;
++    }
++    if (streamText.endsWith(nextText)) {
++      return;
++    }
++    streamText += nextText;
++  };
++
++  /** Strip trailing incomplete <at ...> tag to prevent streaming card corruption. */
++  const stripIncompleteAtTag = (text: string): string => {
++    const lastAtIdx = text.lastIndexOf("<at");
++    if (lastAtIdx === -1) {
++      return text;
++    }
++    const tail = text.substring(lastAtIdx);
++    if (/<\/at>/i.test(tail) || /\/>/i.test(tail)) {
++      return text;
++    }
++    return text.substring(0, lastAtIdx);
++  };
++
++  const queueStreamingRender = (renderedSnapshot?: string) => {
++    partialUpdateQueue = partialUpdateQueue.then(async () => {
++      if (streamingStartPromise) {
++        await streamingStartPromise;
++      }
++      if (!streaming?.isActive()) {
++        return;
++      }
++      const rendered = renderedSnapshot ?? composeStreamingContent("live");
++      const safeRendered = stripIncompleteAtTag(rendered);
++      const renderedForCard = normalizeMentionTagsForCard(safeRendered);
++      if (!renderedForCard || renderedForCard === lastRenderedStreamContent) {
++        return;
++      }
++      lastRenderedStreamContent = rendered;
++      await streaming.update(rendered);
++    });
++  };
++
++  const shouldRenderStreamingStatus = (): boolean =>
++    renderMode === "card" || Boolean(streamingStartPromise) || Boolean(streaming?.isActive());
++
++  const queueThinkingPrelude = (): boolean => {
++    if (hasThinkingPrelude) {
++      return false;
++    }
++    streamPhase = "thinking";
++    stagedStatusLine = resolveStatusLine();
++    hasThinkingPrelude = true;
++    return true;
++  };
+ 
+   const queueStreamingUpdate = (
+     nextText: string,
+     options?: {
+       dedupeWithLastPartial?: boolean;
+-      mode?: StreamTextUpdateMode;
+     },
+   ) => {
+     if (!nextText) {
+@@ -164,20 +320,40 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     if (options?.dedupeWithLastPartial && nextText === lastPartial) {
+       return;
+     }
++    const shouldResetAfterTool =
++      replaceNextPartialAfterTool &&
++      options?.dedupeWithLastPartial === true &&
++      Boolean(streamText) &&
++      !nextText.startsWith(streamText);
+     if (options?.dedupeWithLastPartial) {
+       lastPartial = nextText;
+     }
+-    const mode = options?.mode ?? "snapshot";
+-    streamText =
+-      mode === "delta" ? `${streamText}${nextText}` : mergeStreamingText(streamText, nextText);
+-    partialUpdateQueue = partialUpdateQueue.then(async () => {
+-      if (streamingStartPromise) {
+-        await streamingStartPromise;
+-      }
+-      if (streaming?.isActive()) {
+-        await streaming.update(streamText);
+-      }
+-    });
++    if (shouldResetAfterTool) {
++      streamText = nextText;
++      replaceNextPartialAfterTool = false;
++      streamPhase = "streaming";
++      queueStreamingRender();
++      return;
++    }
++    replaceNextPartialAfterTool = false;
++    const hadVisibleText = Boolean(streamText);
++    mergeStreamingText(nextText);
++    const shouldRenderStagedStatus =
++      !hadVisibleText && Boolean(streamText) && Boolean(stagedStatusLine);
++    const stagedSnapshot = shouldRenderStagedStatus
++      ? `${stagedStatusLine}\n---\n${streamText}`
++      : undefined;
++    if (shouldRenderStagedStatus) {
++      stagedStatusLine = undefined;
++    }
++    streamPhase = "streaming";
++    if (stagedSnapshot) {
++      queueStreamingRender(stagedSnapshot);
++      // Immediately follow with plain text so close(finalText) remains text-only.
++      queueStreamingRender();
++      return;
++    }
++    queueStreamingRender();
+   };
+ 
+   const startStreaming = () => {
+@@ -209,22 +385,29 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     })();
+   };
+ 
+-  const closeStreaming = async () => {
++  const closeStreaming = async (options?: { emitFinalText?: boolean }) => {
+     if (streamingStartPromise) {
+       await streamingStartPromise;
+     }
+     await partialUpdateQueue;
++    const streamMessageId = streaming?.getMessageId();
+     if (streaming?.isActive()) {
+-      let text = streamText;
++      let text = composeStreamingContent("final");
+       if (mentionTargets?.length) {
+         text = buildMentionedCardContent(mentionTargets, text);
+       }
+-      await streaming.close(text);
+     }
+     streaming = null;
+     streamingStartPromise = null;
+     streamText = "";
+     lastPartial = "";
++    lastRenderedStreamContent = "";
++    streamPhase = "idle";
++    toolUseCount = 0;
++    lastToolName = undefined;
++    hasThinkingPrelude = false;
++    stagedStatusLine = undefined;
++    replaceNextPartialAfterTool = false;
+   };
+ 
+   const { dispatcher, replyOptions, markDispatchIdle } =
+@@ -233,7 +416,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
+       onReplyStart: () => {
+-        deliveredFinalTexts.clear();
+         if (streamingEnabled && renderMode === "card") {
+           startStreaming();
+         }
+@@ -249,15 +431,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               : [];
+         const hasText = Boolean(text.trim());
+         const hasMedia = mediaList.length > 0;
+-        const skipTextForDuplicateFinal =
+-          info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
+-        const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
+ 
+-        if (!shouldDeliverText && !hasMedia) {
++        if (!hasText && !hasMedia) {
+           return;
+         }
+ 
+-        if (shouldDeliverText) {
++        if (hasText) {
+           const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+ 
+           if (info?.kind === "block") {
+@@ -283,12 +462,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             if (info?.kind === "block") {
+               // Some runtimes emit block payloads without onPartial/final callbacks.
+               // Mirror block text into streamText so onIdle close still sends content.
+-              queueStreamingUpdate(text, { mode: "delta" });
++              queueThinkingPrelude();
++              queueStreamingUpdate(text);
+             }
+             if (info?.kind === "final") {
+-              streamText = mergeStreamingText(streamText, text);
+-              await closeStreaming();
+-              deliveredFinalTexts.add(text);
++              streamText = text;
++              await closeStreaming({ emitFinalText: true });
+             }
+             // Send media even when streaming handled the text
+             if (hasMedia) {
+@@ -307,13 +486,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           }
+ 
+           let first = true;
++          let firstMessageId: string | undefined;
+           if (useCard) {
+             for (const chunk of core.channel.text.chunkTextWithMode(
+               text,
+               textChunkLimit,
+               chunkMode,
+             )) {
+-              await sendMarkdownCardFeishu({
++              const sent = await sendMarkdownCardFeishu({
+                 cfg,
+                 to: chatId,
+                 text: chunk,
+@@ -322,11 +502,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                 mentions: first ? mentionTargets : undefined,
+                 accountId,
+               });
++              const sentMessageId = sent?.messageId;
++              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
++                firstMessageId = sentMessageId;
++              }
+               first = false;
+             }
+-            if (info?.kind === "final") {
+-              deliveredFinalTexts.add(text);
+-            }
+           } else {
+             const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+             for (const chunk of core.channel.text.chunkTextWithMode(
+@@ -334,7 +515,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               textChunkLimit,
+               chunkMode,
+             )) {
+-              await sendMessageFeishu({
++              const sent = await sendMessageFeishu({
+                 cfg,
+                 to: chatId,
+                 text: chunk,
+@@ -343,11 +524,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                 mentions: first ? mentionTargets : undefined,
+                 accountId,
+               });
++              const sentMessageId = sent?.messageId;
++              if (!firstMessageId && typeof sentMessageId === "string" && sentMessageId.trim()) {
++                firstMessageId = sentMessageId;
++              }
+               first = false;
+             }
+-            if (info?.kind === "final") {
+-              deliveredFinalTexts.add(text);
+-            }
++          }
++          if (info?.kind === "final") {
++            await emitFinalTextIfNeeded(text, firstMessageId);
+           }
+         }
+ 
+@@ -368,11 +553,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         params.runtime.error?.(
+           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
+         );
+-        await closeStreaming();
++        await closeStreaming({ emitFinalText: false });
+         typingCallbacks.onIdle?.();
+       },
+       onIdle: async () => {
+-        await closeStreaming();
++        await closeStreaming({ emitFinalText: true });
+         typingCallbacks.onIdle?.();
+       },
+       onCleanup: () => {
+@@ -385,16 +570,74 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     replyOptions: {
+       ...replyOptions,
+       onModelSelected: prefixContext.onModelSelected,
+-      disableBlockStreaming: true,
++      onAssistantMessageStart: streamingEnabled
++        ? () => {
++            if (renderMode !== "card") {
++              return;
++            }
++            queueThinkingPrelude();
++          }
++        : undefined,
++      onReasoningStream: streamingEnabled
++        ? () => {
++            queueThinkingPrelude();
++            streamPhase = "thinking";
++            stagedStatusLine = resolveStatusLine();
++            if (!shouldRenderStreamingStatus()) {
++              return;
++            }
++            if (!streaming?.isActive()) {
++              return;
++            }
++            queueStreamingRender();
++          }
++        : undefined,
++      onReasoningEnd: streamingEnabled
++        ? () => {
++            if (streamPhase !== "thinking") {
++              return;
++            }
++            streamPhase = streamText ? "streaming" : "idle";
++            if (!shouldRenderStreamingStatus()) {
++              return;
++            }
++            queueStreamingRender();
++          }
++        : undefined,
++      onToolStart: streamingEnabled
++        ? (payload: { name?: string; phase?: string }) => {
++            const isStartPhase = !payload?.phase || payload.phase === "start";
++            if (isStartPhase) {
++              toolUseCount += 1;
++              lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
++              replaceNextPartialAfterTool = Boolean(streamText);
++            }
++            streamPhase = "tool";
++            stagedStatusLine = resolveStatusLine();
++            if (!shouldRenderStreamingStatus()) {
++              return;
++            }
++            if (!streaming?.isActive()) {
++              return;
++            }
++            queueStreamingRender();
++          }
++        : undefined,
+       onPartialReply: streamingEnabled
+         ? (payload: ReplyPayload) => {
+             if (!payload.text) {
+               return;
+             }
+-            queueStreamingUpdate(payload.text, {
+-              dedupeWithLastPartial: true,
+-              mode: "snapshot",
+-            });
++            // Ensure streaming card is started when partial text arrives.
++            // In embedded mode with block streaming, the card is started by the
++            // deliver handler on the first block reply. CLI mode has no block
++            // streaming — text arrives as complete chunks via onPartialReply —
++            // so the card must be started here. startStreaming() is idempotent
++            // (guarded by streamingStartPromise), so calling it here is safe
++            // even when the card was already started by deliver.
++            queueThinkingPrelude();
++            startStreaming();
++            queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
+           }
+         : undefined,
+     },
+diff --git a/extensions/feishu/src/send.reply-fallback.test.ts b/extensions/feishu/src/send.reply-fallback.test.ts
+index 75dda353bb..dca78b018e 100644
+--- a/extensions/feishu/src/send.reply-fallback.test.ts
++++ b/extensions/feishu/src/send.reply-fallback.test.ts
+@@ -56,6 +56,7 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
+       to: "user:ou_target",
+       text: "hello",
+       replyToMessageId: "om_parent",
++      replyInThread: true,
+     });
+ 
+     expect(replyMock).toHaveBeenCalledTimes(1);
+@@ -78,6 +79,7 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
+       to: "user:ou_target",
+       card: { schema: "2.0" },
+       replyToMessageId: "om_parent",
++      replyInThread: true,
+     });
+ 
+     expect(replyMock).toHaveBeenCalledTimes(1);
+@@ -97,6 +99,7 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
+         to: "user:ou_target",
+         text: "hello",
+         replyToMessageId: "om_parent",
++        replyInThread: true,
+       }),
+     ).rejects.toThrow("Feishu reply failed");
+ 
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index bb12feab61..e27f31a738 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -1,5 +1,35 @@
+-import { describe, expect, it } from "vitest";
+-import { mergeStreamingText, resolveStreamingCardSendMode } from "./streaming-card.js";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fetchWithSsrFGuardMock = vi.hoisted(() => vi.fn());
++
++vi.mock("openclaw/plugin-sdk", () => ({
++  fetchWithSsrFGuard: fetchWithSsrFGuardMock,
++}));
++
++import {
++  FeishuStreamingSession,
++  mergeStreamingText,
++  resolveStreamingCardSendMode,
++} from "./streaming-card.js";
++
++function installFetchMock(): void {
++  fetchWithSsrFGuardMock.mockImplementation(async ({ url }: { url: string }) => {
++    if (url.includes("/auth/v3/tenant_access_token/internal")) {
++      return {
++        response: {
++          json: async () => ({ code: 0, tenant_access_token: "token", expire: 7200 }),
++        },
++        release: async () => {},
++      };
++    }
++    return {
++      response: {
++        json: async () => ({ code: 0, msg: "ok", data: {} }),
++      },
++      release: async () => {},
++    };
++  });
++}
+ 
+ describe("mergeStreamingText", () => {
+   it("prefers the latest full text when it already includes prior text", () => {
+@@ -52,3 +82,84 @@ describe("resolveStreamingCardSendMode", () => {
+     ).toBe("create");
+   });
+ });
++
++describe("FeishuStreamingSession.close", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    installFetchMock();
++  });
++
++  it("treats explicit empty final text as authoritative", async () => {
++    const session = new FeishuStreamingSession({} as never, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "💭 思考中...",
++    };
++    (session as any).pendingText = "💭 思考中...";
++    const updateCardContentSpy = vi
++      .spyOn(session as any, "updateCardContent")
++      .mockResolvedValue(undefined);
++
++    await session.close("");
++
++    expect(updateCardContentSpy).toHaveBeenCalledWith("");
++    expect((session as any).state.currentText).toBe("");
++  });
++
++  it("treats explicit non-empty final text as authoritative", async () => {
++    const { client } = createClientMock();
++    const session = new FeishuStreamingSession(client, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。",
++    };
++    (session as any).pendingUpdate = {
++      text: "**Checking SEO JSON-LD in PR #16**<at id=ou_luke></at> 加了。\n我刚",
++      mode: "replace",
++    };
++    const updateCardContentSpy = vi
++      .spyOn(session as any, "updateCardContent")
++      .mockResolvedValue(undefined);
++
++    await session.close("<at id=ou_luke></at> 加了。\n我刚又确认了一遍");
++
++    expect(updateCardContentSpy).toHaveBeenCalledWith(
++      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
++    );
++    expect((session as any).state.currentText).toBe(
++      "<at id=ou_luke></at> 加了。\n我刚又确认了一遍",
++    );
++  });
++
++  it("keeps pending merge behavior when final text is omitted", async () => {
++    const session = new FeishuStreamingSession({} as never, {
++      appId: "app",
++      appSecret: "secret",
++    });
++    (session as any).state = {
++      cardId: "card-id",
++      messageId: "message-id",
++      sequence: 1,
++      currentText: "第一段",
++    };
++    (session as any).pendingText = "第一段\n第二段";
++    const updateCardContentSpy = vi
++      .spyOn(session as any, "updateCardContent")
++      .mockResolvedValue(undefined);
++
++    await session.close();
++
++    expect(updateCardContentSpy).toHaveBeenCalledWith("第一段\n第二段");
++    expect((session as any).state.currentText).toBe("第一段\n第二段");
++  });
++});
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 856c3c2fec..f667a27954 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -6,8 +6,10 @@ import type { Client } from "@larksuiteoapi/node-sdk";
+ import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/feishu";
+ import type { FeishuDomain } from "./types.js";
+ 
+-type Credentials = { appId: string; appSecret: string; domain?: FeishuDomain };
++type Credentials = { appId: string; appSecret: string; domain?: string };
+ type CardState = { cardId: string; messageId: string; sequence: number; currentText: string };
++type UpdateMode = "merge" | "replace";
++type PendingUpdate = { text: string; mode: UpdateMode };
+ 
+ /** Optional header for streaming cards (title bar with color template) */
+ export type StreamingCardHeader = {
+@@ -88,6 +90,7 @@ async function getToken(creds: Credentials): Promise<string> {
+   return data.tenant_access_token;
+ }
+ 
++
+ function truncateSummary(text: string, max = 50): string {
+   if (!text) {
+     return "";
+@@ -145,18 +148,16 @@ export function resolveStreamingCardSendMode(options?: StreamingStartOptions) {
+ /** Streaming card session manager */
+ export class FeishuStreamingSession {
+   private client: Client;
+-  private creds: Credentials;
+   private state: CardState | null = null;
+   private queue: Promise<void> = Promise.resolve();
+   private closed = false;
+   private log?: (msg: string) => void;
+   private lastUpdateTime = 0;
+-  private pendingText: string | null = null;
++  private pendingUpdate: PendingUpdate | null = null;
+   private updateThrottleMs = 100; // Throttle updates to max 10/sec
+ 
+-  constructor(client: Client, creds: Credentials, log?: (msg: string) => void) {
++  constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
+     this.client = client;
+-    this.creds = creds;
+     this.log = log;
+   }
+ 
+@@ -169,7 +170,6 @@ export class FeishuStreamingSession {
+       return;
+     }
+ 
+-    const apiBase = resolveApiBase(this.creds.domain);
+     const cardJson: Record<string, unknown> = {
+       schema: "2.0",
+       config: {
+@@ -188,31 +188,14 @@ export class FeishuStreamingSession {
+       };
+     }
+ 
+-    // Create card entity
+-    const { response: createRes, release: releaseCreate } = await fetchWithSsrFGuard({
+-      url: `${apiBase}/cardkit/v1/cards`,
+-      init: {
+-        method: "POST",
+-        headers: {
+-          Authorization: `Bearer ${await getToken(this.creds)}`,
+-          "Content-Type": "application/json",
+-        },
+-        body: JSON.stringify({ type: "card_json", data: JSON.stringify(cardJson) }),
++    // Create card entity via SDK
++    const createData = await this.client.cardkit.v1.card.create({
++      data: {
++        type: "card_json",
++        data: JSON.stringify(cardJson),
+       },
+-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+-      auditContext: "feishu.streaming-card.create",
+     });
+-    if (!createRes.ok) {
+-      await releaseCreate();
+-      throw new Error(`Create card request failed with HTTP ${createRes.status}`);
+-    }
+-    const createData = (await createRes.json()) as {
+-      code: number;
+-      msg: string;
+-      data?: { card_id: string };
+-    };
+-    await releaseCreate();
+-    if (createData.code !== 0 || !createData.data?.card_id) {
++    if ((createData.code ?? 0) !== 0 || !createData.data?.card_id) {
+       throw new Error(`Create card failed: ${createData.msg}`);
+     }
+     const cardId = createData.data.card_id;
+@@ -265,36 +248,39 @@ export class FeishuStreamingSession {
+     if (!this.state) {
+       return;
+     }
+-    const apiBase = resolveApiBase(this.creds.domain);
+     this.state.sequence += 1;
+-    await fetchWithSsrFGuard({
+-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
+-      init: {
+-        method: "PUT",
+-        headers: {
+-          Authorization: `Bearer ${await getToken(this.creds)}`,
+-          "Content-Type": "application/json",
++    await this.client.cardkit.v1.cardElement
++      .content({
++        path: {
++          card_id: this.state.cardId,
++          element_id: "content",
+         },
+-        body: JSON.stringify({
++        data: {
+           content: text,
+           sequence: this.state.sequence,
+           uuid: `s_${this.state.cardId}_${this.state.sequence}`,
+-        }),
+-      },
+-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+-      auditContext: "feishu.streaming-card.update",
+-    })
+-      .then(async ({ release }) => {
+-        await release();
++        },
++      })
++      .then((response) => {
++        if ((response.code ?? 0) !== 0) {
++          throw new Error(response.msg || `code ${response.code}`);
++        }
+       })
+       .catch((error) => onError?.(error));
+   }
+ 
+-  async update(text: string): Promise<void> {
++  async update(
++    text: string,
++    options?: {
++      mode?: UpdateMode;
++    },
++  ): Promise<void> {
+     if (!this.state || this.closed) {
+       return;
+     }
+-    const mergedInput = mergeStreamingText(this.pendingText ?? this.state.currentText, text);
++    const mode = options?.mode ?? "merge";
++    const pendingBase = this.pendingUpdate?.text ?? this.state.currentText;
++    const mergedInput = mode === "replace" ? text : mergeStreamingText(pendingBase, text);
+     if (!mergedInput || mergedInput === this.state.currentText) {
+       return;
+     }
+@@ -302,17 +288,18 @@ export class FeishuStreamingSession {
+     // Throttle: skip if updated recently, but remember pending text
+     const now = Date.now();
+     if (now - this.lastUpdateTime < this.updateThrottleMs) {
+-      this.pendingText = mergedInput;
++      this.pendingUpdate = { text: mergedInput, mode: "replace" };
+       return;
+     }
+-    this.pendingText = null;
++    this.pendingUpdate = null;
+     this.lastUpdateTime = now;
+ 
+     this.queue = this.queue.then(async () => {
+       if (!this.state || this.closed) {
+         return;
+       }
+-      const mergedText = mergeStreamingText(this.state.currentText, mergedInput);
++      const mergedText =
++        mode === "replace" ? mergedInput : mergeStreamingText(this.state.currentText, mergedInput);
+       if (!mergedText || mergedText === this.state.currentText) {
+         return;
+       }
+@@ -329,46 +316,66 @@ export class FeishuStreamingSession {
+     this.closed = true;
+     await this.queue;
+ 
+-    const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
+-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
+-    const apiBase = resolveApiBase(this.creds.domain);
++    const hasExplicitFinalText = finalText !== undefined;
++    const pendingMerged = this.pendingUpdate
++      ? this.pendingUpdate.mode === "replace"
++        ? this.pendingUpdate.text
++        : mergeStreamingText(this.state.currentText, this.pendingUpdate.text)
++      : this.state.currentText;
++    this.pendingUpdate = null;
++    const text = hasExplicitFinalText ? finalText : pendingMerged;
+ 
+-    // Only send final update if content differs from what's already displayed
+-    if (text && text !== this.state.currentText) {
++    // Explicit finalText (even empty) must win over transient status lines.
++    if (
++      hasExplicitFinalText
++        ? text !== this.state.currentText
++        : Boolean(text && text !== this.state.currentText)
++    ) {
+       await this.updateCardContent(text);
+       this.state.currentText = text;
+     }
+ 
+     // Close streaming mode
+     this.state.sequence += 1;
+-    await fetchWithSsrFGuard({
+-      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
+-      init: {
+-        method: "PATCH",
+-        headers: {
+-          Authorization: `Bearer ${await getToken(this.creds)}`,
+-          "Content-Type": "application/json; charset=utf-8",
+-        },
+-        body: JSON.stringify({
++    await this.client.cardkit.v1.card
++      .settings({
++        path: { card_id: this.state.cardId },
++        data: {
+           settings: JSON.stringify({
+             config: { streaming_mode: false, summary: { content: truncateSummary(text) } },
+           }),
+           sequence: this.state.sequence,
+           uuid: `c_${this.state.cardId}_${this.state.sequence}`,
+-        }),
+-      },
+-      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+-      auditContext: "feishu.streaming-card.close",
+-    })
+-      .then(async ({ release }) => {
+-        await release();
++        },
++      })
++      .then((response) => {
++        if ((response.code ?? 0) !== 0) {
++          throw new Error(response.msg || `code ${response.code}`);
++        }
+       })
+       .catch((e) => this.log?.(`Close failed: ${String(e)}`));
+ 
+     this.log?.(`Closed streaming: cardId=${this.state.cardId}`);
+   }
+ 
++  async discard(): Promise<void> {
++    if (!this.state || this.closed) {
++      return;
++    }
++    this.closed = true;
++    await this.queue;
++    const messageId = this.state.messageId;
++    const cardId = this.state.cardId;
++    this.pendingUpdate = null;
++    await this.deleteMessage(messageId);
++    this.log?.(`Discarded streaming card: cardId=${cardId}, messageId=${messageId}`);
++  }
++
+   isActive(): boolean {
+     return this.state !== null && !this.closed;
+   }
++
++  getMessageId(): string | undefined {
++    return this.state?.messageId;
++  }
+ }
+diff --git a/src/agents/cli-backends.ts b/src/agents/cli-backends.ts
+index 947855f7b0..0ce2df5eef 100644
+--- a/src/agents/cli-backends.ts
++++ b/src/agents/cli-backends.ts
+@@ -58,7 +58,7 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
+   sessionIdFields: ["session_id", "sessionId", "conversation_id", "conversationId"],
+   systemPromptArg: "--append-system-prompt",
+   systemPromptMode: "append",
+-  systemPromptWhen: "first",
++  systemPromptWhen: "always",
+   clearEnv: ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_OLD"],
+   reliability: {
+     watchdog: {
+diff --git a/src/agents/cli-runner.helpers.stream-json.test.ts b/src/agents/cli-runner.helpers.stream-json.test.ts
+index 7e18c46aa0..348b1e7c32 100644
+--- a/src/agents/cli-runner.helpers.stream-json.test.ts
++++ b/src/agents/cli-runner.helpers.stream-json.test.ts
+@@ -411,4 +411,63 @@ describe("createStreamJsonProcessor", () => {
+     expect(onAssistantTurn).toHaveBeenCalledWith("delta text fallback");
+     expect(output.text).toBe("delta text fallback");
+   });
++
++  it("handles unknown top-level envelope types without requiring exhaustive enumeration", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "custom_agent_event",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "message from unknown envelope type" }],
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).toHaveBeenCalledWith("message from unknown envelope type");
++    expect(output.text).toBe("message from unknown envelope type");
++  });
++
++  it("ignores rate_limit_event envelopes while preserving assistant stream output", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "part 1" }],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "rate_limit_event",
++        current_requests_per_minute: 10,
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "part 2" }],
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).toHaveBeenCalledTimes(2);
++    expect(onAssistantTurn).toHaveBeenNthCalledWith(1, "part 1");
++    expect(onAssistantTurn).toHaveBeenNthCalledWith(2, "part 2");
++    expect(output.text).toBe("part 2");
++  });
+ });
+diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
+index cfe5101807..35d049c7df 100644
+--- a/src/agents/cli-runner.test.ts
++++ b/src/agents/cli-runner.test.ts
+@@ -160,6 +160,873 @@ describe("runCliAgent with process supervisor", () => {
+     expect(input.argv?.[mcpConfigIndex + 1]).toBe("/tmp/openclaw-mcp.json");
+   });
+ 
++  it("omits strict MCP flag when claude-cli backend mcp.strict is false", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionKey: "agent:main:main",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      config: {
++        agents: {
++          defaults: {
++            cliBackends: {
++              "claude-cli": {
++                command: "claude",
++                mcp: {
++                  strict: false,
++                },
++              },
++            },
++          },
++        },
++      } as OpenClawConfig,
++      prompt: "hi",
++      provider: "claude-cli",
++      model: "sonnet",
++      timeoutMs: 1_000,
++      runId: "run-claude-mcp-no-strict",
++    });
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).not.toContain("--strict-mcp-config");
++    expect(input.argv).toContain("--mcp-config");
++  });
++
++  it("disables MCP flags when claude-cli backend mcp.enabled is false", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionKey: "agent:main:main",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      config: {
++        agents: {
++          defaults: {
++            cliBackends: {
++              "claude-cli": {
++                command: "claude",
++                mcp: {
++                  enabled: false,
++                },
++              },
++            },
++          },
++        },
++      } as OpenClawConfig,
++      prompt: "hi",
++      provider: "claude-cli",
++      model: "sonnet",
++      timeoutMs: 1_000,
++      runId: "run-claude-mcp-disabled",
++    });
++
++    expect(ensureMcpConfigFileMock).not.toHaveBeenCalled();
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).not.toContain("--mcp-config");
++    expect(input.argv).not.toContain("--strict-mcp-config");
++  });
++
++  it("falls back to default MCP config when default file cannot be read", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-mcp-fallback-"));
++    const missingDefaultPath = path.join(tempDir, "missing-default-mcp.json");
++    const extraMcpPath = path.join(tempDir, "mcp-extra.json");
++    await fs.writeFile(
++      extraMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            remote: {
++              type: "stdio",
++              command: "node",
++              args: ["remote-mcp.js"],
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    ensureMcpConfigFileMock.mockReturnValue(missingDefaultPath);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        config: {
++          agents: {
++            defaults: {
++              cliBackends: {
++                "claude-cli": {
++                  command: "claude",
++                  mcp: {
++                    mergeConfigPath: extraMcpPath,
++                  },
++                },
++              },
++            },
++          },
++        } as OpenClawConfig,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-mcp-default-read-fallback",
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    const mcpConfigIndex = input.argv?.indexOf("--mcp-config") ?? -1;
++    expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
++    expect(input.argv?.[mcpConfigIndex + 1]).toBe(missingDefaultPath);
++  });
++
++  it("falls back to openclaw MCP servers when primary config file cannot be read", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-mcp-primary-"));
++    const baseMcpPath = path.join(tempDir, "mcp-base.json");
++    const missingPrimaryPath = path.join(tempDir, "mcp-primary-missing.json");
++    await fs.writeFile(
++      baseMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            openclaw: {
++              type: "http",
++              url: "http://127.0.0.1:19001/mcp",
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    ensureMcpConfigFileMock.mockReturnValue(baseMcpPath);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        config: {
++          agents: {
++            defaults: {
++              cliBackends: {
++                "claude-cli": {
++                  command: "claude",
++                  mcp: {
++                    configPath: missingPrimaryPath,
++                  },
++                },
++              },
++            },
++          },
++        } as OpenClawConfig,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-mcp-primary-read-fallback",
++      });
++
++      const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++      const mcpConfigIndex = input.argv?.indexOf("--mcp-config") ?? -1;
++      expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
++      const mergedPath = input.argv?.[mcpConfigIndex + 1];
++      expect(mergedPath).not.toBe(missingPrimaryPath);
++      const mergedRaw = await fs.readFile(String(mergedPath), "utf-8");
++      const merged = JSON.parse(mergedRaw) as { mcpServers?: Record<string, unknown> };
++      expect(merged.mcpServers?.openclaw).toBeTruthy();
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++  });
++
++  it("merges configured MCP servers into claude-cli MCP config", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-mcp-merge-"));
++    const baseMcpPath = path.join(tempDir, "mcp-base.json");
++    const extraMcpPath = path.join(tempDir, "mcp-extra.json");
++    await fs.writeFile(
++      baseMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            openclaw: {
++              type: "http",
++              url: "http://127.0.0.1:19001/mcp",
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    await fs.writeFile(
++      extraMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            remote: {
++              type: "stdio",
++              command: "node",
++              args: ["remote-mcp.js"],
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    ensureMcpConfigFileMock.mockReturnValue(baseMcpPath);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        config: {
++          agents: {
++            defaults: {
++              cliBackends: {
++                "claude-cli": {
++                  command: "claude",
++                  mcp: {
++                    mergeConfigPath: extraMcpPath,
++                  },
++                },
++              },
++            },
++          },
++        } as OpenClawConfig,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-mcp-merged",
++      });
++
++      const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++      const mcpConfigIndex = input.argv?.indexOf("--mcp-config") ?? -1;
++      expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
++      const mergedPath = input.argv?.[mcpConfigIndex + 1];
++      expect(typeof mergedPath).toBe("string");
++      const mergedRaw = await fs.readFile(String(mergedPath), "utf-8");
++      const merged = JSON.parse(mergedRaw) as { mcpServers?: Record<string, unknown> };
++      expect(merged.mcpServers?.openclaw).toBeTruthy();
++      expect(merged.mcpServers?.remote).toBeTruthy();
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++  });
++
++  it("cleans up stale merged MCP config files while keeping recent snapshots", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-mcp-prune-"));
++    const baseMcpPath = path.join(tempDir, "mcp-base.json");
++    const extraMcpPath = path.join(tempDir, "mcp-extra.json");
++    await fs.writeFile(
++      baseMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            openclaw: {
++              type: "http",
++              url: "http://127.0.0.1:19001/mcp",
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    await fs.writeFile(
++      extraMcpPath,
++      `${JSON.stringify(
++        {
++          mcpServers: {
++            remote: {
++              type: "stdio",
++              command: "node",
++              args: ["remote-mcp.js"],
++            },
++          },
++        },
++        null,
++        2,
++      )}\n`,
++      "utf-8",
++    );
++    const oldTime = Date.now() - 2 * 60 * 60 * 1000;
++    for (let index = 0; index < 30; index += 1) {
++      const hash = index.toString(16).padStart(16, "0");
++      const filePath = path.join(tempDir, `mcp.cli-merged.${hash}.json`);
++      await fs.writeFile(filePath, '{"mcpServers":{}}\n', "utf-8");
++      const oldDate = new Date(oldTime);
++      await fs.utimes(filePath, oldDate, oldDate);
++    }
++    ensureMcpConfigFileMock.mockReturnValue(baseMcpPath);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        config: {
++          agents: {
++            defaults: {
++              cliBackends: {
++                "claude-cli": {
++                  command: "claude",
++                  mcp: {
++                    mergeConfigPath: extraMcpPath,
++                  },
++                },
++              },
++            },
++          },
++        } as OpenClawConfig,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-mcp-merged-prune",
++      });
++
++      const files = await fs.readdir(tempDir);
++      const mergedFiles = files.filter((file) =>
++        /^mcp\.cli-merged\.[a-f0-9]{16}\.json$/.test(file),
++      );
++      expect(mergedFiles.length).toBeLessThanOrEqual(20);
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++  });
++
++  it("injects workspace skills into claude system prompt", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-skills-"));
++    const skillDir = path.join(tempDir, "skills", "demo-skill");
++    await fs.mkdir(skillDir, { recursive: true });
++    await fs.writeFile(
++      path.join(skillDir, "SKILL.md"),
++      [
++        "---",
++        "name: demo-skill",
++        "description: Demo skill for CLI prompt injection",
++        "---",
++        "",
++        "Run demo steps from {baseDir}.",
++      ].join("\n"),
++      "utf-8",
++    );
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: tempDir,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-plugin-dir",
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("--append-system-prompt");
++    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
++    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
++    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
++    expect(systemPrompt).toContain("<available_skills>");
++    expect(systemPrompt).toContain("demo-skill");
++  });
++
++  it("uses provided skillsSnapshot prompt for claude runs", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-noskills-"));
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: tempDir,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-no-plugin-dir",
++        skillsSnapshot: {
++          prompt:
++            "<available_skills><skill><name>snapshot-skill</name><description>from snapshot</description><location>/tmp/snapshot-skill/SKILL.md</location></skill></available_skills>",
++          skills: [{ name: "snapshot-skill" }],
++        },
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("--append-system-prompt");
++    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
++    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
++    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
++    expect(systemPrompt).toContain("snapshot-skill");
++  });
++
++  it("applies before_prompt_build hooks in CLI mode", async () => {
++    const hookRunner = {
++      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
++      runBeforePromptBuild: vi.fn(async () => ({
++        prependContext: "HOOK_CONTEXT",
++        systemPrompt: "HOOK_SYSTEM",
++      })),
++      runBeforeAgentStart: vi.fn(async () => undefined),
++      runLlmOutput: vi.fn(async () => undefined),
++    };
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"type":"result","result":"ok"}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionKey: "agent:main:main",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      prompt: "hi",
++      provider: "claude-cli",
++      model: "sonnet",
++      timeoutMs: 1_000,
++      runId: "run-cli-hook-before-prompt-build",
++      trigger: "user",
++      messageChannel: "whatsapp",
++    });
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("HOOK_CONTEXT\n\nhi");
++    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
++    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
++    expect(input.argv?.[systemPromptIndex + 1]).toBe("HOOK_SYSTEM");
++    expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledWith(
++      {
++        prompt: "hi",
++        messages: [],
++      },
++      expect.objectContaining({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        workspaceDir: "/tmp",
++        trigger: "user",
++        messageProvider: "whatsapp",
++        channelId: "whatsapp",
++      }),
++    );
++  });
++
++  it("passes transcript messages to before_prompt_build hooks in CLI mode", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-hook-messages-"));
++    const sessionFile = path.join(tempDir, "session.jsonl");
++    await fs.writeFile(
++      sessionFile,
++      [
++        JSON.stringify({ type: "meta", foo: "bar" }),
++        JSON.stringify({ type: "tool", message: { role: "tool", content: "should-ignore" } }),
++        JSON.stringify({ type: "message", message: { role: "user", content: "hello" } }),
++        JSON.stringify({ type: "message", message: { role: "assistant", content: "world" } }),
++        "not-json",
++        "",
++      ].join("\n"),
++      "utf-8",
++    );
++
++    const hookRunner = {
++      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
++      runBeforePromptBuild: vi.fn(async () => undefined),
++      runBeforeAgentStart: vi.fn(async () => undefined),
++      runLlmOutput: vi.fn(async () => undefined),
++    };
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"type":"result","result":"ok"}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionFile,
++        workspaceDir: tempDir,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-cli-hook-message-history",
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledWith(
++      {
++        prompt: "hi",
++        messages: [
++          { role: "user", content: "hello" },
++          { role: "assistant", content: "world" },
++        ],
++      },
++      expect.any(Object),
++    );
++  });
++
++  it("emits llm_output hooks in CLI mode", async () => {
++    const hookRunner = {
++      hasHooks: vi.fn((hookName: string) => hookName === "llm_output"),
++      runBeforePromptBuild: vi.fn(async () => undefined),
++      runBeforeAgentStart: vi.fn(async () => undefined),
++      runLlmOutput: vi.fn(async () => undefined),
++    };
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: "ok",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      prompt: "hi",
++      provider: "codex-cli",
++      model: "gpt-5.2-codex",
++      timeoutMs: 1_000,
++      runId: "run-cli-hook-llm-output",
++      trigger: "user",
++      messageChannel: "telegram",
++    });
++
++    expect(hookRunner.runLlmOutput).toHaveBeenCalledTimes(1);
++    expect(hookRunner.runLlmOutput).toHaveBeenCalledWith(
++      expect.objectContaining({
++        runId: "run-cli-hook-llm-output",
++        sessionId: "s1",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        assistantTexts: ["ok"],
++      }),
++      expect.objectContaining({
++        sessionId: "s1",
++        workspaceDir: "/tmp",
++        messageProvider: "telegram",
++        channelId: "telegram",
++      }),
++    );
++  });
++
++  it("reports normalized model id in llm_output hooks", async () => {
++    const hookRunner = {
++      hasHooks: vi.fn((hookName: string) => hookName === "llm_output"),
++      runBeforePromptBuild: vi.fn(async () => undefined),
++      runBeforeAgentStart: vi.fn(async () => undefined),
++      runLlmOutput: vi.fn(async () => undefined),
++    };
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: "ok",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      prompt: "hi",
++      provider: "claude-cli",
++      model: "claude-sonnet-4-6",
++      timeoutMs: 1_000,
++      runId: "run-cli-hook-normalized-model",
++    });
++
++    expect(hookRunner.runLlmOutput).toHaveBeenCalledWith(
++      expect.objectContaining({
++        model: "sonnet",
++      }),
++      expect.any(Object),
++    );
++  });
++
++  it("resends system prompt on resumed claude sessions by default", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-"));
++    const skillDir = path.join(tempDir, "skills", "resume-skill");
++    await fs.mkdir(skillDir, { recursive: true });
++    await fs.writeFile(
++      path.join(skillDir, "SKILL.md"),
++      [
++        "---",
++        "name: resume-skill",
++        "description: Resume-skill description",
++        "---",
++        "",
++        "Use this skill after resume.",
++      ].join("\n"),
++      "utf-8",
++    );
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: tempDir,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-resume-plugin-dir",
++        cliSessionId: "existing-claude-session",
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("--resume");
++    expect(input.argv).toContain("existing-claude-session");
++    expect(input.argv).toContain("--append-system-prompt");
++    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
++    expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
++    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
++    expect(systemPrompt).toContain("<available_skills>");
++    expect(systemPrompt).toContain("resume-skill");
++  });
++
++  it("skips system prompt on resumed claude sessions when configured with first", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-first-"));
++    const skillDir = path.join(tempDir, "skills", "resume-skill-first");
++    await fs.mkdir(skillDir, { recursive: true });
++    await fs.writeFile(
++      path.join(skillDir, "SKILL.md"),
++      [
++        "---",
++        "name: resume-skill-first",
++        "description: Resume-skill description for first mode",
++        "---",
++        "",
++        "Use this skill only on first run.",
++      ].join("\n"),
++      "utf-8",
++    );
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    const cfg = {
++      agents: {
++        defaults: {
++          cliBackends: {
++            "claude-cli": {
++              command: "claude",
++              systemPromptWhen: "first",
++            },
++          },
++        },
++      },
++    } satisfies OpenClawConfig;
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: tempDir,
++        prompt: "hi",
++        provider: "claude-cli",
++        model: "sonnet",
++        timeoutMs: 1_000,
++        runId: "run-claude-resume-first",
++        cliSessionId: "existing-claude-session",
++        config: cfg,
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("--resume");
++    expect(input.argv).toContain("existing-claude-session");
++    expect(input.argv).not.toContain("--append-system-prompt");
++  });
++
+   it("fails with timeout when no-output watchdog trips", async () => {
+     supervisorSpawnMock.mockResolvedValueOnce(
+       createManagedRun({
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index a68d019ff4..c04de2426d 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -398,6 +398,7 @@ export async function runCliAgent(params: {
+   bootstrapPromptWarningSignature?: string;
+   images?: ImageContent[];
+   onAssistantTurn?: (text: string) => void;
++  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onToolUse?: (toolName: string) => void;
+   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+@@ -741,6 +742,7 @@ export async function runCliAgent(params: {
+         const streamProcessor =
+           outputMode === "stream-json"
+             ? createStreamJsonProcessor(backend, {
++                onSystemInit: params.onSystemInit,
+                 onAssistantTurn: params.onAssistantTurn,
+                 onToolUse: params.onToolUse,
+                 onThinkingTurn: params.onThinkingTurn,
+@@ -999,6 +1001,7 @@ export async function runClaudeCliAgent(params: {
+   claudeSessionId?: string;
+   images?: ImageContent[];
+   onAssistantTurn?: (text: string) => void;
++  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onToolUse?: (toolName: string) => void;
+   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+@@ -1029,6 +1032,7 @@ export async function runClaudeCliAgent(params: {
+     cliSessionId: params.claudeSessionId,
+     images: params.images,
+     onAssistantTurn: params.onAssistantTurn,
++    onSystemInit: params.onSystemInit,
+     onToolUse: params.onToolUse,
+     onThinkingTurn: params.onThinkingTurn,
+     onToolUseEvent: params.onToolUseEvent,
+diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
+index 781c58ab16..9c0487f952 100644
+--- a/src/agents/cli-runner/helpers.ts
++++ b/src/agents/cli-runner/helpers.ts
+@@ -249,6 +249,7 @@ export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput
+ }
+ 
+ export type StreamJsonCallbacks = {
++  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onAssistantTurn?: (text: string) => void;
+   onToolUse?: (toolName: string) => void;
+   onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+@@ -257,6 +258,20 @@ export type StreamJsonCallbacks = {
+ };
+ 
+ const MAX_STREAM_EVENT_DEDUPE_KEYS = 2_048;
++const KNOWN_STREAM_TOP_LEVEL_TYPES = new Set([
++  "assistant",
++  "user",
++  "system",
++  "result",
++  "rate_limit_event",
++]);
++const KNOWN_STREAM_CONTENT_BLOCK_TYPES = new Set([
++  "text",
++  "thinking",
++  "tool_use",
++  "tool_result",
++  "tool_result_error",
++]);
+ 
+ type StreamContentBlock = Record<string, unknown>;
+ 
+@@ -497,6 +512,19 @@ function buildFallbackAssistantText(params: {
+   return collectText(params.rawMessage) || collectText(params.message);
+ }
+ 
++function logUnknownStreamTypeOnce(params: {
++  seen: Set<string>;
++  value: string;
++  kind: "top-level" | "content-block";
++}): void {
++  const normalized = params.value.trim();
++  if (!normalized || params.seen.has(normalized)) {
++    return;
++  }
++  params.seen.add(normalized);
++  log.debug(`stream-json unknown ${params.kind} type observed: ${normalized}`);
++}
++
+ export function createStreamJsonProcessor(
+   backend: CliBackendConfig,
+   callbacks?: StreamJsonCallbacks,
+@@ -515,6 +543,8 @@ export function createStreamJsonProcessor(
+   const emittedToolResultKeys = new Set<string>();
+   const emittedToolResultOrder: string[] = [];
+   let lastAnonymousToolUseKey: string | undefined;
++  const seenUnknownTopLevelTypes = new Set<string>();
++  const seenUnknownContentBlockTypes = new Set<string>();
+ 
+   const processLine = (line: string) => {
+     const trimmed = line.trim();
+@@ -532,6 +562,13 @@ export function createStreamJsonProcessor(
+     }
+ 
+     const type = typeof parsed.type === "string" ? parsed.type : "";
++    if (type && !KNOWN_STREAM_TOP_LEVEL_TYPES.has(type)) {
++      logUnknownStreamTypeOnce({
++        seen: seenUnknownTopLevelTypes,
++        value: type,
++        kind: "top-level",
++      });
++    }
+ 
+     if (!sessionId) {
+       sessionId = pickSessionId(parsed, backend);
+@@ -552,6 +589,12 @@ export function createStreamJsonProcessor(
+     if (type === "system") {
+       const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
+       log.debug(`stream-json system: subtype=${subtype} sessionId=${sessionId ?? "none"}`);
++      if (subtype === "init") {
++        callbacks?.onSystemInit?.({ subtype, sessionId });
++      }
++      return;
++    }
++    if (type === "rate_limit_event") {
+       return;
+     }
+ 
+@@ -561,6 +604,17 @@ export function createStreamJsonProcessor(
+     const isAssistantEnvelope = type === "assistant" || messageRole === "assistant";
+     const contentBlocks = extractContentBlocks(message);
+     if (contentBlocks.length > 0) {
++      for (const block of contentBlocks) {
++        const blockType = typeof block.type === "string" ? block.type : "";
++        if (!blockType || KNOWN_STREAM_CONTENT_BLOCK_TYPES.has(blockType)) {
++          continue;
++        }
++        logUnknownStreamTypeOnce({
++          seen: seenUnknownContentBlockTypes,
++          value: blockType,
++          kind: "content-block",
++        });
++      }
+       const blockTypes = contentBlocks
+         .map((block) => (typeof block.type === "string" ? block.type : "?"))
+         .join(",");
+@@ -675,7 +729,7 @@ export function resolveSystemPromptUsage(params: {
+   if (!systemPrompt) {
+     return null;
+   }
+-  const when = params.backend.systemPromptWhen ?? "first";
++  const when = params.backend.systemPromptWhen ?? "always";
+   if (when === "never") {
+     return null;
+   }
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index dfef28058a..0189783386 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -47,6 +47,7 @@ import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
+ import type { FollowupRun } from "./queue.js";
+ import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
+ import { createReplyMediaPathNormalizer } from "./reply-media-paths.js";
++import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
+ import type { TypingSignaler } from "./typing-mode.js";
+ 
+ export type RuntimeFallbackAttempt = {
+@@ -243,7 +244,9 @@ export async function runAgentTurnWithFallback(params: {
+               // forward to onPartialReply.  Awaiting this chain after the CLI run
+               // ensures markRunComplete() isn't called before streaming initialises.
+               let streamingChain: Promise<void> = Promise.resolve();
++              const streamingDirectiveAccumulator = createStreamingDirectiveAccumulator();
+               let cliReasoningOpen = false;
++              let assistantMessageStartQueued = false;
+               const queueStreamingStep = (step: () => Promise<void>) => {
+                 streamingChain = streamingChain.then(step).catch((err) => {
+                   defaultRuntime.error(
+@@ -251,6 +254,16 @@ export async function runAgentTurnWithFallback(params: {
+                   );
+                 });
+               };
++              const queueAssistantMessageStart = () => {
++                if (assistantMessageStartQueued) {
++                  return;
++                }
++                assistantMessageStartQueued = true;
++                queueStreamingStep(async () => {
++                  await params.typingSignals.signalMessageStart();
++                  await params.opts?.onAssistantMessageStart?.();
++                });
++              };
+               const escapeMarkdownItalic = (value: string): string =>
+                 value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
+               const formatReasoningPayload = (text: string): string => {
+@@ -300,16 +313,13 @@ export async function runAgentTurnWithFallback(params: {
+                   abortSignal: params.opts?.abortSignal,
+                   trigger: params.isHeartbeat ? "heartbeat" : "user",
+                   messageChannel: params.followupRun.run.messageProvider,
+-                  messageAccountId:
+-                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
+-                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
+-                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
+                   onSystemInit: ({ subtype }) => {
+                     if (subtype === "init") {
+                       queueAssistantMessageStart();
+                     }
+                   },
+                   onAssistantTurn: (text) => {
++                    queueAssistantMessageStart();
+                     queueReasoningEndIfNeeded();
+                     emitAgentEvent({
+                       runId,
+@@ -323,7 +333,15 @@ export async function runAgentTurnWithFallback(params: {
+                     // Chained (not fire-and-forget) so signalTextDelta completes
+                     // before onPartialReply, and markRunComplete waits for all.
+                     queueStreamingStep(async () => {
+-                      const normalizedText = await handlePartialForTyping({ text });
++                      const parsedChunk = streamingDirectiveAccumulator.consume(text, {
++                        silentToken: SILENT_REPLY_TOKEN,
++                      });
++                      const normalizedText = await handlePartialForTyping({
++                        text: parsedChunk?.text,
++                        mediaUrl: parsedChunk?.mediaUrl,
++                        mediaUrls: parsedChunk?.mediaUrls,
++                        audioAsVoice: parsedChunk?.audioAsVoice,
++                      });
+                       if (normalizedText !== undefined && params.opts?.onPartialReply) {
+                         await params.opts.onPartialReply({ text: normalizedText });
+                       }
+@@ -333,6 +351,7 @@ export async function runAgentTurnWithFallback(params: {
+                     if (!text.trim()) {
+                       return;
+                     }
++                    queueAssistantMessageStart();
+                     cliReasoningOpen = true;
+                     emitAgentEvent({
+                       runId,
+@@ -355,6 +374,7 @@ export async function runAgentTurnWithFallback(params: {
+                     });
+                   },
+                   onToolUseEvent: (payload) => {
++                    queueAssistantMessageStart();
+                     queueReasoningEndIfNeeded();
+                     emitAgentEvent({
+                       runId,
+diff --git a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+index 41da3f7bc8..f7f8b65e4c 100644
+--- a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
++++ b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+@@ -790,6 +790,7 @@ describe("runReplyAgent claude-cli routing", () => {
+   function createRun(params?: {
+     typingMode?: "instant" | "thinking";
+     opts?: {
++      onAssistantMessageStart?: () => Promise<void> | void;
+       onReasoningStream?: (payload: {
+         text?: string;
+         isReasoning?: boolean;
+@@ -958,6 +959,90 @@ describe("runReplyAgent claude-cli routing", () => {
+     expect(result).toMatchObject({ text: "Final answer" });
+   });
+ 
++  it("bridges cli system init to assistant message start once", async () => {
++    const callbackOrder: string[] = [];
++    const onAssistantMessageStart = vi.fn(() => {
++      callbackOrder.push("start");
++    });
++    const onReasoningStream = vi.fn(() => {
++      callbackOrder.push("reasoning");
++    });
++    const onToolStart = vi.fn(() => {
++      callbackOrder.push("tool");
++    });
++
++    runCliAgentMock.mockImplementationOnce(
++      async (params: {
++        onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
++        onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++        onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++        onAssistantTurn?: (text: string) => void;
++      }) => {
++        params.onSystemInit?.({ subtype: "init", sessionId: "cli-session-1" });
++        params.onThinkingTurn?.({ text: "step", delta: "step" });
++        params.onToolUseEvent?.({ name: "Read", toolUseId: "toolu_1" });
++        params.onAssistantTurn?.("Answer");
++        return {
++          payloads: [{ text: "Answer" }],
++          meta: {
++            agentMeta: {
++              provider: "claude-cli",
++              model: "opus-4.5",
++            },
++          },
++        };
++      },
++    );
++
++    const result = await createRun({
++      typingMode: "thinking",
++      opts: {
++        onAssistantMessageStart,
++        onReasoningStream,
++        onToolStart,
++      },
++    });
++
++    expect(onAssistantMessageStart).toHaveBeenCalledTimes(1);
++    expect(callbackOrder[0]).toBe("start");
++    expect(callbackOrder).toEqual(expect.arrayContaining(["reasoning", "tool"]));
++    expect(result).toMatchObject({ text: "Answer" });
++  });
++
++  it("strips reply directive tags from cli partial replies (including split tags)", async () => {
++    const onPartialReply = vi.fn();
++    runCliAgentMock.mockImplementationOnce(
++      async (params: { onAssistantTurn?: (text: string) => void }) => {
++        params.onAssistantTurn?.("[[reply_to_cur");
++        params.onAssistantTurn?.("rent]]7452136093975117843 请确认一下");
++        return {
++          payloads: [{ text: "[[reply_to_current]]7452136093975117843 请确认一下" }],
++          meta: {
++            agentMeta: {
++              provider: "claude-cli",
++              model: "opus-4.5",
++            },
++          },
++        };
++      },
++    );
++
++    const result = await createRun({
++      opts: {
++        onPartialReply,
++      },
++    });
++
++    const partialTexts = onPartialReply.mock.calls
++      .map((call) => call[0]?.text)
++      .filter((value): value is string => typeof value === "string");
++    expect(partialTexts).toEqual(["7452136093975117843 请确认一下"]);
++    expect(partialTexts.some((value) => value.includes("[[reply_to"))).toBe(false);
++    expect(result).toMatchObject({
++      text: "7452136093975117843 请确认一下",
++    });
++  });
++
+   it("closes reasoning stream when cli runner throws after thinking", async () => {
+     const onReasoningEnd = vi.fn();
+     runCliAgentMock.mockImplementationOnce(
+diff --git a/src/hooks/llm-slug-generator.test.ts b/src/hooks/llm-slug-generator.test.ts
+index 0524930fbb..1a9bcbbe4b 100644
+--- a/src/hooks/llm-slug-generator.test.ts
++++ b/src/hooks/llm-slug-generator.test.ts
+@@ -1,4 +1,5 @@
+ import { beforeEach, describe, expect, it, vi } from "vitest";
++import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
+ import type { OpenClawConfig } from "../config/config.js";
+ 
+ const {
+@@ -26,10 +27,14 @@ vi.mock("../agents/agent-scope.js", () => ({
+   resolveAgentEffectiveModelPrimary: mockResolveAgentEffectiveModelPrimary,
+ }));
+ 
+-vi.mock("../agents/model-selection.js", () => ({
+-  buildModelAliasIndex: mockBuildModelAliasIndex,
+-  resolveModelRefFromString: mockResolveModelRefFromString,
+-}));
++vi.mock("../agents/model-selection.js", async (importOriginal) => {
++  const orig = await importOriginal<typeof import("../agents/model-selection.js")>();
++  return {
++    ...orig,
++    buildModelAliasIndex: mockBuildModelAliasIndex,
++    resolveModelRefFromString: mockResolveModelRefFromString,
++  };
++});
+ 
+ vi.mock("../agents/pi-embedded.js", () => ({
+   runEmbeddedPiAgent: mockRunEmbeddedPiAgent,
+@@ -118,4 +123,22 @@ describe("generateSlugViaLLM", () => {
+       }),
+     );
+   });
++
++  it("falls back to default embedded provider when primary model is CLI backend", async () => {
++    mockResolveModelRefFromString.mockReturnValue({
++      ref: { provider: "claude-cli", model: "sonnet" },
++    });
++
++    await generateSlugViaLLM({
++      sessionContent: "Conversation body",
++      cfg: {} as OpenClawConfig,
++    });
++
++    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
++      expect.objectContaining({
++        provider: DEFAULT_PROVIDER,
++        model: DEFAULT_MODEL,
++      }),
++    );
++  });
+ });
+diff --git a/src/hooks/llm-slug-generator.ts b/src/hooks/llm-slug-generator.ts
+index fc3cc031cc..822943e556 100644
+--- a/src/hooks/llm-slug-generator.ts
++++ b/src/hooks/llm-slug-generator.ts
+@@ -12,7 +12,11 @@ import {
+   resolveAgentEffectiveModelPrimary,
+ } from "../agents/agent-scope.js";
+ import { DEFAULT_PROVIDER, DEFAULT_MODEL } from "../agents/defaults.js";
+-import { buildModelAliasIndex, resolveModelRefFromString } from "../agents/model-selection.js";
++import {
++  buildModelAliasIndex,
++  isCliProvider,
++  resolveModelRefFromString,
++} from "../agents/model-selection.js";
+ import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
+ import type { OpenClawConfig } from "../config/config.js";
+ import { createSubsystemLogger } from "../logging/subsystem.js";
+@@ -72,45 +76,15 @@ ${params.sessionContent.slice(0, 2000)}
+ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design", "bug-fix"`;
+ 
+     const aliasIndex = buildModelAliasIndex({ cfg: params.cfg, defaultProvider: DEFAULT_PROVIDER });
+-
+-    // Hook-level model override: hooks.internal.entries.session-memory.model
+-    const hookEntry = params.cfg.hooks?.internal?.entries?.["session-memory"];
+-    const hookModelRaw =
+-      hookEntry && typeof hookEntry === "object"
+-        ? (hookEntry as Record<string, unknown>).model
+-        : undefined;
+-    const hookResolved =
+-      typeof hookModelRaw === "string" && hookModelRaw
+-        ? resolveModelRefFromString({
+-            raw: hookModelRaw,
+-            defaultProvider: DEFAULT_PROVIDER,
+-            aliasIndex,
+-          })
+-        : null;
+-
+-    let provider: string;
+-    let model: string;
+-
+-    if (hookResolved && !isCliProvider(hookResolved.ref.provider, params.cfg)) {
+-      // Use explicitly configured hook model
+-      provider = hookResolved.ref.provider;
+-      model = hookResolved.ref.model;
+-    } else {
+-      // Fall back to agent's effective model
+-      const modelRef = resolveAgentEffectiveModelPrimary(params.cfg, agentId);
+-      const resolved = modelRef
+-        ? resolveModelRefFromString({
+-            raw: modelRef,
+-            defaultProvider: DEFAULT_PROVIDER,
+-            aliasIndex,
+-          })
+-        : null;
+-      const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
+-      const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
+-      // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
+-      provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
+-      model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
+-    }
++    const resolved = modelRef
++      ? resolveModelRefFromString({ raw: modelRef, defaultProvider: DEFAULT_PROVIDER, aliasIndex })
++      : null;
++    const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
++    const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
++    // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
++    // Fall back to default embedded provider when the agent's primary model is a CLI backend.
++    const provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
++    const model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
+     const timeoutMs = resolveSlugTimeoutMs(params.cfg);
+ 
+     const result = await runEmbeddedPiAgent({
+-- 
+2.50.1 (Apple Git-155)
+

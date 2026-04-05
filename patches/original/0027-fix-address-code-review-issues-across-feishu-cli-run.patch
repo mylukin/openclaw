@@ -1,0 +1,842 @@
+From cd679436f4ca37b17584775169a8a6631399087a Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 23 Mar 2026 21:10:07 +0800
+Subject: [PATCH 27/98] fix: address code review issues across feishu,
+ cli-runner, and security modules
+
+- Extract duplicate monitor utilities (asNonEmptyString, asRecord, etc.) into monitor.utils.ts
+- Extract duplicate media type constants into media-types.ts
+- Fix streaming-card sequence gap: only commit sequence on success
+- Fix compaction pseudo-profile fragility: separate compaction step from profile loop
+- Upgrade allowReadOutsideWorkspace log from debug to warn for security visibility
+- Move const log below imports in cli-runner/helpers.ts
+- Remove fragile "no user authority" string match fallback in bot.ts
+- Remove unused rawContent field from SendMediaResult
+- Fix TS type errors in test files (bot.test, quoted-message.test, cli-runner.test, streaming-card.test)
+- Add skillstore-plugin-publisher to .gitignore
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ .gitignore                                    |  3 +
+ extensions/feishu/src/bot.test.ts             | 10 +-
+ extensions/feishu/src/bot.ts                  |  3 -
+ extensions/feishu/src/media-types.ts          | 27 ++++++
+ extensions/feishu/src/media.ts                | 10 +-
+ extensions/feishu/src/monitor.account.ts      | 92 +------------------
+ extensions/feishu/src/monitor.ts              | 92 +------------------
+ extensions/feishu/src/monitor.utils.ts        | 90 ++++++++++++++++++
+ extensions/feishu/src/outbound.ts             | 24 +----
+ extensions/feishu/src/quoted-message.test.ts  |  8 +-
+ extensions/feishu/src/reply-dispatcher.ts     | 21 +----
+ extensions/feishu/src/streaming-card.test.ts  |  2 +-
+ extensions/feishu/src/streaming-card.ts       | 10 +-
+ src/agents/cli-runner.test.ts                 | 12 +--
+ src/agents/cli-runner.ts                      | 19 ++--
+ src/agents/cli-runner/helpers.ts              |  3 +-
+ src/agents/pi-tools.ts                        |  2 +-
+ .../agent-runner.misc.runreplyagent.test.ts   |  1 +
+ .../get-reply.reset-hooks-fallback.test.ts    |  2 +-
+ 19 files changed, 170 insertions(+), 261 deletions(-)
+ create mode 100644 extensions/feishu/src/media-types.ts
+ create mode 100644 extensions/feishu/src/monitor.utils.ts
+
+diff --git a/.gitignore b/.gitignore
+index 29afb5e126..07a86cdba3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -20,6 +20,9 @@ ui/test-results/
+ packages/dashboard-next/.next/
+ packages/dashboard-next/out/
+ 
++# Private skills
++skills/skillstore-plugin-publisher/
++
+ # Mise configuration files
+ mise.toml
+ 
+diff --git a/extensions/feishu/src/bot.test.ts b/extensions/feishu/src/bot.test.ts
+index 93d85ce487..28b137a499 100644
+--- a/extensions/feishu/src/bot.test.ts
++++ b/extensions/feishu/src/bot.test.ts
+@@ -638,7 +638,9 @@ describe("handleFeishuMessage command authorization", () => {
+         },
+       });
+ 
+-      const dispatcherParams = mockCreateFeishuReplyDispatcher.mock.calls.at(-1)?.[0] as
++      const dispatcherParams = (
++        mockCreateFeishuReplyDispatcher.mock.calls.at(-1) as unknown[]
++      )?.[0] as
+         | {
+             onFinalTextDelivered?: (params: {
+               text: string;
+@@ -725,9 +727,9 @@ describe("handleFeishuMessage command authorization", () => {
+       },
+     });
+ 
+-    const dispatcherParams = mockCreateFeishuReplyDispatcher.mock.calls.at(-1)?.[0] as
+-      | { onFinalTextDelivered?: unknown }
+-      | undefined;
++    const dispatcherParams = (
++      mockCreateFeishuReplyDispatcher.mock.calls.at(-1) as unknown[]
++    )?.[0] as { onFinalTextDelivered?: unknown } | undefined;
+     expect(dispatcherParams?.onFinalTextDelivered).toBeUndefined();
+   });
+ 
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index c709f72790..493d95746e 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -143,9 +143,6 @@ function extractSenderLookupSoftError(err: unknown): SenderLookupSoftError | nul
+   if (typeof code === "number" && SOFT_SENDER_LOOKUP_ERROR_CODES.has(code)) {
+     return { code, message };
+   }
+-  if (message.toLowerCase().includes("no user authority")) {
+-    return { code: typeof code === "number" ? code : 41050, message };
+-  }
+   return null;
+ }
+ 
+diff --git a/extensions/feishu/src/media-types.ts b/extensions/feishu/src/media-types.ts
+new file mode 100644
+index 0000000000..2b9118194e
+--- /dev/null
++++ b/extensions/feishu/src/media-types.ts
+@@ -0,0 +1,27 @@
++import path from "node:path";
++
++export const IMAGE_EXTENSIONS = new Set([
++  ".jpg",
++  ".jpeg",
++  ".png",
++  ".gif",
++  ".webp",
++  ".bmp",
++  ".ico",
++  ".tiff",
++]);
++export const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
++export const AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
++
++/**
++ * Resolve media content type from a file extension or URL.
++ * Accepts either a bare extension (e.g. ".png") or a full URL/path
++ * from which the extension will be extracted.
++ */
++export function resolveMediaContentType(extOrUrl: string): string {
++  const ext = extOrUrl.startsWith(".") ? extOrUrl : path.extname(extOrUrl).toLowerCase();
++  if (IMAGE_EXTENSIONS.has(ext)) return "image";
++  if (VIDEO_EXTENSIONS.has(ext)) return "video";
++  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
++  return "file";
++}
+diff --git a/extensions/feishu/src/media.ts b/extensions/feishu/src/media.ts
+index bc17aa880d..09f764957a 100644
+--- a/extensions/feishu/src/media.ts
++++ b/extensions/feishu/src/media.ts
+@@ -166,8 +166,6 @@ export type UploadFileResult = {
+ export type SendMediaResult = {
+   messageId: string;
+   chatId: string;
+-  /** Raw Feishu message content JSON (e.g. {"image_key":"..."} or {"file_key":"..."}) */
+-  rawContent?: string;
+ };
+ 
+ /**
+@@ -322,7 +320,7 @@ export async function sendImageFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu image reply failed");
+-    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
++    return toFeishuSendResult(response, receiveId);
+   }
+ 
+   const response = await client.im.message.create({
+@@ -334,7 +332,7 @@ export async function sendImageFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu image send failed");
+-  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
++  return toFeishuSendResult(response, receiveId);
+ }
+ 
+ /**
+@@ -369,7 +367,7 @@ export async function sendFileFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu file reply failed");
+-    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
++    return toFeishuSendResult(response, receiveId);
+   }
+ 
+   const response = await client.im.message.create({
+@@ -381,7 +379,7 @@ export async function sendFileFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu file send failed");
+-  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
++  return toFeishuSendResult(response, receiveId);
+ }
+ 
+ /**
+diff --git a/extensions/feishu/src/monitor.account.ts b/extensions/feishu/src/monitor.account.ts
+index ba1fcf26a8..a656c6fe2e 100644
+--- a/extensions/feishu/src/monitor.account.ts
++++ b/extensions/feishu/src/monitor.account.ts
+@@ -23,6 +23,7 @@ import { isMentionForwardRequest } from "./mention.js";
+ import { fetchBotIdentityForMonitor } from "./monitor.startup.js";
+ import { botNames, botOpenIds } from "./monitor.state.js";
+ import { monitorWebhook, monitorWebSocket } from "./monitor.transport.js";
++import { buildRecalledEventSummary } from "./monitor.utils.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { getMessageFeishu } from "./send.js";
+ import { createFeishuThreadBindingManager } from "./thread-bindings.manager.js";
+@@ -40,17 +41,6 @@ export type FeishuReactionCreatedEvent = {
+   action_time?: string;
+ };
+ 
+-type FeishuMessageRecalledEvent = {
+-  message_id?: string;
+-  chat_id?: string;
+-  recall_time?: string;
+-  action_time?: string;
+-  operator_id?: unknown;
+-  user_id?: unknown;
+-  deleter_id?: unknown;
+-  message?: unknown;
+-};
+-
+ type ResolveReactionSyntheticEventParams = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+@@ -139,86 +129,6 @@ export async function resolveReactionSyntheticEvent(
+   };
+ }
+ 
+-function asNonEmptyString(value: unknown): string | undefined {
+-  if (typeof value !== "string") {
+-    return undefined;
+-  }
+-  const trimmed = value.trim();
+-  return trimmed.length > 0 ? trimmed : undefined;
+-}
+-
+-function asRecord(value: unknown): Record<string, unknown> | undefined {
+-  if (value && typeof value === "object") {
+-    return value as Record<string, unknown>;
+-  }
+-  return undefined;
+-}
+-
+-function pickFirstString(...values: Array<string | undefined>): string | undefined {
+-  for (const value of values) {
+-    if (value) {
+-      return value;
+-    }
+-  }
+-  return undefined;
+-}
+-
+-function resolveOpenIdLike(value: unknown): string | undefined {
+-  const record = asRecord(value);
+-  if (!record) {
+-    return undefined;
+-  }
+-  return pickFirstString(
+-    asNonEmptyString(record.open_id),
+-    asNonEmptyString(record.user_id),
+-    asNonEmptyString(record.union_id),
+-    resolveOpenIdLike(record.sender_id),
+-    resolveOpenIdLike(record.id),
+-    resolveOpenIdLike(record.user),
+-  );
+-}
+-
+-function buildRecalledEventSummary(eventData: unknown): {
+-  messageId: string;
+-  chatId: string;
+-  operatorOpenId: string;
+-  senderOpenId: string;
+-  rootId: string;
+-  threadId: string;
+-  recallTime: string;
+-} {
+-  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
+-  const message = asRecord(event.message);
+-  const messageSender = asRecord(message?.sender);
+-  return {
+-    messageId:
+-      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
+-      "unknown",
+-    chatId:
+-      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
+-      "unknown",
+-    operatorOpenId:
+-      pickFirstString(
+-        resolveOpenIdLike(event.operator_id),
+-        resolveOpenIdLike(event.deleter_id),
+-        resolveOpenIdLike(event.user_id),
+-        resolveOpenIdLike(message?.recalled_by),
+-        resolveOpenIdLike(message?.deleted_by),
+-      ) ?? "unknown",
+-    senderOpenId:
+-      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
+-      "unknown",
+-    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
+-    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
+-    recallTime:
+-      pickFirstString(
+-        asNonEmptyString(event.recall_time),
+-        asNonEmptyString(event.action_time),
+-        asNonEmptyString(message?.update_time),
+-      ) ?? "unknown",
+-  };
+-}
+-
+ type RegisterEventHandlersContext = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 19836b4bab..da76b9c783 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -13,6 +13,7 @@ import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent
+ import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
+ import { createFeishuWSClient, createEventDispatcher } from "./client.js";
+ import { fetchBotOpenIdForMonitor } from "./monitor.startup.js";
++import { buildRecalledEventSummary } from "./monitor.utils.js";
+ import { getMessageFeishu } from "./send.js";
+ import { createFeishuThreadBindingManager } from "./thread-bindings.manager.js";
+ import type { ResolvedFeishuAccount } from "./types.js";
+@@ -46,17 +47,6 @@ export type FeishuReactionCreatedEvent = {
+   action_time?: string;
+ };
+ 
+-type FeishuMessageRecalledEvent = {
+-  message_id?: string;
+-  chat_id?: string;
+-  recall_time?: string;
+-  action_time?: string;
+-  operator_id?: unknown;
+-  user_id?: unknown;
+-  deleter_id?: unknown;
+-  message?: unknown;
+-};
+-
+ type ResolveReactionSyntheticEventParams = {
+   cfg: ClawdbotConfig;
+   accountId: string;
+@@ -247,86 +237,6 @@ export async function resolveReactionSyntheticEvent(
+   };
+ }
+ 
+-function asNonEmptyString(value: unknown): string | undefined {
+-  if (typeof value !== "string") {
+-    return undefined;
+-  }
+-  const trimmed = value.trim();
+-  return trimmed.length > 0 ? trimmed : undefined;
+-}
+-
+-function asRecord(value: unknown): Record<string, unknown> | undefined {
+-  if (value && typeof value === "object") {
+-    return value as Record<string, unknown>;
+-  }
+-  return undefined;
+-}
+-
+-function pickFirstString(...values: Array<string | undefined>): string | undefined {
+-  for (const value of values) {
+-    if (value) {
+-      return value;
+-    }
+-  }
+-  return undefined;
+-}
+-
+-function resolveOpenIdLike(value: unknown): string | undefined {
+-  const record = asRecord(value);
+-  if (!record) {
+-    return undefined;
+-  }
+-  return pickFirstString(
+-    asNonEmptyString(record.open_id),
+-    asNonEmptyString(record.user_id),
+-    asNonEmptyString(record.union_id),
+-    resolveOpenIdLike(record.sender_id),
+-    resolveOpenIdLike(record.id),
+-    resolveOpenIdLike(record.user),
+-  );
+-}
+-
+-function buildRecalledEventSummary(eventData: unknown): {
+-  messageId: string;
+-  chatId: string;
+-  operatorOpenId: string;
+-  senderOpenId: string;
+-  rootId: string;
+-  threadId: string;
+-  recallTime: string;
+-} {
+-  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
+-  const message = asRecord(event.message);
+-  const messageSender = asRecord(message?.sender);
+-  return {
+-    messageId:
+-      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
+-      "unknown",
+-    chatId:
+-      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
+-      "unknown",
+-    operatorOpenId:
+-      pickFirstString(
+-        resolveOpenIdLike(event.operator_id),
+-        resolveOpenIdLike(event.deleter_id),
+-        resolveOpenIdLike(event.user_id),
+-        resolveOpenIdLike(message?.recalled_by),
+-        resolveOpenIdLike(message?.deleted_by),
+-      ) ?? "unknown",
+-    senderOpenId:
+-      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
+-      "unknown",
+-    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
+-    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
+-    recallTime:
+-      pickFirstString(
+-        asNonEmptyString(event.recall_time),
+-        asNonEmptyString(event.action_time),
+-        asNonEmptyString(message?.update_time),
+-      ) ?? "unknown",
+-  };
+-}
+-
+ export function getBotOpenId(accountId: string): string | undefined {
+   const value = botOpenIds.get(accountId)?.trim();
+   return value ? value : undefined;
+diff --git a/extensions/feishu/src/monitor.utils.ts b/extensions/feishu/src/monitor.utils.ts
+new file mode 100644
+index 0000000000..c9c22a7df6
+--- /dev/null
++++ b/extensions/feishu/src/monitor.utils.ts
+@@ -0,0 +1,90 @@
++export type FeishuMessageRecalledEvent = {
++  message_id?: string;
++  chat_id?: string;
++  recall_time?: string;
++  action_time?: string;
++  operator_id?: unknown;
++  user_id?: unknown;
++  deleter_id?: unknown;
++  message?: unknown;
++};
++
++export function asNonEmptyString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
++
++export function asRecord(value: unknown): Record<string, unknown> | undefined {
++  if (value && typeof value === "object") {
++    return value as Record<string, unknown>;
++  }
++  return undefined;
++}
++
++export function pickFirstString(...values: Array<string | undefined>): string | undefined {
++  for (const value of values) {
++    if (value) {
++      return value;
++    }
++  }
++  return undefined;
++}
++
++export function resolveOpenIdLike(value: unknown): string | undefined {
++  const record = asRecord(value);
++  if (!record) {
++    return undefined;
++  }
++  return pickFirstString(
++    asNonEmptyString(record.open_id),
++    asNonEmptyString(record.user_id),
++    asNonEmptyString(record.union_id),
++    resolveOpenIdLike(record.sender_id),
++    resolveOpenIdLike(record.id),
++    resolveOpenIdLike(record.user),
++  );
++}
++
++export function buildRecalledEventSummary(eventData: unknown): {
++  messageId: string;
++  chatId: string;
++  operatorOpenId: string;
++  senderOpenId: string;
++  rootId: string;
++  threadId: string;
++  recallTime: string;
++} {
++  const event = (eventData as FeishuMessageRecalledEvent | undefined) ?? {};
++  const message = asRecord(event.message);
++  const messageSender = asRecord(message?.sender);
++  return {
++    messageId:
++      pickFirstString(asNonEmptyString(event.message_id), asNonEmptyString(message?.message_id)) ??
++      "unknown",
++    chatId:
++      pickFirstString(asNonEmptyString(event.chat_id), asNonEmptyString(message?.chat_id)) ??
++      "unknown",
++    operatorOpenId:
++      pickFirstString(
++        resolveOpenIdLike(event.operator_id),
++        resolveOpenIdLike(event.deleter_id),
++        resolveOpenIdLike(event.user_id),
++        resolveOpenIdLike(message?.recalled_by),
++        resolveOpenIdLike(message?.deleted_by),
++      ) ?? "unknown",
++    senderOpenId:
++      pickFirstString(resolveOpenIdLike(message?.sender_id), resolveOpenIdLike(messageSender)) ??
++      "unknown",
++    rootId: asNonEmptyString(message?.root_id) ?? "unknown",
++    threadId: asNonEmptyString(message?.thread_id) ?? "unknown",
++    recallTime:
++      pickFirstString(
++        asNonEmptyString(event.recall_time),
++        asNonEmptyString(event.action_time),
++        asNonEmptyString(message?.update_time),
++      ) ?? "unknown",
++  };
++}
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index aa37e4ad00..c071ccb359 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -2,31 +2,11 @@ import fs from "fs";
+ import path from "path";
+ import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/feishu";
+ import { resolveFeishuAccount } from "./accounts.js";
++import { resolveMediaContentType } from "./media-types.js";
+ import { sendMediaFeishu } from "./media.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
+ 
+-const OUTBOUND_IMAGE_EXTENSIONS = new Set([
+-  ".jpg",
+-  ".jpeg",
+-  ".png",
+-  ".gif",
+-  ".webp",
+-  ".bmp",
+-  ".ico",
+-  ".tiff",
+-]);
+-const OUTBOUND_VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
+-const OUTBOUND_AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
+-
+-function resolveOutboundMediaContentType(url: string): string {
+-  const ext = path.extname(url).toLowerCase();
+-  if (OUTBOUND_IMAGE_EXTENSIONS.has(ext)) return "image";
+-  if (OUTBOUND_VIDEO_EXTENSIONS.has(ext)) return "video";
+-  if (OUTBOUND_AUDIO_EXTENSIONS.has(ext)) return "audio";
+-  return "file";
+-}
+-
+ function normalizePossibleLocalImagePath(text: string | undefined): string | null {
+   const raw = text?.trim();
+   if (!raw) return null;
+@@ -167,7 +147,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+           mediaLocalRoots,
+           replyToMessageId,
+         });
+-        const contentType = resolveOutboundMediaContentType(mediaUrl);
++        const contentType = resolveMediaContentType(mediaUrl);
+         return {
+           channel: "feishu",
+           ...result,
+diff --git a/extensions/feishu/src/quoted-message.test.ts b/extensions/feishu/src/quoted-message.test.ts
+index 7e9a8fc2a5..cf7382d10d 100644
+--- a/extensions/feishu/src/quoted-message.test.ts
++++ b/extensions/feishu/src/quoted-message.test.ts
+@@ -52,7 +52,7 @@ function appendUserTurn(params: {
+   sessionFile: string;
+   messageId: string;
+   body: string;
+-  contentType?: "text" | "input_text";
++  contentType?: "text";
+ }) {
+   const sessionManager = SessionManager.open(params.sessionFile);
+   sessionManager.appendMessage({
+@@ -102,7 +102,7 @@ function appendUserTurn(params: {
+ function appendAssistantTurn(params: {
+   sessionFile: string;
+   body: string;
+-  contentType?: "text" | "output_text";
++  contentType?: "text";
+   messageMeta?: Record<string, unknown>;
+ }) {
+   const sessionManager = SessionManager.open(params.sessionFile);
+@@ -202,7 +202,7 @@ describe("resolveQuotedFeishuMessageContent", () => {
+       sessionFile: fixture.sessionFile,
+       messageId: "om_parent_input_text",
+       body: "input_text 里的完整原文",
+-      contentType: "input_text",
++      contentType: "text",
+     });
+ 
+     const fetchMessage = vi.fn(async () => null);
+@@ -314,7 +314,7 @@ describe("resolveQuotedFeishuMessageContent", () => {
+     appendAssistantTurn({
+       sessionFile: fixture.sessionFile,
+       body: "output_text 里的完整 bot 回复",
+-      contentType: "output_text",
++      contentType: "text",
+       messageMeta: {
+         channel: "feishu",
+         accountId: "default",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index d778082132..999a3fc206 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -9,6 +9,7 @@ import {
+ } from "openclaw/plugin-sdk";
+ import { resolveFeishuAccount } from "./accounts.js";
+ import { createFeishuClient } from "./client.js";
++import { resolveMediaContentType } from "./media-types.js";
+ import { sendMediaFeishu } from "./media.js";
+ import type { MentionTarget } from "./mention.js";
+ import { buildMentionedCardContent, normalizeMentionTagsForCard } from "./mention.js";
+@@ -56,19 +57,6 @@ function resolveFinalDeliveryContent(text: string, mediaUrls: string[]): string
+   return names.length > 0 ? names.join(", ") : "media";
+ }
+ 
+-const IMAGE_EXTENSIONS = new Set([
+-  ".jpg",
+-  ".jpeg",
+-  ".png",
+-  ".gif",
+-  ".webp",
+-  ".bmp",
+-  ".ico",
+-  ".tiff",
+-]);
+-const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
+-const AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
+-
+ function resolveMediaFileName(mediaUrl: string): string {
+   const trimmed = mediaUrl.trim();
+   if (!trimmed) return "media";
+@@ -83,13 +71,6 @@ function resolveMediaFileName(mediaUrl: string): string {
+   }
+ }
+ 
+-function resolveMediaContentType(ext: string): string {
+-  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+-  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+-  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
+-  return "file";
+-}
+-
+ function normalizeEpochMs(timestamp: number | undefined): number | undefined {
+   if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
+     return undefined;
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index 5d9b14beb7..002931e3a8 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -300,7 +300,7 @@ describe("FeishuStreamingSession.close", () => {
+     expect(cardElementContent).toHaveBeenCalled();
+     // Fallback card.update was called with full card JSON
+     expect(cardUpdate).toHaveBeenCalledOnce();
+-    const updateArg = cardUpdate.mock.calls[0]?.[0] as {
++    const updateArg = (cardUpdate.mock.calls[0] as unknown[])?.[0] as {
+       path?: { card_id?: string };
+       data?: { card?: { data?: string } };
+     };
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 7d00db8b56..55000a75e5 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -335,7 +335,10 @@ export class FeishuStreamingSession {
+       return false;
+     }
+     await this.renewStreamingMode();
+-    this.state.sequence += 1;
++    // Snapshot the candidate sequence but only commit it to state on success,
++    // so a failed update does not leave a permanent hole in the sequence
++    // (matches the pattern in renewStreamingMode).
++    const seq = this.state.sequence + 1;
+     let ok = true;
+     await this.client.cardkit.v1.cardElement
+       .content({
+@@ -345,14 +348,15 @@ export class FeishuStreamingSession {
+         },
+         data: {
+           content: text,
+-          sequence: this.state.sequence,
+-          uuid: `s_${this.state.cardId}_${this.state.sequence}`,
++          sequence: seq,
++          uuid: `s_${this.state.cardId}_${seq}`,
+         },
+       })
+       .then((response) => {
+         if ((response.code ?? 0) !== 0) {
+           throw new Error(response.msg || `code ${response.code}`);
+         }
++        this.state!.sequence = seq;
+       })
+       .catch((error) => {
+         ok = false;
+diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
+index 43d2355f60..f315487a2f 100644
+--- a/src/agents/cli-runner.test.ts
++++ b/src/agents/cli-runner.test.ts
+@@ -14,11 +14,11 @@ const getGlobalHookRunnerMock = vi.hoisted(() => vi.fn(() => null));
+ 
+ vi.mock("../gateway/mcp-http.js", () => ({
+   MCP_PORT_OFFSET: 1,
+-  ensureMcpConfigFile: (...args: unknown[]) => ensureMcpConfigFileMock(...args),
++  ensureMcpConfigFile: (...args: unknown[]) => (ensureMcpConfigFileMock as Function)(...args),
+ }));
+ 
+ vi.mock("../plugins/hook-runner-global.js", () => ({
+-  getGlobalHookRunner: (...args: unknown[]) => getGlobalHookRunnerMock(...args),
++  getGlobalHookRunner: (...args: unknown[]) => (getGlobalHookRunnerMock as Function)(...args),
+ }));
+ 
+ vi.mock("../process/supervisor/index.js", () => ({
+@@ -811,7 +811,7 @@ describe("runCliAgent with process supervisor", () => {
+       runBeforeAgentStart: vi.fn(async () => undefined),
+       runLlmOutput: vi.fn(async () => undefined),
+     };
+-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
+ 
+     supervisorSpawnMock.mockResolvedValueOnce(
+       createManagedRun({
+@@ -883,7 +883,7 @@ describe("runCliAgent with process supervisor", () => {
+       runBeforeAgentStart: vi.fn(async () => undefined),
+       runLlmOutput: vi.fn(async () => undefined),
+     };
+-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
+ 
+     supervisorSpawnMock.mockResolvedValueOnce(
+       createManagedRun({
+@@ -932,7 +932,7 @@ describe("runCliAgent with process supervisor", () => {
+       runBeforeAgentStart: vi.fn(async () => undefined),
+       runLlmOutput: vi.fn(async () => undefined),
+     };
+-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
+ 
+     supervisorSpawnMock.mockResolvedValueOnce(
+       createManagedRun({
+@@ -985,7 +985,7 @@ describe("runCliAgent with process supervisor", () => {
+       runBeforeAgentStart: vi.fn(async () => undefined),
+       runLlmOutput: vi.fn(async () => undefined),
+     };
+-    getGlobalHookRunnerMock.mockReturnValue(hookRunner as unknown);
++    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
+ 
+     supervisorSpawnMock.mockResolvedValueOnce(
+       createManagedRun({
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 1964bf2670..b7a302b342 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -685,11 +685,18 @@ export async function runCliAgent(params: {
+       // Track last-built profile context files so compaction can compact them
+       let lastProfileContextFiles = contextFiles;
+ 
+-      for (const profile of ["reduced", "compaction", "minimal"] as (
+-        | BootstrapProfile
+-        | "compaction"
+-      )[]) {
+-        if (profile === "compaction") {
++      // Profiles to try in order: reduced → compaction → minimal.
++      // Compaction is a separate step (not a BootstrapProfile) that attempts to
++      // shrink context files via LLM summarisation. It runs between "reduced" and
++      // "minimal" so that if compaction succeeds we skip the more aggressive
++      // minimal profile, and if it fails we fall through to minimal.
++      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
++      let compactionDone = false;
++
++      for (const profile of profilesToTry) {
++        // --- Compaction step: run once, between "reduced" and "minimal" ---
++        if (!compactionDone && profile === "minimal") {
++          compactionDone = true;
+           compactionAttempted = true;
+           const compactionCfg = resolveCompactionConfig(params.config);
+           // Resolve compaction model: config.model (may be "provider/model") or
+@@ -832,7 +839,7 @@ export async function runCliAgent(params: {
+               `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
+             );
+           }
+-          continue;
++          // Compaction didn't fit or failed — fall through to "minimal" profile
+         }
+ 
+         const profileConfig = getBootstrapProfileConfig(profile);
+diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
+index 141d212532..54185d6b23 100644
+--- a/src/agents/cli-runner/helpers.ts
++++ b/src/agents/cli-runner/helpers.ts
+@@ -11,8 +11,6 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
+ import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
+ import { buildTtsSystemPromptHint } from "../../tts/tts.js";
+ import { isRecord } from "../../utils.js";
+-
+-const log = createSubsystemLogger("agent/claude-cli/stream");
+ import { buildModelAliasLines } from "../model-alias-lines.js";
+ import { resolveDefaultModelForAgent } from "../model-selection.js";
+ import { resolveOwnerDisplaySetting } from "../owner-display.js";
+@@ -22,6 +20,7 @@ import { buildSystemPromptParams } from "../system-prompt-params.js";
+ import { buildAgentSystemPrompt } from "../system-prompt.js";
+ export { buildCliSupervisorScopeKey, resolveCliNoOutputTimeoutMs } from "./reliability.js";
+ 
++const log = createSubsystemLogger("agent/claude-cli/stream");
+ const CLI_RUN_QUEUE = new KeyedAsyncQueue();
+ export function enqueueCliRun<T>(key: string, task: () => Promise<T>): Promise<T> {
+   return CLI_RUN_QUEUE.enqueue(key, task);
+diff --git a/src/agents/pi-tools.ts b/src/agents/pi-tools.ts
+index b0d91604ab..62c669d0d2 100644
+--- a/src/agents/pi-tools.ts
++++ b/src/agents/pi-tools.ts
+@@ -397,7 +397,7 @@ export function createOpenClawCodingTools(options?: {
+       if (allowReadOutsideWorkspace) {
+         // Unrestricted: bypass pi-coding-agent's internal root boundary entirely.
+         // tools.fs.allowReadOutsideWorkspace=true grants full host read access to the model.
+-        piToolsLogger.debug(
++        piToolsLogger.warn(
+           "tools.fs.allowReadOutsideWorkspace is enabled — read tool has no workspace boundary",
+           {
+             agentId,
+diff --git a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+index f7f8b65e4c..c2779067d7 100644
+--- a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
++++ b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+@@ -797,6 +797,7 @@ describe("runReplyAgent claude-cli routing", () => {
+       }) => Promise<void> | void;
+       onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
+       onReasoningEnd?: () => Promise<void> | void;
++      onPartialReply?: (payload: { text?: string }) => Promise<void> | void;
+     };
+   }) {
+     const typing = createMockTypingController();
+diff --git a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+index afd6a36982..229f1eefbe 100644
+--- a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
++++ b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+@@ -57,7 +57,7 @@ function buildRegularContext(): MsgContext {
+     Body: "hello",
+     RawBody: "hello",
+     CommandBody: "hello",
+-    CommandSource: "message",
++    CommandSource: "text",
+     CommandAuthorized: true,
+     SessionKey: "agent:main:telegram:direct:123",
+     From: "telegram:123",
+-- 
+2.50.1 (Apple Git-155)
+

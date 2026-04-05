@@ -1,0 +1,2507 @@
+From 308617117ab25d54af2a5de11229c2ac277b75d8 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:43:18 +0800
+Subject: [PATCH 10/98] feat(feishu): integrate CLI stream-json mode with
+ streaming cards
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot.ts                  |  96 +++-
+ extensions/feishu/src/monitor.account.ts      |  20 +
+ extensions/feishu/src/monitor.ts              |  21 +
+ extensions/feishu/src/reply-dispatcher.ts     |  13 +-
+ .../src/thread-bindings.manager.test.ts       | 393 ++++++++++++++
+ .../feishu/src/thread-bindings.manager.ts     | 512 ++++++++++++++++++
+ .../feishu/src/thread-bindings.state.test.ts  | 127 +++++
+ .../feishu/src/thread-bindings.state.ts       | 218 ++++++++
+ .../feishu/src/thread-bindings.types.ts       |  27 +
+ src/agents/cli-backends.ts                    |   7 +-
+ src/agents/cli-runner.ts                      |  58 +-
+ src/agents/cli-runner/helpers.ts              | 422 ++-------------
+ .../reply/agent-runner-execution.ts           | 148 +----
+ src/config/types.agent-defaults.ts            |   4 +-
+ src/infra/outbound/conversation-id.test.ts    |   7 +
+ src/infra/outbound/conversation-id.ts         |   7 +
+ src/plugin-sdk/index.ts                       |  21 +
+ 17 files changed, 1524 insertions(+), 577 deletions(-)
+ create mode 100644 extensions/feishu/src/thread-bindings.manager.test.ts
+ create mode 100644 extensions/feishu/src/thread-bindings.manager.ts
+ create mode 100644 extensions/feishu/src/thread-bindings.state.test.ts
+ create mode 100644 extensions/feishu/src/thread-bindings.state.ts
+ create mode 100644 extensions/feishu/src/thread-bindings.types.ts
+
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index e9f722732b..a692c47853 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -5,6 +5,7 @@ import {
+   clearHistoryEntriesIfEnabled,
+   createScopedPairingAccess,
+   DEFAULT_GROUP_HISTORY_LIMIT,
++  getSessionBindingService,
+   type HistoryEntry,
+   issuePairingChallenge,
+   normalizeAgentId,
+@@ -1059,6 +1060,7 @@ export async function handleFeishuMessage(params: {
+     : null;
+ 
+   let requireMention = false; // DMs never require mention; groups may override below
++  let boundSessionKey: string | undefined;
+   if (isGroup) {
+     if (groupConfig?.enabled === false) {
+       log(`feishu[${account.accountId}]: group ${ctx.chatId} is disabled`);
+@@ -1119,7 +1121,25 @@ export async function handleFeishuMessage(params: {
+       groupConfig,
+     }));
+ 
+-    if (requireMention && !ctx.mentionedBot) {
++    // Check if message is in a topic thread bound to an ACP/subagent session
++    const inboundRootId = ctx.rootId?.trim() || ctx.threadId?.trim();
++    if (inboundRootId) {
++      const binding = getSessionBindingService().resolveByConversation({
++        channel: "feishu",
++        accountId: account.accountId,
++        conversationId: `${ctx.chatId}:${inboundRootId}`,
++      });
++      if (binding?.targetSessionKey) {
++        boundSessionKey = binding.targetSessionKey;
++        getSessionBindingService().touch(binding.bindingId);
++        requireMention = false;
++        log(
++          `feishu[${account.accountId}]: bound thread detected root=${inboundRootId}, routing to session ${boundSessionKey}`,
++        );
++      }
++    }
++
++    if (dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot) {
+       log(`feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot`);
+       // Record to pending history for non-broadcast groups only. For broadcast groups,
+       // the mentioned handler's broadcast dispatch writes the turn directly into all
+@@ -1452,7 +1472,9 @@ export async function handleFeishuMessage(params: {
+       isTopicSession || configReplyInThread ? (ctx.rootId ?? ctx.messageId) : ctx.messageId;
+     const threadReply = isGroup ? (groupSession?.threadReply ?? false) : false;
+ 
+-    if (broadcastAgents) {
++    if (broadcastAgents && !boundSessionKey) {
++      // Note: bound thread sessions (ACP/subagent) bypass broadcast dispatch —
++      // bound threads route directly to the single-agent path below.
+       // Cross-account dedup: in multi-account setups, Feishu delivers the same
+       // event to every bot account in the group. Only one account should handle
+       // broadcast dispatch to avoid duplicate agent sessions and race conditions.
+@@ -1587,10 +1609,64 @@ export async function handleFeishuMessage(params: {
+       log(
+         `feishu[${account.accountId}]: broadcast dispatch complete for ${broadcastAgents.length} agents`,
+       );
++    } else if (isGroup && dispatchMode === "plugin" && !boundSessionKey) {
++      // --- Plugin dispatch mode: run hooks but suppress reply generation ---
++      const ctxPayload = buildCtxPayloadForAgent(
++        route.sessionKey,
++        route.accountId,
++        ctx.mentionedBot,
++      );
++      const shouldForwardControlCommands = feishuCfg?.pluginMode?.forwardControlCommands ?? true;
++      if (
++        !shouldForwardControlCommands &&
++        core.channel.commands.isControlCommandMessage(ctx.content, effectiveCfg)
++      ) {
++        log(
++          `feishu[${account.accountId}]: skipping control command relay in plugin mode (message=${ctx.messageId})`,
++        );
++        if (isGroup && historyKey && chatHistories) {
++          clearHistoryEntriesIfEnabled({
++            historyMap: chatHistories,
++            historyKey,
++            limit: historyLimit,
++          });
++        }
++        return;
++      }
++
++      const { dispatcher, replyOptions, markDispatchIdle } =
++        core.channel.reply.createReplyDispatcherWithTyping({
++          deliver: async () => {},
++          onIdle: () => {},
++          onError: () => {},
++        });
++
++      log(`feishu[${account.accountId}]: group plugin dispatch mode enabled, skipping auto reply`);
++
++      try {
++        await core.channel.reply.dispatchReplyFromConfig({
++          ctx: ctxPayload,
++          cfg: effectiveCfg,
++          dispatcher,
++          replyOptions,
++          replyResolver: async () => undefined,
++        });
++      } finally {
++        markDispatchIdle();
++      }
++
++      if (isGroup && historyKey && chatHistories) {
++        clearHistoryEntriesIfEnabled({
++          historyMap: chatHistories,
++          historyKey,
++          limit: historyLimit,
++        });
++      }
+     } else {
+       // --- Single-agent dispatch (existing behavior) ---
++      const effectiveSessionKey = boundSessionKey ?? route.sessionKey;
+       const ctxPayload = buildCtxPayloadForAgent(
+-        route.sessionKey,
++        effectiveSessionKey,
+         route.accountId,
+         ctx.mentionedBot,
+       );
+@@ -1600,19 +1676,21 @@ export async function handleFeishuMessage(params: {
+         agentId: route.agentId,
+         runtime: runtime as RuntimeEnv,
+         chatId: ctx.chatId,
+-        replyToMessageId: replyTargetMessageId,
++        replyToMessageId: boundSessionKey
++          ? (ctx.rootId ?? replyTargetMessageId)
++          : replyTargetMessageId,
+         skipReplyToInMessages: !isGroup,
+-        replyInThread,
+-        streamingInThread,
+-        rootId: ctx.rootId,
+-        threadReply,
++        replyInThread: boundSessionKey ? true : replyInThread,
++        streamingInThread: boundSessionKey ? true : streamingInThread,
++        rootId: boundSessionKey ? ctx.rootId : replyInThread ? ctx.rootId : undefined,
++        threadReply: boundSessionKey ? true : replyInThread && threadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
+         botOpenId,
+         messageCreateTimeMs,
+       });
+ 
+-      log(`feishu[${account.accountId}]: dispatching to agent (session=${route.sessionKey})`);
++      log(`feishu[${account.accountId}]: dispatching to agent (session=${effectiveSessionKey})`);
+       const { queuedFinal, counts } = await core.channel.reply.withReplyDispatcher({
+         dispatcher,
+         onSettled: () => {
+diff --git a/extensions/feishu/src/monitor.account.ts b/extensions/feishu/src/monitor.account.ts
+index 1214dff348..010323ef18 100644
+--- a/extensions/feishu/src/monitor.account.ts
++++ b/extensions/feishu/src/monitor.account.ts
+@@ -24,6 +24,7 @@ import { botNames, botOpenIds } from "./monitor.state.js";
+ import { monitorWebhook, monitorWebSocket } from "./monitor.transport.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { getMessageFeishu } from "./send.js";
++import { createFeishuThreadBindingManager } from "./thread-bindings.manager.js";
+ import type { ResolvedFeishuAccount } from "./types.js";
+ 
+ const FEISHU_REACTION_VERIFY_TIMEOUT_MS = 1_500;
+@@ -630,6 +631,25 @@ export async function monitorSingleAccount(params: MonitorSingleAccountParams):
+     log(`feishu[${accountId}]: dedup warmup loaded ${warmupCount} entries from disk`);
+   }
+ 
++  const threadBindingManager = createFeishuThreadBindingManager({
++    accountId,
++    cfg,
++    persist: true,
++    enableSweeper: true,
++  });
++  log(`feishu[${accountId}]: thread binding adapter registered`);
++
++  if (abortSignal) {
++    abortSignal.addEventListener(
++      "abort",
++      () => {
++        threadBindingManager.stop();
++        log(`feishu[${accountId}]: thread binding adapter stopped`);
++      },
++      { once: true },
++    );
++  }
++
+   const eventDispatcher = createEventDispatcher(account);
+   const chatHistories = new Map<string, HistoryEntry[]>();
+ 
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 1f2a1245f3..19836b4bab 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -14,6 +14,7 @@ import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-actio
+ import { createFeishuWSClient, createEventDispatcher } from "./client.js";
+ import { fetchBotOpenIdForMonitor } from "./monitor.startup.js";
+ import { getMessageFeishu } from "./send.js";
++import { createFeishuThreadBindingManager } from "./thread-bindings.manager.js";
+ import type { ResolvedFeishuAccount } from "./types.js";
+ 
+ export type MonitorFeishuOpts = {
+@@ -620,6 +621,26 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
+   if (connectionMode === "webhook" && !account.verificationToken?.trim()) {
+     throw new Error(`Feishu account "${accountId}" webhook mode requires verificationToken`);
+   }
++
++  const threadBindingManager = createFeishuThreadBindingManager({
++    accountId,
++    cfg,
++    persist: true,
++    enableSweeper: true,
++  });
++  log(`feishu[${accountId}]: thread binding adapter registered`);
++
++  if (abortSignal) {
++    abortSignal.addEventListener(
++      "abort",
++      () => {
++        threadBindingManager.stop();
++        log(`feishu[${accountId}]: thread binding adapter stopped`);
++      },
++      { once: true },
++    );
++  }
++
+   const eventDispatcher = createEventDispatcher(account);
+   const chatHistories = new Map<string, HistoryEntry[]>();
+ 
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index fe95dcff51..252b4fb5c9 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -211,12 +211,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return `${statusLine}\n---\n${assistantText}`;
+   };
+ 
++  const TOOL_DISPLAY_NAMES: Record<string, string> = {
++    feishu_chat_history: "聊天记录",
++    feishu_chat_info: "群信息",
++    feishu_chat_members: "群成员",
++    feishu_member_chats: "成员群列表",
++  };
++
+   const normalizeToolName = (name: string | undefined): string | undefined => {
+     const trimmed = name?.trim();
+     if (!trimmed) {
+       return undefined;
+     }
+-    return trimmed.replace(/\s+/g, " ");
++    const stripped = trimmed.replace("mcp__openclaw__", "");
++    return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
+   };
+ 
+   const resolveStatusLine = (): string | undefined => {
+@@ -634,8 +642,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             // streaming — text arrives as complete chunks via onPartialReply —
+             // so the card must be started here. startStreaming() is idempotent
+             // (guarded by streamingStartPromise), so calling it here is safe
+-            // even when the card was already started by deliver.
+-            queueThinkingPrelude();
++            // even when the card was already started by onReplyStart or deliver.
+             startStreaming();
+             queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
+           }
+diff --git a/extensions/feishu/src/thread-bindings.manager.test.ts b/extensions/feishu/src/thread-bindings.manager.test.ts
+new file mode 100644
+index 0000000000..aeaf018471
+--- /dev/null
++++ b/extensions/feishu/src/thread-bindings.manager.test.ts
+@@ -0,0 +1,393 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++// Mock sendMessageFeishu before importing the manager
++vi.mock("./send.js", () => ({
++  sendMessageFeishu: vi.fn().mockResolvedValue({ messageId: "om_intro_msg_1", chatId: "oc_chat1" }),
++}));
++
++// Mock plugin-sdk session binding registration
++const registeredAdapters = new Map<string, any>();
++vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
++  const original = (await importOriginal()) as Record<string, unknown>;
++  return {
++    ...original,
++    registerSessionBindingAdapter: vi.fn((adapter: any) => {
++      registeredAdapters.set(`${adapter.channel}:${adapter.accountId}`, adapter);
++    }),
++    unregisterSessionBindingAdapter: vi.fn((params: any) => {
++      registeredAdapters.delete(`${params.channel}:${params.accountId}`);
++    }),
++    normalizeAccountId: (id?: string) => (id?.trim() || "default").toLowerCase(),
++  };
++});
++
++import type { ClawdbotConfig } from "openclaw/plugin-sdk";
++import { sendMessageFeishu } from "./send.js";
++import {
++  createFeishuThreadBindingManager,
++  resetManagersForTests,
++} from "./thread-bindings.manager.js";
++import { resetForTests } from "./thread-bindings.state.js";
++
++const mockSend = vi.mocked(sendMessageFeishu);
++
++function makeCfg(): ClawdbotConfig {
++  return {} as ClawdbotConfig;
++}
++
++beforeEach(() => {
++  resetManagersForTests();
++  resetForTests();
++  registeredAdapters.clear();
++  mockSend.mockReset();
++  mockSend.mockResolvedValue({ messageId: "om_intro_msg_1", chatId: "oc_chat1" });
++});
++
++afterEach(() => {
++  resetManagersForTests();
++  resetForTests();
++  registeredAdapters.clear();
++});
++
++describe("createFeishuThreadBindingManager", () => {
++  it("registers a session binding adapter on creation", () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "test-acc",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    expect(registeredAdapters.has("feishu:test-acc")).toBe(true);
++    manager.stop();
++    expect(registeredAdapters.has("feishu:test-acc")).toBe(false);
++  });
++
++  it("binds a target by sending intro + reply messages", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const record = await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "agent:default:feishu:group:oc_chat1",
++      introText: "Hello thread!",
++    });
++
++    expect(record).not.toBeNull();
++    expect(record!.chatId).toBe("oc_chat1");
++    expect(record!.rootId).toBe("om_intro_msg_1");
++    expect(record!.targetSessionKey).toBe("agent:default:feishu:group:oc_chat1");
++
++    // Two messages: intro + thread activation reply
++    expect(mockSend).toHaveBeenCalledTimes(2);
++    // First call: intro message
++    expect(mockSend.mock.calls[0][0]).toMatchObject({
++      to: "chat:oc_chat1",
++      text: "Hello thread!",
++    });
++    // Second call: thread activation reply
++    expect(mockSend.mock.calls[1][0]).toMatchObject({
++      to: "chat:oc_chat1",
++      replyToMessageId: "om_intro_msg_1",
++      replyInThread: true,
++    });
++
++    manager.stop();
++  });
++
++  it("retrieves binding by key after bind", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "agent:default:feishu:group:oc_chat1",
++    });
++
++    const found = manager.getByKey("oc_chat1", "om_intro_msg_1");
++    expect(found).not.toBeUndefined();
++    expect(found!.targetSessionKey).toBe("agent:default:feishu:group:oc_chat1");
++
++    manager.stop();
++  });
++
++  it("lists bindings by session key", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    let callCount = 0;
++    mockSend.mockImplementation(async () => {
++      callCount++;
++      return { messageId: `om_msg_${callCount}`, chatId: "oc_chat1" };
++    });
++
++    const sessionKey = "agent:default:feishu:group:oc_chat1";
++    await manager.bind({ chatId: "oc_chat1", targetKind: "acp", targetSessionKey: sessionKey });
++    await manager.bind({ chatId: "oc_chat1", targetKind: "acp", targetSessionKey: sessionKey });
++
++    const list = manager.listBySessionKey(sessionKey);
++    expect(list).toHaveLength(2);
++
++    manager.stop();
++  });
++
++  it("unbinds a binding and sends farewell", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++
++    mockSend.mockClear();
++    const removed = manager.unbind("oc_chat1", "om_intro_msg_1", {
++      reason: "test-done",
++      sendFarewell: true,
++    });
++
++    expect(removed).not.toBeNull();
++    expect(removed!.rootId).toBe("om_intro_msg_1");
++    expect(manager.getByKey("oc_chat1", "om_intro_msg_1")).toBeUndefined();
++    // Farewell message sent
++    expect(mockSend).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_chat1",
++        replyToMessageId: "om_intro_msg_1",
++        replyInThread: true,
++      }),
++    );
++
++    manager.stop();
++  });
++
++  it("unbinds by session key", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++
++    const removed = manager.unbindBySessionKey("sess1");
++    expect(removed).toHaveLength(1);
++    expect(manager.listBindings()).toHaveLength(0);
++
++    manager.stop();
++  });
++
++  it("touches a binding and updates lastActivityAt", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++
++    const before = manager.getByKey("oc_chat1", "om_intro_msg_1")!.lastActivityAt;
++    const futureTime = Date.now() + 60_000;
++    const updated = manager.touch("oc_chat1", "om_intro_msg_1", futureTime);
++    expect(updated!.lastActivityAt).toBeGreaterThanOrEqual(futureTime);
++    expect(updated!.lastActivityAt).toBeGreaterThan(before);
++
++    manager.stop();
++  });
++
++  it("returns null for bind with empty chatId", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const result = await manager.bind({
++      chatId: "",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++    expect(result).toBeNull();
++
++    manager.stop();
++  });
++
++  it("returns null for bind when send fails", async () => {
++    mockSend.mockRejectedValue(new Error("API error"));
++
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const result = await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++    expect(result).toBeNull();
++
++    manager.stop();
++  });
++});
++
++describe("session binding adapter", () => {
++  it("adapter bind with child placement creates thread", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const adapter = registeredAdapters.get("feishu:acc1");
++    expect(adapter).toBeDefined();
++    expect(adapter.capabilities.placements).toContain("child");
++
++    const result = await adapter.bind({
++      targetSessionKey: "sess1",
++      targetKind: "session",
++      conversation: {
++        channel: "feishu",
++        accountId: "acc1",
++        conversationId: "oc_chat1",
++        parentConversationId: "oc_chat1",
++      },
++      placement: "child",
++      metadata: { introText: "Hello from ACP" },
++    });
++
++    expect(result).not.toBeNull();
++    expect(result!.conversation.channel).toBe("feishu");
++    expect(result!.targetSessionKey).toBe("sess1");
++
++    manager.stop();
++  });
++
++  it("adapter bind with current placement binds existing thread", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const adapter = registeredAdapters.get("feishu:acc1");
++    const result = await adapter.bind({
++      targetSessionKey: "sess1",
++      targetKind: "session",
++      conversation: {
++        channel: "feishu",
++        accountId: "acc1",
++        conversationId: "oc_chat1:om_existing_root",
++      },
++      placement: "current",
++    });
++
++    expect(result).not.toBeNull();
++    expect(result!.conversation.conversationId).toBe("oc_chat1:om_existing_root");
++
++    manager.stop();
++  });
++
++  it("adapter resolveByConversation finds bound thread", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++
++    const adapter = registeredAdapters.get("feishu:acc1");
++    const resolved = adapter.resolveByConversation({
++      channel: "feishu",
++      accountId: "acc1",
++      conversationId: "oc_chat1:om_intro_msg_1",
++    });
++
++    expect(resolved).not.toBeNull();
++    expect(resolved!.targetSessionKey).toBe("sess1");
++
++    manager.stop();
++  });
++
++  it("adapter resolveByConversation returns null for unknown thread", () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    const adapter = registeredAdapters.get("feishu:acc1");
++    const resolved = adapter.resolveByConversation({
++      channel: "feishu",
++      accountId: "acc1",
++      conversationId: "oc_chat1:om_nonexistent",
++    });
++
++    expect(resolved).toBeNull();
++
++    manager.stop();
++  });
++
++  it("adapter listBySession returns bound sessions", async () => {
++    const manager = createFeishuThreadBindingManager({
++      accountId: "acc1",
++      cfg: makeCfg(),
++      persist: false,
++      enableSweeper: false,
++    });
++
++    await manager.bind({
++      chatId: "oc_chat1",
++      targetKind: "acp",
++      targetSessionKey: "sess1",
++    });
++
++    const adapter = registeredAdapters.get("feishu:acc1");
++    const list = adapter.listBySession("sess1");
++    expect(list).toHaveLength(1);
++    expect(list[0].targetSessionKey).toBe("sess1");
++
++    manager.stop();
++  });
++});
+diff --git a/extensions/feishu/src/thread-bindings.manager.ts b/extensions/feishu/src/thread-bindings.manager.ts
+new file mode 100644
+index 0000000000..519e535562
+--- /dev/null
++++ b/extensions/feishu/src/thread-bindings.manager.ts
+@@ -0,0 +1,512 @@
++import {
++  registerSessionBindingAdapter,
++  unregisterSessionBindingAdapter,
++  normalizeAccountId,
++  type BindingTargetKind,
++  type ClawdbotConfig,
++  type SessionBindingRecord,
++} from "openclaw/plugin-sdk";
++import { sendMessageFeishu } from "./send.js";
++import {
++  BINDINGS_BY_KEY,
++  ensureBindingsLoaded,
++  parseConversationId,
++  removeBindingRecord,
++  resolveBindingKeysForSession,
++  saveBindingsToDisk,
++  setBindingRecord,
++  setPersistEnabled,
++  shouldDefaultPersist,
++  toBindingKey,
++  toConversationId,
++} from "./thread-bindings.state.js";
++import {
++  DEFAULT_FEISHU_THREAD_BINDING_IDLE_TIMEOUT_MS,
++  DEFAULT_FEISHU_THREAD_BINDING_MAX_AGE_MS,
++  FEISHU_THREAD_BINDINGS_SWEEP_INTERVAL_MS,
++  FEISHU_THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS,
++  type FeishuThreadBindingRecord,
++  type FeishuThreadBindingTargetKind,
++} from "./thread-bindings.types.js";
++
++// ---------------------------------------------------------------------------
++// Conversion helpers
++// ---------------------------------------------------------------------------
++
++function resolveAgentIdFromSessionKey(sessionKey: string): string {
++  // agent:<agentId>:<channel>:<peerKind>:<peerId>
++  const parts = sessionKey.split(":");
++  return parts.length >= 2 ? parts[1] : "default";
++}
++
++function normalizeTargetKind(
++  raw: unknown,
++  targetSessionKey: string,
++): FeishuThreadBindingTargetKind {
++  if (raw === "subagent" || raw === "acp") return raw;
++  return targetSessionKey.includes(":subagent:") ? "subagent" : "acp";
++}
++
++function toSessionBindingTargetKind(raw: string): BindingTargetKind {
++  return raw === "subagent" ? "subagent" : "session";
++}
++
++function toFeishuTargetKind(raw: BindingTargetKind): FeishuThreadBindingTargetKind {
++  return raw === "subagent" ? "subagent" : "acp";
++}
++
++function normalizeDurationMs(raw: unknown, fallback: number): number {
++  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
++    return Math.floor(raw);
++  }
++  return fallback;
++}
++
++function resolveIdleTimeoutMs(record: FeishuThreadBindingRecord, defaultMs: number): number {
++  return normalizeDurationMs(record.idleTimeoutMs, defaultMs);
++}
++
++function resolveMaxAgeMs(record: FeishuThreadBindingRecord, defaultMs: number): number {
++  return normalizeDurationMs(record.maxAgeMs, defaultMs);
++}
++
++function resolveInactivityExpiresAt(
++  record: FeishuThreadBindingRecord,
++  defaultMs: number,
++): number | undefined {
++  const idle = resolveIdleTimeoutMs(record, defaultMs);
++  if (idle <= 0) return undefined;
++  return record.lastActivityAt + idle;
++}
++
++function resolveMaxAgeExpiresAt(
++  record: FeishuThreadBindingRecord,
++  defaultMs: number,
++): number | undefined {
++  const maxAge = resolveMaxAgeMs(record, defaultMs);
++  if (maxAge <= 0) return undefined;
++  return record.boundAt + maxAge;
++}
++
++function resolveEffectiveExpiresAt(
++  record: FeishuThreadBindingRecord,
++  defaults: { idleTimeoutMs: number; maxAgeMs: number },
++): number | undefined {
++  const inactivity = resolveInactivityExpiresAt(record, defaults.idleTimeoutMs);
++  const maxAge = resolveMaxAgeExpiresAt(record, defaults.maxAgeMs);
++  if (inactivity != null && maxAge != null) return Math.min(inactivity, maxAge);
++  return inactivity ?? maxAge;
++}
++
++function toSessionBindingRecord(
++  record: FeishuThreadBindingRecord,
++  defaults: { idleTimeoutMs: number; maxAgeMs: number },
++): SessionBindingRecord {
++  const bindingId = toBindingKey(record.accountId, record.chatId, record.rootId);
++  return {
++    bindingId,
++    targetSessionKey: record.targetSessionKey,
++    targetKind: toSessionBindingTargetKind(record.targetKind),
++    conversation: {
++      channel: "feishu",
++      accountId: record.accountId,
++      conversationId: toConversationId(record.chatId, record.rootId),
++      parentConversationId: record.chatId,
++    },
++    status: "active",
++    boundAt: record.boundAt,
++    expiresAt: resolveEffectiveExpiresAt(record, defaults),
++    metadata: {
++      agentId: record.agentId,
++      label: record.label,
++      boundBy: record.boundBy,
++      lastActivityAt: record.lastActivityAt,
++      idleTimeoutMs: resolveIdleTimeoutMs(record, defaults.idleTimeoutMs),
++      maxAgeMs: resolveMaxAgeMs(record, defaults.maxAgeMs),
++    },
++  };
++}
++
++function parseBindingIdParts(
++  accountId: string,
++  bindingId: string,
++): { chatId: string; rootId: string } | null {
++  const prefix = `${accountId}:`;
++  if (!bindingId.startsWith(prefix)) return null;
++  const rest = bindingId.slice(prefix.length);
++  return parseConversationId(rest);
++}
++
++// ---------------------------------------------------------------------------
++// Manager registry (prevents duplicate managers for the same account)
++// Stored on globalThis so ESM and jiti loader paths share one registry.
++// ---------------------------------------------------------------------------
++
++const MANAGERS_KEY = "__openclawFeishuThreadBindingManagers";
++
++function resolveManagersMap(): Map<string, FeishuThreadBindingManager> {
++  const g = globalThis as typeof globalThis & {
++    [MANAGERS_KEY]?: Map<string, FeishuThreadBindingManager>;
++  };
++  if (!g[MANAGERS_KEY]) {
++    g[MANAGERS_KEY] = new Map();
++  }
++  return g[MANAGERS_KEY];
++}
++
++const MANAGERS_BY_ACCOUNT = resolveManagersMap();
++
++// ---------------------------------------------------------------------------
++// Manager
++// ---------------------------------------------------------------------------
++
++export type FeishuThreadBindingManager = {
++  accountId: string;
++  getByKey: (chatId: string, rootId: string) => FeishuThreadBindingRecord | undefined;
++  listBySessionKey: (sessionKey: string) => FeishuThreadBindingRecord[];
++  listBindings: () => FeishuThreadBindingRecord[];
++  touch: (chatId: string, rootId: string, at?: number) => FeishuThreadBindingRecord | null;
++  bind: (params: FeishuBindParams) => Promise<FeishuThreadBindingRecord | null>;
++  unbind: (
++    chatId: string,
++    rootId: string,
++    opts?: { reason?: string; sendFarewell?: boolean; farewellText?: string },
++  ) => FeishuThreadBindingRecord | null;
++  unbindBySessionKey: (
++    sessionKey: string,
++    opts?: { reason?: string; sendFarewell?: boolean },
++  ) => FeishuThreadBindingRecord[];
++  stop: () => void;
++};
++
++type FeishuBindParams = {
++  chatId: string;
++  targetKind: FeishuThreadBindingTargetKind;
++  targetSessionKey: string;
++  agentId?: string;
++  label?: string;
++  boundBy?: string;
++  introText?: string;
++};
++
++type CreateManagerParams = {
++  accountId?: string;
++  cfg: ClawdbotConfig;
++  persist?: boolean;
++  enableSweeper?: boolean;
++  idleTimeoutMs?: number;
++  maxAgeMs?: number;
++};
++
++export function createFeishuThreadBindingManager(
++  params: CreateManagerParams,
++): FeishuThreadBindingManager {
++  ensureBindingsLoaded();
++
++  const accountId = normalizeAccountId(params.accountId);
++  const existing = MANAGERS_BY_ACCOUNT.get(accountId);
++  if (existing) return existing;
++
++  const { cfg } = params;
++  const persist = params.persist ?? shouldDefaultPersist();
++  setPersistEnabled(accountId, persist);
++
++  const idleTimeoutMs = normalizeDurationMs(
++    params.idleTimeoutMs,
++    DEFAULT_FEISHU_THREAD_BINDING_IDLE_TIMEOUT_MS,
++  );
++  const maxAgeMs = normalizeDurationMs(params.maxAgeMs, DEFAULT_FEISHU_THREAD_BINDING_MAX_AGE_MS);
++  const defaults = { idleTimeoutMs, maxAgeMs };
++
++  let sweepTimer: ReturnType<typeof setInterval> | null = null;
++
++  // -- farewell helper --
++  const sendFarewellInThread = (record: FeishuThreadBindingRecord, text: string) => {
++    void sendMessageFeishu({
++      cfg,
++      to: `chat:${record.chatId}`,
++      text,
++      replyToMessageId: record.rootId,
++      replyInThread: true,
++      accountId,
++    }).catch(() => {});
++  };
++
++  const manager: FeishuThreadBindingManager = {
++    accountId,
++
++    getByKey: (chatId, rootId) => {
++      const key = toBindingKey(accountId, chatId, rootId);
++      const entry = BINDINGS_BY_KEY.get(key);
++      return entry?.accountId === accountId ? entry : undefined;
++    },
++
++    listBySessionKey: (sessionKey) => {
++      const keys = resolveBindingKeysForSession({ targetSessionKey: sessionKey, accountId });
++      return keys
++        .map((k) => BINDINGS_BY_KEY.get(k))
++        .filter((e): e is FeishuThreadBindingRecord => Boolean(e));
++    },
++
++    listBindings: () => [...BINDINGS_BY_KEY.values()].filter((e) => e.accountId === accountId),
++
++    touch: (chatId, rootId, at) => {
++      const key = toBindingKey(accountId, chatId, rootId);
++      const existing = BINDINGS_BY_KEY.get(key);
++      if (!existing || existing.accountId !== accountId) return null;
++      const now = Date.now();
++      const touchAt =
++        typeof at === "number" && Number.isFinite(at) ? Math.max(0, Math.floor(at)) : now;
++      const updated: FeishuThreadBindingRecord = {
++        ...existing,
++        lastActivityAt: Math.max(existing.lastActivityAt || 0, touchAt),
++      };
++      setBindingRecord(updated);
++      if (persist) {
++        saveBindingsToDisk({ minIntervalMs: FEISHU_THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS });
++      }
++      return updated;
++    },
++
++    bind: async (bindParams) => {
++      const chatId = bindParams.chatId?.trim();
++      if (!chatId) return null;
++      const targetSessionKey = bindParams.targetSessionKey.trim();
++      if (!targetSessionKey) return null;
++
++      const introText = bindParams.introText?.trim();
++
++      // Send intro message to create the thread anchor
++      let rootId: string | undefined;
++      try {
++        const result = await sendMessageFeishu({
++          cfg,
++          to: `chat:${chatId}`,
++          text: introText || "Thread created.",
++          accountId,
++        });
++        rootId = result.messageId;
++      } catch {
++        return null;
++      }
++      if (!rootId || rootId === "unknown") return null;
++
++      // Reply in-thread to activate topic thread in Feishu UI
++      try {
++        await sendMessageFeishu({
++          cfg,
++          to: `chat:${chatId}`,
++          text: "Listening in this thread.",
++          replyToMessageId: rootId,
++          replyInThread: true,
++          accountId,
++        });
++      } catch {
++        // Thread activation is best-effort; binding still works
++      }
++
++      const now = Date.now();
++      const targetKind = normalizeTargetKind(bindParams.targetKind, targetSessionKey);
++      const record: FeishuThreadBindingRecord = {
++        accountId,
++        chatId,
++        rootId,
++        targetKind,
++        targetSessionKey,
++        agentId: bindParams.agentId?.trim() || resolveAgentIdFromSessionKey(targetSessionKey),
++        label: bindParams.label?.trim() || undefined,
++        boundBy: bindParams.boundBy?.trim() || "system",
++        boundAt: now,
++        lastActivityAt: now,
++        idleTimeoutMs,
++        maxAgeMs,
++      };
++      setBindingRecord(record);
++      if (persist) saveBindingsToDisk();
++      return record;
++    },
++
++    unbind: (chatId, rootId, opts) => {
++      const key = toBindingKey(accountId, chatId, rootId);
++      const removed = removeBindingRecord(key);
++      if (!removed) return null;
++      if (persist) saveBindingsToDisk();
++      if (opts?.sendFarewell !== false) {
++        const text = opts?.farewellText || opts?.reason || "Thread binding ended.";
++        sendFarewellInThread(removed, text);
++      }
++      return removed;
++    },
++
++    unbindBySessionKey: (sessionKey, opts) => {
++      const keys = resolveBindingKeysForSession({ targetSessionKey: sessionKey, accountId });
++      const removed: FeishuThreadBindingRecord[] = [];
++      for (const key of keys) {
++        const binding = BINDINGS_BY_KEY.get(key);
++        if (!binding) continue;
++        const entry = manager.unbind(binding.chatId, binding.rootId, {
++          reason: opts?.reason,
++          sendFarewell: opts?.sendFarewell,
++        });
++        if (entry) removed.push(entry);
++      }
++      return removed;
++    },
++
++    stop: () => {
++      if (sweepTimer) {
++        clearInterval(sweepTimer);
++        sweepTimer = null;
++      }
++      const current = MANAGERS_BY_ACCOUNT.get(accountId);
++      if (current === manager) MANAGERS_BY_ACCOUNT.delete(accountId);
++      unregisterSessionBindingAdapter({ channel: "feishu", accountId });
++    },
++  };
++
++  // -- sweeper --
++  if (params.enableSweeper !== false) {
++    sweepTimer = setInterval(() => {
++      const bindings = manager.listBindings();
++      for (const snapshot of bindings) {
++        const binding = manager.getByKey(snapshot.chatId, snapshot.rootId);
++        if (!binding) continue;
++        const now = Date.now();
++        const inactivityAt = resolveInactivityExpiresAt(binding, idleTimeoutMs);
++        const maxAgeAt = resolveMaxAgeExpiresAt(binding, maxAgeMs);
++        const candidates: Array<{ reason: string; at: number }> = [];
++        if (inactivityAt != null && now >= inactivityAt) {
++          candidates.push({ reason: "idle-expired", at: inactivityAt });
++        }
++        if (maxAgeAt != null && now >= maxAgeAt) {
++          candidates.push({ reason: "max-age-expired", at: maxAgeAt });
++        }
++        if (candidates.length > 0) {
++          candidates.sort((a, b) => a.at - b.at);
++          manager.unbind(binding.chatId, binding.rootId, {
++            reason: candidates[0].reason,
++            sendFarewell: true,
++            farewellText: `Thread binding ended: ${candidates[0].reason}.`,
++          });
++        }
++      }
++    }, FEISHU_THREAD_BINDINGS_SWEEP_INTERVAL_MS);
++    sweepTimer.unref?.();
++  }
++
++  MANAGERS_BY_ACCOUNT.set(accountId, manager);
++
++  // -- register session binding adapter --
++  registerSessionBindingAdapter({
++    channel: "feishu",
++    accountId,
++    capabilities: { placements: ["current", "child"] },
++
++    bind: async (input) => {
++      if (input.conversation.channel !== "feishu") return null;
++      const targetSessionKey = input.targetSessionKey.trim();
++      if (!targetSessionKey) return null;
++
++      const metadata = input.metadata ?? {};
++      const label =
++        typeof metadata.label === "string" ? metadata.label.trim() || undefined : undefined;
++      const introText =
++        typeof metadata.introText === "string" ? metadata.introText.trim() || undefined : undefined;
++      const boundBy =
++        typeof metadata.boundBy === "string" ? metadata.boundBy.trim() || undefined : undefined;
++      const agentId =
++        typeof metadata.agentId === "string" ? metadata.agentId.trim() || undefined : undefined;
++      const placement = input.placement === "child" ? "child" : "current";
++
++      if (placement === "child") {
++        // Create a new thread in the specified chat.
++        // parentConversationId is the preferred source for the chat ID.
++        // If only conversationId is provided and it's a composite "chatId:rootId",
++        // extract just the chatId portion.
++        let chatId = input.conversation.parentConversationId?.trim();
++        if (!chatId) {
++          const raw = input.conversation.conversationId?.trim();
++          const parsed = raw ? parseConversationId(raw) : null;
++          chatId = parsed ? parsed.chatId : raw;
++        }
++        if (!chatId) return null;
++        const bound = await manager.bind({
++          chatId,
++          targetKind: toFeishuTargetKind(input.targetKind),
++          targetSessionKey,
++          agentId,
++          label,
++          boundBy,
++          introText,
++        });
++        return bound ? toSessionBindingRecord(bound, defaults) : null;
++      }
++
++      // placement === "current": bind to existing thread
++      const parsed = parseConversationId(input.conversation.conversationId);
++      if (!parsed) return null;
++      const { chatId, rootId } = parsed;
++
++      const now = Date.now();
++      const record: FeishuThreadBindingRecord = {
++        accountId,
++        chatId,
++        rootId,
++        targetKind: toFeishuTargetKind(input.targetKind),
++        targetSessionKey,
++        agentId: agentId || resolveAgentIdFromSessionKey(targetSessionKey),
++        label,
++        boundBy: boundBy || "system",
++        boundAt: now,
++        lastActivityAt: now,
++        idleTimeoutMs,
++        maxAgeMs,
++      };
++      setBindingRecord(record);
++      if (persist) saveBindingsToDisk();
++      return toSessionBindingRecord(record, defaults);
++    },
++
++    listBySession: (targetSessionKey) =>
++      manager.listBySessionKey(targetSessionKey).map((e) => toSessionBindingRecord(e, defaults)),
++
++    resolveByConversation: (ref) => {
++      if (ref.channel !== "feishu") return null;
++      const parsed = parseConversationId(ref.conversationId);
++      if (!parsed) return null;
++      const binding = manager.getByKey(parsed.chatId, parsed.rootId);
++      return binding ? toSessionBindingRecord(binding, defaults) : null;
++    },
++
++    touch: (bindingId, at) => {
++      const parts = parseBindingIdParts(accountId, bindingId);
++      if (!parts) return;
++      manager.touch(parts.chatId, parts.rootId, at);
++    },
++
++    unbind: async (input) => {
++      if (input.targetSessionKey?.trim()) {
++        const removed = manager.unbindBySessionKey(input.targetSessionKey, {
++          reason: input.reason,
++        });
++        return removed.map((e) => toSessionBindingRecord(e, defaults));
++      }
++      if (input.bindingId) {
++        const parts = parseBindingIdParts(accountId, input.bindingId);
++        if (!parts) return [];
++        const removed = manager.unbind(parts.chatId, parts.rootId, { reason: input.reason });
++        return removed ? [toSessionBindingRecord(removed, defaults)] : [];
++      }
++      return [];
++    },
++  });
++
++  return manager;
++}
++
++export function resetManagersForTests(): void {
++  for (const m of MANAGERS_BY_ACCOUNT.values()) {
++    m.stop();
++  }
++  MANAGERS_BY_ACCOUNT.clear();
++}
+diff --git a/extensions/feishu/src/thread-bindings.state.test.ts b/extensions/feishu/src/thread-bindings.state.test.ts
+new file mode 100644
+index 0000000000..0f3494c52c
+--- /dev/null
++++ b/extensions/feishu/src/thread-bindings.state.test.ts
+@@ -0,0 +1,127 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  BINDINGS_BY_KEY,
++  BINDINGS_BY_SESSION,
++  ensureBindingsLoaded,
++  parseConversationId,
++  removeBindingRecord,
++  resetForTests,
++  resolveBindingKeysForSession,
++  setBindingRecord,
++  toBindingKey,
++  toConversationId,
++} from "./thread-bindings.state.js";
++import type { FeishuThreadBindingRecord } from "./thread-bindings.types.js";
++
++function makeRecord(overrides: Partial<FeishuThreadBindingRecord> = {}): FeishuThreadBindingRecord {
++  return {
++    accountId: "default",
++    chatId: "oc_chat1",
++    rootId: "om_root1",
++    targetKind: "acp",
++    targetSessionKey: "agent:default:feishu:group:oc_chat1",
++    agentId: "default",
++    boundBy: "system",
++    boundAt: Date.now(),
++    lastActivityAt: Date.now(),
++    ...overrides,
++  };
++}
++
++afterEach(() => {
++  resetForTests();
++});
++
++describe("toBindingKey", () => {
++  it("concatenates accountId:chatId:rootId", () => {
++    expect(toBindingKey("acc1", "oc_chat", "om_msg")).toBe("acc1:oc_chat:om_msg");
++  });
++});
++
++describe("toConversationId / parseConversationId", () => {
++  it("round-trips chatId:rootId", () => {
++    const convId = toConversationId("oc_chat1", "om_root1");
++    expect(convId).toBe("oc_chat1:om_root1");
++    const parsed = parseConversationId(convId);
++    expect(parsed).toEqual({ chatId: "oc_chat1", rootId: "om_root1" });
++  });
++
++  it("returns null for invalid conversationId", () => {
++    expect(parseConversationId("nocolon")).toBeNull();
++    expect(parseConversationId(":trailing")).toBeNull();
++    expect(parseConversationId("leading:")).toBeNull();
++  });
++});
++
++describe("setBindingRecord / removeBindingRecord", () => {
++  it("stores and retrieves a binding record", () => {
++    const record = makeRecord();
++    setBindingRecord(record);
++
++    const key = toBindingKey(record.accountId, record.chatId, record.rootId);
++    expect(BINDINGS_BY_KEY.get(key)).toEqual(record);
++    expect(BINDINGS_BY_SESSION.get(record.targetSessionKey)?.has(key)).toBe(true);
++  });
++
++  it("removes a binding record and unlinks session", () => {
++    const record = makeRecord();
++    setBindingRecord(record);
++    const key = toBindingKey(record.accountId, record.chatId, record.rootId);
++
++    const removed = removeBindingRecord(key);
++    expect(removed).toEqual(record);
++    expect(BINDINGS_BY_KEY.has(key)).toBe(false);
++    expect(BINDINGS_BY_SESSION.has(record.targetSessionKey)).toBe(false);
++  });
++
++  it("returns null when removing non-existent key", () => {
++    expect(removeBindingRecord("nonexistent")).toBeNull();
++  });
++
++  it("updates session index when record is replaced", () => {
++    const record1 = makeRecord({ targetSessionKey: "session-a" });
++    setBindingRecord(record1);
++    const key = toBindingKey(record1.accountId, record1.chatId, record1.rootId);
++
++    const record2 = makeRecord({ targetSessionKey: "session-b" });
++    setBindingRecord(record2);
++
++    expect(BINDINGS_BY_SESSION.has("session-a")).toBe(false);
++    expect(BINDINGS_BY_SESSION.get("session-b")?.has(key)).toBe(true);
++  });
++});
++
++describe("resolveBindingKeysForSession", () => {
++  it("returns all keys for a session", () => {
++    const sessionKey = "agent:default:feishu:group:oc_chat1";
++    setBindingRecord(makeRecord({ rootId: "om_r1", targetSessionKey: sessionKey }));
++    setBindingRecord(makeRecord({ rootId: "om_r2", targetSessionKey: sessionKey }));
++    setBindingRecord(makeRecord({ rootId: "om_r3", targetSessionKey: "other-session" }));
++
++    const keys = resolveBindingKeysForSession({ targetSessionKey: sessionKey });
++    expect(keys).toHaveLength(2);
++  });
++
++  it("filters by accountId when provided", () => {
++    const sessionKey = "agent:default:feishu:group:oc_chat1";
++    setBindingRecord(
++      makeRecord({ accountId: "acc1", rootId: "om_r1", targetSessionKey: sessionKey }),
++    );
++    setBindingRecord(
++      makeRecord({ accountId: "acc2", rootId: "om_r2", targetSessionKey: sessionKey }),
++    );
++
++    const keys = resolveBindingKeysForSession({ targetSessionKey: sessionKey, accountId: "acc1" });
++    expect(keys).toHaveLength(1);
++    expect(keys[0]).toContain("acc1:");
++  });
++});
++
++describe("ensureBindingsLoaded", () => {
++  it("is idempotent", () => {
++    ensureBindingsLoaded();
++    setBindingRecord(makeRecord());
++    ensureBindingsLoaded(); // should not clear the record
++    expect(BINDINGS_BY_KEY.size).toBe(1);
++  });
++});
+diff --git a/extensions/feishu/src/thread-bindings.state.ts b/extensions/feishu/src/thread-bindings.state.ts
+new file mode 100644
+index 0000000000..6453f641f2
+--- /dev/null
++++ b/extensions/feishu/src/thread-bindings.state.ts
+@@ -0,0 +1,218 @@
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  FEISHU_THREAD_BINDINGS_VERSION,
++  FEISHU_THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS,
++  type FeishuThreadBindingRecord,
++  type PersistedFeishuThreadBindingsPayload,
++} from "./thread-bindings.types.js";
++
++// ---------------------------------------------------------------------------
++// globalThis state (shared across ESM / jiti loader paths)
++// ---------------------------------------------------------------------------
++
++type FeishuThreadBindingsGlobalState = {
++  bindingsByKey: Map<string, FeishuThreadBindingRecord>;
++  bindingsBySession: Map<string, Set<string>>;
++  persistByAccountId: Map<string, boolean>;
++  loadedBindings: boolean;
++  lastPersistedAtMs: number;
++};
++
++const STATE_KEY = "__openclawFeishuThreadBindingsState";
++
++function createGlobalState(): FeishuThreadBindingsGlobalState {
++  return {
++    bindingsByKey: new Map(),
++    bindingsBySession: new Map(),
++    persistByAccountId: new Map(),
++    loadedBindings: false,
++    lastPersistedAtMs: 0,
++  };
++}
++
++function resolveGlobalState(): FeishuThreadBindingsGlobalState {
++  const g = globalThis as typeof globalThis & { [STATE_KEY]?: FeishuThreadBindingsGlobalState };
++  if (!g[STATE_KEY]) {
++    g[STATE_KEY] = createGlobalState();
++  }
++  return g[STATE_KEY];
++}
++
++const STATE = resolveGlobalState();
++
++export const BINDINGS_BY_KEY = STATE.bindingsByKey;
++export const BINDINGS_BY_SESSION = STATE.bindingsBySession;
++
++// ---------------------------------------------------------------------------
++// Binding key helpers
++// ---------------------------------------------------------------------------
++
++export function toBindingKey(accountId: string, chatId: string, rootId: string): string {
++  return `${accountId}:${chatId}:${rootId}`;
++}
++
++export function toConversationId(chatId: string, rootId: string): string {
++  return `${chatId}:${rootId}`;
++}
++
++export function parseConversationId(
++  conversationId: string,
++): { chatId: string; rootId: string } | null {
++  const idx = conversationId.indexOf(":");
++  if (idx < 1 || idx === conversationId.length - 1) return null;
++  return { chatId: conversationId.slice(0, idx), rootId: conversationId.slice(idx + 1) };
++}
++
++// ---------------------------------------------------------------------------
++// Session key indexing
++// ---------------------------------------------------------------------------
++
++function linkSession(targetSessionKey: string, bindingKey: string): void {
++  const key = targetSessionKey.trim();
++  if (!key) return;
++  const set = BINDINGS_BY_SESSION.get(key) ?? new Set<string>();
++  set.add(bindingKey);
++  BINDINGS_BY_SESSION.set(key, set);
++}
++
++function unlinkSession(targetSessionKey: string, bindingKey: string): void {
++  const key = targetSessionKey.trim();
++  if (!key) return;
++  const set = BINDINGS_BY_SESSION.get(key);
++  if (!set) return;
++  set.delete(bindingKey);
++  if (set.size === 0) BINDINGS_BY_SESSION.delete(key);
++}
++
++// ---------------------------------------------------------------------------
++// Record CRUD
++// ---------------------------------------------------------------------------
++
++export function setBindingRecord(record: FeishuThreadBindingRecord): void {
++  const key = toBindingKey(record.accountId, record.chatId, record.rootId);
++  const previous = BINDINGS_BY_KEY.get(key);
++  if (previous) {
++    unlinkSession(previous.targetSessionKey, key);
++  }
++  BINDINGS_BY_KEY.set(key, record);
++  linkSession(record.targetSessionKey, key);
++}
++
++export function removeBindingRecord(bindingKey: string): FeishuThreadBindingRecord | null {
++  const existing = BINDINGS_BY_KEY.get(bindingKey);
++  if (!existing) return null;
++  BINDINGS_BY_KEY.delete(bindingKey);
++  unlinkSession(existing.targetSessionKey, bindingKey);
++  return existing;
++}
++
++export function resolveBindingKeysForSession(params: {
++  targetSessionKey: string;
++  accountId?: string;
++}): string[] {
++  const set = BINDINGS_BY_SESSION.get(params.targetSessionKey.trim());
++  if (!set) return [];
++  if (!params.accountId) return [...set];
++  return [...set].filter((key) => key.startsWith(`${params.accountId}:`));
++}
++
++// ---------------------------------------------------------------------------
++// Path resolution
++// ---------------------------------------------------------------------------
++
++function resolveStateDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {
++  const override = env.OPENCLAW_STATE_DIR?.trim() || env.CLAWDBOT_STATE_DIR?.trim();
++  if (override) return override;
++  if (env.VITEST || env.NODE_ENV === "test") {
++    return path.join(os.tmpdir(), ["openclaw-vitest", String(process.pid)].join("-"));
++  }
++  return path.join(os.homedir(), ".openclaw");
++}
++
++export function resolveThreadBindingsPath(): string {
++  return path.join(resolveStateDirFromEnv(), "feishu", "thread-bindings.json");
++}
++
++// ---------------------------------------------------------------------------
++// Persistence
++// ---------------------------------------------------------------------------
++
++export function shouldDefaultPersist(): boolean {
++  return !(process.env.VITEST || process.env.NODE_ENV === "test");
++}
++
++function shouldPersistAnyAccount(): boolean {
++  for (const enabled of STATE.persistByAccountId.values()) {
++    if (enabled) return true;
++  }
++  return false;
++}
++
++export function saveBindingsToDisk(params: { force?: boolean; minIntervalMs?: number } = {}): void {
++  if (!params.force && !shouldPersistAnyAccount()) return;
++  const minIntervalMs = params.minIntervalMs ?? FEISHU_THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS;
++  const now = Date.now();
++  if (
++    !params.force &&
++    minIntervalMs > 0 &&
++    STATE.lastPersistedAtMs > 0 &&
++    now - STATE.lastPersistedAtMs < minIntervalMs
++  ) {
++    return;
++  }
++  const bindings: Record<string, FeishuThreadBindingRecord> = {};
++  for (const [key, record] of BINDINGS_BY_KEY.entries()) {
++    bindings[key] = { ...record };
++  }
++  const payload: PersistedFeishuThreadBindingsPayload = {
++    version: FEISHU_THREAD_BINDINGS_VERSION,
++    bindings,
++  };
++  const filePath = resolveThreadBindingsPath();
++  fs.mkdirSync(path.dirname(filePath), { recursive: true });
++  const tmpPath = `${filePath}.tmp.${process.pid}`;
++  fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2) + "\n", "utf-8");
++  fs.renameSync(tmpPath, filePath);
++  STATE.lastPersistedAtMs = now;
++}
++
++export function ensureBindingsLoaded(): void {
++  if (STATE.loadedBindings) return;
++  STATE.loadedBindings = true;
++  BINDINGS_BY_KEY.clear();
++  BINDINGS_BY_SESSION.clear();
++
++  const filePath = resolveThreadBindingsPath();
++  let raw: PersistedFeishuThreadBindingsPayload | null = null;
++  try {
++    const content = fs.readFileSync(filePath, "utf-8");
++    raw = JSON.parse(content) as PersistedFeishuThreadBindingsPayload;
++  } catch {
++    // File missing or malformed — start fresh
++  }
++  if (!raw || typeof raw !== "object" || raw.version !== FEISHU_THREAD_BINDINGS_VERSION) {
++    return;
++  }
++  if (!raw.bindings || typeof raw.bindings !== "object") {
++    return;
++  }
++  for (const [key, entry] of Object.entries(raw.bindings)) {
++    if (!entry || typeof entry !== "object") continue;
++    if (!entry.accountId || !entry.chatId || !entry.rootId || !entry.targetSessionKey) continue;
++    setBindingRecord(entry as FeishuThreadBindingRecord);
++  }
++}
++
++export function setPersistEnabled(accountId: string, enabled: boolean): void {
++  STATE.persistByAccountId.set(accountId, enabled);
++}
++
++export function resetForTests(): void {
++  BINDINGS_BY_KEY.clear();
++  BINDINGS_BY_SESSION.clear();
++  STATE.persistByAccountId.clear();
++  STATE.loadedBindings = false;
++  STATE.lastPersistedAtMs = 0;
++}
+diff --git a/extensions/feishu/src/thread-bindings.types.ts b/extensions/feishu/src/thread-bindings.types.ts
+new file mode 100644
+index 0000000000..fb53773bab
+--- /dev/null
++++ b/extensions/feishu/src/thread-bindings.types.ts
+@@ -0,0 +1,27 @@
++export type FeishuThreadBindingTargetKind = "subagent" | "acp";
++
++export type FeishuThreadBindingRecord = {
++  accountId: string;
++  chatId: string; // group chat ID (oc_xxx)
++  rootId: string; // message ID anchoring the topic thread
++  targetKind: FeishuThreadBindingTargetKind;
++  targetSessionKey: string;
++  agentId: string;
++  label?: string;
++  boundBy: string;
++  boundAt: number;
++  lastActivityAt: number;
++  idleTimeoutMs?: number;
++  maxAgeMs?: number;
++};
++
++export type PersistedFeishuThreadBindingsPayload = {
++  version: number;
++  bindings: Record<string, FeishuThreadBindingRecord>;
++};
++
++export const FEISHU_THREAD_BINDINGS_VERSION = 1 as const;
++export const FEISHU_THREAD_BINDINGS_SWEEP_INTERVAL_MS = 120_000;
++export const DEFAULT_FEISHU_THREAD_BINDING_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
++export const DEFAULT_FEISHU_THREAD_BINDING_MAX_AGE_MS = 0; // disabled
++export const FEISHU_THREAD_BINDING_TOUCH_PERSIST_MIN_INTERVAL_MS = 15_000;
+diff --git a/src/agents/cli-backends.ts b/src/agents/cli-backends.ts
+index 0ce2df5eef..f4fee2207c 100644
+--- a/src/agents/cli-backends.ts
++++ b/src/agents/cli-backends.ts
+@@ -39,17 +39,18 @@ const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
+ 
+ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
+   command: "claude",
+-  args: ["-p", "--output-format", "json", "--permission-mode", "bypassPermissions"],
++  args: ["-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "bypassPermissions"],
+   resumeArgs: [
+     "-p",
++    "--verbose",
+     "--output-format",
+-    "json",
++    "stream-json",
+     "--permission-mode",
+     "bypassPermissions",
+     "--resume",
+     "{sessionId}",
+   ],
+-  output: "json",
++  output: "stream-json",
+   input: "arg",
+   modelArg: "--model",
+   modelAliases: CLAUDE_MODEL_ALIASES,
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index c04de2426d..5fbf96c174 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -29,6 +29,7 @@ import {
+   buildCliSupervisorScopeKey,
+   buildCliArgs,
+   buildSystemPrompt,
++  createStreamJsonProcessor,
+   enqueueCliRun,
+   normalizeCliModel,
+   parseCliJson,
+@@ -398,17 +399,7 @@ export async function runCliAgent(params: {
+   bootstrapPromptWarningSignature?: string;
+   images?: ImageContent[];
+   onAssistantTurn?: (text: string) => void;
+-  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onToolUse?: (toolName: string) => void;
+-  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+-  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+-  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
+-  abortSignal?: AbortSignal;
+-  trigger?: PluginHookAgentContext["trigger"];
+-  messageChannel?: string;
+-  messageAccountId?: string;
+-  messageTo?: string;
+-  messageThreadId?: string | number;
+ }): Promise<EmbeddedPiRunResult> {
+   const started = Date.now();
+   const workspaceResolution = resolveRunWorkspaceDir({
+@@ -742,12 +733,8 @@ export async function runCliAgent(params: {
+         const streamProcessor =
+           outputMode === "stream-json"
+             ? createStreamJsonProcessor(backend, {
+-                onSystemInit: params.onSystemInit,
+                 onAssistantTurn: params.onAssistantTurn,
+                 onToolUse: params.onToolUse,
+-                onThinkingTurn: params.onThinkingTurn,
+-                onToolUseEvent: params.onToolUseEvent,
+-                onToolResult: params.onToolResult,
+               })
+             : undefined;
+ 
+@@ -763,6 +750,7 @@ export async function runCliAgent(params: {
+           cwd: workspaceDir,
+           env,
+           input: stdinPayload,
++          ...(streamProcessor ? { onStdout: streamProcessor.feed } : {}),
+         });
+         const onAbort = () => {
+           managedRun.cancel("manual-cancel");
+@@ -847,22 +835,14 @@ export async function runCliAgent(params: {
+           });
+         }
+ 
+-        let output: {
+-          text: string;
+-          sessionId?: string;
+-          usage?: {
+-            input?: number;
+-            output?: number;
+-            cacheRead?: number;
+-            cacheWrite?: number;
+-            total?: number;
+-          };
+-        };
+         if (streamProcessor) {
+-          output = streamProcessor.finish();
+-        } else if (outputMode === "text") {
+-          output = { text: stdout, sessionId: undefined };
+-        } else if (outputMode === "jsonl") {
++          return streamProcessor.finish();
++        }
++
++        if (outputMode === "text") {
++          return { text: stdout, sessionId: undefined };
++        }
++        if (outputMode === "jsonl") {
+           const parsed = parseCliJsonl(stdout, backend);
+           output = parsed ?? { text: stdout };
+         } else {
+@@ -1001,17 +981,7 @@ export async function runClaudeCliAgent(params: {
+   claudeSessionId?: string;
+   images?: ImageContent[];
+   onAssistantTurn?: (text: string) => void;
+-  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onToolUse?: (toolName: string) => void;
+-  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+-  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+-  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
+-  abortSignal?: AbortSignal;
+-  trigger?: PluginHookAgentContext["trigger"];
+-  messageChannel?: string;
+-  messageAccountId?: string;
+-  messageTo?: string;
+-  messageThreadId?: string | number;
+ }): Promise<EmbeddedPiRunResult> {
+   return runCliAgent({
+     sessionId: params.sessionId,
+@@ -1032,16 +1002,6 @@ export async function runClaudeCliAgent(params: {
+     cliSessionId: params.claudeSessionId,
+     images: params.images,
+     onAssistantTurn: params.onAssistantTurn,
+-    onSystemInit: params.onSystemInit,
+     onToolUse: params.onToolUse,
+-    onThinkingTurn: params.onThinkingTurn,
+-    onToolUseEvent: params.onToolUseEvent,
+-    onToolResult: params.onToolResult,
+-    abortSignal: params.abortSignal,
+-    trigger: params.trigger,
+-    messageChannel: params.messageChannel,
+-    messageAccountId: params.messageAccountId,
+-    messageTo: params.messageTo,
+-    messageThreadId: params.messageThreadId,
+   });
+ }
+diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
+index 9c0487f952..5695a85d4f 100644
+--- a/src/agents/cli-runner/helpers.ts
++++ b/src/agents/cli-runner/helpers.ts
+@@ -7,9 +7,12 @@ import type { ImageContent } from "@mariozechner/pi-ai";
+ import type { ThinkLevel } from "../../auto-reply/thinking.js";
+ import type { OpenClawConfig } from "../../config/config.js";
+ import type { CliBackendConfig } from "../../config/types.js";
++import { createSubsystemLogger } from "../../logging/subsystem.js";
+ import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
+ import { buildTtsSystemPromptHint } from "../../tts/tts.js";
+ import { isRecord } from "../../utils.js";
++
++const log = createSubsystemLogger("agent/claude-cli/stream");
+ import { buildModelAliasLines } from "../model-alias-lines.js";
+ import { resolveDefaultModelForAgent } from "../model-selection.js";
+ import { resolveOwnerDisplaySetting } from "../owner-display.js";
+@@ -249,282 +252,27 @@ export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput
+ }
+ 
+ export type StreamJsonCallbacks = {
+-  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
+   onAssistantTurn?: (text: string) => void;
+   onToolUse?: (toolName: string) => void;
+-  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
+-  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+-  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
+ };
+ 
+-const MAX_STREAM_EVENT_DEDUPE_KEYS = 2_048;
+-const KNOWN_STREAM_TOP_LEVEL_TYPES = new Set([
+-  "assistant",
+-  "user",
+-  "system",
+-  "result",
+-  "rate_limit_event",
+-]);
+-const KNOWN_STREAM_CONTENT_BLOCK_TYPES = new Set([
+-  "text",
+-  "thinking",
+-  "tool_use",
+-  "tool_result",
+-  "tool_result_error",
+-]);
+-
+-type StreamContentBlock = Record<string, unknown>;
+-
+-function extractContentBlocks(message: unknown): StreamContentBlock[] {
+-  if (!isRecord(message) || !Array.isArray(message.content)) {
++function extractToolUseNames(message: unknown): string[] {
++  if (!isRecord(message)) {
++    return [];
++  }
++  const content = message.content;
++  if (!Array.isArray(content)) {
+     return [];
+   }
+-  return message.content.filter((entry): entry is StreamContentBlock => isRecord(entry));
+-}
+-
+-function extractToolUseNames(contentBlocks: StreamContentBlock[]): string[] {
+   const names: string[] = [];
+-  for (const block of contentBlocks) {
+-    if (block.type === "tool_use" && typeof block.name === "string") {
++  for (const block of content) {
++    if (isRecord(block) && block.type === "tool_use" && typeof block.name === "string") {
+       names.push(block.name);
+     }
+   }
+   return names;
+ }
+ 
+-function extractAssistantTextFromBlocks(contentBlocks: StreamContentBlock[]): string {
+-  const parts: string[] = [];
+-  for (const block of contentBlocks) {
+-    if (block.type !== "text") {
+-      continue;
+-    }
+-    if (typeof block.text === "string" && block.text) {
+-      parts.push(block.text);
+-    }
+-  }
+-  return parts.join("");
+-}
+-
+-function extractThinkingTextFromBlocks(contentBlocks: StreamContentBlock[]): string {
+-  const parts: string[] = [];
+-  for (const block of contentBlocks) {
+-    if (block.type !== "thinking") {
+-      continue;
+-    }
+-    if (typeof block.thinking === "string" && block.thinking) {
+-      parts.push(block.thinking);
+-    }
+-  }
+-  return parts.join("");
+-}
+-
+-type ToolUseBlockEvent = {
+-  name: string;
+-  toolUseId?: string;
+-  input?: unknown;
+-};
+-
+-function extractToolUseEvents(contentBlocks: StreamContentBlock[]): ToolUseBlockEvent[] {
+-  const events: ToolUseBlockEvent[] = [];
+-  for (const block of contentBlocks) {
+-    if (block.type !== "tool_use" || typeof block.name !== "string") {
+-      continue;
+-    }
+-    const toolUseId = typeof block.id === "string" ? block.id : undefined;
+-    events.push({
+-      name: block.name,
+-      toolUseId,
+-      input: block.input,
+-    });
+-  }
+-  return events;
+-}
+-
+-type ToolResultBlockEvent = {
+-  toolUseId?: string;
+-  text?: string;
+-  isError?: boolean;
+-};
+-
+-function extractToolResultEvents(contentBlocks: StreamContentBlock[]): ToolResultBlockEvent[] {
+-  const events: ToolResultBlockEvent[] = [];
+-  for (const block of contentBlocks) {
+-    const type = typeof block.type === "string" ? block.type : "";
+-    if (type !== "tool_result" && type !== "tool_result_error") {
+-      continue;
+-    }
+-    const text = collectText(block.content ?? block.result ?? block.text).trim();
+-    const toolUseId =
+-      typeof block.tool_use_id === "string"
+-        ? block.tool_use_id
+-        : typeof block.toolUseId === "string"
+-          ? block.toolUseId
+-          : undefined;
+-    const isError = block.is_error === true || type === "tool_result_error";
+-    events.push({
+-      toolUseId,
+-      text: text || undefined,
+-      isError,
+-    });
+-  }
+-  return events;
+-}
+-
+-function resolveDelta(nextText: string, previousText: string): string | undefined {
+-  if (!nextText) {
+-    return undefined;
+-  }
+-  if (!previousText) {
+-    return nextText;
+-  }
+-  if (nextText.startsWith(previousText)) {
+-    const delta = nextText.slice(previousText.length);
+-    return delta || undefined;
+-  }
+-  // Non-append rewrites should not be treated as deltas.
+-  return undefined;
+-}
+-
+-function addDedupeKey(bucket: Set<string>, order: string[], key: string): boolean {
+-  if (bucket.has(key)) {
+-    return false;
+-  }
+-  bucket.add(key);
+-  order.push(key);
+-  if (order.length > MAX_STREAM_EVENT_DEDUPE_KEYS) {
+-    const oldest = order.shift();
+-    if (oldest) {
+-      bucket.delete(oldest);
+-    }
+-  }
+-  return true;
+-}
+-
+-function stringifyForDedupe(value: unknown): string {
+-  if (value === undefined) {
+-    return "";
+-  }
+-  try {
+-    return JSON.stringify(value) ?? "";
+-  } catch {
+-    return "[unserializable]";
+-  }
+-}
+-
+-function buildAnonymousToolUseKey(event: ToolUseBlockEvent): string {
+-  return `${event.name}:${stringifyForDedupe(event.input)}`;
+-}
+-
+-function buildToolResultDedupeKey(event: ToolResultBlockEvent): string | undefined {
+-  if (!event.toolUseId) {
+-    return undefined;
+-  }
+-  return `${event.toolUseId}:${event.isError === true ? "1" : "0"}:${event.text ?? ""}`;
+-}
+-
+-function shouldEmitAnonymousToolUse(
+-  event: ToolUseBlockEvent,
+-  lastKey: string | undefined,
+-): { emit: boolean; key: string } {
+-  const key = buildAnonymousToolUseKey(event);
+-  return { emit: key !== lastKey, key };
+-}
+-
+-function formatToolResultDedupeKey(event: ToolResultBlockEvent): string | undefined {
+-  return buildToolResultDedupeKey(event);
+-}
+-
+-function trackToolResultDedupeKey(
+-  emittedToolResultKeys: Set<string>,
+-  emittedToolResultOrder: string[],
+-  event: ToolResultBlockEvent,
+-): boolean {
+-  const dedupeKey = formatToolResultDedupeKey(event);
+-  if (!dedupeKey) {
+-    return true;
+-  }
+-  return addDedupeKey(emittedToolResultKeys, emittedToolResultOrder, dedupeKey);
+-}
+-
+-function trackToolUseDedupeKey(
+-  emittedToolUseKeys: Set<string>,
+-  emittedToolUseOrder: string[],
+-  event: ToolUseBlockEvent,
+-): boolean {
+-  if (!event.toolUseId) {
+-    return true;
+-  }
+-  return addDedupeKey(emittedToolUseKeys, emittedToolUseOrder, event.toolUseId);
+-}
+-
+-function shouldEmitToolUse(
+-  emittedToolUseKeys: Set<string>,
+-  emittedToolUseOrder: string[],
+-  event: ToolUseBlockEvent,
+-  lastAnonymousToolUseKey: string | undefined,
+-): { emit: boolean; nextAnonymousToolUseKey?: string } {
+-  if (event.toolUseId) {
+-    return {
+-      emit: trackToolUseDedupeKey(emittedToolUseKeys, emittedToolUseOrder, event),
+-      nextAnonymousToolUseKey: undefined,
+-    };
+-  }
+-  const anonymous = shouldEmitAnonymousToolUse(event, lastAnonymousToolUseKey);
+-  return {
+-    emit: anonymous.emit,
+-    nextAnonymousToolUseKey: anonymous.key,
+-  };
+-}
+-
+-function shouldEmitToolResult(
+-  emittedToolResultKeys: Set<string>,
+-  emittedToolResultOrder: string[],
+-  event: ToolResultBlockEvent,
+-): boolean {
+-  return trackToolResultDedupeKey(emittedToolResultKeys, emittedToolResultOrder, event);
+-}
+-
+-function isToolResultAllowedEnvelope(params: {
+-  isAssistantEnvelope: boolean;
+-  type: string;
+-  messageRole: string;
+-}): boolean {
+-  if (params.isAssistantEnvelope) {
+-    return true;
+-  }
+-  return (
+-    params.type === "user" ||
+-    params.type === "tool" ||
+-    params.messageRole === "user" ||
+-    params.messageRole === "tool"
+-  );
+-}
+-
+-function buildFallbackAssistantText(params: {
+-  isAssistantEnvelope: boolean;
+-  extractedText: string;
+-  rawMessage: unknown;
+-  message: Record<string, unknown>;
+-}): string {
+-  if (!params.isAssistantEnvelope || params.extractedText) {
+-    return params.extractedText;
+-  }
+-  return collectText(params.rawMessage) || collectText(params.message);
+-}
+-
+-function logUnknownStreamTypeOnce(params: {
+-  seen: Set<string>;
+-  value: string;
+-  kind: "top-level" | "content-block";
+-}): void {
+-  const normalized = params.value.trim();
+-  if (!normalized || params.seen.has(normalized)) {
+-    return;
+-  }
+-  params.seen.add(normalized);
+-  log.debug(`stream-json unknown ${params.kind} type observed: ${normalized}`);
+-}
+-
+ export function createStreamJsonProcessor(
+   backend: CliBackendConfig,
+   callbacks?: StreamJsonCallbacks,
+@@ -534,17 +282,9 @@ export function createStreamJsonProcessor(
+ } {
+   let buffer = "";
+   let lastAssistantText = "";
+-  let lastThinkingText = "";
+   let resultText: string | undefined;
+   let sessionId: string | undefined;
+   let usage: CliUsage | undefined;
+-  const emittedToolUseKeys = new Set<string>();
+-  const emittedToolUseOrder: string[] = [];
+-  const emittedToolResultKeys = new Set<string>();
+-  const emittedToolResultOrder: string[] = [];
+-  let lastAnonymousToolUseKey: string | undefined;
+-  const seenUnknownTopLevelTypes = new Set<string>();
+-  const seenUnknownContentBlockTypes = new Set<string>();
+ 
+   const processLine = (line: string) => {
+     const trimmed = line.trim();
+@@ -562,134 +302,48 @@ export function createStreamJsonProcessor(
+     }
+ 
+     const type = typeof parsed.type === "string" ? parsed.type : "";
+-    if (type && !KNOWN_STREAM_TOP_LEVEL_TYPES.has(type)) {
+-      logUnknownStreamTypeOnce({
+-        seen: seenUnknownTopLevelTypes,
+-        value: type,
+-        kind: "top-level",
+-      });
+-    }
+ 
+     if (!sessionId) {
+       sessionId = pickSessionId(parsed, backend);
+     }
+ 
+-    if (type === "result") {
+-      resultText =
+-        (typeof parsed.result === "string" ? parsed.result : undefined) ?? collectText(parsed);
+-      if (isRecord(parsed.usage)) {
+-        usage = toUsage(parsed.usage);
+-      }
+-      log.debug(
+-        `stream-json result: ${resultText?.length ?? 0} chars, sessionId=${sessionId ?? "none"}`,
+-      );
+-      return;
+-    }
+-
+-    if (type === "system") {
+-      const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
+-      log.debug(`stream-json system: subtype=${subtype} sessionId=${sessionId ?? "none"}`);
+-      if (subtype === "init") {
+-        callbacks?.onSystemInit?.({ subtype, sessionId });
+-      }
+-      return;
+-    }
+-    if (type === "rate_limit_event") {
+-      return;
+-    }
+-
+-    const rawMessage = parsed.message;
+-    const message = isRecord(rawMessage) ? rawMessage : parsed;
+-    const messageRole = typeof message.role === "string" ? message.role : "";
+-    const isAssistantEnvelope = type === "assistant" || messageRole === "assistant";
+-    const contentBlocks = extractContentBlocks(message);
+-    if (contentBlocks.length > 0) {
+-      for (const block of contentBlocks) {
+-        const blockType = typeof block.type === "string" ? block.type : "";
+-        if (!blockType || KNOWN_STREAM_CONTENT_BLOCK_TYPES.has(blockType)) {
+-          continue;
+-        }
+-        logUnknownStreamTypeOnce({
+-          seen: seenUnknownContentBlockTypes,
+-          value: blockType,
+-          kind: "content-block",
+-        });
+-      }
++    if (type === "assistant") {
++      const msg = isRecord(parsed.message) ? parsed.message : parsed;
++      const contentBlocks = Array.isArray(isRecord(msg) ? msg.content : undefined)
++        ? (msg.content as unknown[])
++        : [];
+       const blockTypes = contentBlocks
+-        .map((block) => (typeof block.type === "string" ? block.type : "?"))
++        .map((b) => (isRecord(b) && typeof b.type === "string" ? b.type : "?"))
+         .join(",");
+-      const extractedText = isAssistantEnvelope
+-        ? extractAssistantTextFromBlocks(contentBlocks)
+-        : "";
+-      const text = buildFallbackAssistantText({
+-        isAssistantEnvelope,
+-        extractedText,
+-        rawMessage,
+-        message,
+-      });
+-      const thinkingText = isAssistantEnvelope ? extractThinkingTextFromBlocks(contentBlocks) : "";
+-      const toolUseEvents = isAssistantEnvelope ? extractToolUseEvents(contentBlocks) : [];
+-      const allowToolResultEvents = isToolResultAllowedEnvelope({
+-        isAssistantEnvelope,
+-        type,
+-        messageRole,
+-      });
+-      const toolResultEvents = allowToolResultEvents ? extractToolResultEvents(contentBlocks) : [];
+-      const toolNames = extractToolUseNames(contentBlocks);
+ 
+-      if (isAssistantEnvelope) {
+-        log.debug(
+-          `stream-json assistant: blocks=[${blockTypes}] text=${text.length} chars thinking=${thinkingText.length} chars tools=[${toolNames.join(",")}]${text ? ` content=${text.slice(0, 200)}` : ""}`,
+-        );
+-      }
++      const text = collectText(parsed.message);
++      const toolNames = extractToolUseNames(msg);
++
++      log.debug(
++        `stream-json assistant: blocks=[${blockTypes}] text=${text.length} chars tools=[${toolNames.join(",")}]${text ? ` content=${text.slice(0, 200)}` : ""}`,
++      );
+ 
+-      if (text && text !== lastAssistantText) {
++      if (text) {
+         lastAssistantText = text;
+         callbacks?.onAssistantTurn?.(lastAssistantText);
+       }
+-
+-      if (thinkingText && thinkingText !== lastThinkingText) {
+-        const delta = resolveDelta(thinkingText, lastThinkingText);
+-        lastThinkingText = thinkingText;
+-        callbacks?.onThinkingTurn?.({
+-          text: thinkingText,
+-          ...(delta ? { delta } : {}),
+-        });
+-      }
+-
+-      for (const event of toolUseEvents) {
+-        const dedupe = shouldEmitToolUse(
+-          emittedToolUseKeys,
+-          emittedToolUseOrder,
+-          event,
+-          lastAnonymousToolUseKey,
+-        );
+-        if (!dedupe.emit) {
+-          continue;
++      if (callbacks?.onToolUse) {
++        for (const name of toolNames) {
++          callbacks.onToolUse(name);
+         }
+-        if (!event.toolUseId) {
+-          lastAnonymousToolUseKey = dedupe.nextAnonymousToolUseKey;
+-        } else {
+-          lastAnonymousToolUseKey = undefined;
+-        }
+-        callbacks?.onToolUse?.(event.name);
+-        callbacks?.onToolUseEvent?.(event);
+-      }
+-
+-      for (const event of toolResultEvents) {
+-        if (!shouldEmitToolResult(emittedToolResultKeys, emittedToolResultOrder, event)) {
+-          continue;
+-        }
+-        callbacks?.onToolResult?.(event);
+       }
+-    } else if (isAssistantEnvelope) {
+-      // Backward compatibility for custom stream-json backends that emit
+-      // assistant content as a string/object instead of typed content blocks.
+-      const fallbackText = collectText(rawMessage) || collectText(message);
+-      if (fallbackText && fallbackText !== lastAssistantText) {
+-        lastAssistantText = fallbackText;
+-        callbacks?.onAssistantTurn?.(lastAssistantText);
++    } else if (type === "result") {
++      resultText =
++        (typeof parsed.result === "string" ? parsed.result : undefined) ?? collectText(parsed);
++      if (isRecord(parsed.usage)) {
++        usage = toUsage(parsed.usage);
+       }
++      log.debug(
++        `stream-json result: ${resultText?.length ?? 0} chars, sessionId=${sessionId ?? "none"}`,
++      );
++    } else if (type === "system") {
++      const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
++      log.debug(`stream-json system: subtype=${subtype} sessionId=${sessionId ?? "none"}`);
+     }
+   };
+ 
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index 0189783386..0c76358438 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -244,48 +244,6 @@ export async function runAgentTurnWithFallback(params: {
+               // forward to onPartialReply.  Awaiting this chain after the CLI run
+               // ensures markRunComplete() isn't called before streaming initialises.
+               let streamingChain: Promise<void> = Promise.resolve();
+-              const streamingDirectiveAccumulator = createStreamingDirectiveAccumulator();
+-              let cliReasoningOpen = false;
+-              let assistantMessageStartQueued = false;
+-              const queueStreamingStep = (step: () => Promise<void>) => {
+-                streamingChain = streamingChain.then(step).catch((err) => {
+-                  defaultRuntime.error(
+-                    `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
+-                  );
+-                });
+-              };
+-              const queueAssistantMessageStart = () => {
+-                if (assistantMessageStartQueued) {
+-                  return;
+-                }
+-                assistantMessageStartQueued = true;
+-                queueStreamingStep(async () => {
+-                  await params.typingSignals.signalMessageStart();
+-                  await params.opts?.onAssistantMessageStart?.();
+-                });
+-              };
+-              const escapeMarkdownItalic = (value: string): string =>
+-                value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
+-              const formatReasoningPayload = (text: string): string => {
+-                const trimmed = text.trim();
+-                if (!trimmed) {
+-                  return "";
+-                }
+-                const lines = escapeMarkdownItalic(trimmed)
+-                  .split("\n")
+-                  .map((line) => line.trim());
+-                const italicized = lines.map((line) => (line ? `_${line}_` : "")).join("\n");
+-                return `Reasoning:\n${italicized}`;
+-              };
+-              const queueReasoningEndIfNeeded = () => {
+-                if (!cliReasoningOpen) {
+-                  return;
+-                }
+-                cliReasoningOpen = false;
+-                queueStreamingStep(async () => {
+-                  await params.opts?.onReasoningEnd?.();
+-                });
+-              };
+               try {
+                 const result = await runCliAgent({
+                   sessionId: params.followupRun.run.sessionId,
+@@ -310,17 +268,7 @@ export async function runAgentTurnWithFallback(params: {
+                       bootstrapPromptWarningSignaturesSeen.length - 1
+                     ],
+                   images: params.opts?.images,
+-                  abortSignal: params.opts?.abortSignal,
+-                  trigger: params.isHeartbeat ? "heartbeat" : "user",
+-                  messageChannel: params.followupRun.run.messageProvider,
+-                  onSystemInit: ({ subtype }) => {
+-                    if (subtype === "init") {
+-                      queueAssistantMessageStart();
+-                    }
+-                  },
+                   onAssistantTurn: (text) => {
+-                    queueAssistantMessageStart();
+-                    queueReasoningEndIfNeeded();
+                     emitAgentEvent({
+                       runId,
+                       stream: "assistant",
+@@ -332,83 +280,24 @@ export async function runAgentTurnWithFallback(params: {
+                     // 2. then onPartialReply queues the card content update
+                     // Chained (not fire-and-forget) so signalTextDelta completes
+                     // before onPartialReply, and markRunComplete waits for all.
+-                    queueStreamingStep(async () => {
+-                      const parsedChunk = streamingDirectiveAccumulator.consume(text, {
+-                        silentToken: SILENT_REPLY_TOKEN,
+-                      });
+-                      const normalizedText = await handlePartialForTyping({
+-                        text: parsedChunk?.text,
+-                        mediaUrl: parsedChunk?.mediaUrl,
+-                        mediaUrls: parsedChunk?.mediaUrls,
+-                        audioAsVoice: parsedChunk?.audioAsVoice,
+-                      });
+-                      if (normalizedText !== undefined && params.opts?.onPartialReply) {
+-                        await params.opts.onPartialReply({ text: normalizedText });
+-                      }
+-                    });
+-                  },
+-                  onThinkingTurn: ({ text, delta }) => {
+-                    if (!text.trim()) {
+-                      return;
+-                    }
+-                    queueAssistantMessageStart();
+-                    cliReasoningOpen = true;
+-                    emitAgentEvent({
+-                      runId,
+-                      stream: "thinking",
+-                      data: {
+-                        text,
+-                        ...(delta ? { delta } : {}),
+-                      },
+-                    });
+-                    queueStreamingStep(async () => {
+-                      await params.typingSignals.signalReasoningDelta();
+-                      const rendered = formatReasoningPayload(text);
+-                      if (!rendered) {
+-                        return;
+-                      }
+-                      await params.opts?.onReasoningStream?.({
+-                        text: rendered,
+-                        isReasoning: true,
++                    streamingChain = streamingChain
++                      .then(async () => {
++                        const normalizedText = await handlePartialForTyping({ text });
++                        if (normalizedText !== undefined && params.opts?.onPartialReply) {
++                          await params.opts.onPartialReply({ text: normalizedText });
++                        }
++                      })
++                      .catch((err) => {
++                        defaultRuntime.error(
++                          `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
++                        );
+                       });
+-                    });
+                   },
+-                  onToolUseEvent: (payload) => {
+-                    queueAssistantMessageStart();
+-                    queueReasoningEndIfNeeded();
++                  onToolUse: (toolName) => {
+                     emitAgentEvent({
+                       runId,
+                       stream: "tool",
+-                      data: {
+-                        phase: "start",
+-                        name: payload.name,
+-                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+-                        ...(payload.input !== undefined ? { input: payload.input } : {}),
+-                      },
+-                    });
+-                    queueStreamingStep(async () => {
+-                      await params.typingSignals.signalToolStart();
+-                      await params.opts?.onToolStart?.({
+-                        name: payload.name,
+-                        phase: "start",
+-                      });
+-                    });
+-                  },
+-                  onToolResult: (payload) => {
+-                    queueReasoningEndIfNeeded();
+-                    const preview =
+-                      typeof payload.text === "string" && payload.text.trim()
+-                        ? payload.text.trim().slice(0, 1_200)
+-                        : undefined;
+-                    emitAgentEvent({
+-                      runId,
+-                      stream: "tool",
+-                      data: {
+-                        phase: "result",
+-                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+-                        ...(preview ? { partialResult: preview, result: preview } : {}),
+-                        ...(payload.isError ? { isError: true } : {}),
+-                      },
++                      data: { phase: "start", name: toolName },
+                     });
+                   },
+                 });
+@@ -417,9 +306,14 @@ export async function runAgentTurnWithFallback(params: {
+                 );
+                 queueReasoningEndIfNeeded();
+ 
+-                // CLI backends don't emit streaming assistant events, so we need to
+-                // emit one with the final text so server-chat can populate its buffer
+-                // and send the response to TUI/WebSocket clients.
++                // Drain all pending streaming card updates before returning.
++                // This must happen before the caller's markRunComplete() so the
++                // typing controller's startGuard doesn't block startStreaming().
++                await streamingChain;
++
++                // Emit the final/authoritative assistant text so server-chat can
++                // populate its buffer. For stream-json backends this supplements
++                // the intermediate onAssistantTurn events with the definitive result.
+                 const cliText = result.payloads?.[0]?.text?.trim();
+                 if (cliText) {
+                   emitAgentEvent({
+diff --git a/src/config/types.agent-defaults.ts b/src/config/types.agent-defaults.ts
+index 1d73452f4b..66822073be 100644
+--- a/src/config/types.agent-defaults.ts
++++ b/src/config/types.agent-defaults.ts
+@@ -50,9 +50,9 @@ export type CliBackendConfig = {
+   /** Base args applied to every invocation. */
+   args?: string[];
+   /** Output parsing mode (default: json). */
+-  output?: "json" | "text" | "jsonl";
++  output?: "json" | "text" | "jsonl" | "stream-json";
+   /** Output parsing mode when resuming a CLI session. */
+-  resumeOutput?: "json" | "text" | "jsonl";
++  resumeOutput?: "json" | "text" | "jsonl" | "stream-json";
+   /** Prompt input mode (default: arg). */
+   input?: "arg" | "stdin";
+   /** Max prompt length for arg mode (if exceeded, stdin is used). */
+diff --git a/src/infra/outbound/conversation-id.test.ts b/src/infra/outbound/conversation-id.test.ts
+index b35c8e2e4a..7ea704865f 100644
+--- a/src/infra/outbound/conversation-id.test.ts
++++ b/src/infra/outbound/conversation-id.test.ts
+@@ -31,6 +31,13 @@ describe("resolveConversationIdFromTargets", () => {
+     expect(resolved).toBe("1475250310120214812");
+   });
+ 
++  it("extracts chat ids from chat: targets (Feishu format)", () => {
++    const resolved = resolveConversationIdFromTargets({
++      targets: ["chat:oc_abc123def456"],
++    });
++    expect(resolved).toBe("oc_abc123def456");
++  });
++
+   it("returns undefined for non-channel targets", () => {
+     const resolved = resolveConversationIdFromTargets({
+       targets: ["user:alice", "general"],
+diff --git a/src/infra/outbound/conversation-id.ts b/src/infra/outbound/conversation-id.ts
+index a6f8ed1fd6..b435a1cd5d 100644
+--- a/src/infra/outbound/conversation-id.ts
++++ b/src/infra/outbound/conversation-id.ts
+@@ -28,6 +28,13 @@ export function resolveConversationIdFromTargets(params: {
+       }
+       continue;
+     }
++    if (target.startsWith("chat:")) {
++      const chatId = normalizeConversationId(target.slice("chat:".length));
++      if (chatId) {
++        return chatId;
++      }
++      continue;
++    }
+     const mentionMatch = target.match(/^<#(\d+)>$/);
+     if (mentionMatch?.[1]) {
+       return mentionMatch[1];
+diff --git a/src/plugin-sdk/index.ts b/src/plugin-sdk/index.ts
+index 7b6495cf02..b7ac68e083 100644
+--- a/src/plugin-sdk/index.ts
++++ b/src/plugin-sdk/index.ts
+@@ -603,6 +603,27 @@ export type { HookEntry } from "../hooks/types.js";
+ export { clamp, escapeRegExp, normalizeE164, safeParseJson, sleep } from "../utils.js";
+ export { stripAnsi } from "../terminal/ansi.js";
+ export { missingTargetError } from "../infra/outbound/target-errors.js";
++export {
++  getSessionBindingService,
++  registerSessionBindingAdapter,
++  unregisterSessionBindingAdapter,
++  SessionBindingError,
++  isSessionBindingError,
++} from "../infra/outbound/session-binding-service.js";
++export type {
++  BindingTargetKind,
++  BindingStatus,
++  ConversationRef,
++  SessionBindingAdapter,
++  SessionBindingAdapterCapabilities,
++  SessionBindingBindInput,
++  SessionBindingCapabilities,
++  SessionBindingErrorCode,
++  SessionBindingPlacement,
++  SessionBindingRecord,
++  SessionBindingService,
++  SessionBindingUnbindInput,
++} from "../infra/outbound/session-binding-service.js";
+ export { registerLogTransport } from "../logging/logger.js";
+ export type { LogTransport, LogTransportRecord } from "../logging/logger.js";
+ export {
+-- 
+2.50.1 (Apple Git-155)
+

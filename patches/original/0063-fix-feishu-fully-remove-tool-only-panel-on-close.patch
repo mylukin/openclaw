@@ -1,0 +1,61 @@
+From d67698727c45165334f644a4d63713f5f36c0256 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 10:25:13 +0800
+Subject: [PATCH 63/98] fix(feishu): fully remove tool-only panel on close
+
+---
+ extensions/feishu/src/streaming-card.test.ts | 14 +++++++++++++-
+ extensions/feishu/src/streaming-card.ts      |  5 ++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index 62994a901a..948020ed80 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -523,7 +523,19 @@ describe("FeishuStreamingSession.close", () => {
+ 
+     await session.close("最终答案", { dropThinkingPanel: true });
+ 
+-    expect(cardUpdate).not.toHaveBeenCalled();
++    expect(cardUpdate).toHaveBeenCalledOnce();
++    const updateArg = (cardUpdate.mock.calls[0] as unknown[])?.[0] as {
++      data?: { card?: { data?: string } };
++    };
++    const cardJson = JSON.parse(updateArg.data?.card?.data ?? "{}") as {
++      body?: { elements?: Array<{ tag?: string; content?: string }> };
++    };
++    expect(cardJson.body?.elements?.some((element) => element.tag === "collapsible_panel")).toBe(
++      false,
++    );
++    expect(cardJson.body?.elements?.find((element) => element.tag === "markdown")?.content).toBe(
++      "最终答案",
++    );
+   });
+ 
+   it("does not call full card update when streaming content update succeeds and no thinking", async () => {
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 72bed7a678..996864dc14 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -580,6 +580,7 @@ export class FeishuStreamingSession {
+     // into the terminal card content.
+     const text = finalText !== undefined ? finalText : pendingMerged;
+ 
++    const hadThinkingPanel = this.state.thinkingPanelRendered || Boolean(this.state.thinkingText);
+     if (options?.dropThinkingPanel) {
+       this.state.thinkingText = "";
+       this.state.thinkingPanelRendered = false;
+@@ -596,7 +597,9 @@ export class FeishuStreamingSession {
+     // the issue where a full card update overwrites the note element to empty
+     // and then a subsequent element API note update fails because streaming
+     // mode was disabled by the full card update.
+-    if (this.state.thinkingText) {
++    const requiresFullCardUpdate =
++      Boolean(this.state.thinkingText) || Boolean(options?.dropThinkingPanel && hadThinkingPanel);
++    if (requiresFullCardUpdate) {
+       await this.updateCardFull(this.state.currentText, {
+         note: options?.note,
+       });
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,177 @@
+From 09ee56de848f6dd28192ace8c4b71584406b7e3b Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 30 Mar 2026 15:36:29 +0800
+Subject: [PATCH 94/98] fix: accumulate feishu thinking panel updates
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 58 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     | 53 +++++++++++++++--
+ 2 files changed, 106 insertions(+), 5 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 6299bacfb8..570bfe9725 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -1167,6 +1167,28 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     });
+   });
+ 
++  it("accumulates fragmented reasoning payloads in the live thinking panel", async () => {
++    const { result, options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++    });
++
++    await options.onReplyStart?.();
++    result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_" });
++    result.replyOptions.onReasoningStream?.({ text: "step two" });
++    result.replyOptions.onReasoningStream?.({ text: "step three" });
++    result.replyOptions.onPartialReply?.({ text: "answer part" });
++    result.replyOptions.onReasoningEnd?.();
++    await options.deliver({ text: "answer part final" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(1);
++    const thinkingCalls = streamingInstances[0].updateThinking.mock.calls.map(
++      (call: unknown[]) => call[0] as string,
++    );
++    expect(thinkingCalls.at(-1)).toContain("step one");
++    expect(thinkingCalls.at(-1)).toContain("step two");
++    expect(thinkingCalls.at(-1)).toContain("step three");
++  });
++
+   it("provides onReasoningStream and onReasoningEnd when streaming is enabled", () => {
+     const { result } = createDispatcherHarness({
+       runtime: createRuntimeLogger(),
+@@ -1327,6 +1349,42 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("accumulates fragmented reasoning payloads for non-streaming card replies", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: false,
++      },
++    });
++
++    const { result, options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++      threadReply: true,
++      rootId: "om_root_topic",
++    });
++
++    await result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_" });
++    await result.replyOptions.onReasoningStream?.({ text: "step two" });
++    await result.replyOptions.onReasoningStream?.({ text: "step three" });
++    await result.replyOptions.onReasoningEnd?.();
++    await options.deliver({ text: "final answer" }, { kind: "final" });
++
++    expect(sendStructuredCardFeishuMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: "final answer",
++        thinkingTitle: "💭 Thinking",
++        thinkingText: "step one\n\nstep two\n\nstep three",
++        thinkingExpanded: false,
++      }),
++    );
++  });
++
+   it("deduplicates identical final card sends in non-streaming mode", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index b1047a21cd..35961108fc 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -511,6 +511,50 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+ 
+   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
+ 
++  const normalizeReasoningDisplayText = (text: string | undefined): string => {
++    const trimmed = text?.trim() ?? "";
++    if (!trimmed) {
++      return "";
++    }
++    return trimmed
++      .replace(/^Reasoning:\n/, "")
++      .replace(/^_(.*)_$/gm, "$1")
++      .trim();
++  };
++
++  const mergeReasoningDisplayText = (
++    previousText: string | undefined,
++    nextText: string | undefined,
++  ): string => {
++    const previous = normalizeReasoningDisplayText(previousText);
++    const next = normalizeReasoningDisplayText(nextText);
++    if (!next) {
++      return previous;
++    }
++    if (!previous || next === previous) {
++      return next;
++    }
++    if (next.startsWith(previous)) {
++      return next;
++    }
++    if (previous.startsWith(next)) {
++      return previous;
++    }
++    if (next.includes(previous)) {
++      return next;
++    }
++    if (previous.includes(next)) {
++      return previous;
++    }
++    const maxOverlap = Math.min(previous.length, next.length);
++    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
++      if (previous.slice(-overlap) === next.slice(0, overlap)) {
++        return `${previous}${next.slice(overlap)}`;
++      }
++    }
++    return `${previous}\n\n${next}`;
++  };
++
+   const resolveThinkingPanelTitle = (): string => {
+     if (!hasReasoningText() && toolCallCount > 0) {
+       return `🔧 Tool calls (${toolCallCount})`;
+@@ -525,9 +569,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     const sections: string[] = [];
+     const toolOnlyPanel = !hasReasoningText() && toolCallCount > 0;
+     if (reasoningText) {
+-      const withoutLabel = reasoningText.replace(/^Reasoning:\n/, "");
+-      const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
+-      sections.push(plain);
++      sections.push(reasoningText);
+     }
+     if (toolCallCount > 0) {
+       const currentRunningTool =
+@@ -658,7 +700,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+ 
+   const queueReasoningUpdate = (nextThinking: string) => {
+     if (!nextThinking) return;
+-    reasoningText = nextThinking;
++    reasoningText = mergeReasoningDisplayText(reasoningText, nextThinking);
+     queueThinkingPanelUpdate();
+   };
+ 
+@@ -1131,10 +1173,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             queueThinkingPrelude();
+             streamPhase = "thinking";
+             if (payload?.text) {
+-              reasoningText = payload.text;
+               if (streamingEnabled) {
+                 startStreaming();
+                 queueReasoningUpdate(payload.text);
++              } else {
++                reasoningText = mergeReasoningDisplayText(reasoningText, payload.text);
+               }
+             }
+           }
+-- 
+2.50.1 (Apple Git-155)
+

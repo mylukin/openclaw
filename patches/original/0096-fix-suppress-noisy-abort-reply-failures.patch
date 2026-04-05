@@ -1,0 +1,89 @@
+From 080215cb90e12be1c5c7cc6e9ce05448f7be45de Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 3 Apr 2026 06:33:11 +0800
+Subject: [PATCH 96/98] fix: suppress noisy abort reply failures
+
+---
+ src/auto-reply/reply/agent-runner-execution.ts      | 11 +++++++++++
+ .../reply/agent-runner.runreplyagent.e2e.test.ts    | 13 +++++++++++++
+ src/auto-reply/reply/agent-runner.ts                |  4 ++++
+ 3 files changed, 28 insertions(+)
+
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index d7aca8703b..dd99e6406b 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -75,6 +75,7 @@ export type AgentRunLoopResult =
+       /** Payload keys sent directly (not via pipeline) during tool flush. */
+       directlySentBlockKeys?: Set<string>;
+     }
++  | { kind: "aborted" }
+   | { kind: "final"; payload: ReplyPayload };
+ 
+ export async function runAgentTurnWithFallback(params: {
+@@ -739,6 +740,8 @@ export async function runAgentTurnWithFallback(params: {
+     } catch (err) {
+       const message = err instanceof Error ? err.message : String(err);
+       const failoverReason = resolveFailoverReasonFromError(err);
++      const isExpectedAbort =
++        err instanceof Error && err.name === "AbortError" && failoverReason == null;
+       const isBilling = failoverReason === "billing" || isBillingErrorMessage(message);
+       const isContextOverflow =
+         !isBilling && !failoverReason && isLikelyContextOverflowError(message);
+@@ -832,6 +835,14 @@ export async function runAgentTurnWithFallback(params: {
+         continue;
+       }
+ 
++      if (isExpectedAbort) {
++        // A plain AbortError here means the run was intentionally cancelled
++        // (for example by a newer inbound turn or session control), not that
++        // the user needs an extra failure message in chat.
++        logVerbose(`Embedded agent aborted before reply (suppressed): ${message}`);
++        return { kind: "aborted" };
++      }
++
+       defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
+       const safeMessage = isTransientHttp
+         ? sanitizeUserFacingText(message, { errorContext: true })
+diff --git a/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts b/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
+index 8f27f1b3ff..1955189256 100644
+--- a/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
++++ b/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
+@@ -1539,6 +1539,19 @@ describe("runReplyAgent typing (heartbeat)", () => {
+     });
+   });
+ 
++  it("suppresses plain AbortError failures before reply", async () => {
++    state.runEmbeddedPiAgentMock.mockImplementationOnce(async () => {
++      const err = new Error("aborted");
++      err.name = "AbortError";
++      throw err;
++    });
++
++    const { run } = createMinimalRun();
++    const res = await run();
++
++    expect(res).toBeUndefined();
++  });
++
+   it("still replies even if session reset fails to persist", async () => {
+     await withTempStateDir(async (stateDir) => {
+       const saveSpy = vi
+diff --git a/src/auto-reply/reply/agent-runner.ts b/src/auto-reply/reply/agent-runner.ts
+index 659045a313..861437b7ab 100644
+--- a/src/auto-reply/reply/agent-runner.ts
++++ b/src/auto-reply/reply/agent-runner.ts
+@@ -390,6 +390,10 @@ export async function runReplyAgent(params: {
+       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
+     }
+ 
++    if (runOutcome.kind === "aborted") {
++      return undefined;
++    }
++
+     const {
+       runId,
+       runResult,
+-- 
+2.50.1 (Apple Git-155)
+

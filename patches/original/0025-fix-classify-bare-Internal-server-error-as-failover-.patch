@@ -1,0 +1,55 @@
+From 60df9a0adb7feb169a1a40f086e22d8cbebe11f4 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 18 Mar 2026 22:01:01 +0800
+Subject: [PATCH 25/98] fix: classify bare "Internal server error" as
+ failover-eligible timeout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HTTP 400 with "Internal server error" body (e.g. from OpenAI proxies) was
+not matched by any failover pattern — classifyFailoverReason returned null,
+preventing model fallback. Add a catch-all text check after the JSON-specific
+isJsonApiInternalServerError so bare occurrences also trigger failover.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ .../pi-embedded-helpers.isbillingerrormessage.test.ts       | 6 ++++++
+ src/agents/pi-embedded-helpers/errors.ts                    | 6 ++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
+index 3500df6387..c0fd716085 100644
+--- a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
++++ b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
+@@ -728,4 +728,10 @@ describe("classifyFailoverReason", () => {
+       ),
+     ).toBe("timeout");
+   });
++
++  it("classifies bare 'Internal server error' text as timeout", () => {
++    expect(classifyFailoverReason("HTTP 400: Internal server error")).toBe("timeout");
++    expect(classifyFailoverReason("400 Internal server error")).toBe("timeout");
++    expect(classifyFailoverReason("Internal server error")).toBe("timeout");
++  });
+ });
+diff --git a/src/agents/pi-embedded-helpers/errors.ts b/src/agents/pi-embedded-helpers/errors.ts
+index bf9a8c318d..4f315b53be 100644
+--- a/src/agents/pi-embedded-helpers/errors.ts
++++ b/src/agents/pi-embedded-helpers/errors.ts
+@@ -967,6 +967,12 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
+   if (isJsonApiInternalServerError(raw)) {
+     return "timeout";
+   }
++  // Catch bare "internal server error" text that isn't wrapped in a JSON
++  // payload (e.g. "HTTP 400: Internal server error" from OpenAI proxies).
++  // This is always a server-side fault and should trigger failover.
++  if (raw.toLowerCase().includes("internal server error")) {
++    return "timeout";
++  }
+   if (isCloudCodeAssistFormatError(raw)) {
+     return "format";
+   }
+-- 
+2.50.1 (Apple Git-155)
+

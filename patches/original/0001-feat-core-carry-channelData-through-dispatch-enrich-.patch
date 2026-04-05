@@ -1,0 +1,1475 @@
+From 42ec0345cf46afe4c67ad4042dc90e153adf79f4 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:22 +0800
+Subject: [PATCH 01/98] feat(core): carry channelData through dispatch, enrich
+ delivery metadata, and relay member events to plugin hooks
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot.ts                  |  25 +
+ extensions/feishu/src/monitor.events.test.ts  | 209 +++++
+ extensions/feishu/src/monitor.ts              | 728 ++++++++++++++++--
+ .../reply/dispatch-from-config.test.ts        |  12 +
+ src/auto-reply/templating.ts                  |   2 +
+ src/hooks/message-hook-mappers.test.ts        |   1 +
+ src/hooks/message-hook-mappers.ts             |  10 +
+ src/infra/outbound/deliver.test.ts            |  32 +-
+ src/infra/outbound/deliver.ts                 |   5 +
+ src/plugin-sdk/index.ts                       |   4 +
+ src/plugins/hooks.ts                          |  69 ++
+ src/plugins/runtime/index.ts                  |   2 +
+ src/plugins/runtime/types-core.ts             |   3 +
+ src/plugins/types.ts                          |  38 +
+ 14 files changed, 1087 insertions(+), 53 deletions(-)
+ create mode 100644 extensions/feishu/src/monitor.events.test.ts
+
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index 13a130b3d7..2f84b5293e 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -864,6 +864,7 @@ export async function handleFeishuMessage(params: {
+   event: FeishuMessageEvent;
+   botOpenId?: string;
+   botName?: string;
++  botOpenIdsByAccount?: Record<string, string | undefined>;
+   runtime?: RuntimeEnv;
+   chatHistories?: Map<string, HistoryEntry[]>;
+   accountId?: string;
+@@ -1332,6 +1333,30 @@ export async function handleFeishuMessage(params: {
+         OriginatingChannel: "feishu" as const,
+         OriginatingTo: feishuTo,
+         GroupSystemPrompt: isGroup ? groupConfig?.systemPrompt?.trim() || undefined : undefined,
++        ChannelData: {
++          messageId: ctx.messageId,
++          chatId: ctx.chatId,
++          chatType: ctx.chatType,
++          accountId: account.accountId,
++          accountBotOpenId: botOpenId,
++          botOpenIdsByAccount: params.botOpenIdsByAccount,
++          messageType: event.message.message_type,
++          rawContent: event.message.content,
++          rootId: ctx.rootId,
++          parentId: ctx.parentId,
++          mentions: event.message.mentions ?? [],
++          senderType: event.sender.sender_type,
++          senderOpenId: ctx.senderOpenId,
++          senderUnionId: event.sender.sender_id.union_id,
++          ...(mediaList.length > 0
++            ? {
++                mediaPath: mediaList[0].path,
++                mediaType: mediaList[0].contentType,
++                mediaPaths: mediaList.map((m) => m.path),
++                mediaTypes: mediaList.filter((m) => m.contentType).map((m) => m.contentType!),
++              }
++            : {}),
++        },
+         ...mediaPayload,
+       });
+ 
+diff --git a/extensions/feishu/src/monitor.events.test.ts b/extensions/feishu/src/monitor.events.test.ts
+new file mode 100644
+index 0000000000..6f4a2748c0
+--- /dev/null
++++ b/extensions/feishu/src/monitor.events.test.ts
+@@ -0,0 +1,209 @@
++import type { ClawdbotConfig } from "openclaw/plugin-sdk";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const probeFeishuMock = vi.hoisted(() => vi.fn());
++const createFeishuWSClientMock = vi.hoisted(() => vi.fn());
++const createEventDispatcherMock = vi.hoisted(() => vi.fn());
++const hookRunnerMocks = vi.hoisted(() => ({
++  hasHooks: vi.fn(() => true),
++  runChatMemberBotAdded: vi.fn(),
++  runChatMemberBotDeleted: vi.fn(),
++  runChatMemberUserAdded: vi.fn(),
++  runChatMemberUserDeleted: vi.fn(),
++  runChatMemberUserWithdrawn: vi.fn(),
++}));
++
++vi.mock("./probe.js", () => ({
++  probeFeishu: probeFeishuMock,
++}));
++
++vi.mock("./client.js", () => ({
++  createFeishuWSClient: createFeishuWSClientMock,
++  createEventDispatcher: createEventDispatcherMock,
++}));
++
++vi.mock("openclaw/plugin-sdk", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("openclaw/plugin-sdk")>();
++  return {
++    ...actual,
++    getGlobalHookRunner: () => hookRunnerMocks,
++  };
++});
++
++import { monitorFeishuProvider, stopFeishuMonitor } from "./monitor.js";
++
++type RegisteredHandlers = Record<string, (data: unknown) => Promise<void>>;
++
++function buildWebSocketConfig(accountId = "default"): ClawdbotConfig {
++  return {
++    channels: {
++      feishu: {
++        enabled: true,
++        accounts: {
++          [accountId]: {
++            enabled: true,
++            appId: "cli_test",
++            appSecret: "secret_test",
++            connectionMode: "websocket",
++          },
++        },
++      },
++    },
++  } as ClawdbotConfig;
++}
++
++async function waitForRegisterCall(registerMock: ReturnType<typeof vi.fn>): Promise<void> {
++  for (let i = 0; i < 30; i += 1) {
++    if (registerMock.mock.calls.length > 0) {
++      return;
++    }
++    await new Promise((resolve) => setTimeout(resolve, 0));
++  }
++  throw new Error("event dispatcher handlers were not registered");
++}
++
++async function startMonitorAndGetHandlers(): Promise<{
++  handlers: RegisteredHandlers;
++  stop: () => Promise<void>;
++}> {
++  const registerMock = vi.fn();
++  createEventDispatcherMock.mockReturnValue({ register: registerMock });
++  createFeishuWSClientMock.mockReturnValue({ start: vi.fn() });
++  probeFeishuMock.mockResolvedValue({ ok: true, botOpenId: "ou_bot_default" });
++
++  const abortController = new AbortController();
++  const monitorPromise = monitorFeishuProvider({
++    config: buildWebSocketConfig(),
++    runtime: {
++      log: vi.fn(),
++      error: vi.fn(),
++      exit: vi.fn(),
++    },
++    abortSignal: abortController.signal,
++  });
++
++  await waitForRegisterCall(registerMock);
++  const handlers = registerMock.mock.calls[0]?.[0] as RegisteredHandlers;
++  if (!handlers) {
++    throw new Error("missing registered handlers");
++  }
++
++  return {
++    handlers,
++    stop: async () => {
++      abortController.abort();
++      await monitorPromise;
++    },
++  };
++}
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  hookRunnerMocks.hasHooks.mockReturnValue(true);
++});
++
++afterEach(() => {
++  stopFeishuMonitor();
++});
++
++describe("monitorFeishuProvider chat member relay", () => {
++  it("forwards Feishu member events to hook runner with normalized payload", async () => {
++    const { handlers, stop } = await startMonitorAndGetHandlers();
++    try {
++      await handlers["im.chat.member.bot.added_v1"]({
++        chat_id: "oc_group_1",
++        operator_id: { open_id: "ou_operator" },
++        external: false,
++      });
++      await handlers["im.chat.member.bot.deleted_v1"]({
++        chat_id: "oc_group_1",
++      });
++      await handlers["im.chat.member.user.added_v1"]({
++        chat_id: "oc_group_1",
++        users: [
++          { name: "Alice", user_id: { open_id: "ou_alice", union_id: "on_alice" } },
++          { name: "Ghost", user_id: { union_id: "on_ghost" } },
++          { name: "Bob", user_id: { open_id: "ou_bob" } },
++        ],
++      });
++      await handlers["im.chat.member.user.deleted_v1"]({
++        chat_id: "oc_group_1",
++        users: [
++          { name: "Alice", user_id: { open_id: "ou_alice", union_id: "on_alice" } },
++          { name: "NoOpen", user_id: { union_id: "on_none" } },
++        ],
++      });
++      await handlers["im.chat.member.user.withdrawn_v1"]({
++        chat_id: "oc_group_1",
++        users: [
++          { name: "Bob", user_id: { open_id: "ou_bob", union_id: "on_bob" } },
++          { name: "NoOpen", user_id: {} },
++        ],
++      });
++
++      expect(hookRunnerMocks.runChatMemberBotAdded).toHaveBeenCalledWith(
++        { chatId: "oc_group_1" },
++        { channelId: "feishu", accountId: "default" },
++      );
++      expect(hookRunnerMocks.runChatMemberBotDeleted).toHaveBeenCalledWith(
++        { chatId: "oc_group_1" },
++        { channelId: "feishu", accountId: "default" },
++      );
++      expect(hookRunnerMocks.runChatMemberUserAdded).toHaveBeenCalledWith(
++        {
++          chatId: "oc_group_1",
++          users: [
++            { openId: "ou_alice", unionId: "on_alice", name: "Alice" },
++            { openId: "ou_bob", unionId: undefined, name: "Bob" },
++          ],
++        },
++        { channelId: "feishu", accountId: "default" },
++      );
++      expect(hookRunnerMocks.runChatMemberUserDeleted).toHaveBeenCalledWith(
++        {
++          chatId: "oc_group_1",
++          users: [{ openId: "ou_alice", unionId: "on_alice", name: "Alice" }],
++        },
++        { channelId: "feishu", accountId: "default" },
++      );
++      expect(hookRunnerMocks.runChatMemberUserWithdrawn).toHaveBeenCalledWith(
++        {
++          chatId: "oc_group_1",
++          users: [{ openId: "ou_bob", unionId: "on_bob", name: "Bob" }],
++        },
++        { channelId: "feishu", accountId: "default" },
++      );
++    } finally {
++      await stop();
++    }
++  });
++
++  it("skips member relay when hook is not registered or chat_id is empty", async () => {
++    const { handlers, stop } = await startMonitorAndGetHandlers();
++    try {
++      hookRunnerMocks.hasHooks.mockReturnValue(false);
++      await handlers["im.chat.member.bot.added_v1"]({ chat_id: "oc_group_1" });
++      await handlers["im.chat.member.user.added_v1"]({
++        chat_id: "oc_group_1",
++        users: [{ name: "Alice", user_id: { open_id: "ou_alice" } }],
++      });
++      expect(hookRunnerMocks.runChatMemberBotAdded).not.toHaveBeenCalled();
++      expect(hookRunnerMocks.runChatMemberUserAdded).not.toHaveBeenCalled();
++
++      hookRunnerMocks.hasHooks.mockReturnValue(true);
++      await handlers["im.chat.member.bot.deleted_v1"]({ chat_id: "" });
++      await handlers["im.chat.member.user.deleted_v1"]({
++        chat_id: "",
++        users: [{ name: "Alice", user_id: { open_id: "ou_alice" } }],
++      });
++      await handlers["im.chat.member.user.withdrawn_v1"]({
++        users: [{ name: "Alice", user_id: { open_id: "ou_alice" } }],
++      });
++      expect(hookRunnerMocks.runChatMemberBotDeleted).not.toHaveBeenCalled();
++      expect(hookRunnerMocks.runChatMemberUserDeleted).not.toHaveBeenCalled();
++      expect(hookRunnerMocks.runChatMemberUserWithdrawn).not.toHaveBeenCalled();
++    } finally {
++      await stop();
++    }
++  });
++});
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 50241d36ba..8410ebd60d 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -1,17 +1,21 @@
+-import type { ClawdbotConfig, RuntimeEnv } from "openclaw/plugin-sdk/feishu";
+-import { listEnabledFeishuAccounts, resolveFeishuAccount } from "./accounts.js";
++import * as crypto from "crypto";
++import * as http from "http";
++import * as Lark from "@larksuiteoapi/node-sdk";
+ import {
+-  monitorSingleAccount,
+-  resolveReactionSyntheticEvent,
+-  type FeishuReactionCreatedEvent,
+-} from "./monitor.account.js";
+-import { fetchBotIdentityForMonitor } from "./monitor.startup.js";
+-import {
+-  clearFeishuWebhookRateLimitStateForTest,
+-  getFeishuWebhookRateLimitStateSizeForTest,
+-  isWebhookRateLimitedForTest,
+-  stopFeishuMonitorState,
+-} from "./monitor.state.js";
++  type ClawdbotConfig,
++  type RuntimeEnv,
++  type HistoryEntry,
++  getGlobalHookRunner,
++  installRequestBodyLimitGuard,
++  getGlobalHookRunner,
++} from "openclaw/plugin-sdk";
++import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
++import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
++import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
++import { createFeishuWSClient, createEventDispatcher } from "./client.js";
++import { probeFeishu } from "./probe.js";
++import { getMessageFeishu } from "./send.js";
++import type { ResolvedFeishuAccount } from "./types.js";
+ 
+ export type MonitorFeishuOpts = {
+   config?: ClawdbotConfig;
+@@ -20,14 +24,649 @@ export type MonitorFeishuOpts = {
+   accountId?: string;
+ };
+ 
+-export {
+-  clearFeishuWebhookRateLimitStateForTest,
+-  getFeishuWebhookRateLimitStateSizeForTest,
+-  isWebhookRateLimitedForTest,
+-  resolveReactionSyntheticEvent,
++// Per-account WebSocket clients, HTTP servers, and bot info
++const wsClients = new Map<string, Lark.WSClient>();
++const httpServers = new Map<string, http.Server>();
++const botOpenIds = new Map<string, string>();
++const FEISHU_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
++const FEISHU_WEBHOOK_BODY_TIMEOUT_MS = 30_000;
++const FEISHU_WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
++const FEISHU_WEBHOOK_RATE_LIMIT_MAX_REQUESTS = 120;
++const FEISHU_WEBHOOK_RATE_LIMIT_MAX_TRACKED_KEYS = 4_096;
++const FEISHU_WEBHOOK_COUNTER_LOG_EVERY = 25;
++const FEISHU_REACTION_VERIFY_TIMEOUT_MS = 1_500;
++
++export type FeishuReactionCreatedEvent = {
++  message_id: string;
++  chat_id?: string;
++  chat_type?: "p2p" | "group";
++  reaction_type?: { emoji_type?: string };
++  operator_type?: string;
++  user_id?: { open_id?: string };
++  action_time?: string;
++};
++
++type ResolveReactionSyntheticEventParams = {
++  cfg: ClawdbotConfig;
++  accountId: string;
++  event: FeishuReactionCreatedEvent;
++  botOpenId?: string;
++  fetchMessage?: typeof getMessageFeishu;
++  verificationTimeoutMs?: number;
++  logger?: (message: string) => void;
++  uuid?: () => string;
++};
++
++const feishuWebhookRateLimits = new Map<string, { count: number; windowStartMs: number }>();
++const feishuWebhookStatusCounters = new Map<string, number>();
++let lastWebhookRateLimitCleanupMs = 0;
++
++function isJsonContentType(value: string | string[] | undefined): boolean {
++  const first = Array.isArray(value) ? value[0] : value;
++  if (!first) {
++    return false;
++  }
++  const mediaType = first.split(";", 1)[0]?.trim().toLowerCase();
++  return mediaType === "application/json" || Boolean(mediaType?.endsWith("+json"));
++}
++
++function trimWebhookRateLimitState(): void {
++  while (feishuWebhookRateLimits.size > FEISHU_WEBHOOK_RATE_LIMIT_MAX_TRACKED_KEYS) {
++    const oldestKey = feishuWebhookRateLimits.keys().next().value;
++    if (typeof oldestKey !== "string") {
++      break;
++    }
++    feishuWebhookRateLimits.delete(oldestKey);
++  }
++}
++
++function maybePruneWebhookRateLimitState(nowMs: number): void {
++  if (
++    feishuWebhookRateLimits.size === 0 ||
++    nowMs - lastWebhookRateLimitCleanupMs < FEISHU_WEBHOOK_RATE_LIMIT_WINDOW_MS
++  ) {
++    return;
++  }
++  lastWebhookRateLimitCleanupMs = nowMs;
++  for (const [key, state] of feishuWebhookRateLimits) {
++    if (nowMs - state.windowStartMs >= FEISHU_WEBHOOK_RATE_LIMIT_WINDOW_MS) {
++      feishuWebhookRateLimits.delete(key);
++    }
++  }
++}
++
++export function clearFeishuWebhookRateLimitStateForTest(): void {
++  feishuWebhookRateLimits.clear();
++  lastWebhookRateLimitCleanupMs = 0;
++}
++
++export function getFeishuWebhookRateLimitStateSizeForTest(): number {
++  return feishuWebhookRateLimits.size;
++}
++
++export function isWebhookRateLimitedForTest(key: string, nowMs: number): boolean {
++  maybePruneWebhookRateLimitState(nowMs);
++
++  const state = feishuWebhookRateLimits.get(key);
++  if (!state || nowMs - state.windowStartMs >= FEISHU_WEBHOOK_RATE_LIMIT_WINDOW_MS) {
++    feishuWebhookRateLimits.set(key, { count: 1, windowStartMs: nowMs });
++    trimWebhookRateLimitState();
++    return false;
++  }
++
++  state.count += 1;
++  if (state.count > FEISHU_WEBHOOK_RATE_LIMIT_MAX_REQUESTS) {
++    return true;
++  }
++  return false;
++}
++
++function isWebhookRateLimited(key: string, nowMs: number): boolean {
++  return isWebhookRateLimitedForTest(key, nowMs);
++}
++
++function recordWebhookStatus(
++  runtime: RuntimeEnv | undefined,
++  accountId: string,
++  path: string,
++  statusCode: number,
++): void {
++  if (![400, 401, 408, 413, 415, 429].includes(statusCode)) {
++    return;
++  }
++  const key = `${accountId}:${path}:${statusCode}`;
++  const next = (feishuWebhookStatusCounters.get(key) ?? 0) + 1;
++  feishuWebhookStatusCounters.set(key, next);
++  if (next === 1 || next % FEISHU_WEBHOOK_COUNTER_LOG_EVERY === 0) {
++    const log = runtime?.log ?? console.log;
++    log(`feishu[${accountId}]: webhook anomaly path=${path} status=${statusCode} count=${next}`);
++  }
++}
++
++async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
++  let timeoutId: NodeJS.Timeout | undefined;
++  try {
++    return await Promise.race<T | null>([
++      promise,
++      new Promise<null>((resolve) => {
++        timeoutId = setTimeout(() => resolve(null), timeoutMs);
++      }),
++    ]);
++  } finally {
++    if (timeoutId) {
++      clearTimeout(timeoutId);
++    }
++  }
++}
++
++export async function resolveReactionSyntheticEvent(
++  params: ResolveReactionSyntheticEventParams,
++): Promise<FeishuMessageEvent | null> {
++  const {
++    cfg,
++    accountId,
++    event,
++    botOpenId,
++    fetchMessage = getMessageFeishu,
++    verificationTimeoutMs = FEISHU_REACTION_VERIFY_TIMEOUT_MS,
++    logger,
++    uuid = () => crypto.randomUUID(),
++  } = params;
++
++  const emoji = event.reaction_type?.emoji_type;
++  const messageId = event.message_id;
++  const senderId = event.user_id?.open_id;
++  if (!emoji || !messageId || !senderId) {
++    return null;
++  }
++
++  const account = resolveFeishuAccount({ cfg, accountId });
++  const reactionNotifications = account.config.reactionNotifications ?? "own";
++  if (reactionNotifications === "off") {
++    return null;
++  }
++
++  // Skip bot self-reactions
++  if (event.operator_type === "app" || senderId === botOpenId) {
++    return null;
++  }
++
++  // Skip typing indicator emoji
++  if (emoji === "Typing") {
++    return null;
++  }
++
++  if (reactionNotifications === "own" && !botOpenId) {
++    logger?.(
++      `feishu[${accountId}]: bot open_id unavailable, skipping reaction ${emoji} on ${messageId}`,
++    );
++    return null;
++  }
++
++  const reactedMsg = await withTimeout(
++    fetchMessage({ cfg, messageId, accountId }),
++    verificationTimeoutMs,
++  ).catch(() => null);
++  const isBotMessage = reactedMsg?.senderType === "app" || reactedMsg?.senderOpenId === botOpenId;
++  if (!reactedMsg || (reactionNotifications === "own" && !isBotMessage)) {
++    logger?.(
++      `feishu[${accountId}]: ignoring reaction on non-bot/unverified message ${messageId} ` +
++        `(sender: ${reactedMsg?.senderOpenId ?? "unknown"})`,
++    );
++    return null;
++  }
++
++  const syntheticChatIdRaw = event.chat_id ?? reactedMsg.chatId;
++  const syntheticChatId = syntheticChatIdRaw?.trim() ? syntheticChatIdRaw : `p2p:${senderId}`;
++  const syntheticChatType: "p2p" | "group" = event.chat_type ?? "p2p";
++  return {
++    sender: {
++      sender_id: { open_id: senderId },
++      sender_type: "user",
++    },
++    message: {
++      message_id: `${messageId}:reaction:${emoji}:${uuid()}`,
++      chat_id: syntheticChatId,
++      chat_type: syntheticChatType,
++      message_type: "text",
++      content: JSON.stringify({
++        text: `[reacted with ${emoji} to message ${messageId}]`,
++      }),
++    },
++  };
++}
++
++async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | undefined> {
++  try {
++    const result = await probeFeishu(account);
++    return result.ok ? result.botOpenId : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/**
++ * Register common event handlers on an EventDispatcher.
++ * When fireAndForget is true (webhook mode), message handling is not awaited
++ * to avoid blocking the HTTP response (Lark requires <3s response).
++ */
++function registerEventHandlers(
++  eventDispatcher: Lark.EventDispatcher,
++  context: {
++    cfg: ClawdbotConfig;
++    accountId: string;
++    runtime?: RuntimeEnv;
++    chatHistories: Map<string, HistoryEntry[]>;
++    fireAndForget?: boolean;
++  },
++) {
++  const { cfg, accountId, runtime, chatHistories, fireAndForget } = context;
++  const log = runtime?.log ?? console.log;
++  const error = runtime?.error ?? console.error;
++
++  eventDispatcher.register({
++    "im.message.receive_v1": async (data) => {
++      try {
++        const event = data as unknown as FeishuMessageEvent;
++        const promise = handleFeishuMessage({
++          cfg,
++          event,
++          botOpenId: botOpenIds.get(accountId),
++          botOpenIdsByAccount: Object.fromEntries(
++            Array.from(botOpenIds.entries()).map(([id, openId]) => [id, openId || undefined]),
++          ),
++          runtime,
++          chatHistories,
++          accountId,
++        });
++        if (fireAndForget) {
++          promise.catch((err) => {
++            error(`feishu[${accountId}]: error handling message: ${String(err)}`);
++          });
++        } else {
++          await promise;
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling message: ${String(err)}`);
++      }
++    },
++    "im.message.message_read_v1": async () => {
++      // Ignore read receipts
++    },
++    "im.chat.member.bot.added_v1": async (data) => {
++      try {
++        const event = data as unknown as FeishuBotAddedEvent;
++        log(`feishu[${accountId}]: bot added to chat ${event.chat_id}`);
++        if (!event.chat_id) return;
++        const hookRunner = getGlobalHookRunner();
++        if (hookRunner?.hasHooks("chat_member_bot_added")) {
++          void hookRunner.runChatMemberBotAdded(
++            { chatId: event.chat_id },
++            { channelId: "feishu", accountId },
++          );
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling bot added event: ${String(err)}`);
++      }
++    },
++    "im.chat.member.bot.deleted_v1": async (data) => {
++      try {
++        const event = data as unknown as { chat_id: string };
++        log(`feishu[${accountId}]: bot removed from chat ${event.chat_id}`);
++        if (!event.chat_id) return;
++        const hookRunner = getGlobalHookRunner();
++        if (hookRunner?.hasHooks("chat_member_bot_deleted")) {
++          void hookRunner.runChatMemberBotDeleted(
++            { chatId: event.chat_id },
++            { channelId: "feishu", accountId },
++          );
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling bot removed event: ${String(err)}`);
++      }
++    },
++    "im.chat.member.user.added_v1": async (data) => {
++      try {
++        const event = data as unknown as {
++          chat_id?: string;
++          users?: Array<{
++            name?: string;
++            user_id?: { open_id?: string; union_id?: string };
++          }>;
++        };
++        log(`feishu[${accountId}]: users added to chat ${event.chat_id}`);
++        if (!event.chat_id) return;
++        const hookRunner = getGlobalHookRunner();
++        if (hookRunner?.hasHooks("chat_member_user_added")) {
++          const users = (event.users ?? [])
++            .filter((u) => !!u.user_id?.open_id)
++            .map((u) => ({
++              openId: u.user_id!.open_id!,
++              unionId: u.user_id?.union_id,
++              name: u.name,
++            }));
++          void hookRunner.runChatMemberUserAdded(
++            { chatId: event.chat_id, users },
++            { channelId: "feishu", accountId },
++          );
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling user added event: ${String(err)}`);
++      }
++    },
++    "im.chat.member.user.deleted_v1": async (data) => {
++      try {
++        const event = data as unknown as {
++          chat_id?: string;
++          users?: Array<{
++            name?: string;
++            user_id?: { open_id?: string; union_id?: string };
++          }>;
++        };
++        log(`feishu[${accountId}]: users deleted from chat ${event.chat_id}`);
++        if (!event.chat_id) return;
++        const hookRunner = getGlobalHookRunner();
++        if (hookRunner?.hasHooks("chat_member_user_deleted")) {
++          const users = (event.users ?? [])
++            .filter((u) => !!u.user_id?.open_id)
++            .map((u) => ({
++              openId: u.user_id!.open_id!,
++              unionId: u.user_id?.union_id,
++              name: u.name,
++            }));
++          void hookRunner.runChatMemberUserDeleted(
++            { chatId: event.chat_id, users },
++            { channelId: "feishu", accountId },
++          );
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling user deleted event: ${String(err)}`);
++      }
++    },
++    "im.chat.member.user.withdrawn_v1": async (data) => {
++      try {
++        const event = data as unknown as {
++          chat_id?: string;
++          users?: Array<{
++            name?: string;
++            user_id?: { open_id?: string; union_id?: string };
++          }>;
++        };
++        log(`feishu[${accountId}]: users withdrawn from chat ${event.chat_id}`);
++        if (!event.chat_id) return;
++        const hookRunner = getGlobalHookRunner();
++        if (hookRunner?.hasHooks("chat_member_user_withdrawn")) {
++          const users = (event.users ?? [])
++            .filter((u) => !!u.user_id?.open_id)
++            .map((u) => ({
++              openId: u.user_id!.open_id!,
++              unionId: u.user_id?.union_id,
++              name: u.name,
++            }));
++          void hookRunner.runChatMemberUserWithdrawn(
++            { chatId: event.chat_id, users },
++            { channelId: "feishu", accountId },
++          );
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling user withdrawn event: ${String(err)}`);
++      }
++    },
++    "im.message.reaction.created_v1": async (data) => {
++      const processReaction = async () => {
++        const event = data as FeishuReactionCreatedEvent;
++        const myBotId = botOpenIds.get(accountId);
++        const syntheticEvent = await resolveReactionSyntheticEvent({
++          cfg,
++          accountId,
++          event,
++          botOpenId: myBotId,
++          logger: log,
++        });
++        if (!syntheticEvent) {
++          return;
++        }
++        const promise = handleFeishuMessage({
++          cfg,
++          event: syntheticEvent,
++          botOpenId: myBotId,
++          runtime,
++          chatHistories,
++          accountId,
++        });
++        if (fireAndForget) {
++          promise.catch((err) => {
++            error(`feishu[${accountId}]: error handling reaction: ${String(err)}`);
++          });
++          return;
++        }
++        await promise;
++      };
++
++      if (fireAndForget) {
++        void processReaction().catch((err) => {
++          error(`feishu[${accountId}]: error handling reaction event: ${String(err)}`);
++        });
++        return;
++      }
++
++      try {
++        await processReaction();
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling reaction event: ${String(err)}`);
++      }
++    },
++    "im.message.reaction.deleted_v1": async () => {
++      // Ignore reaction removals
++    },
++    "card.action.trigger": async (data: unknown) => {
++      try {
++        const event = data as unknown as FeishuCardActionEvent;
++        const promise = handleFeishuCardAction({
++          cfg,
++          event,
++          botOpenId: botOpenIds.get(accountId),
++          runtime,
++          accountId,
++        });
++        if (fireAndForget) {
++          promise.catch((err) => {
++            error(`feishu[${accountId}]: error handling card action: ${String(err)}`);
++          });
++        } else {
++          await promise;
++        }
++      } catch (err) {
++        error(`feishu[${accountId}]: error handling card action: ${String(err)}`);
++      }
++    },
++  });
++}
++
++type MonitorAccountParams = {
++  cfg: ClawdbotConfig;
++  account: ResolvedFeishuAccount;
++  runtime?: RuntimeEnv;
++  abortSignal?: AbortSignal;
++};
++
++/**
++ * Monitor a single Feishu account.
++ */
++async function monitorSingleAccount(params: MonitorAccountParams): Promise<void> {
++  const { cfg, account, runtime, abortSignal } = params;
++  const { accountId } = account;
++  const log = runtime?.log ?? console.log;
++
++  // Fetch bot open_id
++  const botOpenId = await fetchBotOpenId(account);
++  botOpenIds.set(accountId, botOpenId ?? "");
++  log(`feishu[${accountId}]: bot open_id resolved: ${botOpenId ?? "unknown"}`);
++
++  const connectionMode = account.config.connectionMode ?? "websocket";
++  if (connectionMode === "webhook" && !account.verificationToken?.trim()) {
++    throw new Error(`Feishu account "${accountId}" webhook mode requires verificationToken`);
++  }
++  const eventDispatcher = createEventDispatcher(account);
++  const chatHistories = new Map<string, HistoryEntry[]>();
++
++  registerEventHandlers(eventDispatcher, {
++    cfg,
++    accountId,
++    runtime,
++    chatHistories,
++    fireAndForget: connectionMode === "webhook",
++  });
++
++  if (connectionMode === "webhook") {
++    return monitorWebhook({ params, accountId, eventDispatcher });
++  }
++
++  return monitorWebSocket({ params, accountId, eventDispatcher });
++}
++
++type ConnectionParams = {
++  params: MonitorAccountParams;
++  accountId: string;
++  eventDispatcher: Lark.EventDispatcher;
+ };
+-export type { FeishuReactionCreatedEvent };
+ 
++async function monitorWebSocket({
++  params,
++  accountId,
++  eventDispatcher,
++}: ConnectionParams): Promise<void> {
++  const { account, runtime, abortSignal } = params;
++  const log = runtime?.log ?? console.log;
++  const error = runtime?.error ?? console.error;
++
++  log(`feishu[${accountId}]: starting WebSocket connection...`);
++
++  const wsClient = createFeishuWSClient(account);
++  wsClients.set(accountId, wsClient);
++
++  return new Promise((resolve, reject) => {
++    const cleanup = () => {
++      wsClients.delete(accountId);
++      botOpenIds.delete(accountId);
++    };
++
++    const handleAbort = () => {
++      log(`feishu[${accountId}]: abort signal received, stopping`);
++      cleanup();
++      resolve();
++    };
++
++    if (abortSignal?.aborted) {
++      cleanup();
++      resolve();
++      return;
++    }
++
++    abortSignal?.addEventListener("abort", handleAbort, { once: true });
++
++    try {
++      wsClient.start({ eventDispatcher });
++      log(`feishu[${accountId}]: WebSocket client started`);
++    } catch (err) {
++      cleanup();
++      abortSignal?.removeEventListener("abort", handleAbort);
++      reject(err);
++    }
++  });
++}
++
++async function monitorWebhook({
++  params,
++  accountId,
++  eventDispatcher,
++}: ConnectionParams): Promise<void> {
++  const { account, runtime, abortSignal } = params;
++  const log = runtime?.log ?? console.log;
++  const error = runtime?.error ?? console.error;
++
++  const port = account.config.webhookPort ?? 3000;
++  const path = account.config.webhookPath ?? "/feishu/events";
++  const host = account.config.webhookHost ?? "127.0.0.1";
++
++  log(`feishu[${accountId}]: starting Webhook server on ${host}:${port}, path ${path}...`);
++
++  const server = http.createServer();
++  const webhookHandler = Lark.adaptDefault(path, eventDispatcher, { autoChallenge: true });
++  server.on("request", (req, res) => {
++    res.on("finish", () => {
++      recordWebhookStatus(runtime, accountId, path, res.statusCode);
++    });
++
++    const rateLimitKey = `${accountId}:${path}:${req.socket.remoteAddress ?? "unknown"}`;
++    if (isWebhookRateLimited(rateLimitKey, Date.now())) {
++      res.statusCode = 429;
++      res.end("Too Many Requests");
++      return;
++    }
++
++    if (req.method === "POST" && !isJsonContentType(req.headers["content-type"])) {
++      res.statusCode = 415;
++      res.end("Unsupported Media Type");
++      return;
++    }
++
++    const guard = installRequestBodyLimitGuard(req, res, {
++      maxBytes: FEISHU_WEBHOOK_MAX_BODY_BYTES,
++      timeoutMs: FEISHU_WEBHOOK_BODY_TIMEOUT_MS,
++      responseFormat: "text",
++    });
++    if (guard.isTripped()) {
++      return;
++    }
++    void Promise.resolve(webhookHandler(req, res))
++      .catch((err) => {
++        if (!guard.isTripped()) {
++          error(`feishu[${accountId}]: webhook handler error: ${String(err)}`);
++        }
++      })
++      .finally(() => {
++        guard.dispose();
++      });
++  });
++  httpServers.set(accountId, server);
++
++  return new Promise((resolve, reject) => {
++    const cleanup = () => {
++      server.close();
++      httpServers.delete(accountId);
++      botOpenIds.delete(accountId);
++    };
++
++    const handleAbort = () => {
++      log(`feishu[${accountId}]: abort signal received, stopping Webhook server`);
++      cleanup();
++      resolve();
++    };
++
++    if (abortSignal?.aborted) {
++      cleanup();
++      resolve();
++      return;
++    }
++
++    abortSignal?.addEventListener("abort", handleAbort, { once: true });
++
++    server.listen(port, host, () => {
++      log(`feishu[${accountId}]: Webhook server listening on ${host}:${port}`);
++    });
++
++    server.on("error", (err) => {
++      error(`feishu[${accountId}]: Webhook server error: ${err}`);
++      abortSignal?.removeEventListener("abort", handleAbort);
++      reject(err);
++    });
++  });
++}
++
++/**
++ * Main entry: start monitoring for all enabled accounts.
++ */
+ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promise<void> {
+   const cfg = opts.config;
+   if (!cfg) {
+@@ -36,6 +675,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+ 
+   const log = opts.runtime?.log ?? console.log;
+ 
++  // If accountId is specified, only monitor that account
+   if (opts.accountId) {
+     const account = resolveFeishuAccount({ cfg, accountId: opts.accountId });
+     if (!account.enabled || !account.configured) {
+@@ -49,6 +689,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+     });
+   }
+ 
++  // Otherwise, start all enabled accounts
+   const accounts = listEnabledFeishuAccounts(cfg);
+   if (accounts.length === 0) {
+     throw new Error("No enabled Feishu accounts configured");
+@@ -58,38 +699,37 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+     `feishu: starting ${accounts.length} account(s): ${accounts.map((a) => a.accountId).join(", ")}`,
+   );
+ 
+-  const monitorPromises: Promise<void>[] = [];
+-  for (const account of accounts) {
+-    if (opts.abortSignal?.aborted) {
+-      log("feishu: abort signal received during startup preflight; stopping startup");
+-      break;
+-    }
+-
+-    // Probe sequentially so large multi-account startups do not burst Feishu's bot-info endpoint.
+-    const { botOpenId, botName } = await fetchBotIdentityForMonitor(account, {
+-      runtime: opts.runtime,
+-      abortSignal: opts.abortSignal,
+-    });
+-
+-    if (opts.abortSignal?.aborted) {
+-      log("feishu: abort signal received during startup preflight; stopping startup");
+-      break;
+-    }
+-
+-    monitorPromises.push(
++  // Start all accounts in parallel
++  await Promise.all(
++    accounts.map((account) =>
+       monitorSingleAccount({
+         cfg,
+         account,
+         runtime: opts.runtime,
+         abortSignal: opts.abortSignal,
+-        botOpenIdSource: { kind: "prefetched", botOpenId, botName },
+       }),
+-    );
+-  }
+-
+-  await Promise.all(monitorPromises);
++    ),
++  );
+ }
+ 
++/**
++ * Stop monitoring for a specific account or all accounts.
++ */
+ export function stopFeishuMonitor(accountId?: string): void {
+-  stopFeishuMonitorState(accountId);
++  if (accountId) {
++    wsClients.delete(accountId);
++    const server = httpServers.get(accountId);
++    if (server) {
++      server.close();
++      httpServers.delete(accountId);
++    }
++    botOpenIds.delete(accountId);
++  } else {
++    wsClients.clear();
++    for (const server of httpServers.values()) {
++      server.close();
++    }
++    httpServers.clear();
++    botOpenIds.clear();
++  }
+ }
+diff --git a/src/auto-reply/reply/dispatch-from-config.test.ts b/src/auto-reply/reply/dispatch-from-config.test.ts
+index 87e77785bb..320ed1a589 100644
+--- a/src/auto-reply/reply/dispatch-from-config.test.ts
++++ b/src/auto-reply/reply/dispatch-from-config.test.ts
+@@ -1723,6 +1723,12 @@ describe("dispatchReplyFromConfig", () => {
+       AccountId: "acc-1",
+       GroupSpace: "guild-123",
+       GroupChannel: "alerts",
++      ChannelData: {
++        feishu: {
++          messageId: "om_123",
++          chatId: "oc_456",
++        },
++      },
+     });
+ 
+     const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
+@@ -1737,6 +1743,12 @@ describe("dispatchReplyFromConfig", () => {
+           originatingChannel: "Telegram",
+           originatingTo: "telegram:999",
+           messageId: "sid-full",
++          channelData: {
++            feishu: {
++              messageId: "om_123",
++              chatId: "oc_456",
++            },
++          },
+           senderId: "user-1",
+           senderName: "Alice",
+           senderUsername: "alice",
+diff --git a/src/auto-reply/templating.ts b/src/auto-reply/templating.ts
+index 8ca3c2389b..1ee129e48b 100644
+--- a/src/auto-reply/templating.ts
++++ b/src/auto-reply/templating.ts
+@@ -164,6 +164,8 @@ export type MsgContext = {
+    * The chat/channel/user ID where the reply should be sent.
+    */
+   OriginatingTo?: string;
++  /** Provider-specific inbound payload (structured raw event data). */
++  ChannelData?: Record<string, unknown>;
+   /**
+    * True when the current turn intentionally requested external delivery to
+    * OriginatingChannel/OriginatingTo, rather than inheriting stale session route metadata.
+diff --git a/src/hooks/message-hook-mappers.test.ts b/src/hooks/message-hook-mappers.test.ts
+index c365f463ad..f297fca2b7 100644
+--- a/src/hooks/message-hook-mappers.test.ts
++++ b/src/hooks/message-hook-mappers.test.ts
+@@ -136,6 +136,7 @@ describe("message hook mappers", () => {
+       to: "telegram:chat:456",
+       content: "reply",
+       success: false,
++      messageId: "out-1",
+       error: "network error",
+     });
+     expect(toInternalMessageSentContext(canonical)).toEqual({
+diff --git a/src/hooks/message-hook-mappers.ts b/src/hooks/message-hook-mappers.ts
+index 1cdd12a93a..856f3411ff 100644
+--- a/src/hooks/message-hook-mappers.ts
++++ b/src/hooks/message-hook-mappers.ts
+@@ -37,6 +37,7 @@ export type CanonicalInboundMessageHookContext = {
+   originatingTo?: string;
+   guildId?: string;
+   channelName?: string;
++  channelData?: Record<string, unknown>;
+   isGroup: boolean;
+   groupId?: string;
+ };
+@@ -50,6 +51,7 @@ export type CanonicalSentMessageHookContext = {
+   accountId?: string;
+   conversationId?: string;
+   messageId?: string;
++  metadata?: Record<string, unknown>;
+   isGroup?: boolean;
+   groupId?: string;
+ };
+@@ -106,6 +108,7 @@ export function deriveInboundMessageHookContext(
+     originatingTo: ctx.OriginatingTo,
+     guildId: ctx.GroupSpace,
+     channelName: ctx.GroupChannel,
++    channelData: ctx.ChannelData,
+     isGroup,
+     groupId: isGroup ? conversationId : undefined,
+   };
+@@ -120,6 +123,7 @@ export function buildCanonicalSentMessageHookContext(params: {
+   accountId?: string;
+   conversationId?: string;
+   messageId?: string;
++  metadata?: Record<string, unknown>;
+   isGroup?: boolean;
+   groupId?: string;
+ }): CanonicalSentMessageHookContext {
+@@ -132,6 +136,7 @@ export function buildCanonicalSentMessageHookContext(params: {
+     accountId: params.accountId,
+     conversationId: params.conversationId ?? params.to,
+     messageId: params.messageId,
++    metadata: params.metadata,
+     isGroup: params.isGroup,
+     groupId: params.groupId,
+   };
+@@ -162,6 +167,7 @@ export function toPluginMessageReceivedEvent(
+       originatingChannel: canonical.originatingChannel,
+       originatingTo: canonical.originatingTo,
+       messageId: canonical.messageId,
++      channelData: canonical.channelData,
+       senderId: canonical.senderId,
+       senderName: canonical.senderName,
+       senderUsername: canonical.senderUsername,
+@@ -179,6 +185,10 @@ export function toPluginMessageSentEvent(
+     to: canonical.to,
+     content: canonical.content,
+     success: canonical.success,
++    ...(canonical.messageId ? { messageId: canonical.messageId } : {}),
++    ...(canonical.metadata && Object.keys(canonical.metadata).length > 0
++      ? { metadata: canonical.metadata }
++      : {}),
+     ...(canonical.error ? { error: canonical.error } : {}),
+   };
+ }
+diff --git a/src/infra/outbound/deliver.test.ts b/src/infra/outbound/deliver.test.ts
+index e5b24c06a8..fc6a128453 100644
+--- a/src/infra/outbound/deliver.test.ts
++++ b/src/infra/outbound/deliver.test.ts
+@@ -889,15 +889,21 @@ describe("deliverOutboundPayloads", () => {
+       deps: { sendWhatsApp },
+     });
+ 
+-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
+-      expect.objectContaining({ to: "+1555", content: "hello", success: true }),
+-      expect.objectContaining({ channelId: "whatsapp" }),
+-    );
++    await vi.waitFor(() => {
++      expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
++        expect.objectContaining({ to: "+1555", content: "hello", success: true, messageId: "w1" }),
++        expect.objectContaining({ channelId: "whatsapp", conversationId: "+1555" }),
++      );
++    });
+   });
+ 
+   it("emits message_sent success for sendPayload deliveries", async () => {
+     hookMocks.runner.hasHooks.mockReturnValue(true);
+-    const sendPayload = vi.fn().mockResolvedValue({ channel: "matrix", messageId: "mx-1" });
++    const sendPayload = vi.fn().mockResolvedValue({
++      channel: "matrix",
++      messageId: "mx-1",
++      meta: { mentions: [{ id: "ou_bot_beta", name: "Bot Beta" }] },
++    });
+     const sendText = vi.fn();
+     const sendMedia = vi.fn();
+     setActivePluginRegistry(
+@@ -920,10 +926,18 @@ describe("deliverOutboundPayloads", () => {
+       payloads: [{ text: "payload text", channelData: { mode: "custom" } }],
+     });
+ 
+-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
+-      expect.objectContaining({ to: "!room:1", content: "payload text", success: true }),
+-      expect.objectContaining({ channelId: "matrix" }),
+-    );
++    await vi.waitFor(() => {
++      expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
++        expect.objectContaining({
++          to: "!room:1",
++          content: "payload text",
++          success: true,
++          messageId: "mx-1",
++          metadata: { mentions: [{ id: "ou_bot_beta", name: "Bot Beta" }] },
++        }),
++        expect.objectContaining({ channelId: "matrix", conversationId: "!room:1" }),
++      );
++    });
+   });
+ 
+   it("preserves channelData-only payloads with empty text for non-WhatsApp sendPayload channels", async () => {
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index caca498537..e8edc5151d 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -260,6 +260,7 @@ type MessageSentEvent = {
+   content: string;
+   error?: string;
+   messageId?: string;
++  metadata?: Record<string, unknown>;
+ };
+ 
+ function hasMediaPayload(payload: ReplyPayload): boolean {
+@@ -359,6 +360,7 @@ function createMessageSentEmitter(params: {
+       accountId: params.accountId ?? undefined,
+       conversationId: params.to,
+       messageId: event.messageId,
++      metadata: event.metadata,
+       isGroup: params.mirrorIsGroup,
+       groupId: params.mirrorGroupId,
+     });
+@@ -732,6 +734,9 @@ async function deliverOutboundPayloadsCore(
+           success: true,
+           content: payloadSummary.text,
+           messageId: delivery.messageId,
++          ...(delivery.meta && Object.keys(delivery.meta).length > 0
++            ? { metadata: delivery.meta }
++            : {}),
+         });
+         continue;
+       }
+diff --git a/src/plugin-sdk/index.ts b/src/plugin-sdk/index.ts
+index 35709dc4fe..7b6495cf02 100644
+--- a/src/plugin-sdk/index.ts
++++ b/src/plugin-sdk/index.ts
+@@ -809,3 +809,7 @@ export type { ResolvedProviderAuth } from "../agents/model-auth.js";
+ 
+ // Security utilities
+ export { redactSensitiveText } from "../logging/redact.js";
++
++// Plugin hooks
++export type { HookRunner } from "../plugins/hooks.js";
++export { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+diff --git a/src/plugins/hooks.ts b/src/plugins/hooks.ts
+index 4d74267d4c..b120f21484 100644
+--- a/src/plugins/hooks.ts
++++ b/src/plugins/hooks.ts
+@@ -19,6 +19,8 @@ import type {
+   PluginHookBeforePromptBuildEvent,
+   PluginHookBeforePromptBuildResult,
+   PluginHookBeforeCompactionEvent,
++  PluginHookChatMemberBotEvent,
++  PluginHookChatMemberUserEvent,
+   PluginHookLlmInputEvent,
+   PluginHookLlmOutputEvent,
+   PluginHookBeforeResetEvent,
+@@ -67,6 +69,8 @@ export type {
+   PluginHookBeforeCompactionEvent,
+   PluginHookBeforeResetEvent,
+   PluginHookAfterCompactionEvent,
++  PluginHookChatMemberBotEvent,
++  PluginHookChatMemberUserEvent,
+   PluginHookMessageContext,
+   PluginHookMessageReceivedEvent,
+   PluginHookMessageSendingEvent,
+@@ -426,6 +430,65 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
+     return runVoidHook("message_sent", event, ctx);
+   }
+ 
++  // =========================================================================
++  // Chat Member Hooks
++  // =========================================================================
++
++  /**
++   * Run chat_member_user_added hook.
++   * Runs in parallel (fire-and-forget).
++   */
++  async function runChatMemberUserAdded(
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ): Promise<void> {
++    return runVoidHook("chat_member_user_added", event, ctx);
++  }
++
++  /**
++   * Run chat_member_user_deleted hook.
++   * Runs in parallel (fire-and-forget).
++   */
++  async function runChatMemberUserDeleted(
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ): Promise<void> {
++    return runVoidHook("chat_member_user_deleted", event, ctx);
++  }
++
++  /**
++   * Run chat_member_user_withdrawn hook.
++   * Runs in parallel (fire-and-forget).
++   */
++  async function runChatMemberUserWithdrawn(
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ): Promise<void> {
++    return runVoidHook("chat_member_user_withdrawn", event, ctx);
++  }
++
++  /**
++   * Run chat_member_bot_added hook.
++   * Runs in parallel (fire-and-forget).
++   */
++  async function runChatMemberBotAdded(
++    event: PluginHookChatMemberBotEvent,
++    ctx: PluginHookMessageContext,
++  ): Promise<void> {
++    return runVoidHook("chat_member_bot_added", event, ctx);
++  }
++
++  /**
++   * Run chat_member_bot_deleted hook.
++   * Runs in parallel (fire-and-forget).
++   */
++  async function runChatMemberBotDeleted(
++    event: PluginHookChatMemberBotEvent,
++    ctx: PluginHookMessageContext,
++  ): Promise<void> {
++    return runVoidHook("chat_member_bot_deleted", event, ctx);
++  }
++
+   // =========================================================================
+   // Tool Hooks
+   // =========================================================================
+@@ -737,6 +800,12 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
+     runMessageReceived,
+     runMessageSending,
+     runMessageSent,
++    // Chat member hooks
++    runChatMemberUserAdded,
++    runChatMemberUserDeleted,
++    runChatMemberUserWithdrawn,
++    runChatMemberBotAdded,
++    runChatMemberBotDeleted,
+     // Tool hooks
+     runBeforeToolCall,
+     runAfterToolCall,
+diff --git a/src/plugins/runtime/index.ts b/src/plugins/runtime/index.ts
+index 12d33168cd..1ea08a423f 100644
+--- a/src/plugins/runtime/index.ts
++++ b/src/plugins/runtime/index.ts
+@@ -3,6 +3,7 @@ import {
+   getApiKeyForModel as getApiKeyForModelRaw,
+   resolveApiKeyForProvider as resolveApiKeyForProviderRaw,
+ } from "../../agents/model-auth.js";
++import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+ import { resolveStateDir } from "../../config/paths.js";
+ import { transcribeAudioFile } from "../../media-understanding/transcribe-audio.js";
+ import { textToSpeechTelephony } from "../../tts/tts.js";
+@@ -52,6 +53,7 @@ export type CreatePluginRuntimeOptions = {
+ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): PluginRuntime {
+   const runtime = {
+     version: resolveVersion(),
++    agents: { runEmbeddedPiAgent },
+     config: createRuntimeConfig(),
+     subagent: _options.subagent ?? createUnavailableSubagentRuntime(),
+     system: createRuntimeSystem(),
+diff --git a/src/plugins/runtime/types-core.ts b/src/plugins/runtime/types-core.ts
+index bfbb747c9c..9b8a1d2db2 100644
+--- a/src/plugins/runtime/types-core.ts
++++ b/src/plugins/runtime/types-core.ts
+@@ -9,6 +9,9 @@ export type RuntimeLogger = {
+ 
+ export type PluginRuntimeCore = {
+   version: string;
++  agents: {
++    runEmbeddedPiAgent: typeof import("../../agents/pi-embedded.js").runEmbeddedPiAgent;
++  };
+   config: {
+     loadConfig: typeof import("../../config/config.js").loadConfig;
+     writeConfigFile: typeof import("../../config/config.js").writeConfigFile;
+diff --git a/src/plugins/types.ts b/src/plugins/types.ts
+index 4c5894ddda..ca66c8054e 100644
+--- a/src/plugins/types.ts
++++ b/src/plugins/types.ts
+@@ -331,6 +331,11 @@ export type PluginHookName =
+   | "message_received"
+   | "message_sending"
+   | "message_sent"
++  | "chat_member_user_added"
++  | "chat_member_user_deleted"
++  | "chat_member_user_withdrawn"
++  | "chat_member_bot_added"
++  | "chat_member_bot_deleted"
+   | "before_tool_call"
+   | "after_tool_call"
+   | "tool_result_persist"
+@@ -587,9 +592,22 @@ export type PluginHookMessageSentEvent = {
+   to: string;
+   content: string;
+   success: boolean;
++  messageId?: string;
++  metadata?: Record<string, unknown>;
+   error?: string;
+ };
+ 
++// chat_member_user_added / chat_member_user_deleted / chat_member_user_withdrawn hook
++export type PluginHookChatMemberUserEvent = {
++  chatId: string;
++  users: Array<{ openId: string; unionId?: string; name?: string }>;
++};
++
++// chat_member_bot_added / chat_member_bot_deleted hook
++export type PluginHookChatMemberBotEvent = {
++  chatId: string;
++};
++
+ // Tool context
+ export type PluginHookToolContext = {
+   agentId?: string;
+@@ -830,6 +848,26 @@ export type PluginHookHandlerMap = {
+     event: PluginHookMessageSentEvent,
+     ctx: PluginHookMessageContext,
+   ) => Promise<void> | void;
++  chat_member_user_added: (
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ) => Promise<void> | void;
++  chat_member_user_deleted: (
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ) => Promise<void> | void;
++  chat_member_user_withdrawn: (
++    event: PluginHookChatMemberUserEvent,
++    ctx: PluginHookMessageContext,
++  ) => Promise<void> | void;
++  chat_member_bot_added: (
++    event: PluginHookChatMemberBotEvent,
++    ctx: PluginHookMessageContext,
++  ) => Promise<void> | void;
++  chat_member_bot_deleted: (
++    event: PluginHookChatMemberBotEvent,
++    ctx: PluginHookMessageContext,
++  ) => Promise<void> | void;
+   before_tool_call: (
+     event: PluginHookBeforeToolCallEvent,
+     ctx: PluginHookToolContext,
+-- 
+2.50.1 (Apple Git-155)
+

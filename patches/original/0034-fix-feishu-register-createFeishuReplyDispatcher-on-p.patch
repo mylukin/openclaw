@@ -1,0 +1,57 @@
+From 60ca74084a34d87f9e01e59c826e52d32a63a218 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 12:29:42 +0800
+Subject: [PATCH 34/98] fix(feishu): register createFeishuReplyDispatcher on
+ plugin runtime
+
+The native feishu reply dispatcher was exported from the extension but
+never registered on api.runtime.channel.reply during plugin init. This
+caused bot-company to always fall back to the generic route-reply path
+with a no-op deliver function, losing streaming cards and card rendering
+in group chat. Now registerFull() injects the dispatcher onto the
+runtime so external plugins can create streaming-card capable dispatchers.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/index.ts            | 9 +++++++++
+ extensions/feishu/src/exports.test.ts | 2 ++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/extensions/feishu/index.ts b/extensions/feishu/index.ts
+index cd78f13e6a..99e366ee2e 100644
+--- a/extensions/feishu/index.ts
++++ b/extensions/feishu/index.ts
+@@ -56,6 +56,15 @@ export default defineChannelPluginEntry({
+   plugin: feishuPlugin,
+   setRuntime: setFeishuRuntime,
+   registerFull(api) {
++    // Expose the native feishu reply dispatcher on the runtime so external
++    // plugins (e.g. bot-company) can create streaming-card capable dispatchers
++    // instead of falling back to the generic route-reply path.
++    const replyRuntime = (api.runtime as { channel?: { reply?: Record<string, unknown> } })?.channel
++      ?.reply;
++    if (replyRuntime && typeof replyRuntime.createFeishuReplyDispatcher !== "function") {
++      replyRuntime.createFeishuReplyDispatcher = createFeishuReplyDispatcher;
++    }
++
+     registerFeishuSubagentHooks(api);
+     registerFeishuDocTools(api);
+     registerFeishuChatTools(api);
+diff --git a/extensions/feishu/src/exports.test.ts b/extensions/feishu/src/exports.test.ts
+index b50b0eba36..b48b97ecd2 100644
+--- a/extensions/feishu/src/exports.test.ts
++++ b/extensions/feishu/src/exports.test.ts
+@@ -20,8 +20,10 @@ describe("feishu extension exports", () => {
+       config: {},
+       logger: {},
+       runtime,
++      registrationMode: "full",
+       registerChannel: vi.fn(),
+       registerTool: vi.fn(),
++      on: vi.fn(),
+     });
+     expect(
+       typeof (runtime as { channel: { reply: { createFeishuReplyDispatcher?: unknown } } }).channel
+-- 
+2.50.1 (Apple Git-155)
+

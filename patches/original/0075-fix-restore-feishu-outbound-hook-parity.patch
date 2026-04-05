@@ -1,0 +1,742 @@
+From 2c00f075a0cc48cf84006c79a21d433cbe4bdba3 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 27 Mar 2026 01:29:51 +0800
+Subject: [PATCH 75/98] fix: restore feishu outbound hook parity
+
+---
+ extensions/feishu/src/bot.ts                  |  4 +
+ extensions/feishu/src/channel.test.ts         | 54 +++++++++++
+ extensions/feishu/src/channel.ts              | 75 +++++++++++++++-
+ .../feishu/src/reply-dispatcher.test.ts       | 89 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     | 69 ++++++++++++--
+ .../outbound/outbound-send-service.test.ts    | 25 +++++-
+ src/infra/outbound/outbound-send-service.ts   | 16 +++-
+ src/plugins/runtime/index.ts                  | 45 +++++++++-
+ src/plugins/runtime/types-core.ts             | 27 ++++++
+ .../helpers/extensions/plugin-runtime-mock.ts |  6 ++
+ 10 files changed, 397 insertions(+), 13 deletions(-)
+
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index 7e999662ef..4db67765be 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -1141,6 +1141,8 @@ export async function handleFeishuMessage(params: {
+             threadReply: replyInThread && threadReply,
+             mentionTargets: ctx.mentionTargets,
+             accountId: account.accountId,
++            sessionKey: agentSessionKey,
++            isGroup,
+             identity,
+             messageCreateTimeMs,
+             onFinalTextDelivered,
+@@ -1310,6 +1312,8 @@ export async function handleFeishuMessage(params: {
+         threadReply: boundSessionKey ? true : replyInThread && threadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
++        sessionKey: effectiveSessionKey,
++        isGroup,
+         identity,
+         messageCreateTimeMs,
+         onFinalTextDelivered,
+diff --git a/extensions/feishu/src/channel.test.ts b/extensions/feishu/src/channel.test.ts
+index 186ff1fd5c..b420d233a8 100644
+--- a/extensions/feishu/src/channel.test.ts
++++ b/extensions/feishu/src/channel.test.ts
+@@ -11,6 +11,7 @@ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
+ const feishuOutboundSendMediaMock = vi.hoisted(() => vi.fn());
+ const emitMessageSentMock = vi.hoisted(() => vi.fn());
++const runMessageSendingMock = vi.hoisted(() => vi.fn());
+ const getMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const editMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const createPinFeishuMock = vi.hoisted(() => vi.fn());
+@@ -58,6 +59,8 @@ vi.mock("./channel.runtime.js", () => ({
+ vi.mock("./runtime.js", () => ({
+   getFeishuRuntime: () => ({
+     hooks: {
++      hasMessageSendingHooks: () => true,
++      runMessageSending: runMessageSendingMock,
+       emitMessageSent: emitMessageSentMock,
+     },
+     channel: {
+@@ -129,6 +132,7 @@ describe("feishuPlugin actions", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     createFeishuClientMock.mockReturnValue({ tag: "client" });
++    runMessageSendingMock.mockResolvedValue(undefined);
+     feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
+     feishuOutboundSendMediaMock.mockResolvedValue({
+       channel: "feishu",
+@@ -223,6 +227,34 @@ describe("feishuPlugin actions", () => {
+     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
+   });
+ 
++  it("applies message_sending rewrites before sending text", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ content: "hello rewritten" });
++
++    await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", message: "hello" },
++      cfg,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(runMessageSendingMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        content: "hello",
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "chat:oc_group_1",
++      }),
++    );
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: "hello rewritten",
++      }),
++    );
++  });
++
+   it("sends card messages", async () => {
+     sendCardFeishuMock.mockResolvedValueOnce({ messageId: "om_card", chatId: "oc_group_1" });
+ 
+@@ -299,6 +331,28 @@ describe("feishuPlugin actions", () => {
+     });
+   });
+ 
++  it("cancels sends when message_sending requests cancellation", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ cancel: true });
++
++    const result = await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", media: "/tmp/generated.png" },
++      cfg,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(feishuOutboundSendTextMock).not.toHaveBeenCalled();
++    expect(feishuOutboundSendMediaMock).not.toHaveBeenCalled();
++    expect(emitMessageSentMock).not.toHaveBeenCalled();
++    expect(result?.details).toMatchObject({
++      ok: true,
++      channel: "feishu",
++      action: "send",
++      cancelled: true,
++    });
++  });
++
+   it("reads messages", async () => {
+     getMessageFeishuMock.mockResolvedValueOnce({
+       messageId: "om_1",
+diff --git a/extensions/feishu/src/channel.ts b/extensions/feishu/src/channel.ts
+index c9ac2007f6..d13392ff49 100644
+--- a/extensions/feishu/src/channel.ts
++++ b/extensions/feishu/src/channel.ts
+@@ -281,6 +281,8 @@ function emitFeishuActionMessageSent(params: {
+   to: string;
+   content: string;
+   accountId?: string;
++  sessionKey?: string | null;
++  isGroup?: boolean;
+   result: { messageId?: string; chatId?: string; meta?: Record<string, unknown> };
+   metadata?: Record<string, unknown>;
+ }) {
+@@ -302,10 +304,48 @@ function emitFeishuActionMessageSent(params: {
+       channelId: "feishu",
+       accountId: params.accountId,
+       conversationId: params.result.chatId ?? params.to,
++      sessionKey: params.sessionKey ?? undefined,
++      isGroup: params.isGroup,
++      groupId: params.isGroup ? (params.result.chatId ?? params.to) : undefined,
+     },
+   );
+ }
+ 
++async function applyFeishuActionMessageSending(params: {
++  to: string;
++  content: string;
++  accountId?: string;
++  replyToId?: string;
++  threadId?: string;
++  mediaUrls?: string[];
++}): Promise<{ cancelled: boolean; content: string }> {
++  const hookResult = await getFeishuRuntime().hooks.runMessageSending(
++    {
++      to: params.to,
++      content: params.content,
++      metadata: {
++        channel: "feishu",
++        accountId: params.accountId,
++        ...(params.mediaUrls?.length ? { mediaUrls: params.mediaUrls } : {}),
++        ...(params.replyToId ? { replyToId: params.replyToId } : {}),
++        ...(params.threadId ? { threadId: params.threadId } : {}),
++      },
++    },
++    {
++      channelId: "feishu",
++      accountId: params.accountId,
++      conversationId: params.to,
++    },
++  );
++  if (hookResult?.cancel) {
++    return { cancelled: true, content: params.content };
++  }
++  return {
++    cancelled: false,
++    content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
++  };
++}
++
+ function readFirstString(
+   params: Record<string, unknown>,
+   keys: string[],
+@@ -541,6 +581,27 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+               throw new Error(`Feishu ${ctx.action} requires text/message, card, or media.`);
+             }
+             const runtime = await loadFeishuChannelRuntime();
++            const isGroupTarget = !/^(user|dm|open_id):/i.test(to);
++            const lifecycleResult = await applyFeishuActionMessageSending({
++              to,
++              content: text ?? "",
++              accountId: ctx.accountId ?? undefined,
++              ...(replyToMessageId
++                ? {
++                    replyToId: replyToMessageId,
++                    threadId: ctx.action === "thread-reply" ? replyToMessageId : undefined,
++                  }
++                : {}),
++              ...(mediaUrl ? { mediaUrls: [mediaUrl] } : {}),
++            });
++            if (lifecycleResult.cancelled) {
++              return jsonActionResult({
++                ok: true,
++                channel: "feishu",
++                action: ctx.action,
++                cancelled: true,
++              });
++            }
+             const result = card
+               ? await runtime.sendCardFeishu({
+                   cfg: ctx.cfg,
+@@ -552,7 +613,7 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                 })
+               : mediaUrl
+                 ? await (async () => {
+-                    const trimmedText = text?.trim() ?? "";
++                    const trimmedText = lifecycleResult.content.trim();
+                     if (trimmedText) {
+                       const sendText = runtime.feishuOutbound.sendText;
+                       if (!sendText) {
+@@ -569,6 +630,8 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                         to,
+                         content: trimmedText,
+                         accountId: ctx.accountId ?? undefined,
++                        sessionKey: ctx.sessionKey,
++                        isGroup: isGroupTarget,
+                         result: textResult,
+                         metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                       });
+@@ -590,6 +653,8 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                       to,
+                       content: "",
+                       accountId: ctx.accountId ?? undefined,
++                      sessionKey: ctx.sessionKey,
++                      isGroup: isGroupTarget,
+                       result: mediaResult,
+                       metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                     });
+@@ -603,14 +668,16 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                     const textResult = await sendText({
+                       cfg: ctx.cfg,
+                       to,
+-                      text: text!,
++                      text: lifecycleResult.content,
+                       accountId: ctx.accountId ?? undefined,
+                       ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
+                     });
+                     emitFeishuActionMessageSent({
+                       to,
+-                      content: text!,
++                      content: lifecycleResult.content,
+                       accountId: ctx.accountId ?? undefined,
++                      sessionKey: ctx.sessionKey,
++                      isGroup: isGroupTarget,
+                       result: textResult,
+                       metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
+                     });
+@@ -621,6 +688,8 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                 to,
+                 content: "",
+                 accountId: ctx.accountId ?? undefined,
++                sessionKey: ctx.sessionKey,
++                isGroup: isGroupTarget,
+                 result,
+                 metadata: {
+                   contentType: "interactive",
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 67c4d67a6f..6706e73f9a 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -10,6 +10,7 @@ const createFeishuClientMock = vi.hoisted(() => vi.fn());
+ const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
+ const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
+ const emitMessageSentMock = vi.hoisted(() => vi.fn());
++const runMessageSendingMock = vi.hoisted(() => vi.fn());
+ const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
+ const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
+ const streamingInstances = vi.hoisted(() => [] as any[]);
+@@ -109,9 +110,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+         },
+       },
+       hooks: {
++        hasMessageSendingHooks: () => false,
++        runMessageSending: runMessageSendingMock,
+         emitMessageSent: emitMessageSentMock,
+       },
+     });
++    runMessageSendingMock.mockResolvedValue(undefined);
+   });
+ 
+   function setupNonStreamingAutoDispatcher() {
+@@ -136,6 +140,48 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     return createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+   }
+ 
++  function setupHookedAutoDispatcher() {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "auto",
++        streaming: true,
++      },
++    });
++    getFeishuRuntimeMock.mockReturnValue({
++      channel: {
++        text: {
++          resolveTextChunkLimit: vi.fn(() => 4000),
++          resolveChunkMode: vi.fn(() => "line"),
++          resolveMarkdownTableMode: vi.fn(() => "preserve"),
++          convertMarkdownTables: vi.fn((text) => text),
++          chunkTextWithMode: vi.fn((text) => [text]),
++        },
++        reply: {
++          createReplyDispatcherWithTyping: createReplyDispatcherWithTypingMock,
++          resolveHumanDelayConfig: vi.fn(() => undefined),
++        },
++      },
++      hooks: {
++        hasMessageSendingHooks: () => true,
++        runMessageSending: runMessageSendingMock,
++        emitMessageSent: emitMessageSentMock,
++      },
++    });
++
++    createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    return createReplyDispatcherWithTypingMock.mock.calls.at(-1)?.[0];
++  }
++
+   function createRuntimeLogger() {
+     return { log: vi.fn(), error: vi.fn() } as never;
+   }
+@@ -406,6 +452,49 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("applies message_sending rewrites before non-streaming final sends", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ content: "rewritten final" });
++
++    const options = setupNonStreamingAutoDispatcher();
++    await options.deliver({ text: "plain final" }, { kind: "final" });
++
++    expect(runMessageSendingMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "oc_chat",
++        content: "plain final",
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "oc_chat",
++      }),
++    );
++    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: "rewritten final",
++      }),
++    );
++  });
++
++  it("honors message_sending cancellation for media-only final sends", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ cancel: true });
++
++    const options = setupNonStreamingAutoDispatcher();
++    await options.deliver({ mediaUrl: "https://example.com/a.png" }, { kind: "final" });
++
++    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
++    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
++    expect(emitMessageSentMock).not.toHaveBeenCalled();
++  });
++
++  it("disables streaming UI when message_sending hooks are active", async () => {
++    const options = setupHookedAutoDispatcher();
++    await options.onReplyStart?.();
++    await options.deliver({ text: "stream candidate" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(0);
++    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
++  });
++
+   it("keeps distinct non-streaming final payloads", async () => {
+     const options = setupNonStreamingAutoDispatcher();
+     await options.deliver({ text: "notice header" }, { kind: "final" });
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 972583643f..e31db2510e 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -131,6 +131,8 @@ export type CreateFeishuReplyDispatcherParams = {
+   rootId?: string;
+   mentionTargets?: MentionTarget[];
+   accountId?: string;
++  sessionKey?: string;
++  isGroup?: boolean;
+   identity?: OutboundIdentity;
+   /** Epoch ms when the inbound message was created. Used to suppress typing
+    *  indicators on old/replayed messages after context compaction (#30418). */
+@@ -159,6 +161,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     rootId,
+     mentionTargets,
+     accountId,
++    sessionKey,
++    isGroup,
+     identity,
+   } = params;
+   const sendReplyToMessageId = skipReplyToInMessages ? undefined : replyToMessageId;
+@@ -198,9 +202,44 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         channelId: "feishu",
+         accountId: accountId ?? account.accountId,
+         conversationId: chatId,
++        sessionKey,
++        isGroup,
++        groupId: isGroup ? chatId : undefined,
+       },
+     );
+   };
++  const runMessageSending = async (params: {
++    content: string;
++    mediaUrls?: string[];
++  }): Promise<{ cancelled: boolean; content: string }> => {
++    const hookResult = await core.hooks.runMessageSending(
++      {
++        to: chatId,
++        content: params.content,
++        metadata: {
++          channel: "feishu",
++          accountId: accountId ?? account.accountId,
++          ...(params.mediaUrls?.length ? { mediaUrls: params.mediaUrls } : {}),
++          ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
++          ...(effectiveReplyInThread && (rootId ?? sendReplyToMessageId)
++            ? { threadId: rootId ?? sendReplyToMessageId }
++            : {}),
++        },
++      },
++      {
++        channelId: "feishu",
++        accountId: accountId ?? account.accountId,
++        conversationId: chatId,
++      },
++    );
++    if (hookResult?.cancel) {
++      return { cancelled: true, content: params.content };
++    }
++    return {
++      cancelled: false,
++      content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
++    };
++  };
+   const prefixContext = createReplyPrefixContext({ cfg, agentId });
+ 
+   let typingState: TypingIndicatorState | null = null;
+@@ -277,8 +316,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   const showCardHeader = account.config?.cardHeader ?? true;
+   const showCardNote = account.config?.cardNote ?? true;
+   const renderMode = account.config?.renderMode ?? "auto";
++  const hasMessageSendingHooks = core.hooks.hasMessageSendingHooks();
+   const streamingEnabled =
+     account.config?.streaming !== false &&
++    !hasMessageSendingHooks &&
+     renderMode !== "raw" &&
+     (!threadReplyMode || streamingInThread === true);
+   // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
+@@ -722,10 +763,26 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         await typingCallbacks?.onReplyStart?.();
+       },
+       deliver: async (payload: ReplyPayload, info) => {
+-        const reply = resolveSendableOutboundReplyParts(payload);
+-        const text = reply.text;
+-        const hasText = reply.hasText;
+-        const hasMedia = reply.hasMedia;
++        const originalReply = resolveSendableOutboundReplyParts(payload);
++        const shouldRunSendingHook =
++          originalReply.hasMedia || !streaming?.isActive() || info?.kind === "final";
++        let text = originalReply.text;
++        if (shouldRunSendingHook) {
++          const hookResult = await runMessageSending({
++            content: text,
++            mediaUrls: originalReply.mediaUrls,
++          });
++          if (hookResult.cancelled) {
++            if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
++              streamText = "";
++              await closeStreaming({ emitFinalText: false });
++            }
++            return;
++          }
++          text = hookResult.content;
++        }
++        const hasText = text.trim().length > 0;
++        const hasMedia = originalReply.hasMedia;
+         const skipTextForDuplicateFinal =
+           info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
+         const shouldDeliverText = hasText && !skipTextForDuplicateFinal;
+@@ -773,7 +830,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             }
+             // Send media even when streaming handled the text
+             if (hasMedia) {
+-              await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
++              await deliverMediaAndEmitIfNeeded(originalReply.mediaUrls, text, info, hasText);
+             }
+             return;
+           }
+@@ -858,7 +915,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         }
+ 
+         if (hasMedia) {
+-          await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
++          await deliverMediaAndEmitIfNeeded(originalReply.mediaUrls, text, info, hasText);
+         }
+       },
+       onError: async (error, info) => {
+diff --git a/src/infra/outbound/outbound-send-service.test.ts b/src/infra/outbound/outbound-send-service.test.ts
+index 76fec66fb6..d794121e82 100644
+--- a/src/infra/outbound/outbound-send-service.test.ts
++++ b/src/infra/outbound/outbound-send-service.test.ts
+@@ -38,9 +38,10 @@ let executePollAction: OutboundSendServiceModule["executePollAction"];
+ let executeSendAction: OutboundSendServiceModule["executeSendAction"];
+ 
+ describe("executeSendAction", () => {
+-  function pluginActionResult(messageId: string) {
++  function pluginActionResult(messageId: string, details?: Record<string, unknown>) {
+     return {
+       ok: true,
++      ...(details ? { details } : {}),
+       value: { messageId },
+       continuePrompt: "",
+       output: "",
+@@ -218,6 +219,28 @@ describe("executeSendAction", () => {
+     });
+   });
+ 
++  it("does not mirror cancelled plugin-handled sends", async () => {
++    mocks.dispatchChannelMessageAction.mockResolvedValue(
++      pluginActionResult("msg-plugin-cancelled", { ok: true, cancelled: true }),
++    );
++
++    await executeSendAction({
++      ctx: {
++        cfg: {},
++        channel: "discord",
++        params: { to: "channel:123", message: "hello" },
++        dryRun: false,
++        mirror: {
++          sessionKey: "agent:main:discord:channel:123",
++        },
++      },
++      to: "channel:123",
++      message: "hello",
++    });
++
++    expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
++  });
++
+   it("falls back to message and media params for plugin-handled mirror writes", async () => {
+     await executePluginMirroredSend({
+       mirror: {
+diff --git a/src/infra/outbound/outbound-send-service.ts b/src/infra/outbound/outbound-send-service.ts
+index b56fade592..28070a8513 100644
+--- a/src/infra/outbound/outbound-send-service.ts
++++ b/src/infra/outbound/outbound-send-service.ts
+@@ -43,6 +43,15 @@ type PluginHandledResult = {
+   toolResult: AgentToolResult<unknown>;
+ };
+ 
++function isCancelledPluginActionPayload(payload: unknown): boolean {
++  return Boolean(
++    payload &&
++    typeof payload === "object" &&
++    "cancelled" in payload &&
++    (payload as { cancelled?: unknown }).cancelled === true,
++  );
++}
++
+ async function tryHandleWithPluginAction(params: {
+   ctx: OutboundSendContext;
+   action: "send" | "poll";
+@@ -69,10 +78,13 @@ async function tryHandleWithPluginAction(params: {
+   if (!handled) {
+     return null;
+   }
+-  await params.onHandled?.();
++  const payload = extractToolPayload(handled);
++  if (!isCancelledPluginActionPayload(payload)) {
++    await params.onHandled?.();
++  }
+   return {
+     handledBy: "plugin",
+-    payload: extractToolPayload(handled),
++    payload,
+     toolResult: handled,
+   };
+ }
+diff --git a/src/plugins/runtime/index.ts b/src/plugins/runtime/index.ts
+index 042d207cc5..468a2e2f7d 100644
+--- a/src/plugins/runtime/index.ts
++++ b/src/plugins/runtime/index.ts
+@@ -1,5 +1,10 @@
+ import { createRequire } from "node:module";
+ import { resolveStateDir } from "../../config/paths.js";
++import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
++import {
++  buildCanonicalSentMessageHookContext,
++  toInternalMessageSentContext,
++} from "../../hooks/message-hook-mappers.js";
+ import {
+   listRuntimeImageGenerationProviders,
+   generateImage,
+@@ -239,12 +244,50 @@ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}):
+     channel: createRuntimeChannel(),
+     events: createRuntimeEvents(),
+     hooks: {
++      hasMessageSendingHooks: () => {
++        const hookRunner = getGlobalHookRunner();
++        return hookRunner?.hasHooks("message_sending") ?? false;
++      },
++      runMessageSending: async (event, context) => {
++        const hookRunner = getGlobalHookRunner();
++        if (!hookRunner?.hasHooks("message_sending")) {
++          return undefined;
++        }
++        return await hookRunner.runMessageSending(event, context);
++      },
+       emitMessageSent: (event, context) => {
+         const hookRunner = getGlobalHookRunner();
+         if (!hookRunner?.hasHooks("message_sent")) {
++          if (!context.sessionKey) {
++            return;
++          }
++        } else {
++          void hookRunner.runMessageSent(event, context);
++        }
++        if (!context.sessionKey) {
+           return;
+         }
+-        void hookRunner.runMessageSent(event, context);
++        const canonical = buildCanonicalSentMessageHookContext({
++          to: event.to,
++          content: event.content,
++          success: event.success,
++          error: event.error,
++          channelId: context.channelId,
++          accountId: context.accountId,
++          conversationId: context.conversationId ?? event.to,
++          messageId: event.messageId,
++          metadata: event.metadata,
++          isGroup: context.isGroup,
++          groupId: context.groupId,
++        });
++        void triggerInternalHook(
++          createInternalHookEvent(
++            "message",
++            "sent",
++            context.sessionKey,
++            toInternalMessageSentContext(canonical),
++          ),
++        ).catch(() => {});
+       },
+     },
+     logging: createRuntimeLogging(),
+diff --git a/src/plugins/runtime/types-core.ts b/src/plugins/runtime/types-core.ts
+index 17173d9b79..572ab67316 100644
+--- a/src/plugins/runtime/types-core.ts
++++ b/src/plugins/runtime/types-core.ts
+@@ -92,6 +92,30 @@ export type PluginRuntimeCore = {
+     ) => RuntimeLogger;
+   };
+   hooks: {
++    hasMessageSendingHooks: () => boolean;
++    /**
++     * Run a message_sending plugin hook event.
++     * Use this from extensions that bypass the core deliverOutboundPayloads pipeline
++     * when they need the same pre-send modify/cancel behavior as standard outbound.
++     */
++    runMessageSending: (
++      event: {
++        to: string;
++        content: string;
++        metadata?: Record<string, unknown>;
++      },
++      context: {
++        channelId: string;
++        accountId?: string;
++        conversationId?: string;
++      },
++    ) => Promise<
++      | {
++          content?: string;
++          cancel?: boolean;
++        }
++      | undefined
++    >;
+     /**
+      * Emit a message_sent plugin hook event.
+      * Use this from extensions that bypass the core deliverOutboundPayloads pipeline
+@@ -111,6 +135,9 @@ export type PluginRuntimeCore = {
+         channelId: string;
+         accountId?: string;
+         conversationId?: string;
++        sessionKey?: string;
++        isGroup?: boolean;
++        groupId?: string;
+       },
+     ) => void;
+   };
+diff --git a/test/helpers/extensions/plugin-runtime-mock.ts b/test/helpers/extensions/plugin-runtime-mock.ts
+index a2e881ebba..ec4d193fd0 100644
+--- a/test/helpers/extensions/plugin-runtime-mock.ts
++++ b/test/helpers/extensions/plugin-runtime-mock.ts
+@@ -41,6 +41,12 @@ export function createPluginRuntimeMock(overrides: DeepPartial<PluginRuntime> =
+       runModelAwareAgent: vi.fn() as unknown as PluginRuntime["agents"]["runModelAwareAgent"],
+     },
+     hooks: {
++      hasMessageSendingHooks: vi.fn(
++        () => false,
++      ) as unknown as PluginRuntime["hooks"]["hasMessageSendingHooks"],
++      runMessageSending: vi.fn(
++        async () => undefined,
++      ) as unknown as PluginRuntime["hooks"]["runMessageSending"],
+       emitMessageSent: vi.fn() as unknown as PluginRuntime["hooks"]["emitMessageSent"],
+     },
+     config: {
+-- 
+2.50.1 (Apple Git-155)
+

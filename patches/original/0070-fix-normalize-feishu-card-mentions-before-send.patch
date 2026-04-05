@@ -1,0 +1,141 @@
+From 1bfd237ed870de959e2dac6cea47559e1123621f Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Thu, 26 Mar 2026 19:30:44 +0800
+Subject: [PATCH 70/98] fix: normalize feishu card mentions before send
+
+---
+ extensions/feishu/src/send.test.ts | 60 ++++++++++++++++++++++++++++++
+ extensions/feishu/src/send.ts      |  9 +++--
+ 2 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/extensions/feishu/src/send.test.ts b/extensions/feishu/src/send.test.ts
+index 0ff8b7dc17..88b33a690f 100644
+--- a/extensions/feishu/src/send.test.ts
++++ b/extensions/feishu/src/send.test.ts
+@@ -1,6 +1,7 @@
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import type { ClawdbotConfig } from "../runtime-api.js";
+ import {
++  buildMarkdownCard,
+   buildStructuredCard,
+   editMessageFeishu,
+   enrichMentionPlaceholders,
+@@ -434,6 +435,37 @@ describe("editMessageFeishu", () => {
+     expect(result).toEqual({ messageId: "om_edit_card", contentType: "interactive" });
+   });
+ 
++  it("normalizes text-style mentions before patching card markdown content", async () => {
++    mockClientPatch.mockResolvedValueOnce({ code: 0 });
++    mockResolveFeishuAccount.mockReturnValue({
++      accountId: "default",
++      configured: true,
++      config: { renderMode: "card" },
++    });
++
++    const result = await editMessageFeishu({
++      cfg: {} as ClawdbotConfig,
++      messageId: "om_edit_card_mentions",
++      text: '<at user_id="ou_123">Emma</at> updated body',
++    });
++
++    expect(mockClientPatch).toHaveBeenCalledWith({
++      path: { message_id: "om_edit_card_mentions" },
++      data: {
++        content: JSON.stringify({
++          schema: "2.0",
++          config: {
++            wide_screen_mode: true,
++          },
++          body: {
++            elements: [{ tag: "markdown", content: "<at id=ou_123></at> updated body" }],
++          },
++        }),
++      },
++    });
++    expect(result).toEqual({ messageId: "om_edit_card_mentions", contentType: "interactive" });
++  });
++
+   it("patches interactive content for text edits in auto mode when markdown needs cards", async () => {
+     mockClientPatch.mockResolvedValueOnce({ code: 0 });
+     mockResolveFeishuAccount.mockReturnValue({
+@@ -494,6 +526,34 @@ describe("buildStructuredCard", () => {
+       }),
+     );
+   });
++
++  it("normalizes text-style mentions in markdown body content", () => {
++    const card = buildStructuredCard('<at user_id="ou_123">Emma</at> hello');
++
++    expect(card).toEqual(
++      expect.objectContaining({
++        body: {
++          elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
++        },
++      }),
++    );
++  });
++});
++
++describe("buildMarkdownCard", () => {
++  it("normalizes text-style mentions before building markdown cards", () => {
++    const card = buildMarkdownCard('<at user_id="ou_123">Emma</at> hello');
++
++    expect(card).toEqual({
++      schema: "2.0",
++      config: {
++        wide_screen_mode: true,
++      },
++      body: {
++        elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
++      },
++    });
++  });
+ });
+ 
+ describe("enrichMentionPlaceholders", () => {
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index 4da3678fdb..10840b5e00 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -646,9 +646,10 @@ export async function editMessageFeishu(params: {
+ 
+   const renderMode = account.config?.renderMode ?? "auto";
+   if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text!))) {
++    const normalizedCardText = normalizeMentionTagsForCard(text!);
+     const response = await client.im.message.patch({
+       path: { message_id: messageId },
+-      data: { content: JSON.stringify(buildMarkdownCard(text!)) },
++      data: { content: JSON.stringify(buildMarkdownCard(normalizedCardText)) },
+     });
+ 
+     if (response.code !== 0) {
+@@ -711,6 +712,7 @@ export function shouldUseFeishuMarkdownCard(text: string): boolean {
+  * Uses schema 2.0 format for proper markdown rendering.
+  */
+ export function buildMarkdownCard(text: string): Record<string, unknown> {
++  const normalizedText = normalizeMentionTagsForCard(text);
+   return {
+     schema: "2.0",
+     config: {
+@@ -720,7 +722,7 @@ export function buildMarkdownCard(text: string): Record<string, unknown> {
+       elements: [
+         {
+           tag: "markdown",
+-          content: text,
++          content: normalizedText,
+         },
+       ],
+     },
+@@ -754,7 +756,8 @@ export function buildStructuredCard(
+     note?: string;
+   },
+ ): Record<string, unknown> {
+-  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: text }];
++  const normalizedText = normalizeMentionTagsForCard(text);
++  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: normalizedText }];
+   if (options?.note) {
+     elements.push({ tag: "hr" });
+     elements.push({ tag: "markdown", content: `<font color='grey'>${options.note}</font>` });
+-- 
+2.50.1 (Apple Git-155)
+

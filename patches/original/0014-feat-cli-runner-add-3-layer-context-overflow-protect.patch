@@ -1,0 +1,1713 @@
+From 210f94fabc69ee0fd483be8cff6b909ab58419b5 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 7 Mar 2026 11:07:45 +0800
+Subject: [PATCH 14/98] feat(cli-runner): add 3-layer context overflow
+ protection (#13)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(cli-runner): add 3-layer context overflow protection
+
+Layer 1 - Pre-flight guard: estimate tokens after building system prompt,
+downgrade bootstrap profile (normal → reduced → minimal) if exceeding
+70% of context window.
+
+Layer 2 - Overflow retry: on context overflow error, rebuild with minimal
+bootstrap and retry once. Second failure gives explicit error suggesting
+pi-embedded runtime or task splitting.
+
+Layer 3 - Dynamic budget: resolveBootstrapBudgetForModel() calculates
+bootstrap char budget from model context window (reserve 30%, min 30K tokens).
+
+Adds BootstrapProfile type with normal/reduced/minimal configs,
+observability logging (estimated_tokens, context_window, reserve,
+trim_profile, retry_count), and 14 unit tests.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+* fix(cli-runner): connect Layer 3 dynamic budget + include task prompt in guard
+
+P0-1: resolveBootstrapTotalMaxChars() now receives contextWindowTokens
+so the dynamic budget actually affects the initial bootstrap build.
+
+P0-2: Pre-flight token estimation now includes promptForRun (user task
+prompt + prepended context), not just the system prompt. Prevents the
+guard from passing when the total prompt would still overflow.
+
+Context window resolution moved earlier (before bootstrap build) so it
+serves both Layer 3 (initial budget) and Layer 1 (pre-flight guard).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+* fix(cli-runner): wire Layer 3 dynamic budget into actual file injection
+
+resolveBootstrapContextForRun() now accepts contextWindowTokens and
+passes it to resolveBootstrapTotalMaxChars(), so the dynamic budget
+controls the actual bootstrap file injection—not just the analysis/report.
+
+Previously contextWindowTokens only affected the stats layer while
+buildBootstrapContextFiles() still used the static 150K default.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/agents/bootstrap-budget.ts                |   2 +
+ src/agents/bootstrap-compaction.test.ts       | 592 ++++++++++++++++++
+ src/agents/bootstrap-compaction.ts            | 269 ++++++++
+ src/agents/bootstrap-files.ts                 |   4 +-
+ src/agents/cli-runner.ts                      | 312 ++++++++-
+ src/agents/model-selection.test.ts            |  66 ++
+ src/agents/model-selection.ts                 |  36 ++
+ ...mbedded-helpers.bootstrap-profiles.test.ts | 106 ++++
+ src/agents/pi-embedded-helpers.ts             |   4 +
+ src/agents/pi-embedded-helpers/bootstrap.ts   |  51 +-
+ src/config/zod-schema.agent-defaults.ts       |   4 +
+ 11 files changed, 1441 insertions(+), 5 deletions(-)
+ create mode 100644 src/agents/bootstrap-compaction.test.ts
+ create mode 100644 src/agents/bootstrap-compaction.ts
+ create mode 100644 src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts
+
+diff --git a/src/agents/bootstrap-budget.ts b/src/agents/bootstrap-budget.ts
+index ddfd4fb5d0..bd063b5533 100644
+--- a/src/agents/bootstrap-budget.ts
++++ b/src/agents/bootstrap-budget.ts
+@@ -2,6 +2,8 @@ import path from "node:path";
+ import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
+ import type { WorkspaceBootstrapFile } from "./workspace.js";
+ 
++export type { BootstrapProfile, BootstrapProfileConfig } from "./pi-embedded-helpers.js";
++
+ export const DEFAULT_BOOTSTRAP_NEAR_LIMIT_RATIO = 0.85;
+ export const DEFAULT_BOOTSTRAP_PROMPT_WARNING_MAX_FILES = 3;
+ export const DEFAULT_BOOTSTRAP_PROMPT_WARNING_SIGNATURE_HISTORY_MAX = 32;
+diff --git a/src/agents/bootstrap-compaction.test.ts b/src/agents/bootstrap-compaction.test.ts
+new file mode 100644
+index 0000000000..faab227e29
+--- /dev/null
++++ b/src/agents/bootstrap-compaction.test.ts
+@@ -0,0 +1,592 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  type CompactionLlmFn,
++  DEFAULT_COMPACTION_TIMEOUT_MS,
++  clearCompactionCache,
++  compactBootstrapFile,
++  compactBootstrapFiles,
++  isCompactableFile,
++  resolveCompactionConfig,
++} from "./bootstrap-compaction.js";
++
++// ── Helpers ───────────────────────────────────────────────────────────────────
++
++const STRUCTURED_SUMMARY = `## Key Rules
++- Rule A
++- Rule B
++
++## Recent Decisions
++- Decision X made because Y
++
++## Open Tasks / Blockers
++- Task 1: in-progress
++
++## Critical References
++- /path/to/file.ts`;
++
++/** Creates a mock llmFn that returns the given text. */
++function makeLlmFn(response: string): CompactionLlmFn & ReturnType<typeof vi.fn> {
++  return vi.fn().mockResolvedValue(response) as CompactionLlmFn & ReturnType<typeof vi.fn>;
++}
++
++/** Creates a mock llmFn that rejects with the given error. */
++function makeFailingLlmFn(error: Error): CompactionLlmFn & ReturnType<typeof vi.fn> {
++  return vi.fn().mockRejectedValue(error) as CompactionLlmFn & ReturnType<typeof vi.fn>;
++}
++
++// ── isCompactableFile ─────────────────────────────────────────────────────────
++
++describe("isCompactableFile", () => {
++  it("accepts MEMORY.md", () => {
++    expect(isCompactableFile("/workspace/MEMORY.md")).toBe(true);
++    expect(isCompactableFile("MEMORY.md")).toBe(true);
++  });
++
++  it("accepts memory/YYYY-MM-DD.md", () => {
++    expect(isCompactableFile("/workspace/memory/2026-03-07.md")).toBe(true);
++    expect(isCompactableFile("memory/2024-01-01.md")).toBe(true);
++    expect(isCompactableFile("/home/user/memory/2025-12-31.md")).toBe(true);
++  });
++
++  it("rejects AGENTS.md", () => {
++    expect(isCompactableFile("/workspace/AGENTS.md")).toBe(false);
++  });
++
++  it("rejects SOUL.md", () => {
++    expect(isCompactableFile("/workspace/SOUL.md")).toBe(false);
++  });
++
++  it("rejects IDENTITY.md", () => {
++    expect(isCompactableFile("IDENTITY.md")).toBe(false);
++  });
++
++  it("rejects CONSTITUTION.md", () => {
++    expect(isCompactableFile("/workspace/CONSTITUTION.md")).toBe(false);
++  });
++
++  it("rejects arbitrary .md files", () => {
++    expect(isCompactableFile("/workspace/README.md")).toBe(false);
++    expect(isCompactableFile("/workspace/TOOLS.md")).toBe(false);
++    expect(isCompactableFile("/workspace/memory/notes.md")).toBe(false);
++  });
++
++  it("rejects MEMORY.md in wrong directory (date-like name but wrong parent)", () => {
++    // A date-named .md that is not inside a 'memory' directory
++    expect(isCompactableFile("/workspace/logs/2026-03-07.md")).toBe(false);
++  });
++
++  it("accepts memory/YYYY-MM-DD.md only when parent dir is 'memory'", () => {
++    expect(isCompactableFile("/workspace/archive/2026-03-07.md")).toBe(false);
++    expect(isCompactableFile("/workspace/memory/2026-03-07.md")).toBe(true);
++  });
++});
++
++// ── resolveCompactionConfig ───────────────────────────────────────────────────
++
++describe("resolveCompactionConfig", () => {
++  it("returns empty config when cfg is undefined", () => {
++    const result = resolveCompactionConfig(undefined);
++    expect(result.model).toBeUndefined();
++    expect(result.timeoutMs).toBeUndefined();
++  });
++
++  it("returns empty config when agents.defaults.compaction is absent", () => {
++    const result = resolveCompactionConfig({ agents: { defaults: {} } } as never);
++    expect(result.model).toBeUndefined();
++    expect(result.timeoutMs).toBeUndefined();
++  });
++
++  it("reads model from config", () => {
++    const cfg = {
++      agents: { defaults: { compaction: { model: "claude-haiku-4-5-20251001" } } },
++    } as never;
++    const result = resolveCompactionConfig(cfg);
++    expect(result.model).toBe("claude-haiku-4-5-20251001");
++  });
++
++  it("reads timeoutMs from config", () => {
++    const cfg = {
++      agents: { defaults: { compaction: { timeoutMs: 15_000 } } },
++    } as never;
++    const result = resolveCompactionConfig(cfg);
++    expect(result.timeoutMs).toBe(15_000);
++  });
++
++  it("reads both model and timeoutMs from config", () => {
++    const cfg = {
++      agents: {
++        defaults: { compaction: { model: "claude-opus-4-6", timeoutMs: 60_000 } },
++      },
++    } as never;
++    const result = resolveCompactionConfig(cfg);
++    expect(result.model).toBe("claude-opus-4-6");
++    expect(result.timeoutMs).toBe(60_000);
++  });
++
++  it("ignores non-string model values", () => {
++    const cfg = {
++      agents: { defaults: { compaction: { model: 42 } } },
++    } as never;
++    const result = resolveCompactionConfig(cfg);
++    expect(result.model).toBeUndefined();
++  });
++
++  it("ignores non-number timeoutMs values", () => {
++    const cfg = {
++      agents: { defaults: { compaction: { timeoutMs: "30000" } } },
++    } as never;
++    const result = resolveCompactionConfig(cfg);
++    expect(result.timeoutMs).toBeUndefined();
++  });
++
++  it("DEFAULT_COMPACTION_TIMEOUT_MS is 30 seconds", () => {
++    expect(DEFAULT_COMPACTION_TIMEOUT_MS).toBe(30_000);
++  });
++});
++
++// ── compactBootstrapFile ──────────────────────────────────────────────────────
++
++describe("compactBootstrapFile", () => {
++  beforeEach(() => {
++    clearCompactionCache();
++  });
++
++  it("calls llmFn and returns compacted content", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const { compacted, result } = await compactBootstrapFile({
++      content: "Some long memory content that needs compaction.",
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(compacted).toBe(STRUCTURED_SUMMARY);
++    expect(result.success).toBe(true);
++    expect(result.path).toBe("/workspace/MEMORY.md");
++    expect(result.charsBefore).toBe("Some long memory content that needs compaction.".length);
++    expect(result.charsAfter).toBe(STRUCTURED_SUMMARY.length);
++    expect(llmFn).toHaveBeenCalledOnce();
++  });
++
++  it("passes content as user prompt to llmFn", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    await compactBootstrapFile({
++      content: "Memory content to compact",
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(llmFn).toHaveBeenCalledWith("Memory content to compact", undefined);
++  });
++
++  it("returns original content with success=false on llmFn error", async () => {
++    const llmFn = makeFailingLlmFn(new Error("API error 500"));
++
++    const content = "Original memory content";
++    const { compacted, result } = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(result.success).toBe(false);
++    expect(compacted).toBe(content);
++    expect(result.fallbackReason).toContain("API error 500");
++    expect(result.charsAfter).toBe(content.length);
++  });
++
++  it("returns original content with success=false on llmFn rejection", async () => {
++    const llmFn = makeFailingLlmFn(new Error("Network error"));
++
++    const content = "Original memory content";
++    const { compacted, result } = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(result.success).toBe(false);
++    expect(compacted).toBe(content);
++    expect(result.fallbackReason).toContain("Network error");
++  });
++
++  it("truncates input to COMPACTION_MAX_INPUT_CHARS with head+tail split before sending", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const longContent = "H".repeat(5_000) + "T".repeat(10_000); // 15K, exceeds 10K limit
++    await compactBootstrapFile({
++      content: longContent,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    const sentPrompt = llmFn.mock.calls[0][0] as string;
++    // Head 30% = 3000 chars, tail 70% = 7000 chars, plus omission marker in between
++    expect(sentPrompt).toContain("[... middle content omitted for compaction ...]");
++    expect(sentPrompt.startsWith("H")).toBe(true);
++    expect(sentPrompt.endsWith("T")).toBe(true);
++    // Total should be 10K + marker length
++    const markerLen = "\n\n[... middle content omitted for compaction ...]\n\n".length;
++    expect(sentPrompt.length).toBe(10_000 + markerLen);
++  });
++
++  it("passes signal to llmFn", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++    const signal = AbortSignal.abort();
++
++    await compactBootstrapFile({
++      content: "Memory content",
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++      signal,
++    });
++
++    expect(llmFn).toHaveBeenCalledWith("Memory content", signal);
++  });
++});
++
++// ── Content-hash caching ──────────────────────────────────────────────────────
++
++describe("compactBootstrapFile - content-hash cache", () => {
++  beforeEach(() => {
++    clearCompactionCache();
++  });
++
++  it("returns cached result without calling LLM on second call with same content", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const content = "Memory content for caching test";
++
++    // First call — should hit the LLM
++    const first = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledOnce();
++
++    // Second call with same content — should use cache
++    const second = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledOnce(); // still only one call
++    expect(second.compacted).toBe(first.compacted);
++  });
++
++  it("calls LLM again when content changes (cache miss)", async () => {
++    const llmFn = vi
++      .fn()
++      .mockResolvedValueOnce("Summary A")
++      .mockResolvedValueOnce("Summary B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
++
++    await compactBootstrapFile({
++      content: "Content version 1",
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(1);
++
++    await compactBootstrapFile({
++      content: "Content version 2 — different content",
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(2);
++  });
++
++  it("cache is keyed by file path — different paths do not share cache", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const content = "Same content for both files";
++
++    await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    await compactBootstrapFile({
++      content,
++      filePath: "/workspace/memory/2026-03-07.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    // Different file paths → two separate LLM calls
++    expect(llmFn).toHaveBeenCalledTimes(2);
++  });
++
++  it("invalidates cache when only middle content changes (full-content hash)", async () => {
++    const llmFn = vi
++      .fn()
++      .mockResolvedValueOnce("Summary A")
++      .mockResolvedValueOnce("Summary B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
++
++    // Content > 10K so it gets truncated (head 3K + tail 7K).
++    // Head and tail stay identical; only the middle (which is omitted from LLM input) changes.
++    const head = "H".repeat(3_000);
++    const tail = "T".repeat(7_000);
++    const contentV1 = head + "MIDDLE-V1".repeat(500) + tail; // well over 10K
++    const contentV2 = head + "MIDDLE-V2".repeat(500) + tail; // same head/tail, different middle
++
++    await compactBootstrapFile({
++      content: contentV1,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(1);
++
++    // Middle changed → full-content hash differs → cache miss → second LLM call
++    const { compacted } = await compactBootstrapFile({
++      content: contentV2,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(2);
++    expect(compacted).toBe("Summary B");
++  });
++
++  it("cache invalidates when modelRef changes", async () => {
++    const llmFn = vi
++      .fn()
++      .mockResolvedValueOnce("Summary model-A")
++      .mockResolvedValueOnce("Summary model-B") as CompactionLlmFn & ReturnType<typeof vi.fn>;
++
++    const content = "Same content for both calls";
++
++    await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "provider/model-a",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(1);
++
++    // Same content, different model → cache miss
++    const { compacted } = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "provider/model-b",
++    });
++    expect(llmFn).toHaveBeenCalledTimes(2);
++    expect(compacted).toBe("Summary model-B");
++  });
++
++  it("hits cache when both content and modelRef are identical", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const content = "Content for model-aware cache test";
++    const modelRef = "anthropic/claude-haiku-4-5-20251001";
++
++    await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef,
++    });
++    await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef,
++    });
++    expect(llmFn).toHaveBeenCalledOnce();
++  });
++});
++
++// ── Timeout handling ──────────────────────────────────────────────────────────
++
++describe("compactBootstrapFile - timeout handling", () => {
++  beforeEach(() => {
++    clearCompactionCache();
++  });
++
++  it("falls back gracefully when llmFn is aborted", async () => {
++    const abortError = new DOMException("The operation was aborted.", "AbortError");
++    const llmFn = makeFailingLlmFn(abortError);
++
++    const content = "Memory content";
++    const { compacted, result } = await compactBootstrapFile({
++      content,
++      filePath: "/workspace/MEMORY.md",
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++      signal: AbortSignal.abort(), // pre-aborted
++    });
++
++    expect(result.success).toBe(false);
++    expect(compacted).toBe(content); // original content returned
++    expect(result.fallbackReason).toBeTruthy();
++  });
++});
++
++// ── compactBootstrapFiles (orchestrator) ──────────────────────────────────────
++
++describe("compactBootstrapFiles", () => {
++  beforeEach(() => {
++    clearCompactionCache();
++  });
++
++  it("returns unchanged files when no compactable files present", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const contextFiles = [
++      { path: "/workspace/AGENTS.md", content: "Agents content" },
++      { path: "/workspace/SOUL.md", content: "Soul content" },
++    ];
++
++    const { contextFiles: result, results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(result).toEqual(contextFiles);
++    expect(results).toHaveLength(0);
++    expect(llmFn).not.toHaveBeenCalled();
++  });
++
++  it("compacts MEMORY.md and replaces its content", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const contextFiles = [
++      { path: "/workspace/AGENTS.md", content: "Agents content (not compactable)" },
++      { path: "/workspace/MEMORY.md", content: "Long memory content".repeat(100) },
++    ];
++
++    const { contextFiles: result, results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(result).toHaveLength(2);
++    // AGENTS.md should be unchanged
++    expect(result[0].content).toBe("Agents content (not compactable)");
++    // MEMORY.md should be compacted
++    expect(result[1].content).toBe(STRUCTURED_SUMMARY);
++    expect(results).toHaveLength(1);
++    expect(results[0].success).toBe(true);
++    expect(results[0].path).toBe("/workspace/MEMORY.md");
++  });
++
++  it("compacts memory/YYYY-MM-DD.md files", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const contextFiles = [
++      { path: "/workspace/memory/2026-03-07.md", content: "Daily log content".repeat(50) },
++    ];
++
++    const { contextFiles: result, results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(result[0].content).toBe(STRUCTURED_SUMMARY);
++    expect(results[0].success).toBe(true);
++  });
++
++  it("selects only the largest 3 compactable files", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const contextFiles = [
++      { path: "/workspace/MEMORY.md", content: "A".repeat(5000) },
++      { path: "/workspace/memory/2026-03-05.md", content: "B".repeat(3000) },
++      { path: "/workspace/memory/2026-03-06.md", content: "C".repeat(4000) },
++      { path: "/workspace/memory/2026-03-07.md", content: "D".repeat(2000) },
++      // 4 compactable files → only 3 largest should be compacted
++    ];
++
++    const { results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(results).toHaveLength(3);
++    expect(llmFn).toHaveBeenCalledTimes(3);
++    // Verify the 3 largest were selected (MEMORY.md=5000, 2026-03-06=4000, 2026-03-05=3000)
++    const compactedPaths = results.map((r) => r.path).toSorted();
++    expect(compactedPaths).toContain("/workspace/MEMORY.md");
++    expect(compactedPaths).toContain("/workspace/memory/2026-03-06.md");
++    expect(compactedPaths).toContain("/workspace/memory/2026-03-05.md");
++    // Smallest (2026-03-07=2000) should NOT be compacted
++    expect(compactedPaths).not.toContain("/workspace/memory/2026-03-07.md");
++  });
++
++  it("preserves original content for files that fail compaction", async () => {
++    const llmFn = makeFailingLlmFn(new Error("API unavailable"));
++
++    const originalContent = "Memory content to compact";
++    const contextFiles = [{ path: "/workspace/MEMORY.md", content: originalContent }];
++
++    const { contextFiles: result, results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    // Content should be unchanged on failure
++    expect(result[0].content).toBe(originalContent);
++    expect(results[0].success).toBe(false);
++    expect(results[0].fallbackReason).toContain("API unavailable");
++  });
++
++  it("returns CompactionResult with correct charsBefore and charsAfter on success", async () => {
++    const llmFn = makeLlmFn(STRUCTURED_SUMMARY);
++
++    const originalContent = "Original content";
++    const contextFiles = [{ path: "/workspace/MEMORY.md", content: originalContent }];
++
++    const { results } = await compactBootstrapFiles({
++      contextFiles,
++      config: {},
++      llmFn,
++      modelRef: "test/model",
++    });
++
++    expect(results[0].charsBefore).toBe(originalContent.length);
++    expect(results[0].charsAfter).toBe(STRUCTURED_SUMMARY.length);
++  });
++});
+diff --git a/src/agents/bootstrap-compaction.ts b/src/agents/bootstrap-compaction.ts
+new file mode 100644
+index 0000000000..9b2c49221d
+--- /dev/null
++++ b/src/agents/bootstrap-compaction.ts
+@@ -0,0 +1,269 @@
++import { createHash } from "node:crypto";
++import path from "node:path";
++import type { OpenClawConfig } from "../config/config.js";
++import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
++
++// ── Constants ─────────────────────────────────────────────────────────────────
++
++export const DEFAULT_COMPACTION_TIMEOUT_MS = 30_000;
++const COMPACTION_MAX_INPUT_CHARS = 10_000;
++const COMPACTION_MAX_FILES = 3;
++/** Bump this when COMPACTION_SYSTEM_PROMPT changes to invalidate caches. */
++const COMPACTION_CACHE_VERSION = 1;
++
++export const COMPACTION_SYSTEM_PROMPT = [
++  "You are a memory compaction assistant. Given the content of a memory file, produce a structured summary using EXACTLY the following template — no additional sections, no content outside the headers:",
++  "",
++  "## Key Rules",
++  "[Essential rules and constraints from the original content]",
++  "",
++  "## Recent Decisions",
++  "[Decisions made recently with rationale]",
++  "",
++  "## Open Tasks / Blockers",
++  "[Active tasks, their status, and any blockers]",
++  "",
++  "## Critical References",
++  "[Important file paths, URLs, IDs, and technical details that must be preserved exactly]",
++  "",
++  "RULES:",
++  "- Use the exact four section headers above.",
++  "- Preserve all identifiers exactly: UUIDs, IDs, file paths, URLs, IP addresses, model names, config keys.",
++  "- Prioritize recent information over older information.",
++  "- Keep output under 5000 characters total.",
++  "- If a section has no relevant content, write '[none]' for that section.",
++].join("\n");
++
++// ── Types ─────────────────────────────────────────────────────────────────────
++
++export interface BootstrapCompactionConfig {
++  /**
++   * Model to use for compaction (provider/model format, e.g. "anthropic/claude-haiku-4-5-20251001").
++   * When unset, inherits the agent's current model.
++   */
++  model?: string;
++  /** Timeout in ms. Default 30_000. */
++  timeoutMs?: number;
++}
++
++export interface CompactionResult {
++  /** Original file path */
++  path: string;
++  /** Original char count */
++  charsBefore: number;
++  /** Compacted char count */
++  charsAfter: number;
++  /** Whether compaction was attempted and succeeded */
++  success: boolean;
++  /** If failed, the reason */
++  fallbackReason?: string;
++}
++
++/**
++ * Provider-agnostic LLM call function.
++ * Takes the user prompt (with system prompt already embedded by the caller or
++ * handled internally) and returns the model's text response.
++ *
++ * The caller is responsible for wiring up model resolution, auth, and the
++ * actual API call (via completeSimple or equivalent).
++ */
++export type CompactionLlmFn = (userPrompt: string, signal?: AbortSignal) => Promise<string>;
++
++// ── Content-hash cache ────────────────────────────────────────────────────────
++
++/**
++ * In-memory cache (process lifetime). Key = file path, value = { hash, compacted }.
++ * Avoids redundant LLM calls when file content hasn't changed.
++ */
++const compactionCache = new Map<string, { hash: string; compacted: string }>();
++
++/** Exported for testing only. */
++export function clearCompactionCache(): void {
++  compactionCache.clear();
++}
++
++function getContentHash(content: string): string {
++  return createHash("sha256").update(content).digest("hex").slice(0, 16);
++}
++
++// ── Public API ────────────────────────────────────────────────────────────────
++
++/**
++ * Resolve compaction config from OpenClawConfig.
++ * Config path: cfg.agents.defaults.compaction.model / .timeoutMs
++ */
++export function resolveCompactionConfig(cfg?: OpenClawConfig): BootstrapCompactionConfig {
++  // The existing AgentCompactionConfig type doesn't include bootstrap-specific fields,
++  // so we access them via a type-erased cast. They're optional runtime extensions.
++  const raw = cfg?.agents?.defaults?.compaction as unknown as
++    | { model?: unknown; timeoutMs?: unknown }
++    | undefined;
++  return {
++    model: typeof raw?.model === "string" ? raw.model : undefined,
++    timeoutMs: typeof raw?.timeoutMs === "number" ? raw.timeoutMs : undefined,
++  };
++}
++
++/**
++ * Check if a bootstrap file is eligible for compaction.
++ * Only MEMORY.md and memory/YYYY-MM-DD.md files can be compacted.
++ */
++export function isCompactableFile(filePath: string): boolean {
++  const basename = path.basename(filePath);
++  if (basename === "MEMORY.md") {
++    return true;
++  }
++  // Match memory/YYYY-MM-DD.md pattern
++  if (/^20\d{2}-\d{2}-\d{2}\.md$/.test(basename)) {
++    const dir = path.basename(path.dirname(filePath));
++    return dir === "memory";
++  }
++  return false;
++}
++
++// ── Core compaction functions ─────────────────────────────────────────────────
++
++/**
++ * Compact a single bootstrap file using LLM summarization.
++ *
++ * Uses content-hash caching: if the file content hasn't changed since last
++ * compaction, returns the cached result without calling the LLM.
++ *
++ * The actual LLM call is delegated to `llmFn`, making this function
++ * provider-agnostic. The caller wires up model resolution and auth.
++ *
++ * Always returns successfully — on LLM failure, returns the original content
++ * with success=false and fallbackReason set.
++ */
++export async function compactBootstrapFile(params: {
++  content: string;
++  filePath: string;
++  config: BootstrapCompactionConfig;
++  /** Provider-agnostic LLM call. The caller resolves model + auth. */
++  llmFn: CompactionLlmFn;
++  /** Resolved "provider/model" used for compaction. Included in cache key so switching models invalidates. */
++  modelRef: string;
++  signal?: AbortSignal;
++}): Promise<{ compacted: string; result: CompactionResult }> {
++  const { content, filePath, signal } = params;
++  const charsBefore = content.length;
++
++  // Enforce max input size — head+tail split to preserve recent content at end of file.
++  // MEMORY.md and daily memory files have latest entries at the bottom.
++  let inputContent: string;
++  if (content.length > COMPACTION_MAX_INPUT_CHARS) {
++    const headChars = Math.floor(COMPACTION_MAX_INPUT_CHARS * 0.3);
++    const tailChars = COMPACTION_MAX_INPUT_CHARS - headChars;
++    inputContent =
++      content.slice(0, headChars) +
++      "\n\n[... middle content omitted for compaction ...]\n\n" +
++      content.slice(-tailChars);
++  } else {
++    inputContent = content;
++  }
++
++  // Cache lookup — hash the FULL content (pre-truncation) so middle-of-file
++  // edits invalidate the cache. Include cache version + resolved model so
++  // prompt changes and model switches also miss.
++  const hashInput = `v${COMPACTION_CACHE_VERSION}:${params.modelRef}:${content}`;
++  const contentHash = getContentHash(hashInput);
++  const cached = compactionCache.get(filePath);
++  if (cached?.hash === contentHash) {
++    return {
++      compacted: cached.compacted,
++      result: {
++        path: filePath,
++        charsBefore,
++        charsAfter: cached.compacted.length,
++        success: true,
++      },
++    };
++  }
++
++  try {
++    const compacted = await params.llmFn(inputContent, signal);
++
++    compactionCache.set(filePath, { hash: contentHash, compacted });
++
++    return {
++      compacted,
++      result: {
++        path: filePath,
++        charsBefore,
++        charsAfter: compacted.length,
++        success: true,
++      },
++    };
++  } catch (err) {
++    const fallbackReason = err instanceof Error ? err.message : String(err);
++    return {
++      compacted: content,
++      result: {
++        path: filePath,
++        charsBefore,
++        charsAfter: charsBefore,
++        success: false,
++        fallbackReason,
++      },
++    };
++  }
++}
++
++/**
++ * Try to compact eligible files in a bootstrap context file list.
++ * Selects up to COMPACTION_MAX_FILES largest compactable files.
++ * Returns new context files with compacted content + per-file results.
++ */
++export async function compactBootstrapFiles(params: {
++  contextFiles: EmbeddedContextFile[];
++  config: BootstrapCompactionConfig;
++  /** Provider-agnostic LLM call. The caller resolves model + auth. */
++  llmFn: CompactionLlmFn;
++  /** Resolved "provider/model" used for compaction. Passed to per-file cache key. */
++  modelRef: string;
++  signal?: AbortSignal;
++}): Promise<{
++  contextFiles: EmbeddedContextFile[];
++  results: CompactionResult[];
++}> {
++  const { contextFiles, config, signal } = params;
++
++  // Select compactable files, sorted by size descending, capped at max
++  const compactable = contextFiles
++    .filter((f) => isCompactableFile(f.path))
++    .toSorted((a, b) => b.content.length - a.content.length)
++    .slice(0, COMPACTION_MAX_FILES);
++
++  if (compactable.length === 0) {
++    return { contextFiles, results: [] };
++  }
++
++  const compactableSet = new Set(compactable.map((f) => f.path));
++  const results: CompactionResult[] = [];
++  const compactedMap = new Map<string, string>();
++
++  for (const file of compactable) {
++    const { compacted, result } = await compactBootstrapFile({
++      content: file.content,
++      filePath: file.path,
++      config,
++      llmFn: params.llmFn,
++      modelRef: params.modelRef,
++      signal,
++    });
++    results.push(result);
++    if (result.success) {
++      compactedMap.set(file.path, compacted);
++    }
++  }
++
++  // Rebuild context files list with compacted content where successful
++  const updatedContextFiles = contextFiles.map((f) => {
++    if (compactableSet.has(f.path) && compactedMap.has(f.path)) {
++      return { ...f, content: compactedMap.get(f.path) as string };
++    }
++    return f;
++  });
++
++  return { contextFiles: updatedContextFiles, results };
++}
+diff --git a/src/agents/bootstrap-files.ts b/src/agents/bootstrap-files.ts
+index ae544ebbac..7090329d2b 100644
+--- a/src/agents/bootstrap-files.ts
++++ b/src/agents/bootstrap-files.ts
+@@ -104,6 +104,8 @@ export async function resolveBootstrapContextForRun(params: {
+   warn?: (message: string) => void;
+   contextMode?: BootstrapContextMode;
+   runKind?: BootstrapContextRunKind;
++  /** When provided, dynamically adjusts bootstrap budget based on model context window. */
++  contextWindowTokens?: number;
+ }): Promise<{
+   bootstrapFiles: WorkspaceBootstrapFile[];
+   contextFiles: EmbeddedContextFile[];
+@@ -111,7 +113,7 @@ export async function resolveBootstrapContextForRun(params: {
+   const bootstrapFiles = await resolveBootstrapFilesForRun(params);
+   const contextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+     maxChars: resolveBootstrapMaxChars(params.config),
+-    totalMaxChars: resolveBootstrapTotalMaxChars(params.config),
++    totalMaxChars: resolveBootstrapTotalMaxChars(params.config, params.contextWindowTokens),
+     warn: params.warn,
+   });
+   return { bootstrapFiles, contextFiles };
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 2f33e2653b..1f0d30315f 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -2,7 +2,7 @@ import crypto from "node:crypto";
+ import fs from "node:fs/promises";
+ import os from "node:os";
+ import path from "node:path";
+-import type { ImageContent } from "@mariozechner/pi-ai";
++import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
+ import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
+ import type { ThinkLevel } from "../auto-reply/thinking.js";
+ import type { OpenClawConfig } from "../config/config.js";
+@@ -26,6 +26,12 @@ import {
+   buildBootstrapPromptWarning,
+   buildBootstrapTruncationReportMeta,
+ } from "./bootstrap-budget.js";
++import {
++  COMPACTION_SYSTEM_PROMPT,
++  DEFAULT_COMPACTION_TIMEOUT_MS,
++  compactBootstrapFiles,
++  resolveCompactionConfig,
++} from "./bootstrap-compaction.js";
+ import { makeBootstrapWarn, resolveBootstrapContextForRun } from "./bootstrap-files.js";
+ import { resolveCliBackendConfig } from "./cli-backends.js";
+ import {
+@@ -44,16 +50,28 @@ import {
+   resolveSystemPromptUsage,
+   writeCliImages,
+ } from "./cli-runner/helpers.js";
++import { resolveContextWindowInfo } from "./context-window-guard.js";
+ import { resolveOpenClawDocsPath } from "./docs-path.js";
+ import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
++import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
++import {
++  isCliProvider,
++  resolveDefaultModelForAgent,
++  resolveNonCliModelRef,
++} from "./model-selection.js";
+ import {
++  buildBootstrapContextFiles,
+   classifyFailoverReason,
++  getBootstrapProfileConfig,
++  isContextOverflowError,
+   isFailoverErrorMessage,
+   resolveBootstrapMaxChars,
+   resolveBootstrapPromptTruncationWarningMode,
+   resolveBootstrapTotalMaxChars,
++  type BootstrapProfile,
+ } from "./pi-embedded-helpers.js";
+ import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
++import { resolveModel } from "./pi-embedded-runner/model.js";
+ import {
+   applySkillEnvOverrides,
+   applySkillEnvOverridesFromSnapshot,
+@@ -98,6 +116,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null;
+ }
+ 
++/** Rough token estimate using chars/4 heuristic (conservative for English-heavy content). */
++function estimatePromptTokens(text: string): number {
++  return Math.ceil(text.length / 4);
++}
++
+ function resolveConfiguredPath(rawPath: string | undefined): string | undefined {
+   const trimmed = rawPath?.trim();
+   if (!trimmed) {
+@@ -467,15 +490,26 @@ export async function runCliAgent(params: {
+         .join("\n");
+ 
+   const sessionLabel = params.sessionKey ?? params.sessionId;
++
++  // Resolve context window early — needed by Layer 3 (dynamic budget) and Layer 1 (pre-flight guard).
++  const contextWindowInfo = resolveContextWindowInfo({
++    cfg: params.config,
++    provider: params.provider,
++    modelId: normalizedModel,
++    defaultTokens: 200_000,
++  });
++  let contextWindowTokens = contextWindowInfo.tokens;
++
+   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
+     workspaceDir,
+     config: params.config,
+     sessionKey: params.sessionKey,
+     sessionId: params.sessionId,
+     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
++    contextWindowTokens,
+   });
+   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
+-  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
++  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
+   const bootstrapAnalysis = analyzeBootstrapBudget({
+     files: buildBootstrapInjectionStats({
+       bootstrapFiles,
+@@ -578,7 +612,210 @@ export async function runCliAgent(params: {
+     modelDisplay,
+     agentId: sessionAgentId,
+   });
+-  const systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
++  let systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
++  let activeProfile: BootstrapProfile = "normal";
++
++  // Layer 1: Pre-flight context window guard
++  // Estimate tokens for the TOTAL prompt (system + task + images), not just system prompt.
++  if (!hookSystemPromptOverride) {
++    const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
++    // Estimate total prompt: system prompt + user task prompt (promptForRun includes prepended context)
++    let estimatedTokens = estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun);
++
++    // Compaction observability state
++    let compactionAttempted = false;
++    let compactedFilesList: string[] = [];
++    let compactionCharsBefore = 0;
++    let compactionCharsAfter = 0;
++    let compactionModelUsed = "";
++    let compactionFallbackReason: string | undefined;
++
++    if (estimatedTokens > hardLimitTokens) {
++      const warnForProfile = makeBootstrapWarn({
++        sessionLabel,
++        warn: (message) => log.warn(message),
++      });
++
++      // Track last-built profile context files so compaction can compact them
++      let lastProfileContextFiles = contextFiles;
++
++      for (const profile of ["reduced", "compaction", "minimal"] as (
++        | BootstrapProfile
++        | "compaction"
++      )[]) {
++        if (profile === "compaction") {
++          compactionAttempted = true;
++          const compactionCfg = resolveCompactionConfig(params.config);
++          // Resolve compaction model: config.model (may be "provider/model") or
++          // inherit the agent's current model + provider.
++          let compactionProvider: string;
++          let compactionModelRef: string;
++          if (compactionCfg.model?.includes("/")) {
++            compactionProvider = compactionCfg.model.split("/")[0];
++            compactionModelRef = compactionCfg.model.split("/").slice(1).join("/");
++          } else if (compactionCfg.model) {
++            compactionProvider = params.provider;
++            compactionModelRef = compactionCfg.model;
++          } else {
++            compactionProvider = params.provider;
++            compactionModelRef = modelId;
++          }
++
++          // CLI backends (claude-cli, codex-cli) are wrappers around real LLM
++          // providers — they don't exist in the model registry. Resolve the
++          // agent's configured default model to get the real provider + model.
++          if (isCliProvider(compactionProvider, params.config)) {
++            const agentDefault = resolveDefaultModelForAgent({
++              cfg: params.config ?? {},
++              agentId: params.agentId,
++            });
++            const resolved = resolveNonCliModelRef(agentDefault, params.config);
++            compactionProvider = resolved.provider;
++            compactionModelRef = resolved.model;
++          }
++
++          compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
++          try {
++            // Resolve model via the unified model registry (provider-agnostic).
++            const resolved = resolveModel(
++              compactionProvider,
++              compactionModelRef,
++              undefined,
++              params.config,
++            );
++            if (!resolved.model) {
++              throw new Error(
++                resolved.error ??
++                  `Unknown compaction model: ${compactionProvider}/${compactionModelRef}`,
++              );
++            }
++            const apiKey = requireApiKey(
++              await getApiKeyForModel({ model: resolved.model, cfg: params.config }),
++              compactionProvider,
++            );
++
++            const isTextBlock = (b: { type: string }): b is { type: "text"; text: string } =>
++              b.type === "text";
++            const compactionSignal = AbortSignal.timeout(
++              compactionCfg.timeoutMs ?? DEFAULT_COMPACTION_TIMEOUT_MS,
++            );
++
++            const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
++              contextFiles: lastProfileContextFiles,
++              config: compactionCfg,
++              modelRef: compactionModelUsed,
++              llmFn: async (userPrompt, signal) => {
++                const res = await completeSimple(
++                  resolved.model!,
++                  {
++                    systemPrompt: COMPACTION_SYSTEM_PROMPT,
++                    messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
++                  },
++                  { apiKey, maxTokens: 4096, temperature: 0, signal },
++                );
++                const texts = res.content.filter(isTextBlock);
++                if (texts.length === 0) {
++                  throw new Error("No text content in compaction response");
++                }
++                return texts.map((b) => b.text).join("\n");
++              },
++              signal: compactionSignal,
++            });
++
++            compactedFilesList = results.filter((r) => r.success).map((r) => r.path);
++            compactionCharsBefore = results.reduce((sum, r) => sum + r.charsBefore, 0);
++            compactionCharsAfter = results.reduce((sum, r) => sum + r.charsAfter, 0);
++
++            if (compactedFilesList.length > 0) {
++              const compactedSystemPrompt = buildSystemPrompt({
++                workspaceDir,
++                config: params.config,
++                defaultThinkLevel: params.thinkLevel,
++                extraSystemPrompt,
++                skillsPrompt,
++                ownerNumbers: params.ownerNumbers,
++                heartbeatPrompt,
++                docsPath: docsPath ?? undefined,
++                tools: [],
++                contextFiles: compactedContextFiles,
++                bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
++                modelDisplay,
++                agentId: sessionAgentId,
++              });
++              const compactedTokens =
++                estimatePromptTokens(compactedSystemPrompt) + estimatePromptTokens(promptForRun);
++              if (compactedTokens <= hardLimitTokens) {
++                systemPrompt = compactedSystemPrompt;
++                estimatedTokens = compactedTokens;
++                break;
++              }
++            }
++          } catch (err) {
++            compactionFallbackReason = err instanceof Error ? err.message : String(err);
++            log.warn(
++              `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
++            );
++          }
++          continue;
++        }
++
++        const profileConfig = getBootstrapProfileConfig(profile);
++        const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
++          maxChars: profileConfig.maxCharsPerFile,
++          totalMaxChars: profileConfig.totalMaxChars,
++          warn: warnForProfile,
++        });
++        lastProfileContextFiles = profileContextFiles;
++        const profileSystemPrompt = buildSystemPrompt({
++          workspaceDir,
++          config: params.config,
++          defaultThinkLevel: params.thinkLevel,
++          extraSystemPrompt,
++          skillsPrompt,
++          ownerNumbers: params.ownerNumbers,
++          heartbeatPrompt,
++          docsPath: docsPath ?? undefined,
++          tools: [],
++          contextFiles: profileContextFiles,
++          bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
++          modelDisplay,
++          agentId: sessionAgentId,
++        });
++        activeProfile = profile;
++        systemPrompt = profileSystemPrompt;
++        estimatedTokens =
++          estimatePromptTokens(profileSystemPrompt) + estimatePromptTokens(promptForRun);
++        if (estimatedTokens <= hardLimitTokens) {
++          break;
++        }
++      }
++      if (estimatedTokens > hardLimitTokens) {
++        log.error(
++          `cli-runner: system prompt exceeds context limit after minimal profile (estimated=${estimatedTokens} tokens, limit=${hardLimitTokens}); proceeding anyway`,
++        );
++      }
++    }
++
++    log.info("cli-runner prompt stats", {
++      estimated_tokens: estimatedTokens,
++      context_window: contextWindowTokens,
++      reserve: contextWindowTokens - hardLimitTokens,
++      trim_profile: activeProfile,
++      retry_count: 0,
++      files_injected: contextFiles.length,
++      files_truncated: bootstrapAnalysis.truncatedFiles.length,
++      files_skipped: bootstrapFiles.length - contextFiles.length,
++      compaction_attempted: compactionAttempted,
++      ...(compactionAttempted && {
++        compacted_files: compactedFilesList,
++        chars_before: compactionCharsBefore,
++        chars_after: compactionCharsAfter,
++        compaction_model: compactionModelUsed,
++        ...(compactionFallbackReason ? { fallback_reason: compactionFallbackReason } : {}),
++      }),
++    });
++  }
++
+   const systemPromptReport = buildSystemPromptReport({
+     source: "run",
+     generatedAt: Date.now(),
+@@ -936,6 +1173,75 @@ export async function runCliAgent(params: {
+       };
+     } catch (err) {
+       if (err instanceof FailoverError) {
++        // Layer 2: Context overflow retry with minimal bootstrap profile
++        if (isContextOverflowError(err.message) && activeProfile !== "minimal") {
++          const preRetryEstimatedTokens = estimatePromptTokens(systemPrompt);
++          log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
++            retry_count: 1,
++            trim_profile: "minimal",
++            reason: "context_overflow",
++            previous_profile: activeProfile,
++            estimated_tokens: preRetryEstimatedTokens,
++            context_window: contextWindowTokens,
++          });
++          const minimalConfig = getBootstrapProfileConfig("minimal");
++          const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
++            maxChars: minimalConfig.maxCharsPerFile,
++            totalMaxChars: minimalConfig.totalMaxChars,
++            warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
++          });
++          const minimalSystemPrompt = buildSystemPrompt({
++            workspaceDir,
++            config: params.config,
++            defaultThinkLevel: params.thinkLevel,
++            extraSystemPrompt,
++            skillsPrompt,
++            ownerNumbers: params.ownerNumbers,
++            heartbeatPrompt,
++            docsPath: docsPath ?? undefined,
++            tools: [],
++            contextFiles: minimalContextFiles,
++            bootstrapTruncationWarningLines: [],
++            modelDisplay,
++            agentId: sessionAgentId,
++          });
++          // Reassign the `let` binding so executeCliWithSession sees the new prompt
++          systemPrompt = minimalSystemPrompt;
++          activeProfile = "minimal";
++          try {
++            const output = await executeCliWithSession(undefined);
++            const text = output.text?.trim();
++            const payloads = text ? [{ text }] : undefined;
++            return {
++              payloads,
++              meta: {
++                durationMs: Date.now() - started,
++                systemPromptReport,
++                agentMeta: {
++                  sessionId: output.sessionId ?? params.sessionId ?? "",
++                  provider: params.provider,
++                  model: modelId,
++                  usage: output.usage,
++                },
++              },
++            };
++          } catch (retryErr) {
++            if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
++              const estimatedTks = estimatePromptTokens(minimalSystemPrompt);
++              throw new FailoverError(
++                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal). 建议改走 pi-embedded runtime 或拆任务。`,
++                {
++                  reason: "unknown",
++                  provider: params.provider,
++                  model: modelId,
++                  status: resolveFailoverStatus("unknown"),
++                },
++              );
++            }
++            throw retryErr;
++          }
++        }
++
+         // Check if this is a session expired error and we have a session to clear
+         if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
+           log.warn(
+diff --git a/src/agents/model-selection.test.ts b/src/agents/model-selection.test.ts
+index a9029540ee..e048abcb4a 100644
+--- a/src/agents/model-selection.test.ts
++++ b/src/agents/model-selection.test.ts
+@@ -12,6 +12,7 @@ import {
+   modelKey,
+   resolveAllowedModelRef,
+   resolveConfiguredModelRef,
++  resolveNonCliModelRef,
+   resolveThinkingDefault,
+   resolveModelRefFromString,
+ } from "./model-selection.js";
+@@ -702,6 +703,71 @@ describe("model-selection", () => {
+   });
+ });
+ 
++describe("resolveNonCliModelRef", () => {
++  it("returns non-CLI provider ref as-is", () => {
++    const ref = { provider: "anthropic", model: "claude-opus-4-6" };
++    expect(resolveNonCliModelRef(ref)).toEqual(ref);
++  });
++
++  it("returns non-CLI openai ref as-is", () => {
++    const ref = { provider: "openai", model: "gpt-4o" };
++    expect(resolveNonCliModelRef(ref)).toEqual(ref);
++  });
++
++  it("maps claude-cli to anthropic", () => {
++    const ref = { provider: "claude-cli", model: "claude-opus-4-6" };
++    const result = resolveNonCliModelRef(ref);
++    expect(result.provider).toBe("anthropic");
++    expect(result.model).toBe("claude-opus-4-6");
++  });
++
++  it("maps codex-cli to openai", () => {
++    const ref = { provider: "codex-cli", model: "o4-mini" };
++    const result = resolveNonCliModelRef(ref);
++    expect(result.provider).toBe("openai");
++    expect(result.model).toBe("o4-mini");
++  });
++
++  it("falls back to DEFAULT_PROVIDER (anthropic) for unknown custom CLI backend", () => {
++    const cfg = {
++      agents: {
++        defaults: {
++          cliBackends: {
++            "my-custom-cli": {},
++          },
++        },
++      },
++    } as never;
++    const ref = { provider: "my-custom-cli", model: "some-model" };
++    const result = resolveNonCliModelRef(ref, cfg);
++    expect(result.provider).toBe("anthropic");
++    expect(result.model).toBe("some-model");
++  });
++
++  it("resolves through alias when cfg + alias index match", () => {
++    const cfg = {
++      agents: {
++        defaults: {
++          models: {
++            "anthropic/claude-haiku-4-5-20251001": { alias: "haiku" },
++          },
++        },
++      },
++    } as never;
++    const ref = { provider: "claude-cli", model: "haiku" };
++    const result = resolveNonCliModelRef(ref, cfg);
++    expect(result.provider).toBe("anthropic");
++    expect(result.model).toBe("claude-haiku-4-5-20251001");
++  });
++
++  it("returns mapped provider + original model when no alias matches", () => {
++    const ref = { provider: "claude-cli", model: "claude-opus-4-6" };
++    const result = resolveNonCliModelRef(ref, undefined);
++    expect(result.provider).toBe("anthropic");
++    expect(result.model).toBe("claude-opus-4-6");
++  });
++});
++
+ describe("normalizeModelSelection", () => {
+   it("returns trimmed string for string input", () => {
+     expect(normalizeModelSelection("ollama/llama3.2:3b")).toBe("ollama/llama3.2:3b");
+diff --git a/src/agents/model-selection.ts b/src/agents/model-selection.ts
+index 75df5ed22f..7d47fa3a87 100644
+--- a/src/agents/model-selection.ts
++++ b/src/agents/model-selection.ts
+@@ -349,6 +349,42 @@ export function resolveConfiguredModelRef(params: {
+   return { provider: params.defaultProvider, model: params.defaultModel };
+ }
+ 
++/**
++ * Resolve a ModelRef that may point to a CLI provider (claude-cli, codex-cli,
++ * or a custom cliBackend) to a real API provider.
++ *
++ * - Non-CLI providers are returned as-is.
++ * - `claude-cli` maps to `anthropic`; `codex-cli` maps to `openai`.
++ * - Unknown custom CLI backends fall back to DEFAULT_PROVIDER.
++ * - The model string is resolved through the alias index for the target provider.
++ */
++export function resolveNonCliModelRef(ref: ModelRef, cfg?: OpenClawConfig): ModelRef {
++  if (!isCliProvider(ref.provider, cfg)) {
++    return ref;
++  }
++
++  const normalized = normalizeProviderId(ref.provider);
++  let realProvider: string;
++  if (normalized === "claude-cli") {
++    realProvider = "anthropic";
++  } else if (normalized === "codex-cli") {
++    realProvider = "openai";
++  } else {
++    realProvider = DEFAULT_PROVIDER;
++  }
++
++  if (cfg) {
++    const aliasIndex = buildModelAliasIndex({ cfg, defaultProvider: realProvider });
++    const aliasKey = normalizeAliasKey(ref.model);
++    const aliasMatch = aliasIndex.byAlias.get(aliasKey);
++    if (aliasMatch) {
++      return aliasMatch.ref;
++    }
++  }
++
++  return { provider: realProvider, model: ref.model };
++}
++
+ export function resolveDefaultModelForAgent(params: {
+   cfg: OpenClawConfig;
+   agentId?: string;
+diff --git a/src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts b/src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts
+new file mode 100644
+index 0000000000..6fbfa213d2
+--- /dev/null
++++ b/src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts
+@@ -0,0 +1,106 @@
++import { describe, expect, it } from "vitest";
++import {
++  getBootstrapProfileConfig,
++  resolveBootstrapBudgetForModel,
++  resolveBootstrapTotalMaxChars,
++  DEFAULT_BOOTSTRAP_MAX_CHARS,
++  DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
++} from "./pi-embedded-helpers.js";
++
++describe("getBootstrapProfileConfig", () => {
++  it("normal profile returns default limits", () => {
++    const config = getBootstrapProfileConfig("normal");
++    expect(config.maxCharsPerFile).toBe(DEFAULT_BOOTSTRAP_MAX_CHARS);
++    expect(config.totalMaxChars).toBe(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++  });
++
++  it("reduced profile has lower limits than normal", () => {
++    const normal = getBootstrapProfileConfig("normal");
++    const reduced = getBootstrapProfileConfig("reduced");
++    expect(reduced.maxCharsPerFile).toBeLessThan(normal.maxCharsPerFile);
++    expect(reduced.totalMaxChars).toBeLessThan(normal.totalMaxChars);
++    expect(reduced.maxCharsPerFile).toBe(10_000);
++    expect(reduced.totalMaxChars).toBe(50_000);
++  });
++
++  it("minimal profile has the lowest limits", () => {
++    const reduced = getBootstrapProfileConfig("reduced");
++    const minimal = getBootstrapProfileConfig("minimal");
++    expect(minimal.maxCharsPerFile).toBeLessThan(reduced.maxCharsPerFile);
++    expect(minimal.totalMaxChars).toBeLessThan(reduced.totalMaxChars);
++    expect(minimal.maxCharsPerFile).toBe(5_000);
++    expect(minimal.totalMaxChars).toBe(20_000);
++  });
++});
++
++describe("resolveBootstrapBudgetForModel", () => {
++  it("returns capped totalMaxChars for large context windows", () => {
++    // 200K token window: reserve = max(60K, 30K) = 60K, available = 140K, chars = 560K → capped at 150K
++    const budget = resolveBootstrapBudgetForModel(200_000);
++    expect(budget.totalMaxChars).toBe(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++  });
++
++  it("returns floored totalMaxChars for tiny context windows", () => {
++    // 1K token window: reserve = max(300, 30K) = 30K, available = -29K → chars = floor(-29K*4) → floor at 20K
++    const budget = resolveBootstrapBudgetForModel(1_000);
++    expect(budget.totalMaxChars).toBe(20_000);
++  });
++
++  it("scales appropriately for mid-range context windows", () => {
++    // 50K token window: reserve = max(15K, 30K) = 30K, available = 20K, chars = 80K → below cap
++    const budget = resolveBootstrapBudgetForModel(50_000);
++    expect(budget.totalMaxChars).toBe(80_000);
++    expect(budget.totalMaxChars).toBeLessThan(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++  });
++
++  it("applies 30K minimum reserve", () => {
++    // 60K token window: reserve = max(18K, 30K) = 30K, available = 30K, chars = 120K
++    const budget = resolveBootstrapBudgetForModel(60_000);
++    expect(budget.totalMaxChars).toBe(120_000);
++  });
++
++  it("preserves default maxCharsPerFile", () => {
++    const budget = resolveBootstrapBudgetForModel(100_000);
++    expect(budget.maxCharsPerFile).toBe(DEFAULT_BOOTSTRAP_MAX_CHARS);
++  });
++
++  it("totalMaxChars is always at least 20K", () => {
++    for (const tokens of [0.001, 100, 1_000, 10_000]) {
++      const budget = resolveBootstrapBudgetForModel(tokens);
++      expect(budget.totalMaxChars).toBeGreaterThanOrEqual(20_000);
++    }
++  });
++
++  it("totalMaxChars never exceeds DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS", () => {
++    for (const tokens of [100_000, 500_000, 1_000_000]) {
++      const budget = resolveBootstrapBudgetForModel(tokens);
++      expect(budget.totalMaxChars).toBeLessThanOrEqual(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++    }
++  });
++});
++
++describe("resolveBootstrapTotalMaxChars with contextWindowTokens", () => {
++  it("returns config value when set, ignoring contextWindowTokens", () => {
++    const cfg = { agents: { defaults: { bootstrapTotalMaxChars: 75_000 } } } as Parameters<
++      typeof resolveBootstrapTotalMaxChars
++    >[0];
++    const result = resolveBootstrapTotalMaxChars(cfg, 200_000);
++    expect(result).toBe(75_000);
++  });
++
++  it("uses contextWindowTokens when config is not set", () => {
++    // 50K token window → resolveBootstrapBudgetForModel gives 80K
++    const result = resolveBootstrapTotalMaxChars(undefined, 50_000);
++    expect(result).toBe(80_000);
++  });
++
++  it("returns default when neither config nor contextWindowTokens is set", () => {
++    const result = resolveBootstrapTotalMaxChars();
++    expect(result).toBe(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++  });
++
++  it("ignores contextWindowTokens of 0", () => {
++    const result = resolveBootstrapTotalMaxChars(undefined, 0);
++    expect(result).toBe(DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS);
++  });
++});
+diff --git a/src/agents/pi-embedded-helpers.ts b/src/agents/pi-embedded-helpers.ts
+index 53f2181449..d92b39f7fd 100644
+--- a/src/agents/pi-embedded-helpers.ts
++++ b/src/agents/pi-embedded-helpers.ts
+@@ -4,10 +4,14 @@ export {
+   DEFAULT_BOOTSTRAP_PROMPT_TRUNCATION_WARNING_MODE,
+   DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
+   ensureSessionHeader,
++  getBootstrapProfileConfig,
++  resolveBootstrapBudgetForModel,
+   resolveBootstrapMaxChars,
+   resolveBootstrapPromptTruncationWarningMode,
+   resolveBootstrapTotalMaxChars,
+   stripThoughtSignatures,
++  type BootstrapProfile,
++  type BootstrapProfileConfig,
+ } from "./pi-embedded-helpers/bootstrap.js";
+ export {
+   BILLING_ERROR_USER_MESSAGE,
+diff --git a/src/agents/pi-embedded-helpers/bootstrap.ts b/src/agents/pi-embedded-helpers/bootstrap.ts
+index e6e0792f4b..219b9ea56c 100644
+--- a/src/agents/pi-embedded-helpers/bootstrap.ts
++++ b/src/agents/pi-embedded-helpers/bootstrap.ts
+@@ -104,14 +104,63 @@ export function resolveBootstrapMaxChars(cfg?: OpenClawConfig): number {
+   return DEFAULT_BOOTSTRAP_MAX_CHARS;
+ }
+ 
+-export function resolveBootstrapTotalMaxChars(cfg?: OpenClawConfig): number {
++export function resolveBootstrapTotalMaxChars(
++  cfg?: OpenClawConfig,
++  contextWindowTokens?: number,
++): number {
+   const raw = cfg?.agents?.defaults?.bootstrapTotalMaxChars;
+   if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+     return Math.floor(raw);
+   }
++  if (typeof contextWindowTokens === "number" && contextWindowTokens > 0) {
++    return resolveBootstrapBudgetForModel(contextWindowTokens).totalMaxChars;
++  }
+   return DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS;
+ }
+ 
++// ── Bootstrap profiles ────────────────────────────────────────────────────────
++
++/** Controls how aggressively bootstrap content is trimmed for context overflow prevention. */
++export type BootstrapProfile = "normal" | "reduced" | "minimal";
++
++export type BootstrapProfileConfig = {
++  maxCharsPerFile: number;
++  totalMaxChars: number;
++};
++
++const BOOTSTRAP_PROFILE_CONFIGS: Record<BootstrapProfile, BootstrapProfileConfig> = {
++  normal: {
++    maxCharsPerFile: DEFAULT_BOOTSTRAP_MAX_CHARS,
++    totalMaxChars: DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
++  },
++  reduced: { maxCharsPerFile: 10_000, totalMaxChars: 50_000 },
++  minimal: { maxCharsPerFile: 5_000, totalMaxChars: 20_000 },
++};
++
++/** Returns the character budget limits for a given bootstrap profile. */
++export function getBootstrapProfileConfig(profile: BootstrapProfile): BootstrapProfileConfig {
++  return BOOTSTRAP_PROFILE_CONFIGS[profile];
++}
++
++/**
++ * Layer 3: Calculates a dynamic bootstrap budget based on the model's context window.
++ * Reserves 30% (minimum 30K tokens) for output and tool calls.
++ */
++export function resolveBootstrapBudgetForModel(
++  contextWindowTokens: number,
++): BootstrapProfileConfig {
++  const reserve = Math.max(contextWindowTokens * 0.3, 30_000);
++  const available = contextWindowTokens - reserve;
++  const bootstrapTotalMaxChars = Math.min(
++    DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
++    Math.max(20_000, Math.floor(available * 4)),
++  );
++  return {
++    maxCharsPerFile: DEFAULT_BOOTSTRAP_MAX_CHARS,
++    totalMaxChars: bootstrapTotalMaxChars,
++  };
++}
++
+ export function resolveBootstrapPromptTruncationWarningMode(
+   cfg?: OpenClawConfig,
+ ): "off" | "once" | "always" {
+diff --git a/src/config/zod-schema.agent-defaults.ts b/src/config/zod-schema.agent-defaults.ts
+index 242d695972..0da61d3869 100644
+--- a/src/config/zod-schema.agent-defaults.ts
++++ b/src/config/zod-schema.agent-defaults.ts
+@@ -86,6 +86,10 @@ export const AgentDefaultsSchema = z
+       .optional(),
+     compaction: z
+       .object({
++        /** Model for bootstrap compaction (e.g. "anthropic/claude-haiku-4-5-20251001"). Inherits agent default when unset. */
++        model: z.string().optional(),
++        /** Bootstrap compaction LLM call timeout in ms. Default 30_000. */
++        timeoutMs: z.number().int().positive().optional(),
+         mode: z.union([z.literal("default"), z.literal("safeguard")]).optional(),
+         reserveTokens: z.number().int().nonnegative().optional(),
+         keepRecentTokens: z.number().int().positive().optional(),
+-- 
+2.50.1 (Apple Git-155)
+

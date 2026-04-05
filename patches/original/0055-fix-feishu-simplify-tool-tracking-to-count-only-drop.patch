@@ -1,0 +1,239 @@
+From 45f83e79205e25ae7c3aaccd2c7e3b4b38a06382 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 23:08:22 +0800
+Subject: [PATCH 55/98] fix(feishu): simplify tool tracking to count-only, drop
+ per-tool history lines
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 46 +++++++++----------
+ extensions/feishu/src/reply-dispatcher.ts     | 34 ++++----------
+ 2 files changed, 29 insertions(+), 51 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 0ccfd3298a..3a8581f9a6 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -482,7 +482,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await flushAsyncTasks();
+ 
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("step\n\n🔧 Tool calls (1)\n- Read\n\n⏳ Running Read..."),
++      expect.stringContaining("step\n\n🔧 Tool calls (1)\n\n⏳ Running Read..."),
+       { title: "💭 Thinking" },
+     );
+ 
+@@ -495,7 +495,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+     await flushAsyncTasks();
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("- Grep"),
++      "step\n\n🔧 Tool calls (2)",
+       { title: "💭 Thinking" },
+     );
+ 
+@@ -536,7 +536,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     expect(streamingInstances).toHaveLength(1);
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("- Read"),
++      "🔧 Tool calls (1)\n\n⏳ Running Read...",
+       { title: "🔧 Tool Activity" },
+     );
+ 
+@@ -579,7 +579,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     expect(streamingInstances).toHaveLength(1);
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("🔧 Tool calls (3)\n- exec ×3\n\n⏳ Running exec..."),
++      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
+       { title: "🔧 Tool Activity" },
+     );
+   });
+@@ -612,10 +612,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await dispatcher.replyOptions.onToolResult?.({});
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      "🔧 Tool calls (1)\n- memory_search",
+-      { title: "🔧 Tool Activity" },
+-    );
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
++      title: "🔧 Tool Activity",
++    });
+   });
+ 
+   it("clears running tool status as soon as assistant text starts streaming", async () => {
+@@ -646,10 +645,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      "🔧 Tool calls (1)\n- Bash",
+-      { title: "🔧 Tool Activity" },
+-    );
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
++      title: "🔧 Tool Activity",
++    });
+   });
+ 
+   it("clears running tool status when visible assistant text arrives through block delivery", async () => {
+@@ -681,13 +679,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await options.deliver({ text: "visible block text" }, { kind: "block" });
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      "🔧 Tool calls (1)\n- Bash",
+-      { title: "🔧 Tool Activity" },
+-    );
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (1)", {
++      title: "🔧 Tool Activity",
++    });
+   });
+ 
+-  it("preserves prior tool history and count without restoring running status after text streaming", async () => {
++  it("preserves tool call count without restoring running status after text streaming", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+       appId: "app_id",
+@@ -713,10 +710,9 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+     await flushAsyncTasks();
+ 
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      "🔧 Tool calls (2)\n- Read\n- Grep",
+-      { title: "🔧 Tool Activity" },
+-    );
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (2)", {
++      title: "🔧 Tool Activity",
++    });
+   });
+ 
+   it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
+@@ -743,7 +739,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await flushAsyncTasks();
+ 
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("🔧 Tool calls (2)\n- Bash\n- tool\n\n⏳ Running tool..."),
++      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running tool..."),
+       { title: "🔧 Tool Activity" },
+     );
+   });
+@@ -786,7 +782,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tool-memory" });
+     await flushAsyncTasks();
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("🔧 Tool calls (2)\n- memory_search\n- exec\n\n⏳ Running exec..."),
++      expect.stringContaining("🔧 Tool calls (2)\n\n⏳ Running exec..."),
+       { title: "🔧 Tool Activity" },
+     );
+   });
+@@ -851,7 +847,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await flushAsyncTasks();
+ 
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("🔧 Tool calls (3)\n- exec\n- read\n- exec\n\n⏳ Running exec..."),
++      expect.stringContaining("🔧 Tool calls (3)\n\n⏳ Running exec..."),
+       { title: "🔧 Tool Activity" },
+     );
+   });
+@@ -1127,7 +1123,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     expect(streamingInstances).toHaveLength(1);
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      expect.stringContaining("- Read"),
++      "thinking\n\n🔧 Tool calls (1)\n\n⏳ Running Read...",
+       { title: "💭 Thinking" },
+     );
+     expect(streamingInstances[0].discard).toHaveBeenCalledTimes(1);
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index c48dfc12d5..20efdaecba 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -302,7 +302,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let replaceNextPartialAfterTool = false;
+   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
+   const activeTools: Array<{ toolCallId?: string; name: string }> = [];
+-  const toolCallHistory: string[] = [];
++  let toolCallCount = 0;
+   let lastRenderedStreamContent = "";
+   let hasThinkingPrelude = false;
+   let thinkingCollapsed = false;
+@@ -424,21 +424,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     activeTools.pop();
+   };
+ 
+-  const formatToolHistoryLines = (): string[] => {
+-    const ordered: Array<{ name: string; count: number }> = [];
+-    for (const name of toolCallHistory) {
+-      const previous = ordered[ordered.length - 1];
+-      if (previous && previous.name === name) {
+-        previous.count += 1;
+-      } else {
+-        ordered.push({ name, count: 1 });
+-      }
+-    }
+-    return ordered.map((entry) => `- ${entry.name}${entry.count > 1 ? ` ×${entry.count}` : ""}`);
+-  };
+-
+   const resolveThinkingPanelTitle = (): string => {
+-    if (!reasoningText.trim() && toolCallHistory.length > 0) {
++    if (!reasoningText.trim() && toolCallCount > 0) {
+       return "🔧 Tool Activity";
+     }
+     return "💭 Thinking";
+@@ -456,22 +443,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
+       sections.push(plain);
+     }
+-    if (toolCallHistory.length > 0) {
+-      const toolLines = formatToolHistoryLines();
++    if (toolCallCount > 0) {
+       const currentRunningTool = !streamText.trim() ? getActiveRunningToolName() : undefined;
+       const toolStatus = options?.final
+-        ? `✅ Completed ${toolCallHistory.length} tool call${toolCallHistory.length === 1 ? "" : "s"}`
++        ? `✅ Completed ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`
+         : currentRunningTool
+           ? `⏳ Running ${currentRunningTool}...`
+           : !streamText.trim() && activeTools.length > 0
+             ? "⏳ Running tool..."
+             : "";
+       sections.push(
+-        [
+-          `🔧 Tool calls (${toolCallHistory.length})`,
+-          ...toolLines,
+-          ...(toolStatus ? ["", toolStatus] : []),
+-        ].join("\n"),
++        [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
+       );
+     }
+     return {
+@@ -669,7 +651,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     reasoningText = "";
+     thinkingCollapsed = false;
+     activeTools.length = 0;
+-    toolCallHistory.length = 0;
++    toolCallCount = 0;
+   };
+ 
+   const sendChunkedTextReply = async (params: {
+@@ -720,7 +702,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         thinkingCollapsed = false;
+         streamPhase = "idle";
+         activeTools.length = 0;
+-        toolCallHistory.length = 0;
++        toolCallCount = 0;
+         lastRenderedStreamContent = "";
+         replaceNextPartialAfterTool = false;
+         if (streamingEnabled && renderMode === "card") {
+@@ -920,7 +902,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                 name: trackedName,
+                 toolCallId: payload.toolCallId?.trim() || undefined,
+               });
+-              toolCallHistory.push(trackedName);
++              toolCallCount += 1;
+               replaceNextPartialAfterTool = Boolean(streamText);
+             }
+             queueThinkingPrelude();
+-- 
+2.50.1 (Apple Git-155)
+

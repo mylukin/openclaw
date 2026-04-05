@@ -1,0 +1,141 @@
+From 6eb8c9af62689b88026c7e50112010ffe966dde7 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 07:31:14 +0800
+Subject: [PATCH 29/98] fix: address codex review issues in feishu, deliver,
+ and monitor
+
+1. reply-dispatcher: replace sendMediaReplies() with deliverMediaAndEmitIfNeeded()
+   so media-only finals properly emit message_sent hooks and onFinalTextDelivered
+2. deliver: fix message_sending hook to use replyToId ?? params.replyToId fallback
+   matching the actual send path
+3. monitor: restore encryptKey validation for webhook mode
+4. monitor: wrap monitor call in try/finally to prevent thread-binding sweeper leak
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/monitor.ts          | 16 ++++++++++++----
+ extensions/feishu/src/reply-dispatcher.ts | 22 ++--------------------
+ src/infra/outbound/deliver.ts             |  4 +++-
+ 3 files changed, 17 insertions(+), 25 deletions(-)
+
+diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
+index 6573cc24dc..6527c1a672 100644
+--- a/extensions/feishu/src/monitor.ts
++++ b/extensions/feishu/src/monitor.ts
+@@ -530,6 +530,9 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
+   if (connectionMode === "webhook" && !account.verificationToken?.trim()) {
+     throw new Error(`Feishu account "${accountId}" webhook mode requires verificationToken`);
+   }
++  if (connectionMode === "webhook" && !account.encryptKey?.trim()) {
++    throw new Error(`Feishu account "${accountId}" webhook mode requires encryptKey`);
++  }
+ 
+   const threadBindingManager = createFeishuThreadBindingManager({
+     accountId,
+@@ -561,11 +564,16 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
+     fireAndForget: connectionMode === "webhook",
+   });
+ 
+-  if (connectionMode === "webhook") {
+-    return monitorWebhook({ params, accountId, eventDispatcher });
+-  }
++  try {
++    if (connectionMode === "webhook") {
++      return await monitorWebhook({ params, accountId, eventDispatcher });
++    }
+ 
+-  return monitorWebSocket({ params, accountId, eventDispatcher });
++    return await monitorWebSocket({ params, accountId, eventDispatcher });
++  } finally {
++    threadBindingManager.stop();
++    log(`feishu[${accountId}]: thread binding adapter stopped (finally)`);
++  }
+ }
+ 
+ type ConnectionParams = {
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 4269bddbf4..3efe9f575a 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -2,7 +2,6 @@ import path from "node:path";
+ import {
+   resolveSendableOutboundReplyParts,
+   resolveTextChunksWithFallback,
+-  sendMediaWithLeadingCaption,
+ } from "openclaw/plugin-sdk/reply-payload";
+ import {
+   createChannelReplyPipeline,
+@@ -627,23 +626,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return { lastMessageId, deliveredMessageIds };
+   };
+ 
+-  const sendMediaReplies = async (payload: ReplyPayload) => {
+-    await sendMediaWithLeadingCaption({
+-      mediaUrls: resolveSendableOutboundReplyParts(payload).mediaUrls,
+-      caption: "",
+-      send: async ({ mediaUrl }) => {
+-        await sendMediaFeishu({
+-          cfg,
+-          to: chatId,
+-          mediaUrl,
+-          replyToMessageId: sendReplyToMessageId,
+-          replyInThread: effectiveReplyInThread,
+-          accountId,
+-        });
+-      },
+-    });
+-  };
+-
+   const { dispatcher, replyOptions, markDispatchIdle } =
+     core.channel.reply.createReplyDispatcherWithTyping({
+       responsePrefix: prefixContext.responsePrefix,
+@@ -709,7 +691,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             }
+             // Send media even when streaming handled the text
+             if (hasMedia) {
+-              await sendMediaReplies(payload);
++              await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
+             }
+             return;
+           }
+@@ -775,7 +757,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         }
+ 
+         if (hasMedia) {
+-          await sendMediaReplies(payload);
++          await deliverMediaAndEmitIfNeeded(reply.mediaUrls, text, info, hasText);
+         }
+       },
+       onError: async (error, info) => {
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index 10e59d8c60..dd953327c3 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -522,6 +522,7 @@ async function applyMessageSendingHook(params: {
+   to: string;
+   channel: Exclude<OutboundChannel, "none">;
+   accountId?: string;
++  replyToId?: string | null;
+ }): Promise<{
+   cancelled: boolean;
+   payload: ReplyPayload;
+@@ -543,7 +544,7 @@ async function applyMessageSendingHook(params: {
+           channel: params.channel,
+           accountId: params.accountId,
+           mediaUrls: params.payloadSummary.mediaUrls,
+-          replyToId: params.payload.replyToId,
++          replyToId: params.payload.replyToId ?? params.replyToId,
+         },
+       },
+       {
+@@ -766,6 +767,7 @@ async function deliverOutboundPayloadsCore(
+         to,
+         channel,
+         accountId,
++        replyToId: params.replyToId,
+       });
+       if (hookResult.cancelled) {
+         continue;
+-- 
+2.50.1 (Apple Git-155)
+
