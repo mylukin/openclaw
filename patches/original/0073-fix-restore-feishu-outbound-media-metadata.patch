@@ -1,0 +1,148 @@
+From 59badd7102675e9dea7a5c7e50ebd2209247ab6f Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Thu, 26 Mar 2026 23:01:30 +0800
+Subject: [PATCH 73/98] fix: restore feishu outbound media metadata
+
+---
+ extensions/feishu/src/outbound.test.ts | 37 +++++++++++++++++++++++---
+ extensions/feishu/src/outbound.ts      | 20 ++++++++++++--
+ 2 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/extensions/feishu/src/outbound.test.ts b/extensions/feishu/src/outbound.test.ts
+index aa874981e0..4324662701 100644
+--- a/extensions/feishu/src/outbound.test.ts
++++ b/extensions/feishu/src/outbound.test.ts
+@@ -42,7 +42,10 @@ function resetOutboundMocks() {
+   sendMessageFeishuMock.mockResolvedValue({ messageId: "text_msg" });
+   sendMarkdownCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+   sendStructuredCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+-  sendMediaFeishuMock.mockResolvedValue({ messageId: "media_msg" });
++  sendMediaFeishuMock.mockResolvedValue({
++    messageId: "media_msg",
++    rawContent: '{"image_key":"img_test_1"}',
++  });
+ }
+ 
+ describe("feishuOutbound.sendText local-image auto-convert", () => {
+@@ -78,7 +81,14 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
+       );
+       expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+       expect(result).toEqual(
+-        expect.objectContaining({ channel: "feishu", messageId: "media_msg" }),
++        expect.objectContaining({
++          channel: "feishu",
++          messageId: "media_msg",
++          meta: {
++            contentType: "image",
++            rawContent: '{"image_key":"img_test_1"}',
++          },
++        }),
+       );
+     } finally {
+       await fs.rm(dir, { recursive: true, force: true });
+@@ -298,7 +308,7 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
+   });
+ 
+   it("forwards replyToId to sendMediaFeishu", async () => {
+-    await feishuOutbound.sendMedia?.({
++    const result = await feishuOutbound.sendMedia?.({
+       cfg: {} as any,
+       to: "chat_1",
+       text: "",
+@@ -312,6 +322,16 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
+         replyToMessageId: "om_reply_target",
+       }),
+     );
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "media_msg",
++        meta: {
++          contentType: "image",
++          rawContent: '{"image_key":"img_test_1"}',
++        },
++      }),
++    );
+   });
+ 
+   it("forwards replyToId to text caption send", async () => {
+@@ -367,7 +387,16 @@ describe("feishuOutbound.sendMedia renderMode", () => {
+       }),
+     );
+     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "media_msg" }));
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "media_msg",
++        meta: {
++          contentType: "image",
++          rawContent: '{"image_key":"img_test_1"}',
++        },
++      }),
++    );
+   });
+ 
+   it("uses threadId fallback as replyToMessageId on sendMedia", async () => {
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index 91ef8e9a5e..8b53d001cd 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -80,6 +80,20 @@ async function sendOutboundText(params: {
+   return sendMessageFeishu({ cfg, to, text, accountId, replyToMessageId });
+ }
+ 
++function attachFeishuMediaMetadata<
++  T extends { rawContent?: string; meta?: Record<string, unknown> },
++>(sent: T, mediaUrl: string) {
++  const contentType = resolveMediaContentType(mediaUrl);
++  return {
++    ...sent,
++    meta: {
++      ...(sent.meta ?? {}),
++      contentType,
++      rawContent: sent.rawContent ?? `[${contentType}: ${mediaUrl}]`,
++    },
++  };
++}
++
+ export const feishuOutbound: ChannelOutboundAdapter = {
+   deliveryMode: "direct",
+   chunker: (text, limit) => getFeishuRuntime().channel.text.chunkMarkdownText(text, limit),
+@@ -104,7 +118,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+       const localImagePath = normalizePossibleLocalImagePath(text);
+       if (localImagePath) {
+         try {
+-          return await sendMediaFeishu({
++          const sent = await sendMediaFeishu({
+             cfg,
+             to,
+             mediaUrl: localImagePath,
+@@ -112,6 +126,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+             replyToMessageId,
+             mediaLocalRoots,
+           });
++          return attachFeishuMediaMetadata(sent, localImagePath);
+         } catch (err) {
+           console.error(`[feishu] local image path auto-send failed:`, err);
+           // fall through to plain text as last resort
+@@ -190,7 +205,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+       // Upload and send media if URL or local path provided
+       if (mediaUrl) {
+         try {
+-          return await sendMediaFeishu({
++          const sent = await sendMediaFeishu({
+             cfg,
+             to,
+             mediaUrl,
+@@ -198,6 +213,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+             mediaLocalRoots,
+             replyToMessageId,
+           });
++          return attachFeishuMediaMetadata(sent, mediaUrl);
+         } catch (err) {
+           // Log the error for debugging
+           console.error(`[feishu] sendMediaFeishu failed:`, err);
+-- 
+2.50.1 (Apple Git-155)
+

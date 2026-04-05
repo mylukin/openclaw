@@ -1,0 +1,1068 @@
+From 818c11ec0b94caf7c2ce47d93a0baae9f9f569c6 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 5 Apr 2026 19:05:37 +0800
+Subject: [PATCH 08/10] feat(feishu): outbound message hooks, media/image
+ sending, and channel integration
+
+- Support media/image sending in outbound messages
+- Emit message_sent hooks from dispatcher and add group plugin dispatch mode
+- Emit per-media message_sent events and suppress discarded card emissions
+- Restore outbound hook parity and media metadata
+- Enforce feishu card rendering for outbound sends
+- Persist bot media-only messages to DB
+- Prevent false media-only persistence when streamed text is pending
+- Register reply dispatcher and expose exports
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ extensions/feishu/index.ts             |  12 ++
+ extensions/feishu/src/channel.test.ts  | 198 +++++++++++++++++++++--
+ extensions/feishu/src/channel.ts       | 207 +++++++++++++++++++++++--
+ extensions/feishu/src/exports.test.ts  |  33 ++++
+ extensions/feishu/src/media-types.ts   |  27 ++++
+ extensions/feishu/src/media.test.ts    |  17 +-
+ extensions/feishu/src/media.ts         |  14 +-
+ extensions/feishu/src/outbound.test.ts |  80 +++++++++-
+ extensions/feishu/src/outbound.ts      |  58 +++++--
+ 9 files changed, 597 insertions(+), 49 deletions(-)
+ create mode 100644 extensions/feishu/src/exports.test.ts
+ create mode 100644 extensions/feishu/src/media-types.ts
+
+diff --git a/extensions/feishu/index.ts b/extensions/feishu/index.ts
+index 1e18c0eea1..99e366ee2e 100644
+--- a/extensions/feishu/index.ts
++++ b/extensions/feishu/index.ts
+@@ -5,6 +5,7 @@ import { registerFeishuChatTools } from "./src/chat.js";
+ import { registerFeishuDocTools } from "./src/docx.js";
+ import { registerFeishuDriveTools } from "./src/drive.js";
+ import { registerFeishuPermTools } from "./src/perm.js";
++import { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
+ import { setFeishuRuntime } from "./src/runtime.js";
+ import { registerFeishuSubagentHooks } from "./src/subagent-hooks.js";
+ import { registerFeishuWikiTools } from "./src/wiki.js";
+@@ -12,6 +13,8 @@ import { registerFeishuWikiTools } from "./src/wiki.js";
+ export { feishuPlugin } from "./src/channel.js";
+ export { setFeishuRuntime } from "./src/runtime.js";
+ export { monitorFeishuProvider } from "./src/monitor.js";
++export { getBotOpenId } from "./src/monitor.js";
++export { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
+ export {
+   sendMessageFeishu,
+   sendCardFeishu,
+@@ -53,6 +56,15 @@ export default defineChannelPluginEntry({
+   plugin: feishuPlugin,
+   setRuntime: setFeishuRuntime,
+   registerFull(api) {
++    // Expose the native feishu reply dispatcher on the runtime so external
++    // plugins (e.g. bot-company) can create streaming-card capable dispatchers
++    // instead of falling back to the generic route-reply path.
++    const replyRuntime = (api.runtime as { channel?: { reply?: Record<string, unknown> } })?.channel
++      ?.reply;
++    if (replyRuntime && typeof replyRuntime.createFeishuReplyDispatcher !== "function") {
++      replyRuntime.createFeishuReplyDispatcher = createFeishuReplyDispatcher;
++    }
++
+     registerFeishuSubagentHooks(api);
+     registerFeishuDocTools(api);
+     registerFeishuChatTools(api);
+diff --git a/extensions/feishu/src/channel.test.ts b/extensions/feishu/src/channel.test.ts
+index 28dfd8dda0..b420d233a8 100644
+--- a/extensions/feishu/src/channel.test.ts
++++ b/extensions/feishu/src/channel.test.ts
+@@ -8,6 +8,10 @@ const listReactionsFeishuMock = vi.hoisted(() => vi.fn());
+ const removeReactionFeishuMock = vi.hoisted(() => vi.fn());
+ const sendCardFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
++const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
++const feishuOutboundSendMediaMock = vi.hoisted(() => vi.fn());
++const emitMessageSentMock = vi.hoisted(() => vi.fn());
++const runMessageSendingMock = vi.hoisted(() => vi.fn());
+ const getMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const editMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const createPinFeishuMock = vi.hoisted(() => vi.fn());
+@@ -46,12 +50,27 @@ vi.mock("./channel.runtime.js", () => ({
+     sendCardFeishu: sendCardFeishuMock,
+     sendMessageFeishu: sendMessageFeishuMock,
+     feishuOutbound: {
+-      sendText: vi.fn(),
+-      sendMedia: vi.fn(),
++      sendText: feishuOutboundSendTextMock,
++      sendMedia: feishuOutboundSendMediaMock,
+     },
+   },
+ }));
+ 
++vi.mock("./runtime.js", () => ({
++  getFeishuRuntime: () => ({
++    hooks: {
++      hasMessageSendingHooks: () => true,
++      runMessageSending: runMessageSendingMock,
++      emitMessageSent: emitMessageSentMock,
++    },
++    channel: {
++      text: {
++        chunkMarkdownText: (text: string) => [text],
++      },
++    },
++  }),
++}));
++
+ import { feishuPlugin } from "./channel.js";
+ 
+ function getDescribedActions(cfg: OpenClawConfig): string[] {
+@@ -113,6 +132,17 @@ describe("feishuPlugin actions", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     createFeishuClientMock.mockReturnValue({ tag: "client" });
++    runMessageSendingMock.mockResolvedValue(undefined);
++    feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
++    feishuOutboundSendMediaMock.mockResolvedValue({
++      channel: "feishu",
++      messageId: "om_media",
++      chatId: "oc_group_1",
++      meta: {
++        contentType: "image",
++        rawContent: '{"image_key":"img_tool_1"}',
++      },
++    });
+   });
+ 
+   it("advertises the expanded Feishu action surface", () => {
+@@ -161,7 +191,11 @@ describe("feishuPlugin actions", () => {
+   });
+ 
+   it("sends text messages", async () => {
+-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_sent", chatId: "oc_group_1" });
++    feishuOutboundSendTextMock.mockResolvedValueOnce({
++      channel: "feishu",
++      messageId: "om_sent",
++      chatId: "oc_group_1",
++    });
+ 
+     const result = await feishuPlugin.actions?.handleAction?.({
+       action: "send",
+@@ -171,17 +205,56 @@ describe("feishuPlugin actions", () => {
+       toolContext: {},
+     } as never);
+ 
+-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
+       cfg,
+       to: "chat:oc_group_1",
+       text: "hello",
+       accountId: undefined,
+-      replyToMessageId: undefined,
+-      replyInThread: false,
+     });
++    expect(emitMessageSentMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        content: "hello",
++        success: true,
++        messageId: "om_sent",
++        metadata: { chatId: "oc_group_1" },
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "oc_group_1",
++      }),
++    );
+     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
+   });
+ 
++  it("applies message_sending rewrites before sending text", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ content: "hello rewritten" });
++
++    await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", message: "hello" },
++      cfg,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(runMessageSendingMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        content: "hello",
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "chat:oc_group_1",
++      }),
++    );
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: "hello rewritten",
++      }),
++    );
++  });
++
+   it("sends card messages", async () => {
+     sendCardFeishuMock.mockResolvedValueOnce({ messageId: "om_card", chatId: "oc_group_1" });
+ 
+@@ -201,9 +274,85 @@ describe("feishuPlugin actions", () => {
+       replyToMessageId: undefined,
+       replyInThread: false,
+     });
++    expect(emitMessageSentMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        content: "",
++        success: true,
++        messageId: "om_card",
++        metadata: { chatId: "oc_group_1", contentType: "interactive" },
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "oc_group_1",
++      }),
++    );
+     expect(result?.details).toMatchObject({ ok: true, messageId: "om_card", chatId: "oc_group_1" });
+   });
+ 
++  it("emits message_sent for media-only message tool sends", async () => {
++    const result = await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", media: "/tmp/generated.png" },
++      cfg,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(feishuOutboundSendMediaMock).toHaveBeenCalledWith({
++      cfg,
++      to: "chat:oc_group_1",
++      text: "",
++      mediaUrl: "/tmp/generated.png",
++      accountId: undefined,
++      mediaLocalRoots: undefined,
++    });
++    expect(emitMessageSentMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        content: "",
++        success: true,
++        messageId: "om_media",
++        metadata: {
++          chatId: "oc_group_1",
++          contentType: "image",
++          rawContent: '{"image_key":"img_tool_1"}',
++        },
++      }),
++      expect.objectContaining({
++        channelId: "feishu",
++        conversationId: "oc_group_1",
++      }),
++    );
++    expect(result?.details).toMatchObject({
++      ok: true,
++      messageId: "om_media",
++      chatId: "oc_group_1",
++    });
++  });
++
++  it("cancels sends when message_sending requests cancellation", async () => {
++    runMessageSendingMock.mockResolvedValueOnce({ cancel: true });
++
++    const result = await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", media: "/tmp/generated.png" },
++      cfg,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(feishuOutboundSendTextMock).not.toHaveBeenCalled();
++    expect(feishuOutboundSendMediaMock).not.toHaveBeenCalled();
++    expect(emitMessageSentMock).not.toHaveBeenCalled();
++    expect(result?.details).toMatchObject({
++      ok: true,
++      channel: "feishu",
++      action: "send",
++      cancelled: true,
++    });
++  });
++
+   it("reads messages", async () => {
+     getMessageFeishuMock.mockResolvedValueOnce({
+       messageId: "om_1",
+@@ -266,7 +415,11 @@ describe("feishuPlugin actions", () => {
+   });
+ 
+   it("sends explicit thread replies with reply_in_thread semantics", async () => {
+-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_reply", chatId: "oc_group_1" });
++    feishuOutboundSendTextMock.mockResolvedValueOnce({
++      channel: "feishu",
++      messageId: "om_reply",
++      chatId: "oc_group_1",
++    });
+ 
+     const result = await feishuPlugin.actions?.handleAction?.({
+       action: "thread-reply",
+@@ -276,13 +429,12 @@ describe("feishuPlugin actions", () => {
+       toolContext: {},
+     } as never);
+ 
+-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
+       cfg,
+       to: "chat:oc_group_1",
+       text: "reply body",
+       accountId: undefined,
+-      replyToMessageId: "om_parent",
+-      replyInThread: true,
++      threadId: "om_parent",
+     });
+     expect(result?.details).toMatchObject({
+       ok: true,
+@@ -291,6 +443,32 @@ describe("feishuPlugin actions", () => {
+     });
+   });
+ 
++  it("routes text sends through the renderMode-aware outbound adapter", async () => {
++    await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", text: "| a | b |\n| - | - |" },
++      cfg: {
++        channels: {
++          feishu: {
++            enabled: true,
++            appId: "cli_main",
++            appSecret: "secret_main",
++            renderMode: "auto",
++          },
++        },
++      } as OpenClawConfig,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        text: "| a | b |\n| - | - |",
++      }),
++    );
++  });
++
+   it("creates pins", async () => {
+     createPinFeishuMock.mockResolvedValueOnce({ messageId: "om_pin", chatId: "oc_group_1" });
+ 
+diff --git a/extensions/feishu/src/channel.ts b/extensions/feishu/src/channel.ts
+index 2bafd590a9..31817bc4c1 100644
+--- a/extensions/feishu/src/channel.ts
++++ b/extensions/feishu/src/channel.ts
+@@ -277,6 +277,79 @@ function jsonActionResult(details: Record<string, unknown>) {
+   };
+ }
+ 
++function emitFeishuActionMessageSent(params: {
++  to: string;
++  content: string;
++  accountId?: string;
++  sessionKey?: string | null;
++  isGroup?: boolean;
++  result: { messageId?: string; chatId?: string; meta?: Record<string, unknown> };
++  metadata?: Record<string, unknown>;
++}) {
++  getFeishuRuntime().hooks.emitMessageSent(
++    {
++      to: params.to,
++      content: params.content,
++      success: true,
++      ...(typeof params.result.messageId === "string" && params.result.messageId.trim()
++        ? { messageId: params.result.messageId }
++        : {}),
++      metadata: {
++        ...(params.result.chatId ? { chatId: params.result.chatId } : {}),
++        ...(params.result.meta ?? {}),
++        ...(params.metadata ?? {}),
++      },
++    },
++    {
++      channelId: "feishu",
++      accountId: params.accountId,
++      conversationId: params.result.chatId ?? params.to,
++      sessionKey: params.sessionKey ?? undefined,
++      isGroup: params.isGroup,
++      groupId: params.isGroup ? (params.result.chatId ?? params.to) : undefined,
++    },
++  );
++}
++
++async function applyFeishuActionMessageSending(params: {
++  to: string;
++  content: string;
++  accountId?: string;
++  replyToId?: string;
++  threadId?: string;
++  mediaUrls?: string[];
++}): Promise<{ cancelled: boolean; content: string; metadata?: Record<string, unknown> }> {
++  const hookResult = await getFeishuRuntime().hooks.runMessageSending(
++    {
++      to: params.to,
++      content: params.content,
++      metadata: {
++        channel: "feishu",
++        accountId: params.accountId,
++        ...(params.mediaUrls?.length ? { mediaUrls: params.mediaUrls } : {}),
++        ...(params.replyToId ? { replyToId: params.replyToId } : {}),
++        ...(params.threadId ? { threadId: params.threadId } : {}),
++      },
++    },
++    {
++      channelId: "feishu",
++      accountId: params.accountId,
++      conversationId: params.to,
++    },
++  );
++  if (hookResult?.cancel) {
++    return { cancelled: true, content: params.content };
++  }
++  return {
++    cancelled: false,
++    content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
++    metadata:
++      hookResult?.metadata && typeof hookResult.metadata === "object"
++        ? hookResult.metadata
++        : undefined,
++  };
++}
++
+ function readFirstString(
+   params: Record<string, unknown>,
+   keys: string[],
+@@ -502,10 +575,37 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                 ? (ctx.params.card as Record<string, unknown>)
+                 : undefined;
+             const text = readFirstString(ctx.params, ["text", "message"]);
+-            if (!card && !text) {
+-              throw new Error(`Feishu ${ctx.action} requires text/message or card.`);
++            const mediaUrl = readFirstString(ctx.params, [
++              "media",
++              "filePath",
++              "media_url",
++              "image",
++            ]);
++            if (!card && !text && !mediaUrl) {
++              throw new Error(`Feishu ${ctx.action} requires text/message, card, or media.`);
+             }
+             const runtime = await loadFeishuChannelRuntime();
++            const isGroupTarget = !/^(user|dm|open_id):/i.test(to);
++            const lifecycleResult = await applyFeishuActionMessageSending({
++              to,
++              content: text ?? "",
++              accountId: ctx.accountId ?? undefined,
++              ...(replyToMessageId
++                ? {
++                    replyToId: replyToMessageId,
++                    threadId: ctx.action === "thread-reply" ? replyToMessageId : undefined,
++                  }
++                : {}),
++              ...(mediaUrl ? { mediaUrls: [mediaUrl] } : {}),
++            });
++            if (lifecycleResult.cancelled) {
++              return jsonActionResult({
++                ok: true,
++                channel: "feishu",
++                action: ctx.action,
++                cancelled: true,
++              });
++            }
+             const result = card
+               ? await runtime.sendCardFeishu({
+                   cfg: ctx.cfg,
+@@ -515,14 +615,101 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                   replyToMessageId,
+                   replyInThread: ctx.action === "thread-reply",
+                 })
+-              : await runtime.sendMessageFeishu({
+-                  cfg: ctx.cfg,
+-                  to,
+-                  text: text!,
+-                  accountId: ctx.accountId ?? undefined,
+-                  replyToMessageId,
+-                  replyInThread: ctx.action === "thread-reply",
+-                });
++              : mediaUrl
++                ? await (async () => {
++                    const trimmedText = lifecycleResult.content.trim();
++                    if (trimmedText) {
++                      const sendText = runtime.feishuOutbound.sendText;
++                      if (!sendText) {
++                        throw new Error("Feishu outbound text sender is unavailable.");
++                      }
++                      const textResult = await sendText({
++                        cfg: ctx.cfg,
++                        to,
++                        text: trimmedText,
++                        accountId: ctx.accountId ?? undefined,
++                        ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
++                      });
++                      emitFeishuActionMessageSent({
++                        to,
++                        content: trimmedText,
++                        accountId: ctx.accountId ?? undefined,
++                        sessionKey: ctx.sessionKey,
++                        isGroup: isGroupTarget,
++                        result: textResult,
++                        metadata: {
++                          ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                          ...(lifecycleResult.metadata ?? {}),
++                        },
++                      });
++                    }
++                    const sendMedia = runtime.feishuOutbound.sendMedia;
++                    if (!sendMedia) {
++                      throw new Error("Feishu outbound media sender is unavailable.");
++                    }
++                    const mediaResult = await sendMedia({
++                      cfg: ctx.cfg,
++                      to,
++                      text: "",
++                      mediaUrl,
++                      accountId: ctx.accountId ?? undefined,
++                      mediaLocalRoots: ctx.mediaLocalRoots,
++                      ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
++                    });
++                    emitFeishuActionMessageSent({
++                      to,
++                      content: "",
++                      accountId: ctx.accountId ?? undefined,
++                      sessionKey: ctx.sessionKey,
++                      isGroup: isGroupTarget,
++                      result: mediaResult,
++                      metadata: {
++                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                        ...(lifecycleResult.metadata ?? {}),
++                      },
++                    });
++                    return mediaResult;
++                  })()
++                : await (async () => {
++                    const sendText = runtime.feishuOutbound.sendText;
++                    if (!sendText) {
++                      throw new Error("Feishu outbound text sender is unavailable.");
++                    }
++                    const textResult = await sendText({
++                      cfg: ctx.cfg,
++                      to,
++                      text: lifecycleResult.content,
++                      accountId: ctx.accountId ?? undefined,
++                      ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
++                    });
++                    emitFeishuActionMessageSent({
++                      to,
++                      content: lifecycleResult.content,
++                      accountId: ctx.accountId ?? undefined,
++                      sessionKey: ctx.sessionKey,
++                      isGroup: isGroupTarget,
++                      result: textResult,
++                      metadata: {
++                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                        ...(lifecycleResult.metadata ?? {}),
++                      },
++                    });
++                    return textResult;
++                  })();
++            if (card) {
++              emitFeishuActionMessageSent({
++                to,
++                content: "",
++                accountId: ctx.accountId ?? undefined,
++                sessionKey: ctx.sessionKey,
++                isGroup: isGroupTarget,
++                result,
++                metadata: {
++                  contentType: "interactive",
++                  ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                },
++              });
++            }
+             return jsonActionResult({
+               ok: true,
+               channel: "feishu",
+diff --git a/extensions/feishu/src/exports.test.ts b/extensions/feishu/src/exports.test.ts
+new file mode 100644
+index 0000000000..b48b97ecd2
+--- /dev/null
++++ b/extensions/feishu/src/exports.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it, vi } from "vitest";
++
++describe("feishu extension exports", () => {
++  it("exports createFeishuReplyDispatcher and getBotOpenId", async () => {
++    const mod = await import("../index.js");
++
++    expect(typeof mod.createFeishuReplyDispatcher).toBe("function");
++    expect(typeof mod.getBotOpenId).toBe("function");
++  });
++
++  it("register() exposes native feishu dispatcher on runtime.channel.reply", async () => {
++    const mod = await import("../index.js");
++    const register = mod.default.register as (api: unknown) => void;
++    const runtime = {
++      channel: {
++        reply: {},
++      },
++    };
++    register({
++      config: {},
++      logger: {},
++      runtime,
++      registrationMode: "full",
++      registerChannel: vi.fn(),
++      registerTool: vi.fn(),
++      on: vi.fn(),
++    });
++    expect(
++      typeof (runtime as { channel: { reply: { createFeishuReplyDispatcher?: unknown } } }).channel
++        .reply.createFeishuReplyDispatcher,
++    ).toBe("function");
++  });
++});
+diff --git a/extensions/feishu/src/media-types.ts b/extensions/feishu/src/media-types.ts
+new file mode 100644
+index 0000000000..2b9118194e
+--- /dev/null
++++ b/extensions/feishu/src/media-types.ts
+@@ -0,0 +1,27 @@
++import path from "node:path";
++
++export const IMAGE_EXTENSIONS = new Set([
++  ".jpg",
++  ".jpeg",
++  ".png",
++  ".gif",
++  ".webp",
++  ".bmp",
++  ".ico",
++  ".tiff",
++]);
++export const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".avi"]);
++export const AUDIO_EXTENSIONS = new Set([".opus", ".ogg", ".mp3", ".wav"]);
++
++/**
++ * Resolve media content type from a file extension or URL.
++ * Accepts either a bare extension (e.g. ".png") or a full URL/path
++ * from which the extension will be extracted.
++ */
++export function resolveMediaContentType(extOrUrl: string): string {
++  const ext = extOrUrl.startsWith(".") ? extOrUrl : path.extname(extOrUrl).toLowerCase();
++  if (IMAGE_EXTENSIONS.has(ext)) return "image";
++  if (VIDEO_EXTENSIONS.has(ext)) return "video";
++  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
++  return "file";
++}
+diff --git a/extensions/feishu/src/media.test.ts b/extensions/feishu/src/media.test.ts
+index 67ea2c1b77..454b824133 100644
+--- a/extensions/feishu/src/media.test.ts
++++ b/extensions/feishu/src/media.test.ts
+@@ -263,7 +263,7 @@ describe("sendMediaFeishu msg_type routing", () => {
+     );
+   });
+ 
+-  it("uses msg_type=media when replying with mp4", async () => {
++  it("uses message.create when replying with mp4 without replyInThread", async () => {
+     await sendMediaFeishu({
+       cfg: {} as any,
+       to: "user:ou_target",
+@@ -272,14 +272,13 @@ describe("sendMediaFeishu msg_type routing", () => {
+       replyToMessageId: "om_parent",
+     });
+ 
+-    expect(messageReplyMock).toHaveBeenCalledWith(
++    expect(messageCreateMock).toHaveBeenCalledWith(
+       expect.objectContaining({
+-        path: { message_id: "om_parent" },
+         data: expect.objectContaining({ msg_type: "media" }),
+       }),
+     );
+ 
+-    expect(messageCreateMock).not.toHaveBeenCalled();
++    expect(messageReplyMock).not.toHaveBeenCalled();
+   });
+ 
+   it("passes reply_in_thread when replyInThread is true", async () => {
+@@ -303,7 +302,7 @@ describe("sendMediaFeishu msg_type routing", () => {
+     );
+   });
+ 
+-  it("omits reply_in_thread when replyInThread is false", async () => {
++  it("uses message.create when replyInThread is false", async () => {
+     await sendMediaFeishu({
+       cfg: {} as any,
+       to: "user:ou_target",
+@@ -313,8 +312,12 @@ describe("sendMediaFeishu msg_type routing", () => {
+       replyInThread: false,
+     });
+ 
+-    const callData = messageReplyMock.mock.calls[0][0].data;
+-    expect(callData).not.toHaveProperty("reply_in_thread");
++    expect(messageCreateMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        data: expect.objectContaining({ msg_type: "media" }),
++      }),
++    );
++    expect(messageReplyMock).not.toHaveBeenCalled();
+   });
+ 
+   it("passes mediaLocalRoots as localRoots to loadWebMedia for local paths (#27884)", async () => {
+diff --git a/extensions/feishu/src/media.ts b/extensions/feishu/src/media.ts
+index a55ed6774e..936f94c243 100644
+--- a/extensions/feishu/src/media.ts
++++ b/extensions/feishu/src/media.ts
+@@ -260,6 +260,8 @@ export type UploadFileResult = {
+ export type SendMediaResult = {
+   messageId: string;
+   chatId: string;
++  /** Raw Feishu message content JSON (e.g. {"image_key":"..."} or {"file_key":"..."}) */
++  rawContent?: string;
+ };
+ 
+ /**
+@@ -369,7 +371,7 @@ export async function sendImageFeishu(params: {
+   });
+   const content = JSON.stringify({ image_key: imageKey });
+ 
+-  if (replyToMessageId) {
++  if (replyToMessageId && replyInThread) {
+     const response = await client.im.message.reply({
+       path: { message_id: replyToMessageId },
+       data: {
+@@ -379,7 +381,7 @@ export async function sendImageFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu image reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+   }
+ 
+   const response = await client.im.message.create({
+@@ -391,7 +393,7 @@ export async function sendImageFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu image send failed");
+-  return toFeishuSendResult(response, receiveId);
++  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+ }
+ 
+ /**
+@@ -416,7 +418,7 @@ export async function sendFileFeishu(params: {
+   });
+   const content = JSON.stringify({ file_key: fileKey });
+ 
+-  if (replyToMessageId) {
++  if (replyToMessageId && replyInThread) {
+     const response = await client.im.message.reply({
+       path: { message_id: replyToMessageId },
+       data: {
+@@ -426,7 +428,7 @@ export async function sendFileFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu file reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+   }
+ 
+   const response = await client.im.message.create({
+@@ -438,7 +440,7 @@ export async function sendFileFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu file send failed");
+-  return toFeishuSendResult(response, receiveId);
++  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+ }
+ 
+ /**
+diff --git a/extensions/feishu/src/outbound.test.ts b/extensions/feishu/src/outbound.test.ts
+index 64420f0a57..4324662701 100644
+--- a/extensions/feishu/src/outbound.test.ts
++++ b/extensions/feishu/src/outbound.test.ts
+@@ -7,6 +7,11 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMarkdownCardFeishuMock = vi.hoisted(() => vi.fn());
+ const sendStructuredCardFeishuMock = vi.hoisted(() => vi.fn());
++const shouldUseFeishuMarkdownCardMock = vi.hoisted(() =>
++  vi.fn((text: string) => {
++    return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
++  }),
++);
+ 
+ vi.mock("./media.js", () => ({
+   sendMediaFeishu: sendMediaFeishuMock,
+@@ -16,6 +21,7 @@ vi.mock("./send.js", () => ({
+   sendMessageFeishu: sendMessageFeishuMock,
+   sendMarkdownCardFeishu: sendMarkdownCardFeishuMock,
+   sendStructuredCardFeishu: sendStructuredCardFeishuMock,
++  shouldUseFeishuMarkdownCard: shouldUseFeishuMarkdownCardMock,
+ }));
+ 
+ vi.mock("./runtime.js", () => ({
+@@ -36,7 +42,10 @@ function resetOutboundMocks() {
+   sendMessageFeishuMock.mockResolvedValue({ messageId: "text_msg" });
+   sendMarkdownCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+   sendStructuredCardFeishuMock.mockResolvedValue({ messageId: "card_msg" });
+-  sendMediaFeishuMock.mockResolvedValue({ messageId: "media_msg" });
++  sendMediaFeishuMock.mockResolvedValue({
++    messageId: "media_msg",
++    rawContent: '{"image_key":"img_test_1"}',
++  });
+ }
+ 
+ describe("feishuOutbound.sendText local-image auto-convert", () => {
+@@ -72,7 +81,14 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
+       );
+       expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+       expect(result).toEqual(
+-        expect.objectContaining({ channel: "feishu", messageId: "media_msg" }),
++        expect.objectContaining({
++          channel: "feishu",
++          messageId: "media_msg",
++          meta: {
++            contentType: "image",
++            rawContent: '{"image_key":"img_test_1"}',
++          },
++        }),
+       );
+     } finally {
+       await fs.rm(dir, { recursive: true, force: true });
+@@ -143,7 +159,42 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
+       }),
+     );
+     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "card_msg" }));
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "card_msg",
++        meta: {
++          contentType: "interactive",
++          finalContent: "| a | b |\n| - | - |",
++        },
++      }),
++    );
++  });
++
++  it("stores normalized finalContent metadata for card mentions", async () => {
++    const result = await sendText({
++      cfg: {
++        channels: {
++          feishu: {
++            renderMode: "card",
++          },
++        },
++      } as any,
++      to: "chat_1",
++      text: '<at user_id="ou_123">Emma</at> hello',
++      accountId: "main",
++    });
++
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "card_msg",
++        meta: {
++          contentType: "interactive",
++          finalContent: "<at id=ou_123></at> hello",
++        },
++      }),
++    );
+   });
+ 
+   it("forwards replyToId as replyToMessageId on sendText", async () => {
+@@ -257,7 +308,7 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
+   });
+ 
+   it("forwards replyToId to sendMediaFeishu", async () => {
+-    await feishuOutbound.sendMedia?.({
++    const result = await feishuOutbound.sendMedia?.({
+       cfg: {} as any,
+       to: "chat_1",
+       text: "",
+@@ -271,6 +322,16 @@ describe("feishuOutbound.sendMedia replyToId forwarding", () => {
+         replyToMessageId: "om_reply_target",
+       }),
+     );
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "media_msg",
++        meta: {
++          contentType: "image",
++          rawContent: '{"image_key":"img_test_1"}',
++        },
++      }),
++    );
+   });
+ 
+   it("forwards replyToId to text caption send", async () => {
+@@ -326,7 +387,16 @@ describe("feishuOutbound.sendMedia renderMode", () => {
+       }),
+     );
+     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "media_msg" }));
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "media_msg",
++        meta: {
++          contentType: "image",
++          rawContent: '{"image_key":"img_test_1"}',
++        },
++      }),
++    );
+   });
+ 
+   it("uses threadId fallback as replyToMessageId on sendMedia", async () => {
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index 0c449f82bd..8b53d001cd 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -3,9 +3,16 @@ import path from "path";
+ import { createAttachedChannelResultAdapter } from "openclaw/plugin-sdk/channel-send-result";
+ import type { ChannelOutboundAdapter } from "../runtime-api.js";
+ import { resolveFeishuAccount } from "./accounts.js";
++import { resolveMediaContentType } from "./media-types.js";
+ import { sendMediaFeishu } from "./media.js";
++import { normalizeMentionTagsForCard } from "./mention.js";
+ import { getFeishuRuntime } from "./runtime.js";
+-import { sendMarkdownCardFeishu, sendMessageFeishu, sendStructuredCardFeishu } from "./send.js";
++import {
++  sendMarkdownCardFeishu,
++  sendMessageFeishu,
++  sendStructuredCardFeishu,
++  shouldUseFeishuMarkdownCard,
++} from "./send.js";
+ 
+ function normalizePossibleLocalImagePath(text: string | undefined): string | null {
+   const raw = text?.trim();
+@@ -40,10 +47,6 @@ function normalizePossibleLocalImagePath(text: string | undefined): string | nul
+   return raw;
+ }
+ 
+-function shouldUseCard(text: string): boolean {
+-  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+-}
+-
+ function resolveReplyToMessageId(params: {
+   replyToId?: string | null;
+   threadId?: string | number | null;
+@@ -70,13 +73,27 @@ async function sendOutboundText(params: {
+   const account = resolveFeishuAccount({ cfg, accountId });
+   const renderMode = account.config?.renderMode ?? "auto";
+ 
+-  if (renderMode === "card" || (renderMode === "auto" && shouldUseCard(text))) {
++  if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text))) {
+     return sendMarkdownCardFeishu({ cfg, to, text, accountId, replyToMessageId });
+   }
+ 
+   return sendMessageFeishu({ cfg, to, text, accountId, replyToMessageId });
+ }
+ 
++function attachFeishuMediaMetadata<
++  T extends { rawContent?: string; meta?: Record<string, unknown> },
++>(sent: T, mediaUrl: string) {
++  const contentType = resolveMediaContentType(mediaUrl);
++  return {
++    ...sent,
++    meta: {
++      ...(sent.meta ?? {}),
++      contentType,
++      rawContent: sent.rawContent ?? `[${contentType}: ${mediaUrl}]`,
++    },
++  };
++}
++
+ export const feishuOutbound: ChannelOutboundAdapter = {
+   deliveryMode: "direct",
+   chunker: (text, limit) => getFeishuRuntime().channel.text.chunkMarkdownText(text, limit),
+@@ -101,7 +118,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+       const localImagePath = normalizePossibleLocalImagePath(text);
+       if (localImagePath) {
+         try {
+-          return await sendMediaFeishu({
++          const sent = await sendMediaFeishu({
+             cfg,
+             to,
+             mediaUrl: localImagePath,
+@@ -109,6 +126,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+             replyToMessageId,
+             mediaLocalRoots,
+           });
++          return attachFeishuMediaMetadata(sent, localImagePath);
+         } catch (err) {
+           console.error(`[feishu] local image path auto-send failed:`, err);
+           // fall through to plain text as last resort
+@@ -117,7 +135,8 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+ 
+       const account = resolveFeishuAccount({ cfg, accountId: accountId ?? undefined });
+       const renderMode = account.config?.renderMode ?? "auto";
+-      const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
++      const useCard =
++        renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text));
+       if (useCard) {
+         const header = identity
+           ? {
+@@ -127,7 +146,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+               template: "blue" as const,
+             }
+           : undefined;
+-        return await sendStructuredCardFeishu({
++        const sent = await sendStructuredCardFeishu({
+           cfg,
+           to,
+           text,
+@@ -136,14 +155,30 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+           accountId: accountId ?? undefined,
+           header: header?.title ? header : undefined,
+         });
++        return {
++          ...sent,
++          meta: {
++            ...(sent.meta ?? {}),
++            contentType: "interactive",
++            finalContent: normalizeMentionTagsForCard(text),
++          },
++        };
+       }
+-      return await sendOutboundText({
++      const sent = await sendOutboundText({
+         cfg,
+         to,
+         text,
+         accountId: accountId ?? undefined,
+         replyToMessageId,
+       });
++      return {
++        ...sent,
++        meta: {
++          ...(sent.meta ?? {}),
++          contentType: "post",
++          finalContent: text,
++        },
++      };
+     },
+     sendMedia: async ({
+       cfg,
+@@ -170,7 +205,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+       // Upload and send media if URL or local path provided
+       if (mediaUrl) {
+         try {
+-          return await sendMediaFeishu({
++          const sent = await sendMediaFeishu({
+             cfg,
+             to,
+             mediaUrl,
+@@ -178,6 +213,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+             mediaLocalRoots,
+             replyToMessageId,
+           });
++          return attachFeishuMediaMetadata(sent, mediaUrl);
+         } catch (err) {
+           // Log the error for debugging
+           console.error(`[feishu] sendMediaFeishu failed:`, err);
+-- 
+2.50.1 (Apple Git-155)
+

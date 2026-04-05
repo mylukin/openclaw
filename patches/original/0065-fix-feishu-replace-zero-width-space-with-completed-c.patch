@@ -1,0 +1,69 @@
+From f18c2e7ae81bf29d37c550fe2639368807a8de33 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 15:06:49 +0800
+Subject: [PATCH 65/98] fix(feishu): replace zero-width space with completed
+ count in tool-only panel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tool-only thinking panel used a zero-width space (U+200B) as placeholder
+between tool calls, causing the panel to appear visually blank during the gap
+between one tool finishing and the next starting. Replace with a visible
+'✓ N completed' label so the panel always shows meaningful content.
+---
+ extensions/feishu/src/reply-dispatcher.test.ts | 6 +++---
+ extensions/feishu/src/reply-dispatcher.ts      | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index cb1511387b..2007590cd9 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -612,7 +612,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await dispatcher.replyOptions.onToolResult?.({});
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
+       title: "🔧 Tool calls (1)",
+     });
+   });
+@@ -645,7 +645,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
+       title: "🔧 Tool calls (1)",
+     });
+   });
+@@ -746,7 +746,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await options.deliver({ text: "visible block text" }, { kind: "block" });
+     await flushAsyncTasks();
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("\u200B", {
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
+       title: "🔧 Tool calls (1)",
+     });
+   });
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 2679d1345b..ebee931d78 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -459,9 +459,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           ? "⏳ Running tool..."
+           : "";
+       if (toolOnlyPanel) {
+-        // Keep the panel rendered after the running label clears while moving
+-        // the cumulative count into the panel title.
+-        sections.push(toolStatus || "\u200B");
++        // Show a completed summary when no tool is actively running, instead
++        // of a zero-width space that renders as a blank panel.
++        sections.push(toolStatus || `✓ ${toolCallCount} completed`);
+       } else {
+         sections.push(
+           [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,136 @@
+From 785242b5da4d60dad87956cc36ab2f4bf334609c Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Thu, 26 Mar 2026 21:38:57 +0800
+Subject: [PATCH 71/98] fix: persist final feishu card mention content
+
+---
+ extensions/feishu/src/outbound.test.ts    | 37 ++++++++++++++++++++++-
+ extensions/feishu/src/outbound.ts         | 21 +++++++++++--
+ extensions/feishu/src/reply-dispatcher.ts |  7 ++++-
+ 3 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/extensions/feishu/src/outbound.test.ts b/extensions/feishu/src/outbound.test.ts
+index 280db760d3..aa874981e0 100644
+--- a/extensions/feishu/src/outbound.test.ts
++++ b/extensions/feishu/src/outbound.test.ts
+@@ -149,7 +149,42 @@ describe("feishuOutbound.sendText local-image auto-convert", () => {
+       }),
+     );
+     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+-    expect(result).toEqual(expect.objectContaining({ channel: "feishu", messageId: "card_msg" }));
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "card_msg",
++        meta: {
++          contentType: "interactive",
++          finalContent: "| a | b |\n| - | - |",
++        },
++      }),
++    );
++  });
++
++  it("stores normalized finalContent metadata for card mentions", async () => {
++    const result = await sendText({
++      cfg: {
++        channels: {
++          feishu: {
++            renderMode: "card",
++          },
++        },
++      } as any,
++      to: "chat_1",
++      text: '<at user_id="ou_123">Emma</at> hello',
++      accountId: "main",
++    });
++
++    expect(result).toEqual(
++      expect.objectContaining({
++        channel: "feishu",
++        messageId: "card_msg",
++        meta: {
++          contentType: "interactive",
++          finalContent: "<at id=ou_123></at> hello",
++        },
++      }),
++    );
+   });
+ 
+   it("forwards replyToId as replyToMessageId on sendText", async () => {
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index 2a7f589ed5..91ef8e9a5e 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -5,6 +5,7 @@ import type { ChannelOutboundAdapter } from "../runtime-api.js";
+ import { resolveFeishuAccount } from "./accounts.js";
+ import { resolveMediaContentType } from "./media-types.js";
+ import { sendMediaFeishu } from "./media.js";
++import { normalizeMentionTagsForCard } from "./mention.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import {
+   sendMarkdownCardFeishu,
+@@ -130,7 +131,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+               template: "blue" as const,
+             }
+           : undefined;
+-        return await sendStructuredCardFeishu({
++        const sent = await sendStructuredCardFeishu({
+           cfg,
+           to,
+           text,
+@@ -139,14 +140,30 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+           accountId: accountId ?? undefined,
+           header: header?.title ? header : undefined,
+         });
++        return {
++          ...sent,
++          meta: {
++            ...(sent.meta ?? {}),
++            contentType: "interactive",
++            finalContent: normalizeMentionTagsForCard(text),
++          },
++        };
+       }
+-      return await sendOutboundText({
++      const sent = await sendOutboundText({
+         cfg,
+         to,
+         text,
+         accountId: accountId ?? undefined,
+         replyToMessageId,
+       });
++      return {
++        ...sent,
++        meta: {
++          ...(sent.meta ?? {}),
++          contentType: "post",
++          finalContent: text,
++        },
++      };
+     },
+     sendMedia: async ({
+       cfg,
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index e6f11c2013..972583643f 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -838,10 +838,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             hasVisibleTextInReply = true;
+           }
+           if (info?.kind === "final") {
++            const deliveredContent = useCard ? normalizeMentionTagsForCard(cardText) : text;
+             emitMessageSent({
+-              content: text,
++              content: deliveredContent,
+               success: true,
+               messageId: chunkResult.lastMessageId,
++              metadata: {
++                finalContent: deliveredContent,
++                contentType: useCard ? "interactive" : "post",
++              },
+             });
+             await emitFinalTextIfNeeded(text, {
+               ...(chunkResult.lastMessageId ? { messageId: chunkResult.lastMessageId } : {}),
+-- 
+2.50.1 (Apple Git-155)
+

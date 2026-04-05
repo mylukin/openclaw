@@ -1,0 +1,65 @@
+From f7648a25778ba1c47b1880dd9f81980e98ca6ece Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 10:40:18 +0800
+Subject: [PATCH 31/98] fix(hooks): expose replyToId and threadId in message
+ hook metadata
+
+Feishu reply-dispatcher now includes replyToId in message_sent hook
+metadata so downstream plugins (e.g. bot-company journal) can correlate
+reply chains. Core deliver pipeline now passes threadId through the
+message_sending hook for full thread-awareness in plugin consumers.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 6 +++++-
+ src/infra/outbound/deliver.ts             | 3 +++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 794607def4..98bbc8bcd5 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -185,7 +185,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         success: event.success,
+         ...(event.messageId ? { messageId: event.messageId } : {}),
+         ...(event.error ? { error: event.error } : {}),
+-        metadata: { chatId, ...(event.metadata ?? {}) },
++        metadata: {
++          chatId,
++          ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
++          ...(event.metadata ?? {}),
++        },
+       },
+       {
+         channelId: "feishu",
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index dd953327c3..e95c40d609 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -523,6 +523,7 @@ async function applyMessageSendingHook(params: {
+   channel: Exclude<OutboundChannel, "none">;
+   accountId?: string;
+   replyToId?: string | null;
++  threadId?: string | number | null;
+ }): Promise<{
+   cancelled: boolean;
+   payload: ReplyPayload;
+@@ -545,6 +546,7 @@ async function applyMessageSendingHook(params: {
+           accountId: params.accountId,
+           mediaUrls: params.payloadSummary.mediaUrls,
+           replyToId: params.payload.replyToId ?? params.replyToId,
++          ...(params.threadId != null ? { threadId: params.threadId } : {}),
+         },
+       },
+       {
+@@ -768,6 +770,7 @@ async function deliverOutboundPayloadsCore(
+         channel,
+         accountId,
+         replyToId: params.replyToId,
++        threadId: params.threadId,
+       });
+       if (hookResult.cancelled) {
+         continue;
+-- 
+2.50.1 (Apple Git-155)
+

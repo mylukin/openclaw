@@ -1,0 +1,373 @@
+From a38cb9601922971e79e327dd6a01e26bd447162a Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 28 Mar 2026 13:30:22 +0800
+Subject: [PATCH 78/98] fix(feishu): preserve thinking panels and hook metadata
+
+---
+ extensions/feishu/src/channel.ts              | 21 ++++++--
+ .../feishu/src/reply-dispatcher.test.ts       | 35 +++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     | 33 +++++++-----
+ extensions/feishu/src/send.test.ts            | 32 ++++++++++++
+ extensions/feishu/src/send.ts                 | 51 +++++++++++++++++--
+ src/plugins/hooks.ts                          |  7 +++
+ src/plugins/runtime/types-core.ts             |  1 +
+ src/plugins/types.ts                          |  1 +
+ 8 files changed, 161 insertions(+), 20 deletions(-)
+
+diff --git a/extensions/feishu/src/channel.ts b/extensions/feishu/src/channel.ts
+index d13392ff49..31817bc4c1 100644
+--- a/extensions/feishu/src/channel.ts
++++ b/extensions/feishu/src/channel.ts
+@@ -318,7 +318,7 @@ async function applyFeishuActionMessageSending(params: {
+   replyToId?: string;
+   threadId?: string;
+   mediaUrls?: string[];
+-}): Promise<{ cancelled: boolean; content: string }> {
++}): Promise<{ cancelled: boolean; content: string; metadata?: Record<string, unknown> }> {
+   const hookResult = await getFeishuRuntime().hooks.runMessageSending(
+     {
+       to: params.to,
+@@ -343,6 +343,10 @@ async function applyFeishuActionMessageSending(params: {
+   return {
+     cancelled: false,
+     content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
++    metadata:
++      hookResult?.metadata && typeof hookResult.metadata === "object"
++        ? hookResult.metadata
++        : undefined,
+   };
+ }
+ 
+@@ -633,7 +637,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                         sessionKey: ctx.sessionKey,
+                         isGroup: isGroupTarget,
+                         result: textResult,
+-                        metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
++                        metadata: {
++                          ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                          ...(lifecycleResult.metadata ?? {}),
++                        },
+                       });
+                     }
+                     const sendMedia = runtime.feishuOutbound.sendMedia;
+@@ -656,7 +663,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                       sessionKey: ctx.sessionKey,
+                       isGroup: isGroupTarget,
+                       result: mediaResult,
+-                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
++                      metadata: {
++                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                        ...(lifecycleResult.metadata ?? {}),
++                      },
+                     });
+                     return mediaResult;
+                   })()
+@@ -679,7 +689,10 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                       sessionKey: ctx.sessionKey,
+                       isGroup: isGroupTarget,
+                       result: textResult,
+-                      metadata: replyToMessageId ? { replyToId: replyToMessageId } : undefined,
++                      metadata: {
++                        ...(replyToMessageId ? { replyToId: replyToMessageId } : {}),
++                        ...(lifecycleResult.metadata ?? {}),
++                      },
+                     });
+                     return textResult;
+                   })();
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index f2739d331b..83b210a5f5 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -1292,6 +1292,41 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("keeps thinking as a collapsible panel for non-streaming card replies", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: false,
++      },
++    });
++
++    const { result, options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++      threadReply: true,
++      rootId: "om_root_topic",
++    });
++
++    await result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_step one_\n_step two_" });
++    await result.replyOptions.onReasoningEnd?.();
++    await options.deliver({ text: "final answer" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(0);
++    expect(sendStructuredCardFeishuMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: "final answer",
++        thinkingTitle: "💭 Thinking",
++        thinkingText: "step one\nstep two",
++        thinkingExpanded: false,
++      }),
++    );
++  });
++
+   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 34c61d401f..b7a5688cdf 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -211,7 +211,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   const runMessageSending = async (params: {
+     content: string;
+     mediaUrls?: string[];
+-  }): Promise<{ cancelled: boolean; content: string }> => {
++  }): Promise<{ cancelled: boolean; content: string; metadata?: Record<string, unknown> }> => {
+     const hookResult = await core.hooks.runMessageSending(
+       {
+         to: chatId,
+@@ -238,6 +238,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return {
+       cancelled: false,
+       content: typeof hookResult?.content === "string" ? hookResult.content : params.content,
++      metadata:
++        hookResult?.metadata && typeof hookResult.metadata === "object"
++          ? hookResult.metadata
++          : undefined,
+     };
+   };
+   const prefixContext = createReplyPrefixContext({ cfg, agentId });
+@@ -830,6 +834,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         const shouldRunSendingHook =
+           originalReply.hasMedia || !streaming?.isActive() || info?.kind === "final";
+         let text = originalReply.text;
++        let hookMetadata: Record<string, unknown> | undefined;
+         if (shouldRunSendingHook) {
+           const hookResult = await runMessageSending({
+             content: text,
+@@ -843,6 +848,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             return;
+           }
+           text = hookResult.content;
++          hookMetadata =
++            hookResult.metadata && typeof hookResult.metadata === "object"
++              ? hookResult.metadata
++              : undefined;
+         }
+         const hasText = text.trim().length > 0;
+         const hasMedia = originalReply.hasMedia;
+@@ -900,17 +909,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             return;
+           }
+ 
+-          // When streaming is off but reasoning was collected, prepend it to
+-          // the final card so thinking is visible even without streaming cards.
+-          const cardText =
+-            useCard && info?.kind === "final" && reasoningText
+-              ? `> 💭 **Thinking**\n${reasoningText
+-                  .replace(/^Reasoning:\n/, "")
+-                  .replace(/^_(.*)_$/gm, "$1")
+-                  .split("\n")
+-                  .map((l: string) => `> ${l}`)
+-                  .join("\n")}\n\n---\n\n${text}`
+-              : text;
++          const finalThinking =
++            useCard && info?.kind === "final" ? composeThinkingContent({ final: true }) : undefined;
++          const cardText = text;
+ 
+           let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
+           if (useCard) {
+@@ -933,6 +934,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                   accountId,
+                   header: cardHeader,
+                   note: cardNote,
++                  ...(isFirst && finalThinking?.text
++                    ? {
++                        thinkingTitle: finalThinking.title,
++                        thinkingText: finalThinking.text,
++                        thinkingExpanded: false,
++                      }
++                    : {}),
+                 });
+                 return { messageId: sent?.messageId };
+               },
+@@ -968,6 +976,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               metadata: {
+                 finalContent: deliveredContent,
+                 contentType: useCard ? "interactive" : "post",
++                ...(hookMetadata ?? {}),
+               },
+             });
+             await emitFinalTextIfNeeded(text, {
+diff --git a/extensions/feishu/src/send.test.ts b/extensions/feishu/src/send.test.ts
+index 2163636219..4ad6087ecc 100644
+--- a/extensions/feishu/src/send.test.ts
++++ b/extensions/feishu/src/send.test.ts
+@@ -621,6 +621,38 @@ describe("buildStructuredCard", () => {
+       }),
+     );
+   });
++
++  it("renders thinking as a collapsible panel instead of blockquote markdown", () => {
++    const card = buildStructuredCard("final answer", {
++      thinkingTitle: "💭 Thinking",
++      thinkingText: "first line\nsecond line",
++      thinkingExpanded: false,
++    });
++
++    expect(card).toEqual(
++      expect.objectContaining({
++        body: {
++          elements: [
++            expect.objectContaining({
++              tag: "collapsible_panel",
++              expanded: false,
++              header: {
++                title: { tag: "plain_text", content: "💭 Thinking" },
++              },
++              elements: [
++                {
++                  tag: "markdown",
++                  content: "first line\nsecond line",
++                  element_id: "thinking_content",
++                },
++              ],
++            }),
++            { tag: "markdown", content: "final answer" },
++          ],
++        },
++      }),
++    );
++  });
+ });
+ 
+ describe("buildMarkdownCard", () => {
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index 51918af363..d40d87c81c 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -754,10 +754,32 @@ export function buildStructuredCard(
+   options?: {
+     header?: CardHeaderConfig;
+     note?: string;
++    thinkingTitle?: string;
++    thinkingText?: string;
++    thinkingExpanded?: boolean;
+   },
+ ): Record<string, unknown> {
+   const normalizedText = normalizeMentionTagsForCard(text);
+-  const elements: Record<string, unknown>[] = [{ tag: "markdown", content: normalizedText }];
++  const elements: Record<string, unknown>[] = [];
++  const thinkingText = options?.thinkingText?.trim();
++  if (thinkingText) {
++    elements.push({
++      tag: "collapsible_panel",
++      expanded: options?.thinkingExpanded ?? false,
++      element_id: "thinking",
++      header: {
++        title: {
++          tag: "plain_text",
++          content: options?.thinkingTitle?.trim() || "💭 Thinking",
++        },
++      },
++      border: { color: "grey" },
++      vertical_spacing: "2px",
++      padding: "4px 12px",
++      elements: [{ tag: "markdown", content: thinkingText, element_id: "thinking_content" }],
++    });
++  }
++  elements.push({ tag: "markdown", content: normalizedText });
+   if (options?.note) {
+     elements.push({ tag: "hr" });
+     elements.push({ tag: "markdown", content: `<font color='grey'>${options.note}</font>` });
+@@ -790,14 +812,35 @@ export async function sendStructuredCardFeishu(params: {
+   accountId?: string;
+   header?: CardHeaderConfig;
+   note?: string;
++  thinkingTitle?: string;
++  thinkingText?: string;
++  thinkingExpanded?: boolean;
+ }): Promise<FeishuSendResult> {
+-  const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId, header, note } =
+-    params;
++  const {
++    cfg,
++    to,
++    text,
++    replyToMessageId,
++    replyInThread,
++    mentions,
++    accountId,
++    header,
++    note,
++    thinkingTitle,
++    thinkingText,
++    thinkingExpanded,
++  } = params;
+   let cardText = normalizeMentionTagsForCard(text);
+   if (mentions && mentions.length > 0) {
+     cardText = buildMentionedCardContent(mentions, cardText);
+   }
+-  const card = buildStructuredCard(cardText, { header, note });
++  const card = buildStructuredCard(cardText, {
++    header,
++    note,
++    thinkingTitle,
++    thinkingText,
++    thinkingExpanded,
++  });
+   return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, accountId });
+ }
+ 
+diff --git a/src/plugins/hooks.ts b/src/plugins/hooks.ts
+index 43ee50ba7a..08e99723bd 100644
+--- a/src/plugins/hooks.ts
++++ b/src/plugins/hooks.ts
+@@ -610,6 +610,13 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
+       ctx,
+       (acc, next) => ({
+         content: next.content ?? acc?.content,
++        metadata:
++          next.metadata || acc?.metadata
++            ? {
++                ...acc?.metadata,
++                ...next.metadata,
++              }
++            : undefined,
+         cancel: next.cancel ?? acc?.cancel,
+       }),
+     );
+diff --git a/src/plugins/runtime/types-core.ts b/src/plugins/runtime/types-core.ts
+index 572ab67316..7cda2c6920 100644
+--- a/src/plugins/runtime/types-core.ts
++++ b/src/plugins/runtime/types-core.ts
+@@ -112,6 +112,7 @@ export type PluginRuntimeCore = {
+     ) => Promise<
+       | {
+           content?: string;
++          metadata?: Record<string, unknown>;
+           cancel?: boolean;
+         }
+       | undefined
+diff --git a/src/plugins/types.ts b/src/plugins/types.ts
+index 1dbe8818a5..5de4aba8f8 100644
+--- a/src/plugins/types.ts
++++ b/src/plugins/types.ts
+@@ -1703,6 +1703,7 @@ export type PluginHookMessageSendingEvent = {
+ 
+ export type PluginHookMessageSendingResult = {
+   content?: string;
++  metadata?: Record<string, unknown>;
+   cancel?: boolean;
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+

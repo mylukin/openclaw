@@ -1,0 +1,166 @@
+From 6b1ec360bd89cf3fd5ab88783a4fcd19a2c1f45a Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 28 Mar 2026 17:53:05 +0800
+Subject: [PATCH 85/98] fix(reply): dedupe equivalent feishu final payloads
+
+---
+ .../reply/dispatch-from-config.test.ts        | 44 +++++++++++++
+ src/auto-reply/reply/dispatch-from-config.ts  | 63 ++++++++++++++++++-
+ 2 files changed, 106 insertions(+), 1 deletion(-)
+
+diff --git a/src/auto-reply/reply/dispatch-from-config.test.ts b/src/auto-reply/reply/dispatch-from-config.test.ts
+index 23f4cd76fc..5696d2a5b4 100644
+--- a/src/auto-reply/reply/dispatch-from-config.test.ts
++++ b/src/auto-reply/reply/dispatch-from-config.test.ts
+@@ -2208,6 +2208,50 @@ describe("dispatchReplyFromConfig", () => {
+     );
+   });
+ 
++  it("deduplicates equivalent Feishu final replies that only differ by mention tag format", async () => {
++    setNoAbort();
++    const cfg = emptyConfig;
++    const dispatcher = createDispatcher();
++    const ctx = buildTestCtx({
++      Provider: "feishu",
++      Surface: "feishu",
++      OriginatingChannel: "feishu",
++      OriginatingTo: "chat:oc_group_1",
++      To: "chat:oc_group_1",
++      AccountId: "default",
++      SenderId: "user-9",
++      SenderUsername: "ada",
++      CommandAuthorized: true,
++      WasMentioned: true,
++      CommandBody: "reply",
++      RawBody: "reply",
++      Body: "reply",
++      MessageSid: "msg-feishu-final-dedupe",
++      SessionKey: "agent:main:feishu:group:oc_group_1",
++    });
++    const replyResolver = vi.fn(
++      async () =>
++        [
++          {
++            text: '<at user_id="ou_lukin">Lukin</at> <at user_id="ou_cody">Cody</at> 确认，可以进 Human Gate。',
++          },
++          {
++            text: "<at id=ou_lukin></at> <at id=ou_cody></at> 确认，可以进 Human Gate。",
++          },
++        ] satisfies ReplyPayload[],
++    );
++
++    const result = await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
++
++    expect(result.queuedFinal).toBe(true);
++    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
++    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
++      expect.objectContaining({
++        text: '<at user_id="ou_lukin">Lukin</at> <at user_id="ou_cody">Cody</at> 确认，可以进 Human Gate。',
++      }),
++    );
++  });
++
+   it("routes plugin-owned bindings to the owning plugin before generic inbound claim broadcast", async () => {
+     setNoAbort();
+     hookMocks.runner.hasHooks.mockImplementation(
+diff --git a/src/auto-reply/reply/dispatch-from-config.ts b/src/auto-reply/reply/dispatch-from-config.ts
+index 5b18b417a3..a113bd4567 100644
+--- a/src/auto-reply/reply/dispatch-from-config.ts
++++ b/src/auto-reply/reply/dispatch-from-config.ts
+@@ -74,6 +74,51 @@ function loadDispatchAcpRuntime() {
+   return dispatchAcpRuntimePromise;
+ }
+ 
++const FEISHU_AT_USER_ID_TAG_RE =
++  /<at\s+user_id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))\s*>[\s\S]*?<\/at>/gi;
++const FEISHU_AT_ID_TAG_RE =
++  /<at\s+id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>/]+))\s*(?:\/>|>\s*<\/at>)/gi;
++
++function pickFeishuMentionId(
++  quotedDouble?: string,
++  quotedSingle?: string,
++  unquoted?: string,
++): string | null {
++  const value = (quotedDouble ?? quotedSingle ?? unquoted ?? "").trim();
++  return value ? value : null;
++}
++
++function normalizeFeishuFinalReplyText(text: string): string {
++  if (!text.includes("<at")) {
++    return text.trim();
++  }
++  return text
++    .replace(FEISHU_AT_USER_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
++      const id = pickFeishuMentionId(quotedDouble, quotedSingle, unquoted);
++      return id ? `<at:${id}>` : full;
++    })
++    .replace(FEISHU_AT_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
++      const id = pickFeishuMentionId(quotedDouble, quotedSingle, unquoted);
++      return id ? `<at:${id}>` : full;
++    })
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++function resolveFinalReplyDedupeKey(
++  channel: string | undefined,
++  payload: ReplyPayload,
++): string | null {
++  const text = payload.text?.trim();
++  if (!text) {
++    return null;
++  }
++  if (channel === "feishu") {
++    return normalizeFeishuFinalReplyText(text);
++  }
++  return text;
++}
++
+ function loadTtsRuntime() {
+   ttsRuntimePromise ??= import("../../tts/tts.runtime.js");
+   return ttsRuntimePromise;
+@@ -672,6 +717,8 @@ export async function dispatchReplyFromConfig(params: {
+     }
+ 
+     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
++    const deliveredFinalReplyKeys = new Set<string>();
++    const finalReplyChannel = shouldRouteToOriginating ? originatingChannel : currentSurface;
+ 
+     let queuedFinal = false;
+     let routedFinalCount = 0;
+@@ -689,6 +736,13 @@ export async function dispatchReplyFromConfig(params: {
+         inboundAudio,
+         ttsAuto: sessionTtsAuto,
+       });
++      const dedupeKey = resolveFinalReplyDedupeKey(finalReplyChannel, ttsReply);
++      if (dedupeKey && deliveredFinalReplyKeys.has(dedupeKey)) {
++        logVerbose(
++          `dispatch-from-config: suppress duplicate final reply channel=${finalReplyChannel ?? "unknown"} key=${dedupeKey.slice(0, 160)}`,
++        );
++        continue;
++      }
+       if (shouldRouteToOriginating && originatingChannel && originatingTo) {
+         // Route final reply to originating channel.
+         const result = await routeReplyRuntime.routeReply({
+@@ -709,10 +763,17 @@ export async function dispatchReplyFromConfig(params: {
+         }
+         queuedFinal = result.ok || queuedFinal;
+         if (result.ok) {
++          if (dedupeKey) {
++            deliveredFinalReplyKeys.add(dedupeKey);
++          }
+           routedFinalCount += 1;
+         }
+       } else {
+-        queuedFinal = dispatcher.sendFinalReply(ttsReply) || queuedFinal;
++        const didQueue = dispatcher.sendFinalReply(ttsReply);
++        queuedFinal = didQueue || queuedFinal;
++        if (didQueue && dedupeKey) {
++          deliveredFinalReplyKeys.add(dedupeKey);
++        }
+       }
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

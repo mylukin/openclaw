@@ -1,0 +1,349 @@
+From 1b84f742a7320a9f3696347f1d7ba5041599f932 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 29 Mar 2026 23:16:09 +0800
+Subject: [PATCH 92/98] fix: restore feishu dm stop handling
+
+---
+ extensions/feishu/src/bot-sender-name.ts | 37 ++++++++++++
+ extensions/feishu/src/bot.test.ts        | 73 ++++++++++++++++++++++--
+ extensions/feishu/src/bot.ts             | 62 ++++++++++++++------
+ 3 files changed, 147 insertions(+), 25 deletions(-)
+
+diff --git a/extensions/feishu/src/bot-sender-name.ts b/extensions/feishu/src/bot-sender-name.ts
+index 57b5aad3c9..e23190c96d 100644
+--- a/extensions/feishu/src/bot-sender-name.ts
++++ b/extensions/feishu/src/bot-sender-name.ts
+@@ -17,7 +17,9 @@ const FEISHU_SCOPE_CORRECTIONS: Record<string, string> = {
+   "contact:contact.base:readonly": "contact:user.base:readonly",
+ };
+ const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
++const SENDER_NAME_NOAUTH_BACKOFF_MS = 10 * 60 * 1000;
+ const senderNameCache = new Map<string, { name: string; expireAt: number }>();
++const senderLookupBackoff = new Map<string, number>();
+ 
+ function correctFeishuScopeInUrl(url: string): string {
+   let corrected = url;
+@@ -66,6 +68,30 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
+   return "user_id";
+ }
+ 
++function buildSenderLookupKey(account: ResolvedFeishuAccount, senderId: string): string {
++  return `${account.appId ?? account.accountId}:${senderId}`;
++}
++
++function isNoUserAuthorityError(err: unknown): boolean {
++  if (!err || typeof err !== "object") {
++    return false;
++  }
++  const axiosErr = err as { response?: { data?: unknown } };
++  const data = axiosErr.response?.data;
++  if (!data || typeof data !== "object") {
++    return false;
++  }
++  const feishuErr = data as { code?: number; msg?: string };
++  return (
++    feishuErr.code === 41050 || feishuErr.msg?.toLowerCase().includes("no user authority") === true
++  );
++}
++
++export function resetFeishuSenderNameCacheForTests(): void {
++  senderNameCache.clear();
++  senderLookupBackoff.clear();
++}
++
+ export async function resolveFeishuSenderName(params: {
+   account: ResolvedFeishuAccount;
+   senderId: string;
+@@ -86,6 +112,11 @@ export async function resolveFeishuSenderName(params: {
+   if (cached && cached.expireAt > now) {
+     return { name: cached.name };
+   }
++  const lookupKey = buildSenderLookupKey(account, normalizedSenderId);
++  const backoffUntil = senderLookupBackoff.get(lookupKey) ?? 0;
++  if (backoffUntil > now) {
++    return {};
++  }
+ 
+   try {
+     const client = createFeishuClient(account);
+@@ -101,11 +132,17 @@ export async function resolveFeishuSenderName(params: {
+       res?.data?.user?.en_name;
+ 
+     if (name && typeof name === "string") {
++      senderLookupBackoff.delete(lookupKey);
+       senderNameCache.set(normalizedSenderId, { name, expireAt: now + SENDER_NAME_TTL_MS });
+       return { name };
+     }
+     return {};
+   } catch (err) {
++    if (isNoUserAuthorityError(err)) {
++      senderLookupBackoff.set(lookupKey, now + SENDER_NAME_NOAUTH_BACKOFF_MS);
++      log(`feishu: backing off sender lookup for ${normalizedSenderId} after no user authority`);
++      return {};
++    }
+     const permErr = extractPermissionError(err);
+     if (permErr) {
+       if (shouldSuppressPermissionErrorNotice(permErr)) {
+diff --git a/extensions/feishu/src/bot.test.ts b/extensions/feishu/src/bot.test.ts
+index 3a9199e20c..2dcd9dd8bb 100644
+--- a/extensions/feishu/src/bot.test.ts
++++ b/extensions/feishu/src/bot.test.ts
+@@ -10,6 +10,7 @@ import {
+ import { createPluginRuntimeMock } from "../../../test/helpers/extensions/plugin-runtime-mock.js";
+ import { createRuntimeEnv } from "../../../test/helpers/extensions/runtime-env.js";
+ import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
++import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
+ import type { FeishuMessageEvent } from "./bot.js";
+ import {
+   buildBroadcastSessionKey,
+@@ -494,11 +495,15 @@ describe("handleFeishuMessage command authorization", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     resetLiveSessionTranscriptRegistryForTests();
++    resetFeishuSenderNameCacheForTests();
+     mockShouldComputeCommandAuthorized.mockReset().mockReturnValue(true);
++    mockResolveCommandAuthorizedFromAuthorizers.mockReset().mockReturnValue(false);
+     mockGetMessageFeishu.mockReset().mockResolvedValue(null);
+     mockListFeishuThreadMessages.mockReset().mockResolvedValue([]);
+     mockReadSessionUpdatedAt.mockReturnValue(undefined);
+-    mockResolveStorePath.mockReturnValue("/tmp/feishu-sessions.json");
++    mockResolveStorePath.mockImplementation(
++      (store?: string) => store ?? "/tmp/feishu-sessions.json",
++    );
+     mockResolveConfiguredBindingRoute.mockReset().mockImplementation(
+       ({ route }) =>
+         ({
+@@ -635,7 +640,10 @@ describe("handleFeishuMessage command authorization", () => {
+ 
+     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
+       useAccessGroups: true,
+-      authorizers: [{ configured: true, allowed: false }],
++      authorizers: [
++        { configured: true, allowed: false },
++        { configured: false, allowed: false },
++      ],
+     });
+     expect(mockFinalizeInboundContext).toHaveBeenCalledTimes(1);
+     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+@@ -647,6 +655,53 @@ describe("handleFeishuMessage command authorization", () => {
+     );
+   });
+ 
++  it("authorizes /stop in open DMs without an explicit allowlist", async () => {
++    mockResolveCommandAuthorizedFromAuthorizers.mockReturnValue(true);
++
++    const cfg: ClawdbotConfig = {
++      commands: { useAccessGroups: true },
++      channels: {
++        feishu: {
++          dmPolicy: "open",
++          allowFrom: [],
++        },
++      },
++    } as ClawdbotConfig;
++
++    const event: FeishuMessageEvent = {
++      sender: {
++        sender_id: {
++          open_id: "ou-attacker",
++        },
++      },
++      message: {
++        message_id: "msg-open-dm-stop",
++        chat_id: "oc-dm",
++        chat_type: "p2p",
++        message_type: "text",
++        content: JSON.stringify({ text: "/stop" }),
++      },
++    };
++
++    await dispatchMessage({ cfg, event });
++
++    expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
++      useAccessGroups: true,
++      authorizers: [
++        { configured: false, allowed: false },
++        { configured: true, allowed: true },
++      ],
++    });
++    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
++      expect.objectContaining({
++        ChatType: "direct",
++        CommandAuthorized: true,
++        CommandBody: "/stop",
++        SenderId: "ou-attacker",
++      }),
++    );
++  });
++
+   it("reads pairing allow store for non-command DMs when dmPolicy is pairing", async () => {
+     mockShouldComputeCommandAuthorized.mockReturnValue(false);
+     mockReadAllowFromStore.mockResolvedValue(["ou-attacker"]);
+@@ -1179,7 +1234,10 @@ describe("handleFeishuMessage command authorization", () => {
+ 
+     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
+       useAccessGroups: true,
+-      authorizers: [{ configured: false, allowed: false }],
++      authorizers: [
++        { configured: false, allowed: false },
++        { configured: false, allowed: false },
++      ],
+     });
+     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+       expect.objectContaining({
+@@ -1263,7 +1321,10 @@ describe("handleFeishuMessage command authorization", () => {
+ 
+     expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
+       useAccessGroups: true,
+-      authorizers: [{ configured: true, allowed: true }],
++      authorizers: [
++        { configured: true, allowed: true },
++        { configured: false, allowed: false },
++      ],
+     });
+     expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+       expect.objectContaining({
+@@ -2442,7 +2503,7 @@ describe("handleFeishuMessage command authorization", () => {
+     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
+       expect.objectContaining({
+         replyToMessageId: "om_topic_root",
+-        rootId: undefined,
++        rootId: "om_topic_root",
+       }),
+     );
+   });
+@@ -2480,7 +2541,7 @@ describe("handleFeishuMessage command authorization", () => {
+     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
+       expect.objectContaining({
+         replyToMessageId: "om_topic_sender_root",
+-        rootId: undefined,
++        rootId: "om_topic_sender_root",
+       }),
+     );
+   });
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index 949bb0569a..7a91ddfd96 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -43,6 +43,7 @@ import {
+   resolveFeishuAllowlistMatch,
+   isFeishuGroupAllowed,
+ } from "./policy.js";
++import { resolveQuotedFeishuMessageContent } from "./quoted-message.js";
+ import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
+@@ -624,7 +625,6 @@ export async function handleFeishuMessage(params: {
+     const feishuTo = isGroup ? `chat:${ctx.chatId}` : `user:${ctx.senderOpenId}`;
+     const peerId = isGroup ? (groupSession?.peerId ?? ctx.chatId) : ctx.senderOpenId;
+     const parentPeer = isGroup ? (groupSession?.parentPeer ?? null) : null;
+-    const replyInThread = isGroup ? (groupSession?.replyInThread ?? false) : false;
+     const feishuAcpConversationSupported =
+       !isGroup ||
+       groupSession?.groupSessionScope === "group_topic" ||
+@@ -740,7 +740,11 @@ export async function handleFeishuMessage(params: {
+           to: `chat:${ctx.chatId}`,
+           text: `⚠️ Failed to initialize the configured ACP session for this Feishu conversation: ${ensured.error}`,
+           replyToMessageId: replyTargetMessageId,
+-          replyInThread: isGroup ? (groupSession?.replyInThread ?? false) : false,
++          replyInThread:
++            isGroup &&
++            (groupSession?.groupSessionScope === "group_topic" ||
++              groupSession?.groupSessionScope === "group_topic_sender" ||
++              (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled"),
+           accountId: account.accountId,
+         }).catch((err) => {
+           log(`feishu[${account.accountId}]: failed to send ACP init error reply: ${String(err)}`);
+@@ -772,20 +776,37 @@ export async function handleFeishuMessage(params: {
+     });
+     const mediaPayload = buildAgentMediaPayload(mediaList);
+ 
+-    // Fetch quoted/replied message content if parentId exists
++    // Fetch quoted/replied message content if parentId exists.
++    // DMs prefer session-backed reconstruction so reply targets survive even
++    // when Feishu's quoted-message API data is unavailable or incomplete.
+     let quotedMessageInfo: Awaited<ReturnType<typeof getMessageFeishu>> = null;
+     let quotedContent: string | undefined;
+     if (ctx.parentId) {
+       try {
+-        quotedMessageInfo = await getMessageFeishu({
+-          cfg,
+-          messageId: ctx.parentId,
+-          accountId: account.accountId,
+-        });
+-        if (quotedMessageInfo) {
+-          quotedContent = quotedMessageInfo.content;
++        if (isGroup) {
++          quotedMessageInfo = await getMessageFeishu({
++            cfg: effectiveCfg,
++            messageId: ctx.parentId,
++            accountId: account.accountId,
++          });
++          if (quotedMessageInfo) {
++            quotedContent = quotedMessageInfo.content;
++          }
++        } else {
++          const resolvedQuoted = await resolveQuotedFeishuMessageContent({
++            cfg: effectiveCfg,
++            accountId: account.accountId,
++            agentId: route.agentId,
++            sessionKey: boundSessionKey ?? route.sessionKey,
++            chatId: ctx.chatId,
++            parentId: ctx.parentId,
++            isGroup: false,
++          });
++          quotedContent = resolvedQuoted.content;
++        }
++        if (quotedContent) {
+           log(
+-            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent?.slice(0, 100)}`,
++            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent.slice(0, 100)}`,
+           );
+         }
+       } catch (err) {
+@@ -1071,9 +1092,12 @@ export async function handleFeishuMessage(params: {
+     const configReplyInThread =
+       isGroup &&
+       (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
+-    const replyTargetMessageId =
+-      isTopicSession || configReplyInThread ? (ctx.rootId ?? ctx.messageId) : ctx.messageId;
++    const dispatchReplyInThread = isTopicSession || configReplyInThread;
++    const replyTargetMessageId = dispatchReplyInThread
++      ? (ctx.rootId ?? ctx.messageId)
++      : ctx.messageId;
+     const threadReply = isGroup ? (groupSession?.threadReply ?? false) : false;
++    const dispatcherThreadReply = dispatchReplyInThread && threadReply;
+     const streamingInThread =
+       isGroup &&
+       (groupConfig?.streamingInThread ?? feishuCfg?.streamingInThread ?? "disabled") === "enabled";
+@@ -1141,10 +1165,10 @@ export async function handleFeishuMessage(params: {
+             chatId: ctx.chatId,
+             replyToMessageId: replyTargetMessageId,
+             skipReplyToInMessages: !isGroup,
+-            replyInThread,
++            replyInThread: dispatchReplyInThread,
+             streamingInThread,
+-            rootId: replyInThread ? ctx.rootId : undefined,
+-            threadReply: replyInThread && threadReply,
++            rootId: dispatchReplyInThread ? ctx.rootId : undefined,
++            threadReply: dispatcherThreadReply,
+             mentionTargets: ctx.mentionTargets,
+             accountId: account.accountId,
+             sessionKey: agentSessionKey,
+@@ -1312,10 +1336,10 @@ export async function handleFeishuMessage(params: {
+           ? (ctx.rootId ?? replyTargetMessageId)
+           : replyTargetMessageId,
+         skipReplyToInMessages: !isGroup,
+-        replyInThread: boundSessionKey ? true : replyInThread,
++        replyInThread: boundSessionKey ? true : dispatchReplyInThread,
+         streamingInThread: boundSessionKey ? true : streamingInThread,
+-        rootId: boundSessionKey ? ctx.rootId : replyInThread ? ctx.rootId : undefined,
+-        threadReply: boundSessionKey ? true : replyInThread && threadReply,
++        rootId: boundSessionKey ? ctx.rootId : dispatchReplyInThread ? ctx.rootId : undefined,
++        threadReply: boundSessionKey ? true : dispatcherThreadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
+         sessionKey: effectiveSessionKey,
+-- 
+2.50.1 (Apple Git-155)
+

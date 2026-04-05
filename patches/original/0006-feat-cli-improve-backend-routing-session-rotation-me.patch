@@ -1,0 +1,4743 @@
+From 928440bcfe86814e923d98d2cdd0611c9fd8e9af Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:31 +0800
+Subject: [PATCH 06/98] feat(cli): improve backend routing, session rotation
+ memory, and system prompt handling
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot.ts                  |   2 +
+ extensions/feishu/src/reply-dispatcher.ts     |   3 +
+ .../src/typing.reaction-id-fallback.test.ts   | 180 +++++
+ extensions/feishu/src/typing.ts               | 101 ++-
+ src/agents/cli-backends.test.ts               |  36 +
+ src/agents/cli-backends.ts                    |  19 +
+ .../cli-runner.helpers.stream-json.test.ts    | 414 +++++++++++
+ src/agents/cli-runner.test.ts                 |  99 ++-
+ src/agents/cli-runner.ts                      | 689 ++++++++++++++++--
+ src/agents/cli-runner/helpers.ts              | 424 ++++++++++-
+ src/agents/model-aware-runner.test.ts         | 147 ++++
+ src/agents/model-aware-runner.ts              | 112 +++
+ src/auto-reply/heartbeat.ts                   |   2 +-
+ .../reply/agent-runner-execution.ts           | 152 +++-
+ .../agent-runner.misc.runreplyagent.test.ts   | 104 ++-
+ src/auto-reply/reply/commands-core.ts         |  22 +-
+ .../get-reply.reset-hooks-fallback.test.ts    |  78 ++
+ src/auto-reply/reply/get-reply.ts             |  31 +-
+ src/auto-reply/reply/reply-utils.test.ts      |  45 ++
+ .../reply/session-hooks-context.test.ts       |  30 +
+ src/auto-reply/reply/session.test.ts          |   1 +
+ src/auto-reply/reply/session.ts               |   6 +-
+ src/auto-reply/reply/streaming-directives.ts  |  31 +-
+ src/auto-reply/tokens.test.ts                 |  48 +-
+ src/auto-reply/tokens.ts                      |  29 +-
+ src/commands/agent.ts                         |   4 +
+ src/config/schema.help.ts                     |  12 +
+ src/config/schema.labels.ts                   |   6 +
+ src/config/sessions/sessions.test.ts          |  69 +-
+ src/config/sessions/transcript.ts             | 125 ++++
+ src/config/types.agent-defaults.ts            |  13 +
+ src/config/zod-schema.core.ts                 |  20 +-
+ src/cron/isolated-agent/run.ts                |   2 +
+ src/gateway/mcp-http.test.ts                  | 158 ++++
+ src/gateway/mcp-http.ts                       | 526 +++++++++++++
+ src/gateway/server.impl.ts                    |  15 +
+ .../bundled/session-memory/handler.test.ts    |  27 +
+ src/hooks/bundled/session-memory/handler.ts   |   5 +
+ src/infra/outbound/session-binding-service.ts |  16 +-
+ src/plugins/runtime/index.ts                  |   3 +-
+ src/plugins/runtime/types-core.ts             |   1 +
+ 41 files changed, 3699 insertions(+), 108 deletions(-)
+ create mode 100644 extensions/feishu/src/typing.reaction-id-fallback.test.ts
+ create mode 100644 src/agents/cli-runner.helpers.stream-json.test.ts
+ create mode 100644 src/agents/model-aware-runner.test.ts
+ create mode 100644 src/agents/model-aware-runner.ts
+ create mode 100644 src/gateway/mcp-http.test.ts
+ create mode 100644 src/gateway/mcp-http.ts
+
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index 4cc7c30412..ac36a83e2e 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -1489,6 +1489,7 @@ export async function handleFeishuMessage(params: {
+             threadReply,
+             mentionTargets: ctx.mentionTargets,
+             accountId: account.accountId,
++            botOpenId,
+             messageCreateTimeMs,
+           });
+ 
+@@ -1587,6 +1588,7 @@ export async function handleFeishuMessage(params: {
+         threadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
++        botOpenId,
+         messageCreateTimeMs,
+       });
+ 
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 3bd1353825..a6f7fbdf5d 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -50,6 +50,8 @@ export type CreateFeishuReplyDispatcherParams = {
+   rootId?: string;
+   mentionTargets?: MentionTarget[];
+   accountId?: string;
++  /** Bot open_id used to identify this app's typing reaction during cleanup lookup. */
++  botOpenId?: string;
+   /** Epoch ms when the inbound message was created. Used to suppress typing
+    *  indicators on old/replayed messages after context compaction (#30418). */
+   messageCreateTimeMs?: number;
+@@ -104,6 +106,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         cfg,
+         messageId: replyToMessageId,
+         accountId,
++        botOpenId: params.botOpenId,
+         runtime: params.runtime,
+       });
+     },
+diff --git a/extensions/feishu/src/typing.reaction-id-fallback.test.ts b/extensions/feishu/src/typing.reaction-id-fallback.test.ts
+new file mode 100644
+index 0000000000..d92ed3fec4
+--- /dev/null
++++ b/extensions/feishu/src/typing.reaction-id-fallback.test.ts
+@@ -0,0 +1,180 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const resolveFeishuAccountMock = vi.hoisted(() => vi.fn());
++const createFeishuClientMock = vi.hoisted(() => vi.fn());
++const shouldLogVerboseMock = vi.hoisted(() => vi.fn(() => false));
++
++vi.mock("./accounts.js", () => ({
++  resolveFeishuAccount: resolveFeishuAccountMock,
++}));
++
++vi.mock("./client.js", () => ({
++  createFeishuClient: createFeishuClientMock,
++}));
++
++vi.mock("./runtime.js", () => ({
++  getFeishuRuntime: () => ({
++    logging: {
++      shouldLogVerbose: shouldLogVerboseMock,
++    },
++  }),
++}));
++
++import { addTypingIndicator, FeishuBackoffError } from "./typing.js";
++
++function createMockClient(options?: { createResponse?: unknown; listResponse?: unknown }) {
++  return {
++    im: {
++      messageReaction: {
++        create: vi.fn(
++          async () => options?.createResponse ?? { code: 0, data: { reaction_id: "rxn_direct" } },
++        ),
++        list: vi.fn(async () => options?.listResponse ?? { code: 0, data: { items: [] } }),
++      },
++    },
++  };
++}
++
++describe("addTypingIndicator reaction-id fallback", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    resolveFeishuAccountMock.mockReturnValue({
++      configured: true,
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++    });
++  });
++
++  it("returns direct reaction_id from create response without list lookup", async () => {
++    const client = createMockClient({
++      createResponse: { code: 0, data: { reaction_id: "rxn_direct" } },
++    });
++    createFeishuClientMock.mockReturnValue(client);
++
++    const result = await addTypingIndicator({
++      cfg: {} as never,
++      messageId: "om_1",
++      accountId: "main",
++    });
++
++    expect(result).toEqual({ messageId: "om_1", reactionId: "rxn_direct" });
++    expect(client.im.messageReaction.create).toHaveBeenCalledTimes(1);
++    expect(client.im.messageReaction.list).not.toHaveBeenCalled();
++  });
++
++  it("falls back to list and matches by botOpenId when create omits reaction_id", async () => {
++    const client = createMockClient({
++      createResponse: { code: 0, data: {} },
++      listResponse: {
++        code: 0,
++        data: {
++          items: [
++            { reaction_id: "rxn_user", operator_type: "user", operator_id: { open_id: "ou_user" } },
++            {
++              reaction_id: "rxn_other",
++              operator_type: "app",
++              operator_id: { open_id: "ou_other_bot" },
++            },
++            {
++              reaction_id: "rxn_self",
++              operator_type: "app",
++              operator_id: { open_id: "ou_self_bot" },
++            },
++          ],
++        },
++      },
++    });
++    createFeishuClientMock.mockReturnValue(client);
++
++    const result = await addTypingIndicator({
++      cfg: {} as never,
++      messageId: "om_2",
++      accountId: "main",
++      botOpenId: "ou_self_bot",
++    });
++
++    expect(result).toEqual({ messageId: "om_2", reactionId: "rxn_self" });
++    expect(client.im.messageReaction.list).toHaveBeenCalledWith({
++      path: { message_id: "om_2" },
++      params: { reaction_type: "Typing" },
++    });
++  });
++
++  it("uses unique app reaction when botOpenId is unavailable", async () => {
++    const client = createMockClient({
++      createResponse: { code: 0, data: {} },
++      listResponse: {
++        code: 0,
++        data: {
++          items: [
++            { reaction_id: "rxn_user", operator_type: "user", operator_id: { open_id: "ou_user" } },
++            {
++              reaction_id: "rxn_app_only",
++              operator_type: "app",
++              operator_id: { open_id: "ou_app" },
++            },
++          ],
++        },
++      },
++    });
++    createFeishuClientMock.mockReturnValue(client);
++
++    const result = await addTypingIndicator({
++      cfg: {} as never,
++      messageId: "om_3",
++      accountId: "main",
++    });
++
++    expect(result).toEqual({ messageId: "om_3", reactionId: "rxn_app_only" });
++  });
++
++  it("returns null reactionId when fallback list has multiple app reactions and no botOpenId", async () => {
++    const client = createMockClient({
++      createResponse: { code: 0, data: {} },
++      listResponse: {
++        code: 0,
++        data: {
++          items: [
++            {
++              reaction_id: "rxn_app_a",
++              operator_type: "app",
++              operator_id: { open_id: "ou_app_a" },
++            },
++            {
++              reaction_id: "rxn_app_b",
++              operator_type: "app",
++              operator_id: { open_id: "ou_app_b" },
++            },
++          ],
++        },
++      },
++    });
++    createFeishuClientMock.mockReturnValue(client);
++
++    const result = await addTypingIndicator({
++      cfg: {} as never,
++      messageId: "om_4",
++      accountId: "main",
++    });
++
++    expect(result).toEqual({ messageId: "om_4", reactionId: null });
++  });
++
++  it("re-throws backoff from list fallback", async () => {
++    const client = createMockClient({
++      createResponse: { code: 0, data: {} },
++      listResponse: { code: 99991403, msg: "quota exceeded", data: null },
++    });
++    createFeishuClientMock.mockReturnValue(client);
++
++    await expect(
++      addTypingIndicator({
++        cfg: {} as never,
++        messageId: "om_5",
++        accountId: "main",
++      }),
++    ).rejects.toBeInstanceOf(FeishuBackoffError);
++  });
++});
+diff --git a/extensions/feishu/src/typing.ts b/extensions/feishu/src/typing.ts
+index f32996003b..9cb5bda92b 100644
+--- a/extensions/feishu/src/typing.ts
++++ b/extensions/feishu/src/typing.ts
+@@ -40,6 +40,60 @@ export type TypingIndicatorState = {
+   reactionId: string | null;
+ };
+ 
++type FeishuReactionListItem = {
++  reaction_id?: string;
++  operator_type?: string;
++  operator_id?: {
++    open_id?: string;
++    user_id?: string;
++    union_id?: string;
++  };
++};
++
++type FeishuReactionListResponse = {
++  code?: number;
++  msg?: string;
++  data?: {
++    items?: FeishuReactionListItem[];
++  };
++};
++
++function asNonEmptyString(value: unknown): string | undefined {
++  return typeof value === "string" && value.trim() ? value.trim() : undefined;
++}
++
++function pickTypingReactionIdForCleanup(params: {
++  items: FeishuReactionListItem[] | undefined;
++  botOpenId?: string;
++}): string | undefined {
++  const botOpenId = asNonEmptyString(params.botOpenId);
++  let firstAppReactionId: string | undefined;
++  let appReactionCount = 0;
++
++  for (const item of params.items ?? []) {
++    const reactionId = asNonEmptyString(item?.reaction_id);
++    if (!reactionId || item?.operator_type !== "app") {
++      continue;
++    }
++    appReactionCount += 1;
++
++    const operatorOpenId = asNonEmptyString(item?.operator_id?.open_id);
++    if (botOpenId && operatorOpenId === botOpenId) {
++      return reactionId;
++    }
++
++    if (!firstAppReactionId) {
++      firstAppReactionId = reactionId;
++    }
++  }
++
++  // No known bot open_id: only accept a unique app reaction to avoid wrong cleanup.
++  if (!botOpenId) {
++    return appReactionCount === 1 ? firstAppReactionId : undefined;
++  }
++  return undefined;
++}
++
+ /**
+  * Check whether an error represents a rate-limit or quota-exceeded condition
+  * from the Feishu API that should stop the typing keepalive loop.
+@@ -104,9 +158,10 @@ export async function addTypingIndicator(params: {
+   cfg: ClawdbotConfig;
+   messageId: string;
+   accountId?: string;
++  botOpenId?: string;
+   runtime?: RuntimeEnv;
+ }): Promise<TypingIndicatorState> {
+-  const { cfg, messageId, accountId, runtime } = params;
++  const { cfg, messageId, accountId, botOpenId, runtime } = params;
+   const account = resolveFeishuAccount({ cfg, accountId });
+   if (!account.configured) {
+     return { messageId, reactionId: null };
+@@ -135,8 +190,48 @@ export async function addTypingIndicator(params: {
+     }
+ 
+     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
+-    const reactionId = (response as any)?.data?.reaction_id ?? null;
+-    return { messageId, reactionId };
++    const directReactionId = asNonEmptyString((response as any)?.data?.reaction_id);
++    if (directReactionId) {
++      return { messageId, reactionId: directReactionId };
++    }
++
++    // Some SDK responses omit reaction_id even on success. Resolve cleanup target
++    // by listing current Typing reactions and matching this bot's operator open_id.
++    const listResult = (await client.im.messageReaction.list({
++      path: { message_id: messageId },
++      params: { reaction_type: TYPING_EMOJI },
++    })) as FeishuReactionListResponse;
++    const listBackoffCode = getBackoffCodeFromResponse(listResult);
++    if (listBackoffCode !== undefined) {
++      if (getFeishuRuntime().logging.shouldLogVerbose()) {
++        runtime?.log?.(
++          `[feishu] typing indicator lookup response contains backoff code ${listBackoffCode}, stopping keepalive`,
++        );
++      }
++      throw new FeishuBackoffError(listBackoffCode);
++    }
++    if (typeof listResult.code === "number" && listResult.code !== 0) {
++      if (getFeishuRuntime().logging.shouldLogVerbose()) {
++        runtime?.log?.(
++          `[feishu] typing indicator lookup failed: ${listResult.msg ?? `code ${String(listResult.code)}`}`,
++        );
++      }
++      return { messageId, reactionId: null };
++    }
++
++    const fallbackReactionId = pickTypingReactionIdForCleanup({
++      items: listResult.data?.items,
++      botOpenId,
++    });
++    if (fallbackReactionId) {
++      return { messageId, reactionId: fallbackReactionId };
++    }
++    if (getFeishuRuntime().logging.shouldLogVerbose()) {
++      runtime?.log?.(
++        "[feishu] typing indicator response missing reaction_id and lookup found no unique cleanup target",
++      );
++    }
++    return { messageId, reactionId: null };
+   } catch (err) {
+     if (isFeishuBackoffError(err)) {
+       if (getFeishuRuntime().logging.shouldLogVerbose()) {
+diff --git a/src/agents/cli-backends.test.ts b/src/agents/cli-backends.test.ts
+index 6dde78797c..fa093b8478 100644
+--- a/src/agents/cli-backends.test.ts
++++ b/src/agents/cli-backends.test.ts
+@@ -58,6 +58,42 @@ describe("resolveCliBackendConfig reliability merge", () => {
+     expect(resolved?.config.reliability?.watchdog?.resume?.maxMs).toBe(180_000);
+     expect(resolved?.config.reliability?.watchdog?.fresh?.noOutputTimeoutRatio).toBe(0.8);
+   });
++
++  it("merges claude-cli MCP overrides without dropping defaults", () => {
++    const cfg = {
++      agents: {
++        defaults: {
++          cliBackends: {
++            "claude-cli": {
++              command: "claude",
++              mcp: {
++                strict: false,
++                servers: {
++                  myserver: {
++                    type: "stdio",
++                    command: "node",
++                    args: ["server.js"],
++                  },
++                },
++              },
++            },
++          },
++        },
++      },
++    } satisfies OpenClawConfig;
++
++    const resolved = resolveCliBackendConfig("claude-cli", cfg);
++
++    expect(resolved).not.toBeNull();
++    expect(resolved?.config.mcp?.enabled).toBe(true);
++    expect(resolved?.config.mcp?.strict).toBe(false);
++    expect(resolved?.config.mcp?.servers).toMatchObject({
++      myserver: {
++        type: "stdio",
++        command: "node",
++      },
++    });
++  });
+ });
+ 
+ describe("resolveCliBackendConfig claude-cli defaults", () => {
+diff --git a/src/agents/cli-backends.ts b/src/agents/cli-backends.ts
+index 1b19c4a508..947855f7b0 100644
+--- a/src/agents/cli-backends.ts
++++ b/src/agents/cli-backends.ts
+@@ -66,6 +66,10 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
+       resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
+     },
+   },
++  mcp: {
++    enabled: true,
++    strict: true,
++  },
+   serialize: true,
+ };
+ 
+@@ -131,6 +135,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
+   const baseResume = base.reliability?.watchdog?.resume ?? {};
+   const overrideFresh = override.reliability?.watchdog?.fresh ?? {};
+   const overrideResume = override.reliability?.watchdog?.resume ?? {};
++  const baseMcp = base.mcp ?? {};
++  const overrideMcp = override.mcp ?? {};
++  const mergedMcp = (() => {
++    const mergedServers = {
++      ...baseMcp.servers,
++      ...overrideMcp.servers,
++    };
++    const next = {
++      ...baseMcp,
++      ...overrideMcp,
++      ...(Object.keys(mergedServers).length ? { servers: mergedServers } : {}),
++    };
++    return Object.keys(next).length ? next : undefined;
++  })();
+   return {
+     ...base,
+     ...override,
+@@ -157,6 +175,7 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
+         },
+       },
+     },
++    mcp: mergedMcp,
+   };
+ }
+ 
+diff --git a/src/agents/cli-runner.helpers.stream-json.test.ts b/src/agents/cli-runner.helpers.stream-json.test.ts
+new file mode 100644
+index 0000000000..7e18c46aa0
+--- /dev/null
++++ b/src/agents/cli-runner.helpers.stream-json.test.ts
+@@ -0,0 +1,414 @@
++import { describe, expect, it, vi } from "vitest";
++import type { CliBackendConfig } from "../config/types.js";
++import { createStreamJsonProcessor } from "./cli-runner/helpers.js";
++
++function createBackend(overrides: Partial<CliBackendConfig> = {}): CliBackendConfig {
++  return {
++    command: "claude",
++    output: "stream-json",
++    ...overrides,
++  };
++}
++
++describe("createStreamJsonProcessor", () => {
++  it("emits thinking/tool events while preserving final assistant output", () => {
++    const onAssistantTurn = vi.fn();
++    const onThinkingTurn = vi.fn();
++    const onToolUse = vi.fn();
++    const onToolUseEvent = vi.fn();
++    const onToolResult = vi.fn();
++
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++      onThinkingTurn,
++      onToolUse,
++      onToolUseEvent,
++      onToolResult,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [
++            { type: "thinking", thinking: "Check inputs first" },
++            {
++              type: "tool_use",
++              id: "toolu_1",
++              name: "Read",
++              input: { path: "README.md" },
++            },
++            { type: "text", text: "Working on it..." },
++          ],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "user",
++        message: {
++          role: "user",
++          content: [
++            {
++              type: "tool_result",
++              tool_use_id: "toolu_1",
++              content: [{ type: "text", text: "README contents" }],
++            },
++          ],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "result",
++        result: "Final answer",
++        session_id: "session-1",
++        usage: {
++          input_tokens: 12,
++          output_tokens: 8,
++          total_tokens: 20,
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++
++    expect(onAssistantTurn).toHaveBeenCalledWith("Working on it...");
++    expect(onThinkingTurn).toHaveBeenCalledWith({
++      text: "Check inputs first",
++      delta: "Check inputs first",
++    });
++    expect(onToolUse).toHaveBeenCalledWith("Read");
++    expect(onToolUseEvent).toHaveBeenCalledWith(
++      expect.objectContaining({
++        name: "Read",
++        toolUseId: "toolu_1",
++        input: { path: "README.md" },
++      }),
++    );
++    expect(onToolResult).toHaveBeenCalledWith(
++      expect.objectContaining({
++        toolUseId: "toolu_1",
++        text: "README contents",
++        isError: false,
++      }),
++    );
++    expect(output).toEqual({
++      text: "Final answer",
++      sessionId: "session-1",
++      usage: {
++        input: 12,
++        output: 8,
++        total: 20,
++        cacheRead: undefined,
++        cacheWrite: undefined,
++      },
++    });
++  });
++
++  it("deduplicates tool_use blocks by id and computes thinking deltas", () => {
++    const onThinkingTurn = vi.fn();
++    const onToolUseEvent = vi.fn();
++
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onThinkingTurn,
++      onToolUseEvent,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [
++            { type: "thinking", thinking: "Plan" },
++            { type: "tool_use", id: "toolu_repeat", name: "Search", input: { q: "a" } },
++          ],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [
++            { type: "thinking", thinking: "Planning next step" },
++            { type: "tool_use", id: "toolu_repeat", name: "Search", input: { q: "a" } },
++          ],
++        },
++      })}\n`,
++    );
++
++    processor.finish();
++
++    expect(onThinkingTurn).toHaveBeenNthCalledWith(1, {
++      text: "Plan",
++      delta: "Plan",
++    });
++    expect(onThinkingTurn).toHaveBeenNthCalledWith(2, {
++      text: "Planning next step",
++      delta: "ning next step",
++    });
++    expect(onToolUseEvent).toHaveBeenCalledTimes(1);
++  });
++
++  it("omits thinking delta when text is rewritten instead of appended", () => {
++    const onThinkingTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onThinkingTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [{ type: "thinking", thinking: "First draft" }],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [{ type: "thinking", thinking: "Rewritten idea" }],
++        },
++      })}\n`,
++    );
++
++    processor.finish();
++    expect(onThinkingTurn).toHaveBeenNthCalledWith(1, {
++      text: "First draft",
++      delta: "First draft",
++    });
++    expect(onThinkingTurn).toHaveBeenNthCalledWith(2, {
++      text: "Rewritten idea",
++    });
++  });
++
++  it("deduplicates consecutive anonymous tool_use blocks", () => {
++    const onToolUseEvent = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onToolUseEvent,
++    });
++
++    const anonymousToolUseLine = JSON.stringify({
++      type: "assistant",
++      message: {
++        role: "assistant",
++        content: [{ type: "tool_use", name: "Search", input: { q: "hello" } }],
++      },
++    });
++    processor.feed(`${anonymousToolUseLine}\n`);
++    processor.feed(`${anonymousToolUseLine}\n`);
++    processor.finish();
++
++    expect(onToolUseEvent).toHaveBeenCalledTimes(1);
++    expect(onToolUseEvent).toHaveBeenCalledWith({
++      name: "Search",
++      input: { q: "hello" },
++      toolUseId: undefined,
++    });
++  });
++
++  it("keeps backward compatibility for assistant content emitted as a string", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: "legacy assistant content",
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).toHaveBeenCalledWith("legacy assistant content");
++    expect(output.text).toBe("legacy assistant content");
++  });
++
++  it("keeps backward compatibility for assistant message emitted as a raw string", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: "legacy raw assistant message",
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).toHaveBeenCalledWith("legacy raw assistant message");
++    expect(output.text).toBe("legacy raw assistant message");
++  });
++
++  it("ignores non-assistant text blocks while still emitting tool_result blocks", () => {
++    const onAssistantTurn = vi.fn();
++    const onToolResult = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++      onToolResult,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "user",
++        message: {
++          role: "user",
++          content: [{ type: "text", text: "user text should not stream as assistant" }],
++        },
++      })}\n`,
++    );
++    processor.feed(
++      `${JSON.stringify({
++        type: "user",
++        message: {
++          role: "user",
++          content: [
++            {
++              type: "tool_result",
++              tool_use_id: "toolu_from_user_turn",
++              content: [{ type: "text", text: "tool output" }],
++            },
++          ],
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).not.toHaveBeenCalled();
++    expect(onToolResult).toHaveBeenCalledWith(
++      expect.objectContaining({
++        toolUseId: "toolu_from_user_turn",
++        text: "tool output",
++      }),
++    );
++    expect(output.text).toBe("");
++  });
++
++  it("ignores tool_result blocks from system envelopes", () => {
++    const onToolResult = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onToolResult,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "system",
++        message: {
++          role: "system",
++          content: [
++            {
++              type: "tool_result",
++              tool_use_id: "toolu_system",
++              content: [{ type: "text", text: "system should not emit tool_result" }],
++            },
++          ],
++        },
++      })}\n`,
++    );
++
++    processor.finish();
++    expect(onToolResult).not.toHaveBeenCalled();
++  });
++
++  it("keeps result handling when result payload includes content blocks", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "result",
++        session_id: "session-with-blocks",
++        message: {
++          role: "system",
++          content: [{ type: "text", text: "final from result blocks" }],
++        },
++        usage: {
++          input_tokens: 4,
++          output_tokens: 3,
++          total_tokens: 7,
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).not.toHaveBeenCalled();
++    expect(output).toEqual({
++      text: "final from result blocks",
++      sessionId: "session-with-blocks",
++      usage: {
++        input: 4,
++        output: 3,
++        total: 7,
++        cacheRead: undefined,
++        cacheWrite: undefined,
++      },
++    });
++  });
++
++  it("deduplicates identical tool_result blocks by tool_use_id", () => {
++    const onToolResult = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onToolResult,
++    });
++
++    const event = {
++      type: "user",
++      message: {
++        role: "user",
++        content: [
++          {
++            type: "tool_result",
++            tool_use_id: "toolu_dup",
++            content: [{ type: "text", text: "same output" }],
++          },
++        ],
++      },
++    };
++    processor.feed(`${JSON.stringify(event)}\n`);
++    processor.feed(`${JSON.stringify(event)}\n`);
++
++    processor.finish();
++    expect(onToolResult).toHaveBeenCalledTimes(1);
++    expect(onToolResult).toHaveBeenCalledWith({
++      toolUseId: "toolu_dup",
++      text: "same output",
++      isError: false,
++    });
++  });
++
++  it("falls back to collectText when assistant content blocks are non-standard", () => {
++    const onAssistantTurn = vi.fn();
++    const processor = createStreamJsonProcessor(createBackend(), {
++      onAssistantTurn,
++    });
++
++    processor.feed(
++      `${JSON.stringify({
++        type: "assistant",
++        message: {
++          role: "assistant",
++          content: [{ type: "text_delta", text: "delta text fallback" }],
++        },
++      })}\n`,
++    );
++
++    const output = processor.finish();
++    expect(onAssistantTurn).toHaveBeenCalledWith("delta text fallback");
++    expect(output.text).toBe("delta text fallback");
++  });
++});
+diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
+index ec1b0b09ac..cfe5101807 100644
+--- a/src/agents/cli-runner.test.ts
++++ b/src/agents/cli-runner.test.ts
+@@ -9,6 +9,12 @@ import { resolveCliNoOutputTimeoutMs } from "./cli-runner/helpers.js";
+ const supervisorSpawnMock = vi.fn();
+ const enqueueSystemEventMock = vi.fn();
+ const requestHeartbeatNowMock = vi.fn();
++const ensureMcpConfigFileMock = vi.hoisted(() => vi.fn(() => "/tmp/openclaw-mcp.json"));
++
++vi.mock("../gateway/mcp-http.js", () => ({
++  MCP_PORT_OFFSET: 1,
++  ensureMcpConfigFile: (...args: unknown[]) => ensureMcpConfigFileMock(...args),
++}));
+ 
+ vi.mock("../process/supervisor/index.js", () => ({
+   getProcessSupervisor: () => ({
+@@ -57,10 +63,12 @@ function createManagedRun(exit: MockRunExit, pid = 1234) {
+ }
+ 
+ describe("runCliAgent with process supervisor", () => {
+-  beforeEach(() => {
++  beforeEach(async () => {
+     supervisorSpawnMock.mockClear();
+     enqueueSystemEventMock.mockClear();
+     requestHeartbeatNowMock.mockClear();
++    ensureMcpConfigFileMock.mockClear();
++    ensureMcpConfigFileMock.mockReturnValue("/tmp/openclaw-mcp.json");
+   });
+ 
+   it("runs CLI through supervisor and returns payload", async () => {
+@@ -105,6 +113,51 @@ describe("runCliAgent with process supervisor", () => {
+     expect(input.noOutputTimeoutMs).toBeGreaterThanOrEqual(1_000);
+     expect(input.replaceExistingScope).toBe(true);
+     expect(input.scopeKey).toContain("thread-123");
++    expect(ensureMcpConfigFileMock).not.toHaveBeenCalled();
++  });
++
++  it("adds strict MCP config flags for claude-cli", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: '{"content":[{"type":"text","text":"ok"}]}',
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionKey: "agent:main:main",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      config: {
++        gateway: {
++          port: 19000,
++        },
++      } as OpenClawConfig,
++      prompt: "hi",
++      provider: "claude-cli",
++      model: "sonnet",
++      timeoutMs: 1_000,
++      runId: "run-claude-mcp",
++    });
++
++    expect(ensureMcpConfigFileMock).toHaveBeenCalledTimes(1);
++    expect(ensureMcpConfigFileMock).toHaveBeenCalledWith(
++      path.join(os.homedir(), ".openclaw"),
++      19001,
++    );
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
++    expect(input.argv).toContain("--strict-mcp-config");
++    expect(input.argv).toContain("--mcp-config");
++    const mcpConfigIndex = input.argv?.indexOf("--mcp-config") ?? -1;
++    expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
++    expect(input.argv?.[mcpConfigIndex + 1]).toBe("/tmp/openclaw-mcp.json");
+   });
+ 
+   it("fails with timeout when no-output watchdog trips", async () => {
+@@ -294,6 +347,50 @@ describe("runCliAgent with process supervisor", () => {
+     const input = supervisorSpawnMock.mock.calls[0]?.[0] as { cwd?: string };
+     expect(input.cwd).toBe(path.resolve(fallbackWorkspace));
+   });
++
++  it("cancels running CLI process on abort signal", async () => {
++    const managedRun = createManagedRun({
++      reason: "manual-cancel",
++      exitCode: null,
++      exitSignal: "SIGTERM",
++      durationMs: 25,
++      stdout: "",
++      stderr: "",
++      timedOut: false,
++      noOutputTimedOut: false,
++    });
++    managedRun.wait = vi.fn(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 50));
++      return {
++        reason: "manual-cancel",
++        exitCode: null,
++        exitSignal: "SIGTERM",
++        durationMs: 25,
++        stdout: "",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      };
++    });
++    supervisorSpawnMock.mockResolvedValueOnce(managedRun);
++    const abortController = new AbortController();
++    const runPromise = runCliAgent({
++      sessionId: "s1",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      prompt: "hi",
++      provider: "codex-cli",
++      model: "gpt-5.2-codex",
++      timeoutMs: 1_000,
++      runId: "run-abort",
++      abortSignal: abortController.signal,
++    });
++
++    await vi.waitFor(() => expect(supervisorSpawnMock).toHaveBeenCalledTimes(1));
++    abortController.abort("stop");
++    await expect(runPromise).rejects.toMatchObject({ name: "AbortError" });
++    expect(managedRun.cancel).toHaveBeenCalledWith("manual-cancel");
++  });
+ });
+ 
+ describe("resolveCliNoOutputTimeoutMs", () => {
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 3dfe728ce3..a68d019ff4 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -1,14 +1,20 @@
++import os from "node:os";
++import path from "node:path";
+ import type { ImageContent } from "@mariozechner/pi-ai";
+ import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
+ import type { ThinkLevel } from "../auto-reply/thinking.js";
+ import type { OpenClawConfig } from "../config/config.js";
++import { MCP_PORT_OFFSET, ensureMcpConfigFile } from "../gateway/mcp-http.js";
+ import { shouldLogVerbose } from "../globals.js";
+ import { isTruthyEnvValue } from "../infra/env.js";
+ import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
+ import { enqueueSystemEvent } from "../infra/system-events.js";
+ import { createSubsystemLogger } from "../logging/subsystem.js";
++import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
++import type { PluginHookAgentContext } from "../plugins/types.js";
+ import { getProcessSupervisor } from "../process/supervisor/index.js";
+ import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
++import { sliceUtf16Safe, resolveUserPath } from "../utils.js";
+ import { resolveSessionAgentIds } from "./agent-scope.js";
+ import {
+   analyzeBootstrapBudget,
+@@ -43,11 +49,332 @@ import {
+   resolveBootstrapTotalMaxChars,
+ } from "./pi-embedded-helpers.js";
+ import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
++import {
++  applySkillEnvOverrides,
++  applySkillEnvOverridesFromSnapshot,
++  loadWorkspaceSkillEntries,
++  resolveSkillsPromptForRun,
++  type SkillSnapshot,
++} from "./skills.js";
+ import { buildSystemPromptReport } from "./system-prompt-report.js";
+ import { redactRunIdentifier, resolveRunWorkspaceDir } from "./workspace-run.js";
+ 
+ const log = createSubsystemLogger("agent/claude-cli");
+ 
++type McpServers = Record<string, unknown>;
++const MERGED_MCP_CONFIG_BASENAME_RE = /^mcp\.cli-merged\.[a-f0-9]{16}\.json$/;
++const MERGED_MCP_CONFIG_MAX_FILES = 20;
++const MERGED_MCP_CONFIG_MIN_AGE_MS = 60 * 60 * 1000;
++const CLI_OUTPUT_LOG_HEAD_CHARS = 240;
++const CLI_OUTPUT_LOG_TAIL_CHARS = 160;
++const CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS = CLI_OUTPUT_LOG_HEAD_CHARS + CLI_OUTPUT_LOG_TAIL_CHARS;
++
++function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): string {
++  if (!text) {
++    return `cli ${channel}: <empty>`;
++  }
++  const totalChars = text.length;
++  if (totalChars <= CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS) {
++    return `cli ${channel} (${totalChars} chars):\n${text}`;
++  }
++  const head = sliceUtf16Safe(text, 0, CLI_OUTPUT_LOG_HEAD_CHARS);
++  const tailStart = Math.max(0, totalChars - CLI_OUTPUT_LOG_TAIL_CHARS);
++  const tail = sliceUtf16Safe(text, tailStart);
++  const truncatedChars = Math.max(0, totalChars - head.length - tail.length);
++  return [
++    `cli ${channel} (${totalChars} chars):`,
++    head,
++    `[truncated ${truncatedChars} chars]`,
++    tail,
++  ].join("\n");
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null;
++}
++
++function resolveConfiguredPath(rawPath: string | undefined): string | undefined {
++  const trimmed = rawPath?.trim();
++  if (!trimmed) {
++    return undefined;
++  }
++  return resolveUserPath(trimmed);
++}
++
++async function readMcpServers(filePath: string): Promise<McpServers | null> {
++  try {
++    const raw = await fs.readFile(filePath, "utf-8");
++    const parsed = JSON.parse(raw) as unknown;
++    if (!isRecord(parsed)) {
++      return {};
++    }
++    const serversRaw = parsed.mcpServers;
++    if (!isRecord(serversRaw)) {
++      return {};
++    }
++    return { ...serversRaw };
++  } catch {
++    return null;
++  }
++}
++
++async function writeMcpConfigIfChanged(filePath: string, content: string): Promise<void> {
++  try {
++    const existing = await fs.readFile(filePath, "utf-8");
++    if (existing === content) {
++      return;
++    }
++  } catch {
++    // file may not exist yet
++  }
++  await fs.mkdir(path.dirname(filePath), { recursive: true });
++  await fs.writeFile(filePath, content, { mode: 0o600 });
++}
++
++async function cleanupMergedMcpConfigs(params: {
++  dir: string;
++  keepFilePath: string;
++}): Promise<void> {
++  const keepName = path.basename(params.keepFilePath);
++  const now = Date.now();
++  const entries = await fs.readdir(params.dir, { withFileTypes: true }).catch(() => []);
++  const candidates: Array<{ name: string; filePath: string; mtimeMs: number }> = [];
++  for (const entry of entries) {
++    if (!entry.isFile() || !MERGED_MCP_CONFIG_BASENAME_RE.test(entry.name)) {
++      continue;
++    }
++    const filePath = path.join(params.dir, entry.name);
++    const stat = await fs.stat(filePath).catch(() => null);
++    if (!stat) {
++      continue;
++    }
++    candidates.push({
++      name: entry.name,
++      filePath,
++      mtimeMs: stat.mtimeMs,
++    });
++  }
++  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
++
++  const keepNames = new Set<string>([keepName]);
++  for (const candidate of candidates) {
++    if (keepNames.size >= MERGED_MCP_CONFIG_MAX_FILES) {
++      break;
++    }
++    keepNames.add(candidate.name);
++  }
++
++  for (const candidate of candidates) {
++    if (keepNames.has(candidate.name)) {
++      continue;
++    }
++    if (now - candidate.mtimeMs < MERGED_MCP_CONFIG_MIN_AGE_MS) {
++      continue;
++    }
++    await fs.unlink(candidate.filePath).catch(() => undefined);
++  }
++}
++
++async function resolveClaudeMcpConfigForRun(params: {
++  backend: CliBackendConfig;
++  config?: OpenClawConfig;
++}): Promise<{ mcpConfigPath?: string; useStrictMcp: boolean }> {
++  const mcpCfg = params.backend.mcp;
++  if (mcpCfg?.enabled === false) {
++    return { mcpConfigPath: undefined, useStrictMcp: false };
++  }
++
++  const useStrictMcp = mcpCfg?.strict !== false;
++  const gatewayPort = params.config?.gateway?.port ?? 18789;
++  const mcpPort = gatewayPort + MCP_PORT_OFFSET;
++  const openclawDir = path.join(os.homedir(), ".openclaw");
++  const defaultMcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);
++
++  const configuredMcpPath = resolveConfiguredPath(mcpCfg?.configPath);
++  const mergeMcpPath = resolveConfiguredPath(mcpCfg?.mergeConfigPath);
++  const inlineServers = isRecord(mcpCfg?.servers) ? { ...mcpCfg.servers } : {};
++  const hasInlineServers = Object.keys(inlineServers).length > 0;
++  const needsMerge = Boolean(
++    mergeMcpPath ||
++    hasInlineServers ||
++    (configuredMcpPath && configuredMcpPath !== defaultMcpConfigPath),
++  );
++  if (!needsMerge) {
++    return {
++      mcpConfigPath: configuredMcpPath ?? defaultMcpConfigPath,
++      useStrictMcp,
++    };
++  }
++
++  const openclawServers = await readMcpServers(defaultMcpConfigPath);
++  if (openclawServers === null) {
++    log.warn(`MCP default config read failed, skipping merge: ${defaultMcpConfigPath}`);
++    return {
++      mcpConfigPath: defaultMcpConfigPath,
++      useStrictMcp,
++    };
++  }
++  const configuredServers = configuredMcpPath
++    ? await readMcpServers(configuredMcpPath)
++    : openclawServers;
++  if (configuredMcpPath && configuredServers === null) {
++    log.warn(`MCP primary config read failed: ${configuredMcpPath}`);
++  }
++  const mergeServers = mergeMcpPath ? await readMcpServers(mergeMcpPath) : {};
++  if (mergeMcpPath && mergeServers === null) {
++    log.warn(`MCP merge config read failed: ${mergeMcpPath}`);
++  }
++
++  const mergedServers: McpServers = {
++    ...(configuredServers ?? openclawServers),
++    ...mergeServers,
++    ...inlineServers,
++  };
++  const openclawServer = openclawServers.openclaw;
++  if (isRecord(openclawServer)) {
++    // Keep OpenClaw MCP server authoritative so tool routing cannot be shadowed.
++    mergedServers.openclaw = openclawServer;
++  }
++
++  const mergedContent = `${JSON.stringify({ mcpServers: mergedServers }, null, 2)}\n`;
++  const mergedHash = crypto.createHash("sha256").update(mergedContent).digest("hex").slice(0, 16);
++  const mergedPath = path.join(
++    path.dirname(defaultMcpConfigPath),
++    `mcp.cli-merged.${mergedHash}.json`,
++  );
++  await writeMcpConfigIfChanged(mergedPath, mergedContent);
++  await cleanupMergedMcpConfigs({
++    dir: path.dirname(defaultMcpConfigPath),
++    keepFilePath: mergedPath,
++  }).catch((err) => {
++    log.debug(`MCP merged config cleanup skipped: ${String(err)}`);
++  });
++  return { mcpConfigPath: mergedPath, useStrictMcp };
++}
++
++function createAbortError(signal?: AbortSignal): Error {
++  const reason = signal && "reason" in signal ? (signal as { reason?: unknown }).reason : undefined;
++  const err = reason ? new Error("aborted", { cause: reason }) : new Error("aborted");
++  err.name = "AbortError";
++  return err;
++}
++
++async function readCliHookMessages(sessionFile: string): Promise<unknown[]> {
++  const trimmed = sessionFile.trim();
++  if (!trimmed) {
++    return [];
++  }
++  try {
++    const raw = await fs.readFile(path.resolve(trimmed), "utf-8");
++    const lines = raw.split(/\r?\n/g);
++    const messages: unknown[] = [];
++    for (const line of lines) {
++      const value = line.trim();
++      if (!value) {
++        continue;
++      }
++      try {
++        const parsed = JSON.parse(value) as unknown;
++        if (isRecord(parsed) && parsed.type === "message" && "message" in parsed) {
++          messages.push(parsed.message);
++        }
++      } catch {
++        // ignore malformed lines
++      }
++    }
++    return messages;
++  } catch {
++    return [];
++  }
++}
++
++async function resolveCliPromptBuildHookResult(params: {
++  hookRunner: ReturnType<typeof getGlobalHookRunner>;
++  prompt: string;
++  messages: unknown[];
++  hookCtx: PluginHookAgentContext;
++}): Promise<{ systemPrompt?: string; prependContext?: string } | undefined> {
++  const hookRunner = params.hookRunner;
++  if (!hookRunner) {
++    return undefined;
++  }
++  const promptBuildResult = hookRunner.hasHooks("before_prompt_build")
++    ? await hookRunner
++        .runBeforePromptBuild(
++          {
++            prompt: params.prompt,
++            messages: params.messages,
++          },
++          params.hookCtx,
++        )
++        .catch((hookErr: unknown) => {
++          log.warn(`before_prompt_build hook failed: ${String(hookErr)}`);
++          return undefined;
++        })
++    : undefined;
++  const legacyResult = hookRunner.hasHooks("before_agent_start")
++    ? await hookRunner
++        .runBeforeAgentStart(
++          {
++            prompt: params.prompt,
++            messages: params.messages,
++          },
++          params.hookCtx,
++        )
++        .catch((hookErr: unknown) => {
++          log.warn(`before_agent_start hook (CLI path) failed: ${String(hookErr)}`);
++          return undefined;
++        })
++    : undefined;
++  return {
++    systemPrompt: promptBuildResult?.systemPrompt ?? legacyResult?.systemPrompt,
++    prependContext: [promptBuildResult?.prependContext, legacyResult?.prependContext]
++      .filter((value): value is string => Boolean(value))
++      .join("\n\n"),
++  };
++}
++
++function emitCliLlmOutputHook(params: {
++  hookRunner: ReturnType<typeof getGlobalHookRunner>;
++  hookCtx: PluginHookAgentContext;
++  runId: string;
++  sessionId: string;
++  provider: string;
++  model: string;
++  output: {
++    text: string;
++    usage?: {
++      input?: number;
++      output?: number;
++      cacheRead?: number;
++      cacheWrite?: number;
++      total?: number;
++    };
++  };
++}) {
++  const hookRunner = params.hookRunner;
++  if (!hookRunner?.hasHooks("llm_output")) {
++    return;
++  }
++  const text = params.output.text.trim();
++  hookRunner
++    .runLlmOutput(
++      {
++        runId: params.runId,
++        sessionId: params.sessionId,
++        provider: params.provider,
++        model: params.model,
++        assistantTexts: text ? [text] : [],
++        lastAssistant: text ? { role: "assistant", content: text } : undefined,
++        usage: params.output.usage,
++      },
++      params.hookCtx,
++    )
++    .catch((hookErr) => {
++      log.warn(`llm_output hook failed (CLI path): ${String(hookErr)}`);
++    });
++}
++
+ export async function runCliAgent(params: {
+   sessionId: string;
+   sessionKey?: string;
+@@ -62,6 +389,7 @@ export async function runCliAgent(params: {
+   timeoutMs: number;
+   runId: string;
+   extraSystemPrompt?: string;
++  skillsSnapshot?: SkillSnapshot;
+   streamParams?: import("../commands/agent/types.js").AgentStreamParams;
+   ownerNumbers?: string[];
+   cliSessionId?: string;
+@@ -69,6 +397,17 @@ export async function runCliAgent(params: {
+   /** Backward-compat fallback when only the previous signature is available. */
+   bootstrapPromptWarningSignature?: string;
+   images?: ImageContent[];
++  onAssistantTurn?: (text: string) => void;
++  onToolUse?: (toolName: string) => void;
++  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
++  abortSignal?: AbortSignal;
++  trigger?: PluginHookAgentContext["trigger"];
++  messageChannel?: string;
++  messageAccountId?: string;
++  messageTo?: string;
++  messageThreadId?: string | number;
+ }): Promise<EmbeddedPiRunResult> {
+   const started = Date.now();
+   const workspaceResolution = resolveRunWorkspaceDir({
+@@ -97,12 +436,26 @@ export async function runCliAgent(params: {
+   const normalizedModel = normalizeCliModel(modelId, backend);
+   const modelDisplay = `${params.provider}/${modelId}`;
+ 
+-  const extraSystemPrompt = [
+-    params.extraSystemPrompt?.trim(),
+-    "Tools are disabled in this session. Do not call tools.",
+-  ]
+-    .filter(Boolean)
+-    .join("\n");
++  const isClaude = backendResolved.id === "claude-cli";
++
++  // MCP tool access only for Claude CLI; other backends get a "tools disabled" hint.
++  let mcpConfigPath: string | undefined;
++  if (isClaude) {
++    try {
++      const gatewayPort = params.config?.gateway?.port ?? 18789;
++      const mcpPort = gatewayPort + MCP_PORT_OFFSET;
++      const openclawDir = path.join(os.homedir(), ".openclaw");
++      mcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);
++    } catch (err) {
++      log.warn(`mcp config setup failed: ${String(err)}`);
++    }
++  }
++
++  const extraSystemPrompt = isClaude
++    ? params.extraSystemPrompt?.trim() || undefined
++    : [params.extraSystemPrompt?.trim(), "Tools are disabled in this session. Do not call tools."]
++        .filter(Boolean)
++        .join("\n");
+ 
+   const sessionLabel = params.sessionKey ?? params.sessionId;
+   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
+@@ -134,6 +487,40 @@ export async function runCliAgent(params: {
+     config: params.config,
+     agentId: params.agentId,
+   });
++  const hookCtx: PluginHookAgentContext = {
++    agentId: sessionAgentId,
++    sessionKey: params.sessionKey,
++    sessionId: params.sessionId,
++    workspaceDir,
++    messageProvider: params.messageChannel,
++    trigger: params.trigger,
++    channelId: params.messageChannel,
++  };
++  const hookRunner = getGlobalHookRunner();
++  const hasPromptBuildHooks = Boolean(
++    hookRunner?.hasHooks("before_prompt_build") || hookRunner?.hasHooks("before_agent_start"),
++  );
++  let promptForRun = params.prompt;
++  const hookMessages = hasPromptBuildHooks ? await readCliHookMessages(params.sessionFile) : [];
++  const promptBuildHookResult = hasPromptBuildHooks
++    ? await resolveCliPromptBuildHookResult({
++        hookRunner,
++        prompt: params.prompt,
++        messages: hookMessages,
++        hookCtx,
++      })
++    : undefined;
++  const prependContext = promptBuildHookResult?.prependContext;
++  if (prependContext?.trim()) {
++    promptForRun = `${prependContext}\n\n${params.prompt}`;
++    log.debug(`hooks: prepended context to CLI prompt (${prependContext.length} chars)`);
++  }
++  const hookSystemPromptOverride = promptBuildHookResult?.systemPrompt?.trim() || undefined;
++  if (hookSystemPromptOverride) {
++    log.debug(
++      `hooks: applied CLI systemPrompt override (${hookSystemPromptOverride.length} chars)`,
++    );
++  }
+   const heartbeatPrompt =
+     sessionAgentId === defaultAgentId
+       ? resolveHeartbeatPrompt(params.config?.agents?.defaults?.heartbeat?.prompt)
+@@ -144,11 +531,35 @@ export async function runCliAgent(params: {
+     cwd: process.cwd(),
+     moduleUrl: import.meta.url,
+   });
+-  const systemPrompt = buildSystemPrompt({
++  let skillsPrompt: string | undefined;
++  let restoreSkillEnv: (() => void) | undefined;
++  if (isClaude) {
++    const shouldLoadSkillEntries = !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
++    const skillEntries = shouldLoadSkillEntries
++      ? loadWorkspaceSkillEntries(workspaceDir, { config: params.config })
++      : undefined;
++    restoreSkillEnv = params.skillsSnapshot
++      ? applySkillEnvOverridesFromSnapshot({
++          snapshot: params.skillsSnapshot,
++          config: params.config,
++        })
++      : applySkillEnvOverrides({
++          skills: skillEntries ?? [],
++          config: params.config,
++        });
++    skillsPrompt = resolveSkillsPromptForRun({
++      skillsSnapshot: params.skillsSnapshot,
++      entries: shouldLoadSkillEntries ? skillEntries : undefined,
++      config: params.config,
++      workspaceDir,
++    });
++  }
++  const builtSystemPrompt = buildSystemPrompt({
+     workspaceDir,
+     config: params.config,
+     defaultThinkLevel: params.thinkLevel,
+     extraSystemPrompt,
++    skillsPrompt,
+     ownerNumbers: params.ownerNumbers,
+     heartbeatPrompt,
+     docsPath: docsPath ?? undefined,
+@@ -158,6 +569,7 @@ export async function runCliAgent(params: {
+     modelDisplay,
+     agentId: sessionAgentId,
+   });
++  const systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
+   const systemPromptReport = buildSystemPromptReport({
+     source: "run",
+     generatedAt: Date.now(),
+@@ -195,6 +607,9 @@ export async function runCliAgent(params: {
+       total?: number;
+     };
+   }> => {
++    if (params.abortSignal?.aborted) {
++      throw createAbortError(params.abortSignal);
++    }
+     const { sessionId: resolvedSessionId, isNew } = resolveSessionIdToSend({
+       backend,
+       cliSessionId: cliSessionIdToUse,
+@@ -210,7 +625,7 @@ export async function runCliAgent(params: {
+ 
+     let imagePaths: string[] | undefined;
+     let cleanupImages: (() => Promise<void>) | undefined;
+-    let prompt = params.prompt;
++    let prompt = promptForRun;
+     if (params.images && params.images.length > 0) {
+       const imagePayload = await writeCliImages(params.images);
+       imagePaths = imagePayload.paths;
+@@ -239,6 +654,13 @@ export async function runCliAgent(params: {
+       promptArg: argsPrompt,
+       useResume,
+     });
++    // --mcp-config is a Claude Code specific flag.
++    if (mcpConfigPath && backendResolved.id === "claude-cli") {
++      if (!args.includes("--strict-mcp-config")) {
++        args.push("--strict-mcp-config");
++      }
++      args.push("--mcp-config", mcpConfigPath);
++    }
+ 
+     const serialize = backend.serialize ?? true;
+     const queueKey = serialize ? backendResolved.id : `${backendResolved.id}:${params.runId}`;
+@@ -246,7 +668,7 @@ export async function runCliAgent(params: {
+     try {
+       const output = await enqueueCliRun(queueKey, async () => {
+         log.info(
+-          `cli exec: provider=${params.provider} model=${normalizedModel} promptChars=${params.prompt.length}`,
++          `cli exec: provider=${params.provider} model=${normalizedModel} promptChars=${promptForRun.length}`,
+         );
+         const logOutputText = isTruthyEnvValue(process.env.OPENCLAW_CLAUDE_CLI_LOG_OUTPUT);
+         if (logOutputText) {
+@@ -290,6 +712,15 @@ export async function runCliAgent(params: {
+           for (const key of backend.clearEnv ?? []) {
+             delete next[key];
+           }
++          if (mcpConfigPath) {
++            next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
++            next.OPENCLAW_MCP_ACCOUNT_ID = params.messageAccountId ?? "";
++            next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
++            next.OPENCLAW_MCP_MESSAGE_CHANNEL = params.messageChannel ?? "";
++            next.OPENCLAW_MCP_TO = params.messageTo ?? "";
++            next.OPENCLAW_MCP_THREAD_ID =
++              params.messageThreadId != null ? String(params.messageThreadId) : "";
++          }
+           return next;
+         })();
+         const noOutputTimeoutMs = resolveCliNoOutputTimeoutMs({
+@@ -304,6 +735,20 @@ export async function runCliAgent(params: {
+           cliSessionId: useResume ? resolvedSessionId : undefined,
+         });
+ 
++        const outputMode = useResume ? (backend.resumeOutput ?? backend.output) : backend.output;
++
++        // Stream-json mode: process NDJSON lines as they arrive via onStdout
++        const streamProcessor =
++          outputMode === "stream-json"
++            ? createStreamJsonProcessor(backend, {
++                onAssistantTurn: params.onAssistantTurn,
++                onToolUse: params.onToolUse,
++                onThinkingTurn: params.onThinkingTurn,
++                onToolUseEvent: params.onToolUseEvent,
++                onToolResult: params.onToolResult,
++              })
++            : undefined;
++
+         const managedRun = await supervisor.spawn({
+           sessionId: params.sessionId,
+           backendId: backendResolved.id,
+@@ -317,24 +762,42 @@ export async function runCliAgent(params: {
+           env,
+           input: stdinPayload,
+         });
+-        const result = await managedRun.wait();
++        const onAbort = () => {
++          managedRun.cancel("manual-cancel");
++        };
++        if (params.abortSignal) {
++          if (params.abortSignal.aborted) {
++            onAbort();
++          } else {
++            params.abortSignal.addEventListener("abort", onAbort, { once: true });
++          }
++        }
++        let result;
++        try {
++          result = await managedRun.wait();
++        } finally {
++          params.abortSignal?.removeEventListener("abort", onAbort);
++        }
++        if (result.reason === "manual-cancel" && params.abortSignal?.aborted) {
++          throw createAbortError(params.abortSignal);
++        }
+ 
+         const stdout = result.stdout.trim();
+         const stderr = result.stderr.trim();
+         if (logOutputText) {
+           if (stdout) {
+-            log.info(`cli stdout:\n${stdout}`);
++            log.info(formatCliOutputForLog("stdout", stdout));
+           }
+           if (stderr) {
+-            log.info(`cli stderr:\n${stderr}`);
++            log.info(formatCliOutputForLog("stderr", stderr));
+           }
+         }
+         if (shouldLogVerbose()) {
+           if (stdout) {
+-            log.debug(`cli stdout:\n${stdout}`);
++            log.debug(formatCliOutputForLog("stdout", stdout));
+           }
+           if (stderr) {
+-            log.debug(`cli stderr:\n${stderr}`);
++            log.debug(formatCliOutputForLog("stderr", stderr));
+           }
+         }
+ 
+@@ -382,18 +845,54 @@ export async function runCliAgent(params: {
+           });
+         }
+ 
+-        const outputMode = useResume ? (backend.resumeOutput ?? backend.output) : backend.output;
+-
+-        if (outputMode === "text") {
+-          return { text: stdout, sessionId: undefined };
+-        }
+-        if (outputMode === "jsonl") {
++        let output: {
++          text: string;
++          sessionId?: string;
++          usage?: {
++            input?: number;
++            output?: number;
++            cacheRead?: number;
++            cacheWrite?: number;
++            total?: number;
++          };
++        };
++        if (streamProcessor) {
++          output = streamProcessor.finish();
++        } else if (outputMode === "text") {
++          output = { text: stdout, sessionId: undefined };
++        } else if (outputMode === "jsonl") {
+           const parsed = parseCliJsonl(stdout, backend);
+-          return parsed ?? { text: stdout };
++          output = parsed ?? { text: stdout };
++        } else {
++          const parsed = parseCliJson(stdout, backend);
++          output = parsed ?? { text: stdout };
+         }
+-
+-        const parsed = parseCliJson(stdout, backend);
+-        return parsed ?? { text: stdout };
++        try {
++          const appendResult = await appendCliTurnToSessionTranscript({
++            sessionFile: params.sessionFile,
++            sessionId: params.sessionId,
++            userText: params.prompt,
++            assistantText: output.text,
++            provider: params.provider,
++            model: normalizedModel,
++            usage: output.usage,
++          });
++          if (!appendResult.ok) {
++            log.debug(`cli transcript append skipped: ${appendResult.reason}`);
++          }
++        } catch (err) {
++          log.warn(`cli transcript append failed: ${String(err)}`);
++        }
++        emitCliLlmOutputHook({
++          hookRunner,
++          hookCtx,
++          runId: params.runId,
++          sessionId: output.sessionId ?? resolvedSessionId ?? params.sessionId,
++          provider: params.provider,
++          model: normalizedModel,
++          output,
++        });
++        return output;
+       });
+ 
+       return output;
+@@ -406,68 +905,78 @@ export async function runCliAgent(params: {
+ 
+   // Try with the provided CLI session ID first
+   try {
+-    const output = await executeCliWithSession(params.cliSessionId);
+-    const text = output.text?.trim();
+-    const payloads = text ? [{ text }] : undefined;
++    try {
++      const output = await executeCliWithSession(params.cliSessionId);
++      const text = output.text?.trim();
++      const payloads = text ? [{ text }] : undefined;
+ 
+-    return {
+-      payloads,
+-      meta: {
+-        durationMs: Date.now() - started,
+-        systemPromptReport,
+-        agentMeta: {
+-          sessionId: output.sessionId ?? params.cliSessionId ?? params.sessionId ?? "",
+-          provider: params.provider,
+-          model: modelId,
+-          usage: output.usage,
++      return {
++        payloads,
++        meta: {
++          durationMs: Date.now() - started,
++          systemPromptReport,
++          agentMeta: {
++            sessionId: output.sessionId ?? params.cliSessionId ?? params.sessionId ?? "",
++            provider: params.provider,
++            model: modelId,
++            usage: output.usage,
++          },
+         },
+-      },
+-    };
+-  } catch (err) {
+-    if (err instanceof FailoverError) {
+-      // Check if this is a session expired error and we have a session to clear
+-      if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
+-        log.warn(
+-          `CLI session expired, clearing session ID and retrying: provider=${params.provider} session=${redactRunIdentifier(params.cliSessionId)}`,
+-        );
++      };
++    } catch (err) {
++      if (err instanceof FailoverError) {
++        // Check if this is a session expired error and we have a session to clear
++        if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
++          log.warn(
++            `CLI session expired, clearing session ID and retrying: provider=${params.provider} session=${redactRunIdentifier(params.cliSessionId)}`,
++          );
+ 
+-        // Clear the expired session ID from the session entry
+-        // This requires access to the session store, which we don't have here
+-        // We'll need to modify the caller to handle this case
+-
+-        // For now, retry without the session ID to create a new session
+-        const output = await executeCliWithSession(undefined);
+-        const text = output.text?.trim();
+-        const payloads = text ? [{ text }] : undefined;
+-
+-        return {
+-          payloads,
+-          meta: {
+-            durationMs: Date.now() - started,
+-            systemPromptReport,
+-            agentMeta: {
+-              sessionId: output.sessionId ?? params.sessionId ?? "",
+-              provider: params.provider,
+-              model: modelId,
+-              usage: output.usage,
++          // Clear the expired session ID from the session entry
++          // This requires access to the session store, which we don't have here
++          // We'll need to modify the caller to handle this case
++
++          // For now, retry without the session ID to create a new session
++          const output = await executeCliWithSession(undefined);
++          const text = output.text?.trim();
++          const payloads = text ? [{ text }] : undefined;
++
++          return {
++            payloads,
++            meta: {
++              durationMs: Date.now() - started,
++              systemPromptReport,
++              agentMeta: {
++                sessionId: output.sessionId ?? params.sessionId ?? "",
++                provider: params.provider,
++                model: modelId,
++                usage: output.usage,
++              },
+             },
+-          },
+-        };
++          };
++        }
++        throw err;
++      }
++      const message = err instanceof Error ? err.message : String(err);
++      if (isFailoverErrorMessage(message)) {
++        const reason = classifyFailoverReason(message) ?? "unknown";
++        const status = resolveFailoverStatus(reason);
++        throw new FailoverError(message, {
++          reason,
++          provider: params.provider,
++          model: modelId,
++          status,
++        });
+       }
+       throw err;
+     }
+-    const message = err instanceof Error ? err.message : String(err);
+-    if (isFailoverErrorMessage(message)) {
+-      const reason = classifyFailoverReason(message) ?? "unknown";
+-      const status = resolveFailoverStatus(reason);
+-      throw new FailoverError(message, {
+-        reason,
+-        provider: params.provider,
+-        model: modelId,
+-        status,
+-      });
++  } finally {
++    if (restoreSkillEnv) {
++      try {
++        restoreSkillEnv();
++      } catch (error) {
++        log.warn(`failed to restore skill env overrides: ${String(error)}`);
++      }
+     }
+-    throw err;
+   }
+ }
+ 
+@@ -485,9 +994,21 @@ export async function runClaudeCliAgent(params: {
+   timeoutMs: number;
+   runId: string;
+   extraSystemPrompt?: string;
++  skillsSnapshot?: SkillSnapshot;
+   ownerNumbers?: string[];
+   claudeSessionId?: string;
+   images?: ImageContent[];
++  onAssistantTurn?: (text: string) => void;
++  onToolUse?: (toolName: string) => void;
++  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
++  abortSignal?: AbortSignal;
++  trigger?: PluginHookAgentContext["trigger"];
++  messageChannel?: string;
++  messageAccountId?: string;
++  messageTo?: string;
++  messageThreadId?: string | number;
+ }): Promise<EmbeddedPiRunResult> {
+   return runCliAgent({
+     sessionId: params.sessionId,
+@@ -503,8 +1024,20 @@ export async function runClaudeCliAgent(params: {
+     timeoutMs: params.timeoutMs,
+     runId: params.runId,
+     extraSystemPrompt: params.extraSystemPrompt,
++    skillsSnapshot: params.skillsSnapshot,
+     ownerNumbers: params.ownerNumbers,
+     cliSessionId: params.claudeSessionId,
+     images: params.images,
++    onAssistantTurn: params.onAssistantTurn,
++    onToolUse: params.onToolUse,
++    onThinkingTurn: params.onThinkingTurn,
++    onToolUseEvent: params.onToolUseEvent,
++    onToolResult: params.onToolResult,
++    abortSignal: params.abortSignal,
++    trigger: params.trigger,
++    messageChannel: params.messageChannel,
++    messageAccountId: params.messageAccountId,
++    messageTo: params.messageTo,
++    messageThreadId: params.messageThreadId,
+   });
+ }
+diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
+index 7f0598cfaa..781c58ab16 100644
+--- a/src/agents/cli-runner/helpers.ts
++++ b/src/agents/cli-runner/helpers.ts
+@@ -43,6 +43,7 @@ export function buildSystemPrompt(params: {
+   config?: OpenClawConfig;
+   defaultThinkLevel?: ThinkLevel;
+   extraSystemPrompt?: string;
++  skillsPrompt?: string;
+   ownerNumbers?: string[];
+   heartbeatPrompt?: string;
+   docsPath?: string;
+@@ -78,6 +79,7 @@ export function buildSystemPrompt(params: {
+     workspaceDir: params.workspaceDir,
+     defaultThinkLevel: params.defaultThinkLevel,
+     extraSystemPrompt: params.extraSystemPrompt,
++    skillsPrompt: params.skillsPrompt,
+     ownerNumbers: params.ownerNumbers,
+     ownerDisplay: ownerDisplay.ownerDisplay,
+     ownerDisplaySecret: ownerDisplay.ownerDisplaySecret,
+@@ -246,6 +248,424 @@ export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput
+   return { text, sessionId, usage };
+ }
+ 
++export type StreamJsonCallbacks = {
++  onAssistantTurn?: (text: string) => void;
++  onToolUse?: (toolName: string) => void;
++  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
++};
++
++const MAX_STREAM_EVENT_DEDUPE_KEYS = 2_048;
++
++type StreamContentBlock = Record<string, unknown>;
++
++function extractContentBlocks(message: unknown): StreamContentBlock[] {
++  if (!isRecord(message) || !Array.isArray(message.content)) {
++    return [];
++  }
++  return message.content.filter((entry): entry is StreamContentBlock => isRecord(entry));
++}
++
++function extractToolUseNames(contentBlocks: StreamContentBlock[]): string[] {
++  const names: string[] = [];
++  for (const block of contentBlocks) {
++    if (block.type === "tool_use" && typeof block.name === "string") {
++      names.push(block.name);
++    }
++  }
++  return names;
++}
++
++function extractAssistantTextFromBlocks(contentBlocks: StreamContentBlock[]): string {
++  const parts: string[] = [];
++  for (const block of contentBlocks) {
++    if (block.type !== "text") {
++      continue;
++    }
++    if (typeof block.text === "string" && block.text) {
++      parts.push(block.text);
++    }
++  }
++  return parts.join("");
++}
++
++function extractThinkingTextFromBlocks(contentBlocks: StreamContentBlock[]): string {
++  const parts: string[] = [];
++  for (const block of contentBlocks) {
++    if (block.type !== "thinking") {
++      continue;
++    }
++    if (typeof block.thinking === "string" && block.thinking) {
++      parts.push(block.thinking);
++    }
++  }
++  return parts.join("");
++}
++
++type ToolUseBlockEvent = {
++  name: string;
++  toolUseId?: string;
++  input?: unknown;
++};
++
++function extractToolUseEvents(contentBlocks: StreamContentBlock[]): ToolUseBlockEvent[] {
++  const events: ToolUseBlockEvent[] = [];
++  for (const block of contentBlocks) {
++    if (block.type !== "tool_use" || typeof block.name !== "string") {
++      continue;
++    }
++    const toolUseId = typeof block.id === "string" ? block.id : undefined;
++    events.push({
++      name: block.name,
++      toolUseId,
++      input: block.input,
++    });
++  }
++  return events;
++}
++
++type ToolResultBlockEvent = {
++  toolUseId?: string;
++  text?: string;
++  isError?: boolean;
++};
++
++function extractToolResultEvents(contentBlocks: StreamContentBlock[]): ToolResultBlockEvent[] {
++  const events: ToolResultBlockEvent[] = [];
++  for (const block of contentBlocks) {
++    const type = typeof block.type === "string" ? block.type : "";
++    if (type !== "tool_result" && type !== "tool_result_error") {
++      continue;
++    }
++    const text = collectText(block.content ?? block.result ?? block.text).trim();
++    const toolUseId =
++      typeof block.tool_use_id === "string"
++        ? block.tool_use_id
++        : typeof block.toolUseId === "string"
++          ? block.toolUseId
++          : undefined;
++    const isError = block.is_error === true || type === "tool_result_error";
++    events.push({
++      toolUseId,
++      text: text || undefined,
++      isError,
++    });
++  }
++  return events;
++}
++
++function resolveDelta(nextText: string, previousText: string): string | undefined {
++  if (!nextText) {
++    return undefined;
++  }
++  if (!previousText) {
++    return nextText;
++  }
++  if (nextText.startsWith(previousText)) {
++    const delta = nextText.slice(previousText.length);
++    return delta || undefined;
++  }
++  // Non-append rewrites should not be treated as deltas.
++  return undefined;
++}
++
++function addDedupeKey(bucket: Set<string>, order: string[], key: string): boolean {
++  if (bucket.has(key)) {
++    return false;
++  }
++  bucket.add(key);
++  order.push(key);
++  if (order.length > MAX_STREAM_EVENT_DEDUPE_KEYS) {
++    const oldest = order.shift();
++    if (oldest) {
++      bucket.delete(oldest);
++    }
++  }
++  return true;
++}
++
++function stringifyForDedupe(value: unknown): string {
++  if (value === undefined) {
++    return "";
++  }
++  try {
++    return JSON.stringify(value) ?? "";
++  } catch {
++    return "[unserializable]";
++  }
++}
++
++function buildAnonymousToolUseKey(event: ToolUseBlockEvent): string {
++  return `${event.name}:${stringifyForDedupe(event.input)}`;
++}
++
++function buildToolResultDedupeKey(event: ToolResultBlockEvent): string | undefined {
++  if (!event.toolUseId) {
++    return undefined;
++  }
++  return `${event.toolUseId}:${event.isError === true ? "1" : "0"}:${event.text ?? ""}`;
++}
++
++function shouldEmitAnonymousToolUse(
++  event: ToolUseBlockEvent,
++  lastKey: string | undefined,
++): { emit: boolean; key: string } {
++  const key = buildAnonymousToolUseKey(event);
++  return { emit: key !== lastKey, key };
++}
++
++function formatToolResultDedupeKey(event: ToolResultBlockEvent): string | undefined {
++  return buildToolResultDedupeKey(event);
++}
++
++function trackToolResultDedupeKey(
++  emittedToolResultKeys: Set<string>,
++  emittedToolResultOrder: string[],
++  event: ToolResultBlockEvent,
++): boolean {
++  const dedupeKey = formatToolResultDedupeKey(event);
++  if (!dedupeKey) {
++    return true;
++  }
++  return addDedupeKey(emittedToolResultKeys, emittedToolResultOrder, dedupeKey);
++}
++
++function trackToolUseDedupeKey(
++  emittedToolUseKeys: Set<string>,
++  emittedToolUseOrder: string[],
++  event: ToolUseBlockEvent,
++): boolean {
++  if (!event.toolUseId) {
++    return true;
++  }
++  return addDedupeKey(emittedToolUseKeys, emittedToolUseOrder, event.toolUseId);
++}
++
++function shouldEmitToolUse(
++  emittedToolUseKeys: Set<string>,
++  emittedToolUseOrder: string[],
++  event: ToolUseBlockEvent,
++  lastAnonymousToolUseKey: string | undefined,
++): { emit: boolean; nextAnonymousToolUseKey?: string } {
++  if (event.toolUseId) {
++    return {
++      emit: trackToolUseDedupeKey(emittedToolUseKeys, emittedToolUseOrder, event),
++      nextAnonymousToolUseKey: undefined,
++    };
++  }
++  const anonymous = shouldEmitAnonymousToolUse(event, lastAnonymousToolUseKey);
++  return {
++    emit: anonymous.emit,
++    nextAnonymousToolUseKey: anonymous.key,
++  };
++}
++
++function shouldEmitToolResult(
++  emittedToolResultKeys: Set<string>,
++  emittedToolResultOrder: string[],
++  event: ToolResultBlockEvent,
++): boolean {
++  return trackToolResultDedupeKey(emittedToolResultKeys, emittedToolResultOrder, event);
++}
++
++function isToolResultAllowedEnvelope(params: {
++  isAssistantEnvelope: boolean;
++  type: string;
++  messageRole: string;
++}): boolean {
++  if (params.isAssistantEnvelope) {
++    return true;
++  }
++  return (
++    params.type === "user" ||
++    params.type === "tool" ||
++    params.messageRole === "user" ||
++    params.messageRole === "tool"
++  );
++}
++
++function buildFallbackAssistantText(params: {
++  isAssistantEnvelope: boolean;
++  extractedText: string;
++  rawMessage: unknown;
++  message: Record<string, unknown>;
++}): string {
++  if (!params.isAssistantEnvelope || params.extractedText) {
++    return params.extractedText;
++  }
++  return collectText(params.rawMessage) || collectText(params.message);
++}
++
++export function createStreamJsonProcessor(
++  backend: CliBackendConfig,
++  callbacks?: StreamJsonCallbacks,
++): {
++  feed: (chunk: string) => void;
++  finish: () => CliOutput;
++} {
++  let buffer = "";
++  let lastAssistantText = "";
++  let lastThinkingText = "";
++  let resultText: string | undefined;
++  let sessionId: string | undefined;
++  let usage: CliUsage | undefined;
++  const emittedToolUseKeys = new Set<string>();
++  const emittedToolUseOrder: string[] = [];
++  const emittedToolResultKeys = new Set<string>();
++  const emittedToolResultOrder: string[] = [];
++  let lastAnonymousToolUseKey: string | undefined;
++
++  const processLine = (line: string) => {
++    const trimmed = line.trim();
++    if (!trimmed) {
++      return;
++    }
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(trimmed);
++    } catch {
++      return;
++    }
++    if (!isRecord(parsed)) {
++      return;
++    }
++
++    const type = typeof parsed.type === "string" ? parsed.type : "";
++
++    if (!sessionId) {
++      sessionId = pickSessionId(parsed, backend);
++    }
++
++    if (type === "result") {
++      resultText =
++        (typeof parsed.result === "string" ? parsed.result : undefined) ?? collectText(parsed);
++      if (isRecord(parsed.usage)) {
++        usage = toUsage(parsed.usage);
++      }
++      log.debug(
++        `stream-json result: ${resultText?.length ?? 0} chars, sessionId=${sessionId ?? "none"}`,
++      );
++      return;
++    }
++
++    if (type === "system") {
++      const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
++      log.debug(`stream-json system: subtype=${subtype} sessionId=${sessionId ?? "none"}`);
++      return;
++    }
++
++    const rawMessage = parsed.message;
++    const message = isRecord(rawMessage) ? rawMessage : parsed;
++    const messageRole = typeof message.role === "string" ? message.role : "";
++    const isAssistantEnvelope = type === "assistant" || messageRole === "assistant";
++    const contentBlocks = extractContentBlocks(message);
++    if (contentBlocks.length > 0) {
++      const blockTypes = contentBlocks
++        .map((block) => (typeof block.type === "string" ? block.type : "?"))
++        .join(",");
++      const extractedText = isAssistantEnvelope
++        ? extractAssistantTextFromBlocks(contentBlocks)
++        : "";
++      const text = buildFallbackAssistantText({
++        isAssistantEnvelope,
++        extractedText,
++        rawMessage,
++        message,
++      });
++      const thinkingText = isAssistantEnvelope ? extractThinkingTextFromBlocks(contentBlocks) : "";
++      const toolUseEvents = isAssistantEnvelope ? extractToolUseEvents(contentBlocks) : [];
++      const allowToolResultEvents = isToolResultAllowedEnvelope({
++        isAssistantEnvelope,
++        type,
++        messageRole,
++      });
++      const toolResultEvents = allowToolResultEvents ? extractToolResultEvents(contentBlocks) : [];
++      const toolNames = extractToolUseNames(contentBlocks);
++
++      if (isAssistantEnvelope) {
++        log.debug(
++          `stream-json assistant: blocks=[${blockTypes}] text=${text.length} chars thinking=${thinkingText.length} chars tools=[${toolNames.join(",")}]${text ? ` content=${text.slice(0, 200)}` : ""}`,
++        );
++      }
++
++      if (text && text !== lastAssistantText) {
++        lastAssistantText = text;
++        callbacks?.onAssistantTurn?.(lastAssistantText);
++      }
++
++      if (thinkingText && thinkingText !== lastThinkingText) {
++        const delta = resolveDelta(thinkingText, lastThinkingText);
++        lastThinkingText = thinkingText;
++        callbacks?.onThinkingTurn?.({
++          text: thinkingText,
++          ...(delta ? { delta } : {}),
++        });
++      }
++
++      for (const event of toolUseEvents) {
++        const dedupe = shouldEmitToolUse(
++          emittedToolUseKeys,
++          emittedToolUseOrder,
++          event,
++          lastAnonymousToolUseKey,
++        );
++        if (!dedupe.emit) {
++          continue;
++        }
++        if (!event.toolUseId) {
++          lastAnonymousToolUseKey = dedupe.nextAnonymousToolUseKey;
++        } else {
++          lastAnonymousToolUseKey = undefined;
++        }
++        callbacks?.onToolUse?.(event.name);
++        callbacks?.onToolUseEvent?.(event);
++      }
++
++      for (const event of toolResultEvents) {
++        if (!shouldEmitToolResult(emittedToolResultKeys, emittedToolResultOrder, event)) {
++          continue;
++        }
++        callbacks?.onToolResult?.(event);
++      }
++    } else if (isAssistantEnvelope) {
++      // Backward compatibility for custom stream-json backends that emit
++      // assistant content as a string/object instead of typed content blocks.
++      const fallbackText = collectText(rawMessage) || collectText(message);
++      if (fallbackText && fallbackText !== lastAssistantText) {
++        lastAssistantText = fallbackText;
++        callbacks?.onAssistantTurn?.(lastAssistantText);
++      }
++    }
++  };
++
++  const feed = (chunk: string) => {
++    buffer += chunk;
++    const lines = buffer.split("\n");
++    // Keep the last (possibly incomplete) segment in buffer
++    buffer = lines.pop() ?? "";
++    for (const line of lines) {
++      try {
++        processLine(line);
++      } catch (err) {
++        log.warn(`stream-json processLine error: ${String(err)}`);
++      }
++    }
++  };
++
++  const finish = (): CliOutput => {
++    // Process any remaining data in buffer
++    if (buffer.trim()) {
++      processLine(buffer);
++      buffer = "";
++    }
++    const text = resultText ?? lastAssistantText;
++    return { text: text.trim(), sessionId, usage };
++  };
++
++  return { feed, finish };
++}
++
+ export function resolveSystemPromptUsage(params: {
+   backend: CliBackendConfig;
+   isNewSession: boolean;
+@@ -356,10 +776,10 @@ export function buildCliArgs(params: {
+   useResume: boolean;
+ }): string[] {
+   const args: string[] = [...params.baseArgs];
+-  if (!params.useResume && params.backend.modelArg && params.modelId) {
++  if (params.backend.modelArg && params.modelId) {
+     args.push(params.backend.modelArg, params.modelId);
+   }
+-  if (!params.useResume && params.systemPrompt && params.backend.systemPromptArg) {
++  if (params.systemPrompt && params.backend.systemPromptArg) {
+     args.push(params.backend.systemPromptArg, params.systemPrompt);
+   }
+   if (!params.useResume && params.sessionId) {
+diff --git a/src/agents/model-aware-runner.test.ts b/src/agents/model-aware-runner.test.ts
+new file mode 100644
+index 0000000000..22ee9544a4
+--- /dev/null
++++ b/src/agents/model-aware-runner.test.ts
+@@ -0,0 +1,147 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { OpenClawConfig } from "../config/config.js";
++
++const runEmbeddedPiAgentMock = vi.hoisted(() => vi.fn());
++const runCliAgentMock = vi.hoisted(() => vi.fn());
++
++vi.mock("./pi-embedded.js", () => ({
++  runEmbeddedPiAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
++}));
++
++vi.mock("./cli-runner.js", () => ({
++  runCliAgent: (params: unknown) => runCliAgentMock(params),
++}));
++
++import { runModelAwareAgent } from "./model-aware-runner.js";
++
++describe("runModelAwareAgent", () => {
++  const baseParams = {
++    sessionId: "session-1",
++    sessionFile: "/tmp/oc-session.jsonl",
++    workspaceDir: "/tmp/oc-workspace",
++    prompt: "hello",
++    timeoutMs: 5_000,
++    runId: "run-1",
++  };
++
++  beforeEach(() => {
++    runEmbeddedPiAgentMock.mockReset();
++    runCliAgentMock.mockReset();
++  });
++
++  it("routes non-CLI providers to runEmbeddedPiAgent", async () => {
++    runEmbeddedPiAgentMock.mockResolvedValue({ payloads: [{ text: "embedded-ok" }] });
++
++    const result = await runModelAwareAgent({
++      ...baseParams,
++      provider: "openai",
++      model: "gpt-4.1-mini",
++      config: {},
++    });
++
++    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
++    expect(runCliAgentMock).not.toHaveBeenCalled();
++    expect(result).toEqual({ payloads: [{ text: "embedded-ok" }] });
++  });
++
++  it("routes CLI providers to runCliAgent and maps streaming callbacks", async () => {
++    runCliAgentMock.mockImplementation(async (params: Record<string, unknown>) => {
++      (params.onAssistantTurn as ((text: string) => void) | undefined)?.("assistant text");
++      (
++        (params.onThinkingTurn as
++          | ((payload: { text: string; delta?: string }) => void)
++          | undefined) ?? (() => {})
++      )({
++        text: "thinking text",
++        delta: "delta",
++      });
++      (
++        (params.onToolUseEvent as
++          | ((payload: { name: string; toolUseId?: string; input?: unknown }) => void)
++          | undefined) ?? (() => {})
++      )({
++        name: "web_search",
++        toolUseId: "tool_1",
++        input: { q: "openclaw" },
++      });
++      (
++        (params.onToolResult as
++          | ((payload: { toolUseId?: string; text?: string; isError?: boolean }) => void)
++          | undefined) ?? (() => {})
++      )({
++        toolUseId: "tool_1",
++        text: "tool done",
++      });
++      return { payloads: [{ text: "cli-ok" }] };
++    });
++
++    const onPartialReply = vi.fn();
++    const onReasoningStream = vi.fn();
++    const onToolResult = vi.fn();
++    const onAgentEvent = vi.fn();
++
++    const result = await runModelAwareAgent({
++      ...baseParams,
++      provider: "claude-cli",
++      model: "opus",
++      config: {
++        agents: {
++          defaults: {
++            cliBackends: {
++              "claude-cli": {
++                command: "claude",
++              },
++            },
++          },
++        },
++      } as OpenClawConfig,
++      messageProvider: "feishu",
++      disableTools: true,
++      extraSystemPrompt: "BASE_SYSTEM",
++      onPartialReply,
++      onReasoningStream,
++      onToolResult,
++      onAgentEvent,
++    });
++
++    expect(runCliAgentMock).toHaveBeenCalledTimes(1);
++    expect(runEmbeddedPiAgentMock).not.toHaveBeenCalled();
++    const cliCallArg = runCliAgentMock.mock.calls[0]?.[0] as
++      | { messageChannel?: string; extraSystemPrompt?: string }
++      | undefined;
++    expect(cliCallArg?.messageChannel).toBe("feishu");
++    expect(cliCallArg?.extraSystemPrompt).toContain("BASE_SYSTEM");
++    expect(cliCallArg?.extraSystemPrompt).toContain("Tools are disabled in this session.");
++
++    expect(onPartialReply).toHaveBeenCalledWith({ text: "assistant text" });
++    expect(onReasoningStream).toHaveBeenCalledWith({ text: "thinking text" });
++    expect(onToolResult).toHaveBeenCalledWith({ text: "tool done" });
++    expect(onAgentEvent).toHaveBeenCalledWith({
++      stream: "assistant",
++      data: { text: "assistant text" },
++    });
++    expect(onAgentEvent).toHaveBeenCalledWith({
++      stream: "thinking",
++      data: { text: "thinking text", delta: "delta" },
++    });
++    expect(onAgentEvent).toHaveBeenCalledWith({
++      stream: "tool",
++      data: {
++        phase: "start",
++        name: "web_search",
++        toolUseId: "tool_1",
++        input: { q: "openclaw" },
++      },
++    });
++    expect(onAgentEvent).toHaveBeenCalledWith({
++      stream: "tool",
++      data: {
++        phase: "result",
++        toolUseId: "tool_1",
++        result: "tool done",
++        partialResult: "tool done",
++      },
++    });
++    expect(result).toEqual({ payloads: [{ text: "cli-ok" }] });
++  });
++});
+diff --git a/src/agents/model-aware-runner.ts b/src/agents/model-aware-runner.ts
+new file mode 100644
+index 0000000000..2276f516d5
+--- /dev/null
++++ b/src/agents/model-aware-runner.ts
+@@ -0,0 +1,112 @@
++import { runCliAgent } from "./cli-runner.js";
++import { DEFAULT_PROVIDER } from "./defaults.js";
++import { isCliProvider } from "./model-selection.js";
++import type { RunEmbeddedPiAgentParams } from "./pi-embedded-runner/run/params.js";
++import type { EmbeddedPiRunResult } from "./pi-embedded-runner/types.js";
++import { runEmbeddedPiAgent } from "./pi-embedded.js";
++
++function resolveDecisionLikeSystemPrompt(params: {
++  extraSystemPrompt?: string;
++  disableTools?: boolean;
++}): string | undefined {
++  const base = params.extraSystemPrompt?.trim();
++  if (!params.disableTools) {
++    return base || undefined;
++  }
++  return [base, "Tools are disabled in this session. Do not call tools."]
++    .filter((part): part is string => Boolean(part && part.trim()))
++    .join("\n");
++}
++
++function emitAgentEvent(
++  cb: RunEmbeddedPiAgentParams["onAgentEvent"],
++  event: { stream: string; data: Record<string, unknown> },
++): void {
++  if (!cb) {
++    return;
++  }
++  cb(event);
++}
++
++export async function runModelAwareAgent(
++  params: RunEmbeddedPiAgentParams & { cliSessionId?: string },
++): Promise<EmbeddedPiRunResult> {
++  const provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
++  if (!isCliProvider(provider, params.config)) {
++    return runEmbeddedPiAgent(params);
++  }
++
++  const messageChannel = params.messageChannel ?? params.messageProvider;
++  const extraSystemPrompt = resolveDecisionLikeSystemPrompt({
++    extraSystemPrompt: params.extraSystemPrompt,
++    disableTools: params.disableTools,
++  });
++
++  return runCliAgent({
++    sessionId: params.sessionId,
++    sessionKey: params.sessionKey,
++    agentId: params.agentId,
++    sessionFile: params.sessionFile,
++    workspaceDir: params.workspaceDir,
++    config: params.config,
++    prompt: params.prompt,
++    provider,
++    model: params.model,
++    thinkLevel: params.thinkLevel,
++    timeoutMs: params.timeoutMs,
++    runId: params.runId,
++    extraSystemPrompt,
++    skillsSnapshot: params.skillsSnapshot,
++    ownerNumbers: params.ownerNumbers,
++    cliSessionId: params.cliSessionId,
++    images: params.images,
++    abortSignal: params.abortSignal,
++    trigger: params.trigger,
++    messageChannel,
++    onAssistantTurn: (text) => {
++      if (text.trim()) {
++        void params.onPartialReply?.({ text });
++      }
++      emitAgentEvent(params.onAgentEvent, {
++        stream: "assistant",
++        data: { text },
++      });
++    },
++    onThinkingTurn: (payload) => {
++      if (payload.text.trim()) {
++        void params.onReasoningStream?.({ text: payload.text });
++      }
++      emitAgentEvent(params.onAgentEvent, {
++        stream: "thinking",
++        data: payload.delta ? { text: payload.text, delta: payload.delta } : { text: payload.text },
++      });
++    },
++    onToolUseEvent: (payload) => {
++      emitAgentEvent(params.onAgentEvent, {
++        stream: "tool",
++        data: {
++          phase: "start",
++          name: payload.name,
++          ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
++          ...(payload.input !== undefined ? { input: payload.input } : {}),
++        },
++      });
++    },
++    onToolResult: (payload) => {
++      if (payload.text || payload.isError) {
++        void params.onToolResult?.({
++          text: payload.text,
++        });
++      }
++      emitAgentEvent(params.onAgentEvent, {
++        stream: "tool",
++        data: {
++          phase: "result",
++          ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
++          ...(payload.text ? { result: payload.text, partialResult: payload.text } : {}),
++          ...(payload.isError ? { isError: true } : {}),
++        },
++      });
++    },
++  });
++}
+diff --git a/src/auto-reply/heartbeat.ts b/src/auto-reply/heartbeat.ts
+index 4141d180f6..56a56eb70d 100644
+--- a/src/auto-reply/heartbeat.ts
++++ b/src/auto-reply/heartbeat.ts
+@@ -4,7 +4,7 @@ import { HEARTBEAT_TOKEN } from "./tokens.js";
+ // Default heartbeat prompt (used when config.agents.defaults.heartbeat.prompt is unset).
+ // Keep it tight and avoid encouraging the model to invent/rehash "open loops" from prior chat context.
+ export const HEARTBEAT_PROMPT =
+-  "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
++  "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK as plain text — do NOT use the message tool to send it.";
+ export const DEFAULT_HEARTBEAT_EVERY = "30m";
+ export const DEFAULT_HEARTBEAT_ACK_MAX_CHARS = 300;
+ 
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index 2f6c27519b..dfef28058a 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -31,6 +31,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
+ import type { TemplateContext } from "../templating.js";
+ import type { VerboseLevel } from "../thinking.js";
+ import {
++  couldBeSilentTokenStart,
+   HEARTBEAT_TOKEN,
+   isSilentReplyPrefixText,
+   isSilentReplyText,
+@@ -184,11 +185,24 @@ export async function runAgentTurnWithFallback(params: {
+         }
+         return { text: sanitized, skip: false };
+       };
++      // Buffer potential silent-token prefix from BPE-split streaming chunks (e.g. "NO" + "_REPLY").
++      // Only buffers SILENT_REPLY_TOKEN; HEARTBEAT_TOKEN is handled by normalizeStreamingText
++      // via string includes() which works on partial text without prefix-buffering.
++      let silentPrefixBuf = "";
+       const handlePartialForTyping = async (payload: ReplyPayload): Promise<string | undefined> => {
+-        if (isSilentReplyPrefixText(payload.text, SILENT_REPLY_TOKEN)) {
++        const combinedText = silentPrefixBuf + (payload.text ?? "");
++        silentPrefixBuf = "";
++        if (isSilentReplyText(combinedText, SILENT_REPLY_TOKEN)) {
+           return undefined;
+         }
+-        const { text, skip } = normalizeStreamingText(payload);
++        if (isSilentReplyPrefixText(combinedText, SILENT_REPLY_TOKEN)) {
++          return undefined;
++        }
++        if (couldBeSilentTokenStart(combinedText, SILENT_REPLY_TOKEN)) {
++          silentPrefixBuf = combinedText;
++          return undefined;
++        }
++        const { text, skip } = normalizeStreamingText({ ...payload, text: combinedText });
+         if (skip || !text) {
+           return undefined;
+         }
+@@ -223,6 +237,42 @@ export async function runAgentTurnWithFallback(params: {
+             const cliSessionId = getCliSessionId(params.getActiveSessionEntry(), provider);
+             return (async () => {
+               let lifecycleTerminalEmitted = false;
++              // Serialized chain for streaming card updates.  Each onAssistantTurn
++              // appends an async step that mirrors the embedded path: first await
++              // signalTextDelta (which triggers startStreaming on first call), then
++              // forward to onPartialReply.  Awaiting this chain after the CLI run
++              // ensures markRunComplete() isn't called before streaming initialises.
++              let streamingChain: Promise<void> = Promise.resolve();
++              let cliReasoningOpen = false;
++              const queueStreamingStep = (step: () => Promise<void>) => {
++                streamingChain = streamingChain.then(step).catch((err) => {
++                  defaultRuntime.error(
++                    `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
++                  );
++                });
++              };
++              const escapeMarkdownItalic = (value: string): string =>
++                value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
++              const formatReasoningPayload = (text: string): string => {
++                const trimmed = text.trim();
++                if (!trimmed) {
++                  return "";
++                }
++                const lines = escapeMarkdownItalic(trimmed)
++                  .split("\n")
++                  .map((line) => line.trim());
++                const italicized = lines.map((line) => (line ? `_${line}_` : "")).join("\n");
++                return `Reasoning:\n${italicized}`;
++              };
++              const queueReasoningEndIfNeeded = () => {
++                if (!cliReasoningOpen) {
++                  return;
++                }
++                cliReasoningOpen = false;
++                queueStreamingStep(async () => {
++                  await params.opts?.onReasoningEnd?.();
++                });
++              };
+               try {
+                 const result = await runCliAgent({
+                   sessionId: params.followupRun.run.sessionId,
+@@ -238,6 +288,7 @@ export async function runAgentTurnWithFallback(params: {
+                   timeoutMs: params.followupRun.run.timeoutMs,
+                   runId,
+                   extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
++                  skillsSnapshot: params.followupRun.run.skillsSnapshot,
+                   ownerNumbers: params.followupRun.run.ownerNumbers,
+                   cliSessionId,
+                   bootstrapPromptWarningSignaturesSeen,
+@@ -246,10 +297,105 @@ export async function runAgentTurnWithFallback(params: {
+                       bootstrapPromptWarningSignaturesSeen.length - 1
+                     ],
+                   images: params.opts?.images,
++                  abortSignal: params.opts?.abortSignal,
++                  trigger: params.isHeartbeat ? "heartbeat" : "user",
++                  messageChannel: params.followupRun.run.messageProvider,
++                  messageAccountId:
++                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
++                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
++                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
++                  onSystemInit: ({ subtype }) => {
++                    if (subtype === "init") {
++                      queueAssistantMessageStart();
++                    }
++                  },
++                  onAssistantTurn: (text) => {
++                    queueReasoningEndIfNeeded();
++                    emitAgentEvent({
++                      runId,
++                      stream: "assistant",
++                      data: { text },
++                    });
++                    // Mirror the embedded path's onPartialReply flow:
++                    // 1. handlePartialForTyping awaits signalTextDelta (starts
++                    //    streaming card on first call via typing → onReplyStart)
++                    // 2. then onPartialReply queues the card content update
++                    // Chained (not fire-and-forget) so signalTextDelta completes
++                    // before onPartialReply, and markRunComplete waits for all.
++                    queueStreamingStep(async () => {
++                      const normalizedText = await handlePartialForTyping({ text });
++                      if (normalizedText !== undefined && params.opts?.onPartialReply) {
++                        await params.opts.onPartialReply({ text: normalizedText });
++                      }
++                    });
++                  },
++                  onThinkingTurn: ({ text, delta }) => {
++                    if (!text.trim()) {
++                      return;
++                    }
++                    cliReasoningOpen = true;
++                    emitAgentEvent({
++                      runId,
++                      stream: "thinking",
++                      data: {
++                        text,
++                        ...(delta ? { delta } : {}),
++                      },
++                    });
++                    queueStreamingStep(async () => {
++                      await params.typingSignals.signalReasoningDelta();
++                      const rendered = formatReasoningPayload(text);
++                      if (!rendered) {
++                        return;
++                      }
++                      await params.opts?.onReasoningStream?.({
++                        text: rendered,
++                        isReasoning: true,
++                      });
++                    });
++                  },
++                  onToolUseEvent: (payload) => {
++                    queueReasoningEndIfNeeded();
++                    emitAgentEvent({
++                      runId,
++                      stream: "tool",
++                      data: {
++                        phase: "start",
++                        name: payload.name,
++                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
++                        ...(payload.input !== undefined ? { input: payload.input } : {}),
++                      },
++                    });
++                    queueStreamingStep(async () => {
++                      await params.typingSignals.signalToolStart();
++                      await params.opts?.onToolStart?.({
++                        name: payload.name,
++                        phase: "start",
++                      });
++                    });
++                  },
++                  onToolResult: (payload) => {
++                    queueReasoningEndIfNeeded();
++                    const preview =
++                      typeof payload.text === "string" && payload.text.trim()
++                        ? payload.text.trim().slice(0, 1_200)
++                        : undefined;
++                    emitAgentEvent({
++                      runId,
++                      stream: "tool",
++                      data: {
++                        phase: "result",
++                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
++                        ...(preview ? { partialResult: preview, result: preview } : {}),
++                        ...(payload.isError ? { isError: true } : {}),
++                      },
++                    });
++                  },
+                 });
+                 bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
+                   result.meta?.systemPromptReport,
+                 );
++                queueReasoningEndIfNeeded();
+ 
+                 // CLI backends don't emit streaming assistant events, so we need to
+                 // emit one with the final text so server-chat can populate its buffer
+@@ -276,6 +422,8 @@ export async function runAgentTurnWithFallback(params: {
+ 
+                 return result;
+               } catch (err) {
++                queueReasoningEndIfNeeded();
++                await streamingChain;
+                 emitAgentEvent({
+                   runId,
+                   stream: "lifecycle",
+diff --git a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+index 659ccfe795..41da3f7bc8 100644
+--- a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
++++ b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+@@ -787,7 +787,17 @@ describe("runReplyAgent block streaming", () => {
+ });
+ 
+ describe("runReplyAgent claude-cli routing", () => {
+-  function createRun() {
++  function createRun(params?: {
++    typingMode?: "instant" | "thinking";
++    opts?: {
++      onReasoningStream?: (payload: {
++        text?: string;
++        isReasoning?: boolean;
++      }) => Promise<void> | void;
++      onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
++      onReasoningEnd?: () => Promise<void> | void;
++    };
++  }) {
+     const typing = createMockTypingController();
+     const sessionCtx = {
+       Provider: "webchat",
+@@ -840,7 +850,8 @@ describe("runReplyAgent claude-cli routing", () => {
+       blockStreamingEnabled: false,
+       resolvedBlockStreamingBreak: "message_end",
+       shouldInjectGroupIntro: false,
+-      typingMode: "instant",
++      typingMode: params?.typingMode ?? "instant",
++      opts: params?.opts,
+     });
+   }
+ 
+@@ -879,6 +890,95 @@ describe("runReplyAgent claude-cli routing", () => {
+     expect(lifecyclePhases).toEqual(["start", "end"]);
+     expect(result).toMatchObject({ text: "ok" });
+   });
++
++  it("forwards cli thinking/tool stream events to reply callbacks", async () => {
++    const runId = "00000000-0000-0000-0000-000000000002";
++    const randomSpy = vi.spyOn(crypto, "randomUUID").mockReturnValue(runId);
++    const onReasoningStream = vi.fn();
++    const onToolStart = vi.fn();
++    const toolPhases: string[] = [];
++    const thinkingEvents: string[] = [];
++    const unsubscribe = onAgentEvent((evt) => {
++      if (evt.runId !== runId) {
++        return;
++      }
++      if (evt.stream === "tool" && typeof evt.data?.phase === "string") {
++        toolPhases.push(evt.data.phase);
++      }
++      if (evt.stream === "thinking" && typeof evt.data?.text === "string") {
++        thinkingEvents.push(evt.data.text);
++      }
++    });
++    runCliAgentMock.mockImplementationOnce(
++      async (params: {
++        onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++        onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++        onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
++        onAssistantTurn?: (text: string) => void;
++      }) => {
++        params.onThinkingTurn?.({
++          text: "Check_*files*\n\nThen_more",
++          delta: "Check_*files*\n\nThen_more",
++        });
++        params.onToolUseEvent?.({ name: "Read", toolUseId: "toolu_1" });
++        params.onToolResult?.({ toolUseId: "toolu_1", text: "README contents" });
++        params.onAssistantTurn?.("Final answer");
++        return {
++          payloads: [{ text: "Final answer" }],
++          meta: {
++            agentMeta: {
++              provider: "claude-cli",
++              model: "opus-4.5",
++            },
++          },
++        };
++      },
++    );
++
++    const result = await createRun({
++      typingMode: "thinking",
++      opts: {
++        onReasoningStream,
++        onToolStart,
++      },
++    });
++    unsubscribe();
++    randomSpy.mockRestore();
++
++    expect(onReasoningStream).toHaveBeenCalledWith({
++      text: "Reasoning:\n_Check\\_\\*files\\*_\n\n_Then\\_more_",
++      isReasoning: true,
++    });
++    expect(onToolStart).toHaveBeenCalledWith({
++      name: "Read",
++      phase: "start",
++    });
++    expect(thinkingEvents).toEqual(["Check_*files*\n\nThen_more"]);
++    expect(toolPhases).toEqual(expect.arrayContaining(["start", "result"]));
++    expect(result).toMatchObject({ text: "Final answer" });
++  });
++
++  it("closes reasoning stream when cli runner throws after thinking", async () => {
++    const onReasoningEnd = vi.fn();
++    runCliAgentMock.mockImplementationOnce(
++      async (params: { onThinkingTurn?: (payload: { text: string; delta?: string }) => void }) => {
++        params.onThinkingTurn?.({ text: "debug path", delta: "debug path" });
++        throw new Error("cli boom");
++      },
++    );
++
++    const result = await createRun({
++      typingMode: "thinking",
++      opts: {
++        onReasoningEnd,
++      },
++    });
++
++    expect(result).toMatchObject({
++      text: expect.stringContaining("cli boom"),
++    });
++    expect(onReasoningEnd).toHaveBeenCalledTimes(1);
++  });
+ });
+ 
+ describe("runReplyAgent messaging tool suppression", () => {
+diff --git a/src/auto-reply/reply/commands-core.ts b/src/auto-reply/reply/commands-core.ts
+index 894724bcfb..3a8d0018bf 100644
+--- a/src/auto-reply/reply/commands-core.ts
++++ b/src/auto-reply/reply/commands-core.ts
+@@ -49,33 +49,39 @@ export async function emitResetCommandHooks(params: {
+   action: ResetCommandAction;
+   ctx: HandleCommandsParams["ctx"];
+   cfg: HandleCommandsParams["cfg"];
+-  command: Pick<
++  command?: Pick<
+     HandleCommandsParams["command"],
+     "surface" | "senderId" | "channel" | "from" | "to" | "resetHookTriggered"
+   >;
++  commandSource?: string;
++  senderId?: string;
+   sessionKey?: string;
+   sessionEntry?: HandleCommandsParams["sessionEntry"];
+   previousSessionEntry?: HandleCommandsParams["previousSessionEntry"];
+   workspaceDir: string;
++  routeHookMessages?: boolean;
+ }): Promise<void> {
++  const commandSource = params.command?.surface ?? params.commandSource;
++  const senderId = params.command?.senderId ?? params.senderId;
+   const hookEvent = createInternalHookEvent("command", params.action, params.sessionKey ?? "", {
+     sessionEntry: params.sessionEntry,
+     previousSessionEntry: params.previousSessionEntry,
+-    commandSource: params.command.surface,
+-    senderId: params.command.senderId,
+-    workspaceDir: params.workspaceDir,
++    commandSource,
++    senderId,
+     cfg: params.cfg, // Pass config for LLM slug generation
+   });
+   await triggerInternalHook(hookEvent);
+-  params.command.resetHookTriggered = true;
++  if (params.command) {
++    params.command.resetHookTriggered = true;
++  }
+ 
+   // Send hook messages immediately if present
+-  if (hookEvent.messages.length > 0) {
++  if (params.routeHookMessages !== false && hookEvent.messages.length > 0) {
+     // Use OriginatingChannel/To if available, otherwise fall back to command channel/from
+     // oxlint-disable-next-line typescript/no-explicit-any
+-    const channel = params.ctx.OriginatingChannel || (params.command.channel as any);
++    const channel = params.ctx.OriginatingChannel || (params.command?.channel as any);
+     // For replies, use 'from' (the sender) not 'to' (which might be the bot itself)
+-    const to = params.ctx.OriginatingTo || params.command.from || params.command.to;
++    const to = params.ctx.OriginatingTo || params.command?.from || params.command?.to;
+ 
+     if (channel && to) {
+       const hookReply = { text: hookEvent.messages.join("\n\n") };
+diff --git a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+index 110b46af47..740432d57b 100644
+--- a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
++++ b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
+@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
+ 
+ registerGetReplyCommonMocks();
+ 
++
+ vi.mock("../../link-understanding/apply.js", () => ({
+   applyLinkUnderstanding: vi.fn(async () => undefined),
+ }));
+@@ -49,6 +50,22 @@ function buildNativeResetContext(): MsgContext {
+   };
+ }
+ 
++function buildRegularContext(): MsgContext {
++  return {
++    Provider: "telegram",
++    Surface: "telegram",
++    ChatType: "direct",
++    Body: "hello",
++    RawBody: "hello",
++    CommandBody: "hello",
++    CommandSource: "message",
++    CommandAuthorized: true,
++    SessionKey: "agent:main:telegram:direct:123",
++    From: "telegram:123",
++    To: "telegram:bot",
++  };
++}
++
+ function createContinueDirectivesResult(resetHookTriggered: boolean) {
+   return {
+     kind: "continue" as const,
+@@ -150,4 +167,65 @@ describe("getReplyFromConfig reset-hook fallback", () => {
+ 
+     expect(mocks.emitResetCommandHooks).not.toHaveBeenCalled();
+   });
++
++  it("emits auto-rotation hooks when session rolls without explicit /new command", async () => {
++    mocks.initSessionState.mockResolvedValue({
++      sessionCtx: buildRegularContext(),
++      sessionEntry: { sessionId: "session-2" },
++      previousSessionEntry: { sessionId: "old-session-1", claudeCliSessionId: "cli-old-session" },
++      sessionStore: {},
++      sessionKey: "agent:main:telegram:direct:123",
++      sessionId: "session-2",
++      isNewSession: true,
++      resetTriggered: false,
++      systemSent: false,
++      abortedLastRun: false,
++      storePath: "/tmp/sessions.json",
++      sessionScope: "per-sender",
++      groupResolution: undefined,
++      isGroup: false,
++      triggerBodyNormalized: "hello",
++      bodyStripped: "hello",
++    });
++    mocks.resolveReplyDirectives.mockResolvedValue(createContinueDirectivesResult(true));
++    mocks.handleInlineActions.mockResolvedValue({ kind: "reply", reply: undefined });
++
++    await getReplyFromConfig(buildRegularContext(), undefined, {});
++
++    expect(mocks.emitResetCommandHooks).toHaveBeenCalledWith(
++      expect.objectContaining({
++        action: "reset",
++        sessionKey: "agent:main:telegram:direct:123",
++        routeHookMessages: false,
++        commandSource: "auto-rotation",
++      }),
++    );
++  });
++
++  it("keeps API auto-rotation behavior unchanged (no reset hook emission)", async () => {
++    mocks.initSessionState.mockResolvedValue({
++      sessionCtx: buildRegularContext(),
++      sessionEntry: { sessionId: "session-2" },
++      previousSessionEntry: { sessionId: "old-session-1" },
++      sessionStore: {},
++      sessionKey: "agent:main:telegram:direct:123",
++      sessionId: "session-2",
++      isNewSession: true,
++      resetTriggered: false,
++      systemSent: false,
++      abortedLastRun: false,
++      storePath: "/tmp/sessions.json",
++      sessionScope: "per-sender",
++      groupResolution: undefined,
++      isGroup: false,
++      triggerBodyNormalized: "hello",
++      bodyStripped: "hello",
++    });
++    mocks.resolveReplyDirectives.mockResolvedValue(createContinueDirectivesResult(true));
++    mocks.handleInlineActions.mockResolvedValue({ kind: "reply", reply: undefined });
++
++    await getReplyFromConfig(buildRegularContext(), undefined, {});
++
++    expect(mocks.emitResetCommandHooks).not.toHaveBeenCalled();
++  });
+ });
+diff --git a/src/auto-reply/reply/get-reply.ts b/src/auto-reply/reply/get-reply.ts
+index be4c8d362f..d95a935ab1 100644
+--- a/src/auto-reply/reply/get-reply.ts
++++ b/src/auto-reply/reply/get-reply.ts
+@@ -4,7 +4,7 @@ import {
+   resolveSessionAgentId,
+   resolveAgentSkillsFilter,
+ } from "../../agents/agent-scope.js";
+-import { resolveModelRefFromString } from "../../agents/model-selection.js";
++import { isCliProvider, resolveModelRefFromString } from "../../agents/model-selection.js";
+ import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
+ import { DEFAULT_AGENT_WORKSPACE_DIR, ensureAgentWorkspace } from "../../agents/workspace.js";
+ import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
+@@ -173,6 +173,35 @@ export async function getReplyFromConfig(
+     bodyStripped,
+   } = sessionState;
+ 
++  const previousProviderCandidate =
++    previousSessionEntry?.modelProvider ?? previousSessionEntry?.providerOverride ?? "";
++  const previousHasCliSessionMarker = Boolean(
++    previousSessionEntry?.claudeCliSessionId?.trim() ||
++    Object.keys(previousSessionEntry?.cliSessionIds ?? {}).length > 0,
++  );
++  const shouldEmitAutoRotationResetHooks =
++    isNewSession &&
++    !resetTriggered &&
++    previousSessionEntry?.sessionId &&
++    (isCliProvider(provider, cfg) ||
++      isCliProvider(previousProviderCandidate, cfg) ||
++      previousHasCliSessionMarker);
++
++  if (shouldEmitAutoRotationResetHooks) {
++    await emitResetCommandHooks({
++      action: "reset",
++      ctx: finalized,
++      cfg,
++      sessionKey,
++      sessionEntry,
++      previousSessionEntry,
++      workspaceDir,
++      routeHookMessages: false,
++      commandSource: "auto-rotation",
++      senderId: finalized.SenderId,
++    });
++  }
++
+   await applyResetModelOverride({
+     cfg,
+     resetTriggered,
+diff --git a/src/auto-reply/reply/reply-utils.test.ts b/src/auto-reply/reply/reply-utils.test.ts
+index c1e76e5040..5a61e8adcd 100644
+--- a/src/auto-reply/reply/reply-utils.test.ts
++++ b/src/auto-reply/reply/reply-utils.test.ts
+@@ -776,6 +776,51 @@ describe("createStreamingDirectiveAccumulator", () => {
+     expect(afterReset?.replyToTag).toBe(false);
+     expect(afterReset?.replyToId).toBeUndefined();
+   });
++
++  it("buffers split silent-token prefix 'NO' then swallows completed 'NO_REPLY'", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("NO", { silentToken: "NO_REPLY" })).toBeNull();
++    expect(acc.consume("_REPLY", { silentToken: "NO_REPLY" })).toBeNull();
++  });
++
++  it("flushes buffered prefix when next chunk proves it is not a silent token", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("NO", { silentToken: "NO_REPLY" })).toBeNull();
++    const result = acc.consume("T really");
++    expect(result?.text).toBe("NOT really");
++  });
++
++  it("does not buffer lowercase 'No' (natural language)", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    const result = acc.consume("No");
++    expect(result?.text).toBe("No");
++  });
++
++  it("handles single-token NO_REPLY without buffering", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("NO_REPLY", { silentToken: "NO_REPLY" })).toBeNull();
++  });
++
++  it("buffers split HEARTBEAT_OK prefix then swallows completed token", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("HEART", { silentToken: "HEARTBEAT_OK" })).toBeNull();
++    expect(acc.consume("BEAT_OK", { silentToken: "HEARTBEAT_OK" })).toBeNull();
++  });
++
++  it("flushes buffered prefix as text on final with no continuation", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("NO", { silentToken: "NO_REPLY" })).toBeNull();
++    const result = acc.consume("", { final: true });
++    expect(result?.text).toBe("NO");
++  });
++
++  it("reset clears pending silent buffer", () => {
++    const acc = createStreamingDirectiveAccumulator();
++    expect(acc.consume("NO", { silentToken: "NO_REPLY" })).toBeNull();
++    acc.reset();
++    const result = acc.consume("Hello");
++    expect(result?.text).toBe("Hello");
++  });
+ });
+ 
+ describe("extractShortModelName", () => {
+diff --git a/src/auto-reply/reply/session-hooks-context.test.ts b/src/auto-reply/reply/session-hooks-context.test.ts
+index ee8137d3dd..ec4f8b9a6b 100644
+--- a/src/auto-reply/reply/session-hooks-context.test.ts
++++ b/src/auto-reply/reply/session-hooks-context.test.ts
+@@ -98,4 +98,34 @@ describe("session hook context wiring", () => {
+     const [startEvent] = hookRunnerMocks.runSessionStart.mock.calls[0] ?? [];
+     expect(startEvent).toMatchObject({ resumedFrom: "old-session" });
+   });
++
++  it("fires session_end/session_start when session rolls automatically by reset policy", async () => {
++    const sessionKey = "agent:main:telegram:direct:auto";
++    const storePath = await createStorePath("openclaw-session-hook-auto-rollover");
++    await writeStore(storePath, {
++      [sessionKey]: {
++        sessionId: "old-auto-session",
++        updatedAt: Date.now() - 5 * 60_000,
++      },
++    });
++    const cfg = {
++      session: {
++        store: storePath,
++        reset: { mode: "idle", idleMinutes: 1 },
++      },
++    } as OpenClawConfig;
++
++    await initSessionState({
++      ctx: { Body: "hello", SessionKey: sessionKey },
++      cfg,
++      commandAuthorized: true,
++    });
++
++    await vi.waitFor(() => expect(hookRunnerMocks.runSessionEnd).toHaveBeenCalledTimes(1));
++    await vi.waitFor(() => expect(hookRunnerMocks.runSessionStart).toHaveBeenCalledTimes(1));
++    const [endEvent] = hookRunnerMocks.runSessionEnd.mock.calls[0] ?? [];
++    const [startEvent] = hookRunnerMocks.runSessionStart.mock.calls[0] ?? [];
++    expect(endEvent).toMatchObject({ sessionKey, sessionId: "old-auto-session" });
++    expect(startEvent).toMatchObject({ sessionKey, resumedFrom: "old-auto-session" });
++  });
+ });
+diff --git a/src/auto-reply/reply/session.test.ts b/src/auto-reply/reply/session.test.ts
+index db0870b704..b7f6f21f28 100644
+--- a/src/auto-reply/reply/session.test.ts
++++ b/src/auto-reply/reply/session.test.ts
+@@ -889,6 +889,7 @@ describe("initSessionState reset policy", () => {
+ 
+     expect(result.isNewSession).toBe(true);
+     expect(result.sessionId).not.toBe(existingSessionId);
++    expect(result.previousSessionEntry?.sessionId).toBe(existingSessionId);
+     expect(clearBootstrapSnapshotOnSessionRolloverSpy).toHaveBeenCalledWith({
+       sessionKey,
+       previousSessionId: existingSessionId,
+diff --git a/src/auto-reply/reply/session.ts b/src/auto-reply/reply/session.ts
+index 6db6b1708c..cc2b02fee6 100644
+--- a/src/auto-reply/reply/session.ts
++++ b/src/auto-reply/reply/session.ts
+@@ -329,6 +329,7 @@ export async function initSessionState(params: {
+     sessionStore[retiredLegacyMainDelivery.key] = retiredLegacyMainDelivery.entry;
+   }
+   const entry = sessionStore[sessionKey];
++  let previousSessionEntry: SessionEntry | undefined;
+   const now = Date.now();
+   const isThread = resolveThreadFlag({
+     sessionKey,
+@@ -358,7 +359,7 @@ export async function initSessionState(params: {
+   // archived afterward.  We need to do this for both explicit resets (/new, /reset)
+   // and for scheduled/daily resets where the session has become stale (!freshEntry).
+   // Without this, daily-reset transcripts are left as orphaned files on disk (#35481).
+-  const previousSessionEntry = (resetTriggered || !freshEntry) && entry ? { ...entry } : undefined;
++  previousSessionEntry = (resetTriggered || !freshEntry) && entry ? { ...entry } : undefined;
+   clearBootstrapSnapshotOnSessionRollover({
+     sessionKey,
+     previousSessionId: previousSessionEntry?.sessionId,
+@@ -393,6 +394,9 @@ export async function initSessionState(params: {
+       persistedLabel = entry.label;
+     }
+   }
++  if (isNewSession && entry?.sessionId) {
++    previousSessionEntry = { ...entry };
++  }
+ 
+   const baseEntry = !isNewSession && freshEntry ? entry : undefined;
+   // Track the originating channel/to for announce routing (subagent announce-back).
+diff --git a/src/auto-reply/reply/streaming-directives.ts b/src/auto-reply/reply/streaming-directives.ts
+index e61499200e..2f3ae8302f 100644
+--- a/src/auto-reply/reply/streaming-directives.ts
++++ b/src/auto-reply/reply/streaming-directives.ts
+@@ -1,6 +1,11 @@
+ import { splitMediaFromOutput } from "../../media/parse.js";
+ import { parseInlineDirectives } from "../../utils/directive-tags.js";
+-import { isSilentReplyPrefixText, isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
++import {
++  couldBeSilentTokenStart,
++  isSilentReplyPrefixText,
++  isSilentReplyText,
++  SILENT_REPLY_TOKEN,
++} from "../tokens.js";
+ import type { ReplyDirectiveParseResult } from "./reply-directives.js";
+ 
+ type PendingReplyState = {
+@@ -74,17 +79,21 @@ const hasRenderableContent = (parsed: ReplyDirectiveParseResult): boolean =>
+ 
+ export function createStreamingDirectiveAccumulator() {
+   let pendingTail = "";
++  let pendingSilent = "";
+   let pendingReply: PendingReplyState = { sawCurrent: false, hasTag: false };
+   let activeReply: PendingReplyState = { sawCurrent: false, hasTag: false };
+ 
+   const reset = () => {
+     pendingTail = "";
++    pendingSilent = "";
+     pendingReply = { sawCurrent: false, hasTag: false };
+     activeReply = { sawCurrent: false, hasTag: false };
+   };
+ 
+   const consume = (raw: string, options: ConsumeOptions = {}): ReplyDirectiveParseResult | null => {
+-    let combined = `${pendingTail}${raw ?? ""}`;
++    const withSilent = `${pendingSilent}${raw ?? ""}`;
++    pendingSilent = "";
++    let combined = `${pendingTail}${withSilent}`;
+     pendingTail = "";
+ 
+     if (!options.final) {
+@@ -98,6 +107,24 @@ export function createStreamingDirectiveAccumulator() {
+     }
+ 
+     const parsed = parseChunk(combined, { silentToken: options.silentToken });
++
++    // Buffer potential silent-token prefixes (e.g. "NO" from split "NO_REPLY").
++    // Wait for the next chunk to decide: if it completes to "NO_REPLY" → swallow;
++    // if it doesn't (e.g. "NOT really") → flush as normal text.
++    const silentToken = options.silentToken ?? SILENT_REPLY_TOKEN;
++    if (
++      !options.final &&
++      !parsed.isSilent &&
++      parsed.text &&
++      couldBeSilentTokenStart(parsed.text, silentToken) &&
++      !parsed.mediaUrl &&
++      (parsed.mediaUrls?.length ?? 0) === 0 &&
++      !parsed.audioAsVoice
++    ) {
++      pendingSilent = combined;
++      return null;
++    }
++
+     const hasTag = activeReply.hasTag || pendingReply.hasTag || parsed.replyToTag;
+     const sawCurrent = activeReply.sawCurrent || pendingReply.sawCurrent || parsed.replyToCurrent;
+     const explicitId =
+diff --git a/src/auto-reply/tokens.test.ts b/src/auto-reply/tokens.test.ts
+index f610fa3546..b38aa9a899 100644
+--- a/src/auto-reply/tokens.test.ts
++++ b/src/auto-reply/tokens.test.ts
+@@ -1,5 +1,10 @@
+ import { describe, it, expect } from "vitest";
+-import { isSilentReplyPrefixText, isSilentReplyText, stripSilentToken } from "./tokens.js";
++import {
++  couldBeSilentTokenStart,
++  isSilentReplyPrefixText,
++  isSilentReplyText,
++  stripSilentToken,
++} from "./tokens.js";
+ 
+ describe("isSilentReplyText", () => {
+   it("returns true for exact token", () => {
+@@ -102,3 +107,44 @@ describe("isSilentReplyPrefixText", () => {
+     expect(isSilentReplyPrefixText("NO-")).toBe(false);
+   });
+ });
++
++describe("couldBeSilentTokenStart", () => {
++  it("matches uppercase-only prefixes shorter than token", () => {
++    expect(couldBeSilentTokenStart("N")).toBe(true);
++    expect(couldBeSilentTokenStart("NO")).toBe(true);
++    expect(couldBeSilentTokenStart("NO_")).toBe(true);
++    expect(couldBeSilentTokenStart("NO_RE")).toBe(true);
++  });
++
++  it("returns false for exact full token (not a strict prefix)", () => {
++    expect(couldBeSilentTokenStart("NO_REPLY")).toBe(false);
++  });
++
++  it("rejects lowercase / mixed case", () => {
++    expect(couldBeSilentTokenStart("No")).toBe(false);
++    expect(couldBeSilentTokenStart("no")).toBe(false);
++    expect(couldBeSilentTokenStart("No_Reply")).toBe(false);
++  });
++
++  it("rejects non-prefix matches", () => {
++    expect(couldBeSilentTokenStart("NO_X")).toBe(false);
++    expect(couldBeSilentTokenStart("NX")).toBe(false);
++    expect(couldBeSilentTokenStart("HELLO")).toBe(false);
++  });
++
++  it("rejects text with non-token characters", () => {
++    expect(couldBeSilentTokenStart("NO ")).toBe(false);
++    expect(couldBeSilentTokenStart("NO:")).toBe(false);
++    expect(couldBeSilentTokenStart("NO_REPLY: reason")).toBe(false);
++  });
++
++  it("works with HEARTBEAT_OK token", () => {
++    expect(couldBeSilentTokenStart("HEART", "HEARTBEAT_OK")).toBe(true);
++    expect(couldBeSilentTokenStart("HEARTBEAT_OK", "HEARTBEAT_OK")).toBe(false);
++  });
++
++  it("handles undefined/empty", () => {
++    expect(couldBeSilentTokenStart(undefined)).toBe(false);
++    expect(couldBeSilentTokenStart("")).toBe(false);
++  });
++});
+diff --git a/src/auto-reply/tokens.ts b/src/auto-reply/tokens.ts
+index f5445ad553..f7239a2aef 100644
+--- a/src/auto-reply/tokens.ts
++++ b/src/auto-reply/tokens.ts
+@@ -3,6 +3,7 @@ import { escapeRegExp } from "../utils.js";
+ export const HEARTBEAT_TOKEN = "HEARTBEAT_OK";
+ export const SILENT_REPLY_TOKEN = "NO_REPLY";
+ 
++const TOKEN_CHARS_ONLY = /[^A-Z_]/;
+ const silentExactRegexByToken = new Map<string, RegExp>();
+ const silentTrailingRegexByToken = new Map<string, RegExp>();
+ 
+@@ -49,6 +50,32 @@ export function stripSilentToken(text: string, token: string = SILENT_REPLY_TOKE
+   return text.replace(getSilentTrailingRegex(token), "").trim();
+ }
+ 
++/**
++ * Lenient prefix check for streaming buffering.
++ * Unlike isSilentReplyPrefixText, does NOT require an underscore —
++ * catches "NO" as a valid prefix of "NO_REPLY" from BPE tokenizers
++ * that split the token across streaming chunks (e.g. "NO" + "_REPLY").
++ * Returns true only for strict prefixes (shorter than full token).
++ */
++export function couldBeSilentTokenStart(
++  text: string | undefined,
++  token: string = SILENT_REPLY_TOKEN,
++): boolean {
++  if (!text) {
++    return false;
++  }
++  const trimmed = text.trimStart();
++  if (!trimmed) {
++    return false;
++  }
++  // Must already be uppercase + underscores only (reject "No", "no", etc.)
++  if (TOKEN_CHARS_ONLY.test(trimmed)) {
++    return false;
++  }
++  const upper = token.toUpperCase();
++  return trimmed.length < upper.length && upper.startsWith(trimmed);
++}
++
+ export function isSilentReplyPrefixText(
+   text: string | undefined,
+   token: string = SILENT_REPLY_TOKEN,
+@@ -72,7 +99,7 @@ export function isSilentReplyPrefixText(
+   if (normalized.length < 2) {
+     return false;
+   }
+-  if (/[^A-Z_]/.test(normalized)) {
++  if (TOKEN_CHARS_ONLY.test(normalized)) {
+     return false;
+   }
+   const tokenUpper = token.toUpperCase();
+diff --git a/src/commands/agent.ts b/src/commands/agent.ts
+index 74a5078d03..5cbf0518b6 100644
+--- a/src/commands/agent.ts
++++ b/src/commands/agent.ts
+@@ -371,11 +371,15 @@ function runAgentAttempt(params: {
+         timeoutMs: params.timeoutMs,
+         runId: params.runId,
+         extraSystemPrompt: params.opts.extraSystemPrompt,
++        skillsSnapshot: params.skillsSnapshot,
+         cliSessionId: nextCliSessionId,
+         bootstrapPromptWarningSignaturesSeen,
+         bootstrapPromptWarningSignature,
+         images: params.isFallbackRetry ? undefined : params.opts.images,
+         streamParams: params.opts.streamParams,
++        abortSignal: params.opts.abortSignal,
++        trigger: "user",
++        messageChannel: params.messageChannel,
+       });
+     return runCliWithSession(cliSessionId).catch(async (err) => {
+       // Handle CLI session expired error
+diff --git a/src/config/schema.help.ts b/src/config/schema.help.ts
+index 70bd029549..1e85356713 100644
+--- a/src/config/schema.help.ts
++++ b/src/config/schema.help.ts
+@@ -993,6 +993,18 @@ export const FIELD_HELP: Record<string, string> = {
+   "agents.defaults.imageMaxDimensionPx":
+     "Max image side length in pixels when sanitizing transcript/tool-result image payloads (default: 1200).",
+   "agents.defaults.cliBackends": "Optional CLI backends for text-only fallback (claude-cli, etc.).",
++  "agents.defaults.cliBackends.*.mcp":
++    "MCP wiring options for CLI backends. Useful for merging custom MCP servers with OpenClaw's built-in MCP server in claude-cli sessions.",
++  "agents.defaults.cliBackends.*.mcp.enabled":
++    "Enables MCP config injection for this CLI backend (default on for claude-cli). Disable to run without MCP tools.",
++  "agents.defaults.cliBackends.*.mcp.strict":
++    "When true, passes --strict-mcp-config to the CLI. Set false only when you intentionally allow unknown MCP config references.",
++  "agents.defaults.cliBackends.*.mcp.configPath":
++    "Optional primary MCP config path. When set for claude-cli, OpenClaw merges this config with its own MCP server entry.",
++  "agents.defaults.cliBackends.*.mcp.mergeConfigPath":
++    "Optional additional MCP config path merged on top of the primary config for this backend.",
++  "agents.defaults.cliBackends.*.mcp.servers":
++    "Inline MCP servers merged into the effective backend MCP config (map of server name to server config object).",
+   "agents.defaults.compaction":
+     "Compaction tuning for when context nears token limits, including history share, reserve headroom, and pre-compaction memory flush behavior. Use this when long-running sessions need stable continuity under tight context windows.",
+   "agents.defaults.compaction.mode":
+diff --git a/src/config/schema.labels.ts b/src/config/schema.labels.ts
+index 98c7ba1f64..264be69da9 100644
+--- a/src/config/schema.labels.ts
++++ b/src/config/schema.labels.ts
+@@ -447,6 +447,12 @@ export const FIELD_LABELS: Record<string, string> = {
+   "agents.defaults.humanDelay.minMs": "Human Delay Min (ms)",
+   "agents.defaults.humanDelay.maxMs": "Human Delay Max (ms)",
+   "agents.defaults.cliBackends": "CLI Backends",
++  "agents.defaults.cliBackends.*.mcp": "CLI Backend MCP",
++  "agents.defaults.cliBackends.*.mcp.enabled": "CLI Backend MCP Enabled",
++  "agents.defaults.cliBackends.*.mcp.strict": "CLI Backend MCP Strict Mode",
++  "agents.defaults.cliBackends.*.mcp.configPath": "CLI Backend MCP Config Path",
++  "agents.defaults.cliBackends.*.mcp.mergeConfigPath": "CLI Backend MCP Merge Config Path",
++  "agents.defaults.cliBackends.*.mcp.servers": "CLI Backend MCP Inline Servers",
+   "agents.defaults.compaction": "Compaction",
+   "agents.defaults.compaction.mode": "Compaction Mode",
+   "agents.defaults.compaction.reserveTokens": "Compaction Reserve Tokens",
+diff --git a/src/config/sessions/sessions.test.ts b/src/config/sessions/sessions.test.ts
+index dfe4b74e9b..e110aceb0e 100644
+--- a/src/config/sessions/sessions.test.ts
++++ b/src/config/sessions/sessions.test.ts
+@@ -19,7 +19,10 @@ import {
+   validateSessionId,
+ } from "./paths.js";
+ import { resolveSessionResetPolicy } from "./reset.js";
+-import { appendAssistantMessageToSessionTranscript } from "./transcript.js";
++import {
++  appendAssistantMessageToSessionTranscript,
++  appendCliTurnToSessionTranscript,
++} from "./transcript.js";
+ import type { SessionEntry } from "./types.js";
+ 
+ function useTempSessionsFixture(prefix: string) {
+@@ -326,6 +329,70 @@ describe("appendAssistantMessageToSessionTranscript", () => {
+   });
+ });
+ 
++describe("appendCliTurnToSessionTranscript", () => {
++  const fixture = useTempSessionsFixture("transcript-cli-test-");
++
++  it("appends user+assistant turns to a session transcript", async () => {
++    const sessionFile = path.join(fixture.sessionsDir(), "cli-session.jsonl");
++
++    const result = await appendCliTurnToSessionTranscript({
++      sessionFile,
++      sessionId: "cli-session",
++      userText: "Summarize yesterday notes",
++      assistantText: "Done.",
++      provider: "claude-cli",
++      model: "sonnet",
++      usage: {
++        input: 12,
++        output: 8,
++      },
++    });
++
++    expect(result.ok).toBe(true);
++    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
++    const entries = lines.map((line) => JSON.parse(line));
++    const header = entries.find((entry) => entry.type === "session");
++    expect(header.type).toBe("session");
++    expect(header.id).toBe("cli-session");
++
++    const messages = entries.filter((entry) => entry.type === "message");
++    expect(messages.length).toBe(2);
++
++    const userLine = messages[0];
++    expect(userLine.type).toBe("message");
++    expect(userLine.message.role).toBe("user");
++    expect(userLine.message.content[0].text).toBe("Summarize yesterday notes");
++
++    const assistantLine = messages[1];
++    expect(assistantLine.type).toBe("message");
++    expect(assistantLine.message.role).toBe("assistant");
++    expect(assistantLine.message.provider).toBe("claude-cli");
++    expect(assistantLine.message.model).toBe("sonnet");
++    expect(assistantLine.message.usage.totalTokens).toBe(20);
++  });
++
++  it("uses zero usage when cli output does not include usage", async () => {
++    const sessionFile = path.join(fixture.sessionsDir(), "cli-session-no-usage.jsonl");
++
++    const result = await appendCliTurnToSessionTranscript({
++      sessionFile,
++      sessionId: "cli-session-no-usage",
++      userText: "ping",
++      assistantText: "pong",
++      provider: "claude-cli",
++      model: "sonnet",
++    });
++
++    expect(result.ok).toBe(true);
++    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
++    const entries = lines.map((line) => JSON.parse(line));
++    const messages = entries.filter((entry) => entry.type === "message");
++    const assistantLine = messages[1];
++    expect(assistantLine.message.role).toBe("assistant");
++    expect(assistantLine.message.usage.totalTokens).toBe(0);
++  });
++});
++
+ describe("resolveAndPersistSessionFile", () => {
+   const fixture = useTempSessionsFixture("session-file-test-");
+ 
+diff --git a/src/config/sessions/transcript.ts b/src/config/sessions/transcript.ts
+index dae2cbf266..626f127d4f 100644
+--- a/src/config/sessions/transcript.ts
++++ b/src/config/sessions/transcript.ts
+@@ -130,6 +130,131 @@ export async function resolveSessionTranscriptFile(params: {
+   };
+ }
+ 
++type CliTurnUsage = {
++  input?: number;
++  output?: number;
++  cacheRead?: number;
++  cacheWrite?: number;
++  total?: number;
++};
++
++const ZERO_USAGE = {
++  input: 0,
++  output: 0,
++  cacheRead: 0,
++  cacheWrite: 0,
++  totalTokens: 0,
++  cost: {
++    input: 0,
++    output: 0,
++    cacheRead: 0,
++    cacheWrite: 0,
++    total: 0,
++  },
++};
++
++function normalizeNonNegativeNumber(value: unknown): number | undefined {
++  if (typeof value !== "number" || !Number.isFinite(value)) {
++    return undefined;
++  }
++  const normalized = Math.max(0, Math.floor(value));
++  return normalized;
++}
++
++function buildCliUsage(usage?: CliTurnUsage): {
++  input: number;
++  output: number;
++  cacheRead: number;
++  cacheWrite: number;
++  totalTokens: number;
++  cost: {
++    input: number;
++    output: number;
++    cacheRead: number;
++    cacheWrite: number;
++    total: number;
++  };
++} | null {
++  if (!usage) {
++    return null;
++  }
++  const input = normalizeNonNegativeNumber(usage.input) ?? 0;
++  const output = normalizeNonNegativeNumber(usage.output) ?? 0;
++  const cacheRead = normalizeNonNegativeNumber(usage.cacheRead) ?? 0;
++  const cacheWrite = normalizeNonNegativeNumber(usage.cacheWrite) ?? 0;
++  const totalTokens =
++    normalizeNonNegativeNumber(usage.total) ?? input + output + cacheRead + cacheWrite;
++  const hasUsage = totalTokens > 0 || input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0;
++  if (!hasUsage) {
++    return null;
++  }
++  return {
++    input,
++    output,
++    cacheRead,
++    cacheWrite,
++    totalTokens,
++    cost: {
++      input: 0,
++      output: 0,
++      cacheRead: 0,
++      cacheWrite: 0,
++      total: 0,
++    },
++  };
++}
++
++export async function appendCliTurnToSessionTranscript(params: {
++  sessionFile: string;
++  sessionId: string;
++  userText?: string;
++  assistantText?: string;
++  provider: string;
++  model: string;
++  usage?: CliTurnUsage;
++}): Promise<{ ok: true } | { ok: false; reason: string }> {
++  const sessionFile = params.sessionFile.trim();
++  if (!sessionFile) {
++    return { ok: false, reason: "missing sessionFile" };
++  }
++  const sessionId = params.sessionId.trim();
++  if (!sessionId) {
++    return { ok: false, reason: "missing sessionId" };
++  }
++  const userText = params.userText?.trim() ?? "";
++  const assistantText = params.assistantText?.trim() ?? "";
++  if (!userText && !assistantText) {
++    return { ok: false, reason: "empty turn" };
++  }
++
++  await ensureSessionHeader({ sessionFile, sessionId });
++
++  const sessionManager = SessionManager.open(sessionFile);
++  if (userText) {
++    sessionManager.appendMessage({
++      role: "user",
++      content: [{ type: "text", text: userText }],
++      timestamp: Date.now(),
++    });
++  }
++  if (assistantText) {
++    const usage = buildCliUsage(params.usage) ?? ZERO_USAGE;
++    sessionManager.appendMessage({
++      role: "assistant",
++      content: [{ type: "text", text: assistantText }],
++      api: "cli",
++      provider: params.provider,
++      model: params.model,
++      usage,
++      stopReason: "stop",
++      timestamp: Date.now(),
++    });
++  }
++  emitSessionTranscriptUpdate(sessionFile);
++  return { ok: true };
++}
++
++
+ export async function appendAssistantMessageToSessionTranscript(params: {
+   agentId?: string;
+   sessionKey: string;
+diff --git a/src/config/types.agent-defaults.ts b/src/config/types.agent-defaults.ts
+index 9124e4084d..1d73452f4b 100644
+--- a/src/config/types.agent-defaults.ts
++++ b/src/config/types.agent-defaults.ts
+@@ -115,6 +115,19 @@ export type CliBackendConfig = {
+       };
+     };
+   };
++  /** MCP wiring controls (primarily for Claude CLI backends). */
++  mcp?: {
++    /** Enable MCP config injection for this backend (default: true for claude-cli). */
++    enabled?: boolean;
++    /** Add `--strict-mcp-config` when true (default: true). */
++    strict?: boolean;
++    /** Optional primary MCP config path (merged with OpenClaw MCP server when provided). */
++    configPath?: string;
++    /** Optional extra MCP config path whose servers are merged into the effective config. */
++    mergeConfigPath?: string;
++    /** Optional inline MCP servers merged into the effective config. */
++    servers?: Record<string, unknown>;
++  };
+ };
+ 
+ export type AgentDefaultsConfig = {
+diff --git a/src/config/zod-schema.core.ts b/src/config/zod-schema.core.ts
+index 23accd8163..4bcf29f36e 100644
+--- a/src/config/zod-schema.core.ts
++++ b/src/config/zod-schema.core.ts
+@@ -449,12 +449,27 @@ const CliBackendWatchdogModeSchema = z
+   .strict()
+   .optional();
+ 
++const CliBackendMcpSchema = z
++  .object({
++    enabled: z.boolean().optional(),
++    strict: z.boolean().optional(),
++    configPath: z.string().optional(),
++    mergeConfigPath: z.string().optional(),
++    servers: z.record(z.string(), z.unknown()).optional(),
++  })
++  .strict()
++  .optional();
++
+ export const CliBackendSchema = z
+   .object({
+     command: z.string(),
+     args: z.array(z.string()).optional(),
+-    output: z.union([z.literal("json"), z.literal("text"), z.literal("jsonl")]).optional(),
+-    resumeOutput: z.union([z.literal("json"), z.literal("text"), z.literal("jsonl")]).optional(),
++    output: z
++      .union([z.literal("json"), z.literal("text"), z.literal("jsonl"), z.literal("stream-json")])
++      .optional(),
++    resumeOutput: z
++      .union([z.literal("json"), z.literal("text"), z.literal("jsonl"), z.literal("stream-json")])
++      .optional(),
+     input: z.union([z.literal("arg"), z.literal("stdin")]).optional(),
+     maxPromptArgChars: z.number().int().positive().optional(),
+     env: z.record(z.string(), z.string()).optional(),
+@@ -488,6 +503,7 @@ export const CliBackendSchema = z
+       })
+       .strict()
+       .optional(),
++    mcp: CliBackendMcpSchema,
+   })
+   .strict();
+ 
+diff --git a/src/cron/isolated-agent/run.ts b/src/cron/isolated-agent/run.ts
+index 0666b752e5..7adbb82827 100644
+--- a/src/cron/isolated-agent/run.ts
++++ b/src/cron/isolated-agent/run.ts
+@@ -625,6 +625,8 @@ export async function runCronIsolatedAgentTurn(params: {
+             disableMessageTool: toolPolicy.disableMessageTool,
+             allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
+             abortSignal,
++            trigger: "cron",
++            messageChannel,
+             bootstrapPromptWarningSignaturesSeen,
+             bootstrapPromptWarningSignature,
+           });
+diff --git a/src/gateway/mcp-http.test.ts b/src/gateway/mcp-http.test.ts
+new file mode 100644
+index 0000000000..d5202aaa12
+--- /dev/null
++++ b/src/gateway/mcp-http.test.ts
+@@ -0,0 +1,158 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { getFreePortBlockWithPermissionFallback } from "../test-utils/ports.js";
++import { startMcpLoopbackServer } from "./mcp-http.js";
++
++type MockConfig = {
++  marker: string;
++  session?: { mainKey?: string };
++};
++
++const groupPolicyMock = vi.hoisted(() => vi.fn());
++let runtimeConfig: MockConfig = {
++  marker: "a",
++  session: { mainKey: "main" },
++};
++
++vi.mock("../config/config.js", () => ({
++  loadConfig: () => runtimeConfig,
++}));
++
++vi.mock("../config/sessions.js", () => ({
++  resolveMainSessionKey: (cfg?: { session?: { mainKey?: string } }) =>
++    `agent:main:${cfg?.session?.mainKey ?? "main"}`,
++}));
++
++vi.mock("../agents/openclaw-tools.js", () => ({
++  createOpenClawTools: (options?: { config?: MockConfig }) => {
++    const marker = options?.config?.marker ?? "unknown";
++    return [
++      {
++        name: `tool-${marker}`,
++        description: `tool ${marker}`,
++        parameters: { type: "object", properties: {} },
++        execute: async () => ({
++          content: [{ type: "text", text: `ok-${marker}` }],
++        }),
++      },
++    ];
++  },
++}));
++
++vi.mock("../agents/pi-tools.policy.js", () => ({
++  resolveEffectiveToolPolicy: () => ({
++    agentId: "main",
++    globalPolicy: undefined,
++    globalProviderPolicy: undefined,
++    agentPolicy: undefined,
++    agentProviderPolicy: undefined,
++    profile: undefined,
++    providerProfile: undefined,
++    profileAlsoAllow: undefined,
++    providerProfileAlsoAllow: undefined,
++  }),
++  resolveGroupToolPolicy: (...args: unknown[]) => groupPolicyMock(...args),
++  resolveSubagentToolPolicy: () => undefined,
++}));
++
++vi.mock("../agents/tool-policy-pipeline.js", () => ({
++  applyToolPolicyPipeline: (params: { tools: unknown[] }) => params.tools,
++  buildDefaultToolPolicyPipelineSteps: () => [],
++}));
++
++vi.mock("../agents/tool-policy.js", () => ({
++  collectExplicitAllowlist: () => [],
++  mergeAlsoAllowPolicy: (policy: unknown) => policy,
++  resolveToolProfilePolicy: () => undefined,
++}));
++
++vi.mock("../plugins/tools.js", () => ({
++  getPluginToolMeta: () => undefined,
++}));
++
++vi.mock("../routing/session-key.js", () => ({
++  isSubagentSessionKey: () => false,
++}));
++
++let server: Awaited<ReturnType<typeof startMcpLoopbackServer>> | null = null;
++
++async function sendJsonRpc(params: {
++  port: number;
++  body: Record<string, unknown>;
++  headers?: Record<string, string>;
++}) {
++  const response = await fetch(`http://127.0.0.1:${params.port}/mcp`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      ...params.headers,
++    },
++    body: JSON.stringify(params.body),
++  });
++  return await response.json();
++}
++
++describe("mcp-http", () => {
++  beforeEach(() => {
++    runtimeConfig = {
++      marker: "a",
++      session: { mainKey: "main" },
++    };
++    groupPolicyMock.mockReset();
++    groupPolicyMock.mockReturnValue(undefined);
++  });
++
++  afterEach(async () => {
++    await server?.close();
++    server = null;
++  });
++
++  it("refreshes tool cache when runtime config snapshot changes", async () => {
++    const port = await getFreePortBlockWithPermissionFallback({
++      offsets: [0],
++      fallbackBase: 47_000,
++    });
++    server = await startMcpLoopbackServer(port);
++
++    const first = (await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
++    })) as { result?: { tools?: Array<{ name?: string }> } };
++    expect(first.result?.tools?.[0]?.name).toBe("tool-a");
++
++    runtimeConfig = {
++      marker: "b",
++      session: { mainKey: "main" },
++    };
++
++    const second = (await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 2, method: "tools/list" },
++    })) as { result?: { tools?: Array<{ name?: string }> } };
++    expect(second.result?.tools?.[0]?.name).toBe("tool-b");
++  });
++
++  it("passes message channel and account headers into group tool policy resolution", async () => {
++    const port = await getFreePortBlockWithPermissionFallback({
++      offsets: [0],
++      fallbackBase: 48_000,
++    });
++    server = await startMcpLoopbackServer(port);
++
++    await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
++      headers: {
++        "x-session-key": "agent:main:telegram:group:chat123",
++        "x-openclaw-message-channel": "telegram",
++        "x-openclaw-account-id": "work",
++      },
++    });
++
++    const lastCall = groupPolicyMock.mock.calls.at(-1)?.[0] as
++      | { sessionKey?: string; messageProvider?: string; accountId?: string | null }
++      | undefined;
++    expect(lastCall?.sessionKey).toBe("agent:main:telegram:group:chat123");
++    expect(lastCall?.messageProvider).toBe("telegram");
++    expect(lastCall?.accountId).toBe("work");
++  });
++});
+diff --git a/src/gateway/mcp-http.ts b/src/gateway/mcp-http.ts
+new file mode 100644
+index 0000000000..8ccfd5783c
+--- /dev/null
++++ b/src/gateway/mcp-http.ts
+@@ -0,0 +1,526 @@
++import crypto from "node:crypto";
++import fs from "node:fs";
++import { createServer as createHttpServer } from "node:http";
++import type { IncomingMessage } from "node:http";
++import path from "node:path";
++import { createOpenClawTools } from "../agents/openclaw-tools.js";
++import {
++  resolveEffectiveToolPolicy,
++  resolveGroupToolPolicy,
++  resolveSubagentToolPolicy,
++} from "../agents/pi-tools.policy.js";
++import {
++  applyToolPolicyPipeline,
++  buildDefaultToolPolicyPipelineSteps,
++} from "../agents/tool-policy-pipeline.js";
++import {
++  collectExplicitAllowlist,
++  mergeAlsoAllowPolicy,
++  resolveToolProfilePolicy,
++} from "../agents/tool-policy.js";
++import { loadConfig } from "../config/config.js";
++import { resolveMainSessionKey } from "../config/sessions.js";
++import { logDebug, logWarn } from "../logger.js";
++import { getPluginToolMeta } from "../plugins/tools.js";
++import { isSubagentSessionKey } from "../routing/session-key.js";
++import { normalizeMessageChannel, resolveGatewayMessageChannel } from "../utils/message-channel.js";
++import { getHeader } from "./http-utils.js";
++
++/** MCP loopback server runs on gateway port + this offset. */
++export const MCP_PORT_OFFSET = 1;
++
++const SERVER_NAME = "openclaw";
++const SERVER_VERSION = "0.1.0";
++
++/**
++ * Supported MCP protocol versions (newest first).
++ */
++const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05"];
++
++/**
++ * Tools that Claude Code already provides natively — no point exposing via MCP.
++ */
++const NATIVE_TOOL_EXCLUDE = new Set(["read", "write", "edit", "apply_patch", "exec", "process"]);
++
++// ---------- Tool resolution ----------
++
++function resolveFilteredTools(params: {
++  cfg: ReturnType<typeof loadConfig>;
++  sessionKey: string;
++  messageProvider?: string;
++  accountId?: string;
++  messageTo?: string;
++  messageThreadId?: string;
++}) {
++  const {
++    agentId,
++    globalPolicy,
++    globalProviderPolicy,
++    agentPolicy,
++    agentProviderPolicy,
++    profile,
++    providerProfile,
++    profileAlsoAllow,
++    providerProfileAlsoAllow,
++  } = resolveEffectiveToolPolicy({ config: params.cfg, sessionKey: params.sessionKey });
++
++  const profilePolicy = resolveToolProfilePolicy(profile);
++  const providerProfilePolicy = resolveToolProfilePolicy(providerProfile);
++  const profilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(profilePolicy, profileAlsoAllow);
++  const providerProfilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(
++    providerProfilePolicy,
++    providerProfileAlsoAllow,
++  );
++  const groupPolicy = resolveGroupToolPolicy({
++    config: params.cfg,
++    sessionKey: params.sessionKey,
++    messageProvider: params.messageProvider,
++    accountId: params.accountId ?? null,
++  });
++  const subagentPolicy = isSubagentSessionKey(params.sessionKey)
++    ? resolveSubagentToolPolicy(params.cfg)
++    : undefined;
++
++  const allTools = createOpenClawTools({
++    agentSessionKey: params.sessionKey,
++    agentChannel: resolveGatewayMessageChannel(params.messageProvider),
++    agentAccountId: params.accountId,
++    agentTo: params.messageTo,
++    agentThreadId: params.messageThreadId,
++    config: params.cfg,
++    pluginToolAllowlist: collectExplicitAllowlist([
++      profilePolicy,
++      providerProfilePolicy,
++      globalPolicy,
++      globalProviderPolicy,
++      agentPolicy,
++      agentProviderPolicy,
++      groupPolicy,
++      subagentPolicy,
++    ]),
++  });
++
++  const policyFiltered = applyToolPolicyPipeline({
++    // oxlint-disable-next-line typescript/no-explicit-any
++    tools: allTools as any,
++    // oxlint-disable-next-line typescript/no-explicit-any
++    toolMeta: (tool) => getPluginToolMeta(tool as any),
++    warn: logWarn,
++    steps: [
++      ...buildDefaultToolPolicyPipelineSteps({
++        profilePolicy: profilePolicyWithAlsoAllow,
++        profile,
++        providerProfilePolicy: providerProfilePolicyWithAlsoAllow,
++        providerProfile,
++        globalPolicy,
++        globalProviderPolicy,
++        agentPolicy,
++        agentProviderPolicy,
++        groupPolicy,
++        agentId,
++      }),
++      { policy: subagentPolicy, label: "subagent tools.allow" },
++    ],
++  });
++
++  return policyFiltered.filter((t) => !NATIVE_TOOL_EXCLUDE.has(t.name));
++}
++
++// ---------- JSON-RPC helpers ----------
++
++interface JsonRpcRequest {
++  jsonrpc: "2.0";
++  id?: string | number | null;
++  method: string;
++  params?: Record<string, unknown>;
++}
++
++function jsonRpcResult(id: string | number | null | undefined, result: unknown) {
++  return { jsonrpc: "2.0" as const, id: id ?? null, result };
++}
++
++function jsonRpcError(id: string | number | null | undefined, code: number, message: string) {
++  return { jsonrpc: "2.0" as const, id: id ?? null, error: { code, message } };
++}
++
++// ---------- Request handler ----------
++
++/**
++ * Flatten a top-level `anyOf`/`oneOf` union of objects into a single
++ * `{ type: "object" }` schema by merging all variant properties.
++ *
++ * The Anthropic API rejects `anyOf`/`oneOf`/`allOf` at the input_schema
++ * top level, and Claude Code forwards MCP tool schemas as-is.
++ */
++function flattenUnionSchema(raw: Record<string, unknown>): Record<string, unknown> {
++  const variants = (raw.anyOf ?? raw.oneOf) as Record<string, unknown>[] | undefined;
++  if (!Array.isArray(variants) || variants.length === 0) {
++    return raw;
++  }
++  const mergedProps: Record<string, unknown> = {};
++  const requiredSets: Set<string>[] = [];
++  for (const variant of variants) {
++    const props = variant.properties as Record<string, unknown> | undefined;
++    if (props) {
++      for (const [key, schema] of Object.entries(props)) {
++        // First variant wins for each property definition.
++        if (!(key in mergedProps)) {
++          mergedProps[key] = schema;
++        }
++      }
++    }
++    if (Array.isArray(variant.required)) {
++      requiredSets.push(new Set(variant.required as string[]));
++    }
++  }
++  // Only mark a field as required if ALL variants require it.
++  const required =
++    requiredSets.length > 0
++      ? [...requiredSets.reduce((a, b) => new Set([...a].filter((x) => b.has(x))))]
++      : [];
++  const { anyOf: _a, oneOf: _o, ...rest } = raw;
++  return { ...rest, type: "object", properties: mergedProps, required };
++}
++
++function buildToolSchema(tools: ReturnType<typeof resolveFilteredTools>) {
++  return tools.map((t) => {
++    let raw =
++      t.parameters && typeof t.parameters === "object"
++        ? { ...(t.parameters as Record<string, unknown>) }
++        : {};
++    // Flatten anyOf/oneOf unions — Anthropic API forbids them at top level.
++    if (raw.anyOf || raw.oneOf) {
++      raw = flattenUnionSchema(raw);
++    }
++    if (raw.type !== "object") {
++      raw.type = "object";
++      if (!raw.properties) {
++        raw.properties = {};
++      }
++    }
++    return { name: t.name, description: t.description, inputSchema: raw };
++  });
++}
++
++async function handleJsonRpc(
++  msg: JsonRpcRequest,
++  tools: ReturnType<typeof resolveFilteredTools>,
++  toolSchema: ReturnType<typeof buildToolSchema>,
++): Promise<object | null> {
++  const { id, method, params } = msg;
++
++  switch (method) {
++    // ---- lifecycle ----
++    case "initialize": {
++      const clientVersion = (params?.protocolVersion as string) ?? "";
++      const negotiated =
++        SUPPORTED_PROTOCOL_VERSIONS.find((v) => v === clientVersion) ??
++        SUPPORTED_PROTOCOL_VERSIONS[0];
++      logDebug(`mcp ← initialize (protocol=${clientVersion}, negotiated=${negotiated})`);
++      return jsonRpcResult(id, {
++        protocolVersion: negotiated,
++        capabilities: { tools: {} },
++        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
++      });
++    }
++
++    case "notifications/initialized":
++    case "notifications/cancelled":
++      logDebug(`mcp ← ${method}`);
++      return null; // notification — no response
++
++    // ---- tools ----
++    case "tools/list":
++      logDebug(`mcp ← tools/list (${toolSchema.length} tools)`);
++      return jsonRpcResult(id, { tools: toolSchema });
++
++    case "tools/call": {
++      const toolName = params?.name as string;
++      const toolArgs = (params?.arguments ?? {}) as Record<string, unknown>;
++      const tool = tools.find((t) => t.name === toolName);
++      if (!tool) {
++        logWarn(`mcp ← tools/call: not found: ${toolName}`);
++        return jsonRpcResult(id, {
++          content: [{ type: "text", text: `Tool not available: ${toolName}` }],
++          isError: true,
++        });
++      }
++      const argsSummary = Object.keys(toolArgs).join(",") || "(none)";
++      logDebug(`mcp ← tools/call: ${toolName} [${argsSummary}]`);
++      const t0 = Date.now();
++      try {
++        // oxlint-disable-next-line typescript/no-explicit-any
++        const result = await (tool as any).execute(`mcp-${crypto.randomUUID()}`, toolArgs);
++        const content =
++          result?.content && Array.isArray(result.content)
++            ? result.content.map((block: { type?: string; text?: string }) => ({
++                type: (block.type ?? "text") as "text",
++                text: block.text ?? (typeof block === "string" ? block : JSON.stringify(block)),
++              }))
++            : [
++                {
++                  type: "text",
++                  text: typeof result === "string" ? result : JSON.stringify(result),
++                },
++              ];
++        const elapsed = Date.now() - t0;
++        const snippet = content[0]?.text?.slice(0, 120) ?? "";
++        logDebug(`mcp → ${toolName} OK (${elapsed}ms) ${snippet}`);
++        return jsonRpcResult(id, { content, isError: false });
++      } catch (err) {
++        const message = err instanceof Error ? err.message : String(err);
++        const elapsed = Date.now() - t0;
++        logWarn(`mcp → ${toolName} FAIL (${elapsed}ms): ${message}`);
++        return jsonRpcResult(id, {
++          content: [{ type: "text", text: message || "tool execution failed" }],
++          isError: true,
++        });
++      }
++    }
++
++    default:
++      logDebug(`mcp ← unknown method: ${method}`);
++      return jsonRpcError(id, -32601, `Method not found: ${method}`);
++  }
++}
++
++const MAX_BODY_BYTES = 1_048_576; // 1 MB
++
++function readBody(req: IncomingMessage): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const chunks: Buffer[] = [];
++    let received = 0;
++    req.on("data", (chunk: Buffer) => {
++      received += chunk.length;
++      if (received > MAX_BODY_BYTES) {
++        req.destroy();
++        reject(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`));
++        return;
++      }
++      chunks.push(chunk);
++    });
++    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
++    req.on("error", reject);
++  });
++}
++
++// ---------- MCP config file ----------
++
++/**
++ * Ensure the MCP config file exists at `~/.openclaw/mcp.json`.
++ * Returns the absolute path to the config file.
++ */
++export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): string {
++  const filePath = path.join(openclawDir, "mcp.json");
++  const config = {
++    mcpServers: {
++      openclaw: {
++        type: "http",
++        url: `http://127.0.0.1:${mcpPort}/mcp`,
++        headers: {
++          "x-session-key": "${OPENCLAW_MCP_SESSION_KEY}",
++          "x-openclaw-agent-id": "${OPENCLAW_MCP_AGENT_ID}",
++          "x-openclaw-account-id": "${OPENCLAW_MCP_ACCOUNT_ID}",
++          "x-openclaw-message-channel": "${OPENCLAW_MCP_MESSAGE_CHANNEL}",
++          "x-openclaw-message-to": "${OPENCLAW_MCP_TO}",
++          "x-openclaw-thread-id": "${OPENCLAW_MCP_THREAD_ID}",
++        },
++      },
++    },
++  };
++  const content = JSON.stringify(config, null, 2) + "\n";
++
++  try {
++    const existing = fs.readFileSync(filePath, "utf-8");
++    if (existing === content) {
++      return filePath;
++    }
++  } catch (err: unknown) {
++    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
++      throw err;
++    }
++  }
++
++  fs.mkdirSync(openclawDir, { recursive: true });
++  fs.writeFileSync(filePath, content, "utf-8");
++  return filePath;
++}
++
++// ---------- MCP loopback HTTP server ----------
++
++/**
++ * Start a plain HTTP server on 127.0.0.1 dedicated to the MCP endpoint.
++ *
++ * Implements MCP Streamable HTTP transport (stateless mode) with plain
++ * JSON responses — no SSE, no session state.
++ */
++export async function startMcpLoopbackServer(port: number): Promise<{
++  close: () => Promise<void>;
++}> {
++  // Per-tool-context cache with TTL; clears when runtime config snapshot changes.
++  const TOOL_CACHE_TTL_MS = 30_000;
++  const toolCache = new Map<
++    string,
++    {
++      tools: ReturnType<typeof resolveFilteredTools>;
++      schema: ReturnType<typeof buildToolSchema>;
++      time: number;
++    }
++  >();
++  let toolCacheConfigRef: ReturnType<typeof loadConfig> | null = null;
++
++  function getTools(params: {
++    cfg: ReturnType<typeof loadConfig>;
++    sessionKey: string;
++    messageProvider?: string;
++    accountId?: string;
++    messageTo?: string;
++    messageThreadId?: string;
++  }) {
++    if (toolCacheConfigRef && toolCacheConfigRef !== params.cfg) {
++      toolCache.clear();
++    }
++    toolCacheConfigRef = params.cfg;
++    const cacheKey = [
++      params.sessionKey,
++      params.messageProvider ?? "",
++      params.accountId ?? "",
++      params.messageTo ?? "",
++      params.messageThreadId ?? "",
++    ].join("\u0000");
++    const now = Date.now();
++    const cached = toolCache.get(cacheKey);
++    if (cached && now - cached.time < TOOL_CACHE_TTL_MS) {
++      return { tools: cached.tools, toolSchema: cached.schema };
++    }
++    // Evict expired entries to prevent unbounded growth.
++    for (const [key, entry] of toolCache) {
++      if (now - entry.time >= TOOL_CACHE_TTL_MS) {
++        toolCache.delete(key);
++      }
++    }
++    const tools = resolveFilteredTools(params);
++    const schema = buildToolSchema(tools);
++    toolCache.set(cacheKey, { tools, schema, time: now });
++    if (!tools.length) {
++      logWarn("mcp: tool resolution returned 0 tools — plugins may not be loaded yet");
++    }
++    return { tools, toolSchema: schema };
++  }
++
++  const httpServer = createHttpServer((req, res) => {
++    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
++
++    // Fast-path well-known OAuth endpoints — tell clients no auth needed.
++    if (req.method === "GET" && url.pathname.startsWith("/.well-known/")) {
++      res.writeHead(404);
++      res.end();
++      return;
++    }
++
++    if (url.pathname !== "/mcp") {
++      res.writeHead(404, { "Content-Type": "application/json" });
++      res.end(JSON.stringify({ error: "not_found" }));
++      return;
++    }
++
++    // GET = SSE stream — not supported in stateless mode.
++    if (req.method === "GET") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    // DELETE = session termination — not applicable in stateless mode.
++    if (req.method === "DELETE") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    if (req.method !== "POST") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    void (async () => {
++      try {
++        const body = await readBody(req);
++        const parsed: JsonRpcRequest | JsonRpcRequest[] = JSON.parse(body);
++
++        const cfg = loadConfig();
++        const reqSessionKey = getHeader(req, "x-session-key")?.trim() || resolveMainSessionKey(cfg);
++        const messageProvider =
++          normalizeMessageChannel(getHeader(req, "x-openclaw-message-channel")) ?? undefined;
++        const accountId = getHeader(req, "x-openclaw-account-id")?.trim() || undefined;
++        const messageTo = getHeader(req, "x-openclaw-message-to")?.trim() || undefined;
++        const messageThreadId = getHeader(req, "x-openclaw-thread-id")?.trim() || undefined;
++        const { tools, toolSchema } = getTools({
++          cfg,
++          sessionKey: reqSessionKey,
++          messageProvider,
++          accountId,
++          messageTo,
++          messageThreadId,
++        });
++
++        // Handle batch or single request.
++        const messages = Array.isArray(parsed) ? parsed : [parsed];
++        const responses: object[] = [];
++
++        for (const msg of messages) {
++          const result = await handleJsonRpc(msg, tools, toolSchema);
++          if (result !== null) {
++            responses.push(result);
++          }
++        }
++
++        // If all messages were notifications, return 202 Accepted.
++        if (responses.length === 0) {
++          res.writeHead(202);
++          res.end();
++          return;
++        }
++
++        const payload = Array.isArray(parsed)
++          ? JSON.stringify(responses)
++          : JSON.stringify(responses[0]);
++
++        res.writeHead(200, {
++          "Content-Type": "application/json",
++        });
++        res.end(payload);
++      } catch (err) {
++        logWarn(
++          `mcp: request handling failed: ${err instanceof Error ? err.message : String(err)}`,
++        );
++        if (!res.headersSent) {
++          res.writeHead(400, { "Content-Type": "application/json" });
++          res.end(JSON.stringify(jsonRpcError(null, -32700, "Parse error")));
++        }
++      }
++    })();
++  });
++
++  await new Promise<void>((resolve, reject) => {
++    httpServer.once("error", reject);
++    httpServer.listen(port, "127.0.0.1", () => {
++      httpServer.removeListener("error", reject);
++      const cfg = loadConfig();
++      const defaultSessionKey = resolveMainSessionKey(cfg);
++      const { tools: initial } = getTools({ cfg, sessionKey: defaultSessionKey });
++      logDebug(
++        `mcp: loopback server listening on 127.0.0.1:${port} (${initial.length} tools, ttl=${TOOL_CACHE_TTL_MS}ms)`,
++      );
++      resolve();
++    });
++  });
++
++  return {
++    close: () =>
++      new Promise<void>((resolve, reject) => {
++        httpServer.close((err) => (err ? reject(err) : resolve()));
++      }),
++  };
++}
+diff --git a/src/gateway/server.impl.ts b/src/gateway/server.impl.ts
+index 898cdc6fe8..9edb9ad949 100644
+--- a/src/gateway/server.impl.ts
++++ b/src/gateway/server.impl.ts
+@@ -1,3 +1,4 @@
++import os from "node:os";
+ import path from "node:path";
+ import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
+ import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
+@@ -73,6 +74,7 @@ import {
+   type GatewayUpdateAvailableEventPayload,
+ } from "./events.js";
+ import { ExecApprovalManager } from "./exec-approval-manager.js";
++import { MCP_PORT_OFFSET, ensureMcpConfigFile, startMcpLoopbackServer } from "./mcp-http.js";
+ import { NodeRegistry } from "./node-registry.js";
+ import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
+ import { createChannelManager } from "./server-channels.js";
+@@ -900,6 +902,18 @@ export async function startGatewayServer(
+     log,
+     isNixMode,
+   });
++
++  // Start a plain HTTP loopback server for MCP (avoids self-signed TLS issues).
++  const mcpPort = port + MCP_PORT_OFFSET;
++  let mcpServer: { close: () => Promise<void> } | undefined;
++  try {
++    mcpServer = await startMcpLoopbackServer(mcpPort);
++    ensureMcpConfigFile(path.join(os.homedir(), ".openclaw"), mcpPort);
++    log.info(`MCP loopback server listening on http://127.0.0.1:${mcpPort}/mcp`);
++  } catch (err) {
++    log.warn(`MCP loopback server failed to start: ${String(err)}`);
++  }
++
+   const stopGatewayUpdateCheck = minimalTestGateway
+     ? () => {}
+     : scheduleGatewayUpdateCheck({
+@@ -1059,6 +1073,7 @@ export async function startGatewayServer(
+       browserAuthRateLimiter.dispose();
+       channelHealthMonitor?.stop();
+       clearSecretsRuntimeSnapshot();
++      await mcpServer?.close().catch(() => {});
+       await close(opts);
+     },
+   };
+diff --git a/src/hooks/bundled/session-memory/handler.test.ts b/src/hooks/bundled/session-memory/handler.test.ts
+index fb7e9ca0a4..a3e6958c8c 100644
+--- a/src/hooks/bundled/session-memory/handler.test.ts
++++ b/src/hooks/bundled/session-memory/handler.test.ts
+@@ -335,6 +335,33 @@ describe("session-memory hook", () => {
+     expect(memoryContent).toContain("user: External follow-up");
+   });
+ 
++  it("filters out delivery-mirror assistant entries to avoid duplicate summaries", async () => {
++    const sessionContent = [
++      JSON.stringify({
++        type: "message",
++        message: { role: "user", content: "Real user turn" },
++      }),
++      JSON.stringify({
++        type: "message",
++        message: {
++          role: "assistant",
++          content: "Mirrored outbound message",
++          provider: "openclaw",
++          model: "delivery-mirror",
++        },
++      }),
++      JSON.stringify({
++        type: "message",
++        message: { role: "assistant", content: "Real model answer", provider: "anthropic" },
++      }),
++    ].join("\n");
++    const { memoryContent } = await runNewWithPreviousSession({ sessionContent });
++
++    expect(memoryContent).toContain("user: Real user turn");
++    expect(memoryContent).not.toContain("Mirrored outbound message");
++    expect(memoryContent).toContain("assistant: Real model answer");
++  });
++
+   it("filters out command messages starting with /", async () => {
+     const sessionContent = createMockSessionContent([
+       { role: "user", content: "/help" },
+diff --git a/src/hooks/bundled/session-memory/handler.ts b/src/hooks/bundled/session-memory/handler.ts
+index 32fc36b23f..851f4747e7 100644
+--- a/src/hooks/bundled/session-memory/handler.ts
++++ b/src/hooks/bundled/session-memory/handler.ts
+@@ -71,6 +71,11 @@ async function getRecentSessionContent(
+             if (role === "user" && hasInterSessionUserProvenance(msg)) {
+               continue;
+             }
++            const provider = typeof msg.provider === "string" ? msg.provider : "";
++            const model = typeof msg.model === "string" ? msg.model : "";
++            if (role === "assistant" && provider === "openclaw" && model === "delivery-mirror") {
++              continue;
++            }
+             // Extract text content
+             const text = Array.isArray(msg.content)
+               ? // oxlint-disable-next-line typescript/no-explicit-any
+diff --git a/src/infra/outbound/session-binding-service.ts b/src/infra/outbound/session-binding-service.ts
+index ffbf04758e..9c20f50a8c 100644
+--- a/src/infra/outbound/session-binding-service.ts
++++ b/src/infra/outbound/session-binding-service.ts
+@@ -145,7 +145,21 @@ function resolveAdapterCapabilities(
+   };
+ }
+ 
+-const ADAPTERS_BY_CHANNEL_ACCOUNT = new Map<string, SessionBindingAdapter>();
++// Store the adapter map on globalThis so extensions loaded via jiti (from TypeScript source)
++// and core code loaded from the bundled dist share the same adapter registry.
++const SESSION_BINDING_ADAPTERS_KEY = "__openclawSessionBindingAdapters";
++
++function resolveAdaptersMap(): Map<string, SessionBindingAdapter> {
++  const g = globalThis as typeof globalThis & {
++    [SESSION_BINDING_ADAPTERS_KEY]?: Map<string, SessionBindingAdapter>;
++  };
++  if (!g[SESSION_BINDING_ADAPTERS_KEY]) {
++    g[SESSION_BINDING_ADAPTERS_KEY] = new Map();
++  }
++  return g[SESSION_BINDING_ADAPTERS_KEY];
++}
++
++const ADAPTERS_BY_CHANNEL_ACCOUNT = resolveAdaptersMap();
+ 
+ export function registerSessionBindingAdapter(adapter: SessionBindingAdapter): void {
+   const key = toAdapterKey({
+diff --git a/src/plugins/runtime/index.ts b/src/plugins/runtime/index.ts
+index 1ea08a423f..91be50a2f5 100644
+--- a/src/plugins/runtime/index.ts
++++ b/src/plugins/runtime/index.ts
+@@ -3,6 +3,7 @@ import {
+   getApiKeyForModel as getApiKeyForModelRaw,
+   resolveApiKeyForProvider as resolveApiKeyForProviderRaw,
+ } from "../../agents/model-auth.js";
++import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
+ import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+ import { resolveStateDir } from "../../config/paths.js";
+ import { transcribeAudioFile } from "../../media-understanding/transcribe-audio.js";
+@@ -53,7 +54,7 @@ export type CreatePluginRuntimeOptions = {
+ export function createPluginRuntime(_options: CreatePluginRuntimeOptions = {}): PluginRuntime {
+   const runtime = {
+     version: resolveVersion(),
+-    agents: { runEmbeddedPiAgent },
++    agents: { runEmbeddedPiAgent, runModelAwareAgent },
+     config: createRuntimeConfig(),
+     subagent: _options.subagent ?? createUnavailableSubagentRuntime(),
+     system: createRuntimeSystem(),
+diff --git a/src/plugins/runtime/types-core.ts b/src/plugins/runtime/types-core.ts
+index 9b8a1d2db2..b9286752f8 100644
+--- a/src/plugins/runtime/types-core.ts
++++ b/src/plugins/runtime/types-core.ts
+@@ -11,6 +11,7 @@ export type PluginRuntimeCore = {
+   version: string;
+   agents: {
+     runEmbeddedPiAgent: typeof import("../../agents/pi-embedded.js").runEmbeddedPiAgent;
++    runModelAwareAgent: typeof import("../../agents/model-aware-runner.js").runModelAwareAgent;
+   };
+   config: {
+     loadConfig: typeof import("../../config/config.js").loadConfig;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,37 @@
+From 344ecc33ea6f12dcb458fe27170a2ecafff99f81 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 19:39:26 +0800
+Subject: [PATCH 49/98] fix(feishu): start streaming card at session init
+ instead of first thinking block
+
+The streaming card was only created when thinking content or tool events
+arrived. In stream-json mode, thinking arrives as complete blocks (not
+incremental deltas), causing a multi-second gap between session init and
+the card appearing. Now the card is created immediately on
+onAssistantMessageStart (triggered by the init event), showing the
+"Thinking..." placeholder right away.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 20bfe49ba2..4098b11976 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -832,10 +832,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       onModelSelected: prefixContext.onModelSelected,
+       onAssistantMessageStart: streamingEnabled
+         ? () => {
+-            if (renderMode !== "card") {
+-              return;
+-            }
+             queueThinkingPrelude();
++            startStreaming();
+           }
+         : undefined,
+       onReasoningStream: reasoningEnabled
+-- 
+2.50.1 (Apple Git-155)
+

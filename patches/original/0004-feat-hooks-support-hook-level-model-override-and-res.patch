@@ -1,0 +1,498 @@
+From 6c43f917b6e1241d81fc363c2e7a128f6a61a20c Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:28 +0800
+Subject: [PATCH 04/98] feat(hooks): support hook-level model override and
+ resolve aliases in slug generator
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot.test.ts        | 104 +++++++++++++++++++
+ extensions/feishu/src/bot.ts             |  51 ++++++++++
+ src/hooks/bundled/session-memory/HOOK.md |  12 ++-
+ src/hooks/llm-slug-generator.test.ts     | 121 +++++++++++++++++++++++
+ src/hooks/llm-slug-generator.ts          |  80 +++++++++++++--
+ 5 files changed, 357 insertions(+), 11 deletions(-)
+ create mode 100644 src/hooks/llm-slug-generator.test.ts
+
+diff --git a/extensions/feishu/src/bot.test.ts b/extensions/feishu/src/bot.test.ts
+index 858d83cbc7..50a6db9aed 100644
+--- a/extensions/feishu/src/bot.test.ts
++++ b/extensions/feishu/src/bot.test.ts
+@@ -1194,6 +1194,110 @@ describe("handleFeishuMessage command authorization", () => {
+     );
+   });
+ 
++  it("backs off sender name lookup per sender when Feishu returns no user authority", async () => {
++    mockShouldComputeCommandAuthorized.mockReturnValue(false);
++    const mockGetUser = vi.fn().mockRejectedValue({
++      response: {
++        data: {
++          code: 41050,
++          msg: "no user authority error",
++        },
++      },
++    });
++    mockCreateFeishuClient.mockReturnValue({
++      contact: {
++        user: {
++          get: mockGetUser,
++        },
++      },
++    });
++
++    const cfg: ClawdbotConfig = {
++      channels: {
++        feishu: {
++          appId: "cli_noauth",
++          appSecret: "sec_noauth",
++          groups: {
++            "oc-group": {
++              requireMention: false,
++            },
++          },
++        },
++      },
++    } as ClawdbotConfig;
++
++    const eventA: FeishuMessageEvent = {
++      sender: {
++        sender_id: {
++          open_id: "ou-noauth-a",
++        },
++      },
++      message: {
++        message_id: "msg-noauth-1",
++        chat_id: "oc-group",
++        chat_type: "group",
++        message_type: "text",
++        content: JSON.stringify({ text: "hello group A" }),
++      },
++    };
++    const eventARepeat: FeishuMessageEvent = {
++      sender: {
++        sender_id: {
++          open_id: "ou-noauth-a",
++        },
++      },
++      message: {
++        message_id: "msg-noauth-2",
++        chat_id: "oc-group",
++        chat_type: "group",
++        message_type: "text",
++        content: JSON.stringify({ text: "hello group A repeat" }),
++      },
++    };
++    const eventB: FeishuMessageEvent = {
++      sender: {
++        sender_id: {
++          open_id: "ou-noauth-b",
++        },
++      },
++      message: {
++        message_id: "msg-noauth-3",
++        chat_id: "oc-group",
++        chat_type: "group",
++        message_type: "text",
++        content: JSON.stringify({ text: "hello group B" }),
++      },
++    };
++
++    await dispatchMessage({ cfg, event: eventA });
++    await dispatchMessage({ cfg, event: eventARepeat });
++    await dispatchMessage({ cfg, event: eventB });
++
++    expect(mockGetUser).toHaveBeenCalledTimes(2);
++    expect(mockCreateFeishuClient).toHaveBeenCalledTimes(2);
++    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(3);
++
++    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
++      expect.objectContaining({
++        BodyForAgent: expect.stringContaining("ou-noauth-a: hello group A"),
++      }),
++    );
++    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
++      expect.objectContaining({
++        BodyForAgent: expect.stringContaining("ou-noauth-a: hello group A repeat"),
++      }),
++    );
++    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
++      expect.objectContaining({
++        BodyForAgent: expect.stringContaining("ou-noauth-b: hello group B"),
++      }),
++    );
++    for (const [arg] of mockFinalizeInboundContext.mock.calls) {
++      const body = (arg as { BodyForAgent?: string }).BodyForAgent ?? "";
++      expect(body).not.toContain("Permission grant URL");
++    }
++  });
++
+   it("routes group sessions by sender when groupSessionScope=group_sender", async () => {
+     mockShouldComputeCommandAuthorized.mockReturnValue(false);
+ 
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index 2f84b5293e..4cc7c30412 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -42,6 +42,7 @@ type PermissionError = {
+ };
+ 
+ const IGNORED_PERMISSION_SCOPE_TOKENS = ["contact:contact.base:readonly"];
++const SOFT_SENDER_LOOKUP_ERROR_CODES = new Set([41050]);
+ 
+ // Feishu API sometimes returns incorrect scope names in permission error
+ // responses (e.g. "contact:contact.base:readonly" instead of the valid
+@@ -97,6 +98,8 @@ function extractPermissionError(err: unknown): PermissionError | null {
+ // Cache display names by sender id (open_id/user_id) to avoid an API call on every message.
+ const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
+ const senderNameCache = new Map<string, { name: string; expireAt: number }>();
++const senderLookupBackoffUntilByAccountSender = new Map<string, number>();
++const SENDER_LOOKUP_BACKOFF_MS = 10 * 60 * 1000;
+ 
+ // Cache permission errors to avoid spamming the user with repeated notifications.
+ // Key: appId or "default", Value: timestamp of last notification
+@@ -108,6 +111,11 @@ type SenderNameResult = {
+   permissionError?: PermissionError;
+ };
+ 
++type SenderLookupSoftError = {
++  code: number;
++  message: string;
++};
++
+ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "union_id" {
+   const trimmed = senderId.trim();
+   if (trimmed.startsWith("ou_")) {
+@@ -119,6 +127,33 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
+   return "user_id";
+ }
+ 
++function extractSenderLookupSoftError(err: unknown): SenderLookupSoftError | null {
++  if (!err || typeof err !== "object") return null;
++
++  const axiosErr = err as { response?: { data?: unknown } };
++  const data = axiosErr.response?.data;
++  if (!data || typeof data !== "object") return null;
++
++  const feishuErr = data as { code?: number; msg?: string };
++  const code = feishuErr.code;
++  const message = typeof feishuErr.msg === "string" ? feishuErr.msg : "";
++  if (typeof code === "number" && SOFT_SENDER_LOOKUP_ERROR_CODES.has(code)) {
++    return { code, message };
++  }
++  if (message.toLowerCase().includes("no user authority")) {
++    return { code: typeof code === "number" ? code : 41050, message };
++  }
++  return null;
++}
++
++function resolveSenderLookupBackoffKey(
++  account: ResolvedFeishuAccount,
++  normalizedSenderId: string,
++): string {
++  const accountKey = account.accountId?.trim() || account.appId?.trim() || "default";
++  return `${accountKey}:${normalizedSenderId}`;
++}
++
+ async function resolveFeishuSenderName(params: {
+   account: ResolvedFeishuAccount;
+   senderId: string;
+@@ -133,6 +168,9 @@ async function resolveFeishuSenderName(params: {
+   const cached = senderNameCache.get(normalizedSenderId);
+   const now = Date.now();
+   if (cached && cached.expireAt > now) return { name: cached.name };
++  const lookupBackoffKey = resolveSenderLookupBackoffKey(account, normalizedSenderId);
++  const backoffUntil = senderLookupBackoffUntilByAccountSender.get(lookupBackoffKey) ?? 0;
++  if (backoffUntil > now) return {};
+ 
+   try {
+     const client = createFeishuClient(account);
+@@ -157,6 +195,19 @@ async function resolveFeishuSenderName(params: {
+ 
+     return {};
+   } catch (err) {
++    const softErr = extractSenderLookupSoftError(err);
++    if (softErr) {
++      const priorBackoffUntil = senderLookupBackoffUntilByAccountSender.get(lookupBackoffKey) ?? 0;
++      senderLookupBackoffUntilByAccountSender.set(lookupBackoffKey, now + SENDER_LOOKUP_BACKOFF_MS);
++      if (priorBackoffUntil <= now) {
++        const accountKey = account.accountId?.trim() || account.appId?.trim() || "default";
++        log(
++          `feishu: sender name lookup temporarily disabled for account=${accountKey} sender=${normalizedSenderId} code=${softErr.code}`,
++        );
++      }
++      return {};
++    }
++
+     // Check if this is a permission error
+     const permErr = extractPermissionError(err);
+     if (permErr) {
+diff --git a/src/hooks/bundled/session-memory/HOOK.md b/src/hooks/bundled/session-memory/HOOK.md
+index 6969fb2b8b..7dc2f35149 100644
+--- a/src/hooks/bundled/session-memory/HOOK.md
++++ b/src/hooks/bundled/session-memory/HOOK.md
+@@ -59,9 +59,11 @@ The hook uses your configured LLM provider to generate slugs, so it works with a
+ 
+ The hook supports optional configuration:
+ 
+-| Option     | Type   | Default | Description                                                     |
+-| ---------- | ------ | ------- | --------------------------------------------------------------- |
+-| `messages` | number | 15      | Number of user/assistant messages to include in the memory file |
++| Option             | Type    | Default | Description                                                               |
++| ------------------ | ------- | ------- | ------------------------------------------------------------------------- |
++| `messages`         | number  | 15      | Number of user/assistant messages to include in the memory file           |
++| `llmSlug`          | boolean | true    | Enable/disable LLM slug generation (when false, filenames use time only)  |
++| `llmSlugTimeoutMs` | number  | 45000   | Timeout for slug LLM generation in milliseconds (clamped to 5000..300000) |
+ 
+ Example configuration:
+ 
+@@ -72,7 +74,9 @@ Example configuration:
+       "entries": {
+         "session-memory": {
+           "enabled": true,
+-          "messages": 25
++          "messages": 25,
++          "llmSlug": true,
++          "llmSlugTimeoutMs": 60000
+         }
+       }
+     }
+diff --git a/src/hooks/llm-slug-generator.test.ts b/src/hooks/llm-slug-generator.test.ts
+new file mode 100644
+index 0000000000..0524930fbb
+--- /dev/null
++++ b/src/hooks/llm-slug-generator.test.ts
+@@ -0,0 +1,121 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { OpenClawConfig } from "../config/config.js";
++
++const {
++  mockResolveDefaultAgentId,
++  mockResolveAgentWorkspaceDir,
++  mockResolveAgentDir,
++  mockResolveAgentEffectiveModelPrimary,
++  mockBuildModelAliasIndex,
++  mockResolveModelRefFromString,
++  mockRunEmbeddedPiAgent,
++} = vi.hoisted(() => ({
++  mockResolveDefaultAgentId: vi.fn(),
++  mockResolveAgentWorkspaceDir: vi.fn(),
++  mockResolveAgentDir: vi.fn(),
++  mockResolveAgentEffectiveModelPrimary: vi.fn(),
++  mockBuildModelAliasIndex: vi.fn(),
++  mockResolveModelRefFromString: vi.fn(),
++  mockRunEmbeddedPiAgent: vi.fn(),
++}));
++
++vi.mock("../agents/agent-scope.js", () => ({
++  resolveDefaultAgentId: mockResolveDefaultAgentId,
++  resolveAgentWorkspaceDir: mockResolveAgentWorkspaceDir,
++  resolveAgentDir: mockResolveAgentDir,
++  resolveAgentEffectiveModelPrimary: mockResolveAgentEffectiveModelPrimary,
++}));
++
++vi.mock("../agents/model-selection.js", () => ({
++  buildModelAliasIndex: mockBuildModelAliasIndex,
++  resolveModelRefFromString: mockResolveModelRefFromString,
++}));
++
++vi.mock("../agents/pi-embedded.js", () => ({
++  runEmbeddedPiAgent: mockRunEmbeddedPiAgent,
++}));
++
++import { generateSlugViaLLM } from "./llm-slug-generator.js";
++
++describe("generateSlugViaLLM", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    mockResolveDefaultAgentId.mockReturnValue("chief");
++    mockResolveAgentWorkspaceDir.mockReturnValue("/tmp/openclaw-workspace");
++    mockResolveAgentDir.mockReturnValue("/tmp/openclaw-agent");
++    mockResolveAgentEffectiveModelPrimary.mockReturnValue("minimax");
++    mockBuildModelAliasIndex.mockReturnValue({});
++    mockResolveModelRefFromString.mockReturnValue({
++      ref: { provider: "minimax", model: "minimax" },
++    });
++    mockRunEmbeddedPiAgent.mockResolvedValue({ payloads: [{ text: "Vendor Pitch" }] });
++  });
++
++  it("uses lightweight slug generation defaults", async () => {
++    const slug = await generateSlugViaLLM({
++      sessionContent: "Conversation body",
++      cfg: {} as OpenClawConfig,
++    });
++
++    expect(slug).toBe("vendor-pitch");
++    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledTimes(1);
++    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
++      expect.objectContaining({
++        trigger: "memory",
++        thinkLevel: "minimal",
++        disableTools: true,
++        timeoutMs: 45_000,
++      }),
++    );
++  });
++
++  it("reads llmSlugTimeoutMs from session-memory hook config", async () => {
++    const cfg = {
++      hooks: {
++        internal: {
++          entries: {
++            "session-memory": {
++              llmSlugTimeoutMs: 90_000,
++            },
++          },
++        },
++      },
++    } as OpenClawConfig;
++
++    await generateSlugViaLLM({
++      sessionContent: "Conversation body",
++      cfg,
++    });
++
++    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
++      expect.objectContaining({
++        timeoutMs: 90_000,
++      }),
++    );
++  });
++
++  it("clamps llmSlugTimeoutMs to safe bounds", async () => {
++    const cfg = {
++      hooks: {
++        internal: {
++          entries: {
++            "session-memory": {
++              llmSlugTimeoutMs: 1_000,
++            },
++          },
++        },
++      },
++    } as OpenClawConfig;
++
++    await generateSlugViaLLM({
++      sessionContent: "Conversation body",
++      cfg,
++    });
++
++    expect(mockRunEmbeddedPiAgent).toHaveBeenCalledWith(
++      expect.objectContaining({
++        timeoutMs: 5_000,
++      }),
++    );
++  });
++});
+diff --git a/src/hooks/llm-slug-generator.ts b/src/hooks/llm-slug-generator.ts
+index eb355fc328..fc3cc031cc 100644
+--- a/src/hooks/llm-slug-generator.ts
++++ b/src/hooks/llm-slug-generator.ts
+@@ -12,12 +12,39 @@ import {
+   resolveAgentEffectiveModelPrimary,
+ } from "../agents/agent-scope.js";
+ import { DEFAULT_PROVIDER, DEFAULT_MODEL } from "../agents/defaults.js";
+-import { parseModelRef } from "../agents/model-selection.js";
++import { buildModelAliasIndex, resolveModelRefFromString } from "../agents/model-selection.js";
+ import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
+ import type { OpenClawConfig } from "../config/config.js";
+ import { createSubsystemLogger } from "../logging/subsystem.js";
+ 
+ const log = createSubsystemLogger("llm-slug-generator");
++const DEFAULT_LLM_SLUG_TIMEOUT_MS = 45_000;
++const MIN_LLM_SLUG_TIMEOUT_MS = 5_000;
++const MAX_LLM_SLUG_TIMEOUT_MS = 300_000;
++
++function clampNumber(value: number, min: number, max: number): number {
++  return Math.max(min, Math.min(max, value));
++}
++
++function resolveSlugTimeoutMs(cfg: OpenClawConfig): number {
++  const hookEntry = cfg.hooks?.internal?.entries?.["session-memory"];
++  const raw =
++    hookEntry && typeof hookEntry === "object"
++      ? (hookEntry as Record<string, unknown>).llmSlugTimeoutMs
++      : undefined;
++  const parsed =
++    typeof raw === "number"
++      ? Number.isFinite(raw)
++        ? Math.floor(raw)
++        : undefined
++      : typeof raw === "string"
++        ? Number.parseInt(raw, 10)
++        : undefined;
++  if (typeof parsed !== "number" || Number.isNaN(parsed) || parsed <= 0) {
++    return DEFAULT_LLM_SLUG_TIMEOUT_MS;
++  }
++  return clampNumber(parsed, MIN_LLM_SLUG_TIMEOUT_MS, MAX_LLM_SLUG_TIMEOUT_MS);
++}
+ 
+ /**
+  * Generate a short 1-2 word filename slug from session content using LLM
+@@ -44,11 +71,47 @@ ${params.sessionContent.slice(0, 2000)}
+ 
+ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design", "bug-fix"`;
+ 
+-    // Resolve model from agent config instead of using hardcoded defaults
+-    const modelRef = resolveAgentEffectiveModelPrimary(params.cfg, agentId);
+-    const parsed = modelRef ? parseModelRef(modelRef, DEFAULT_PROVIDER) : null;
+-    const provider = parsed?.provider ?? DEFAULT_PROVIDER;
+-    const model = parsed?.model ?? DEFAULT_MODEL;
++    const aliasIndex = buildModelAliasIndex({ cfg: params.cfg, defaultProvider: DEFAULT_PROVIDER });
++
++    // Hook-level model override: hooks.internal.entries.session-memory.model
++    const hookEntry = params.cfg.hooks?.internal?.entries?.["session-memory"];
++    const hookModelRaw =
++      hookEntry && typeof hookEntry === "object"
++        ? (hookEntry as Record<string, unknown>).model
++        : undefined;
++    const hookResolved =
++      typeof hookModelRaw === "string" && hookModelRaw
++        ? resolveModelRefFromString({
++            raw: hookModelRaw,
++            defaultProvider: DEFAULT_PROVIDER,
++            aliasIndex,
++          })
++        : null;
++
++    let provider: string;
++    let model: string;
++
++    if (hookResolved && !isCliProvider(hookResolved.ref.provider, params.cfg)) {
++      // Use explicitly configured hook model
++      provider = hookResolved.ref.provider;
++      model = hookResolved.ref.model;
++    } else {
++      // Fall back to agent's effective model
++      const modelRef = resolveAgentEffectiveModelPrimary(params.cfg, agentId);
++      const resolved = modelRef
++        ? resolveModelRefFromString({
++            raw: modelRef,
++            defaultProvider: DEFAULT_PROVIDER,
++            aliasIndex,
++          })
++        : null;
++      const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
++      const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
++      // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
++      provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
++      model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
++    }
++    const timeoutMs = resolveSlugTimeoutMs(params.cfg);
+ 
+     const result = await runEmbeddedPiAgent({
+       sessionId: `slug-generator-${Date.now()}`,
+@@ -61,7 +124,10 @@ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design",
+       prompt,
+       provider,
+       model,
+-      timeoutMs: 15_000, // 15 second timeout
++      trigger: "memory",
++      thinkLevel: "minimal",
++      disableTools: true,
++      timeoutMs,
+       runId: `slug-gen-${Date.now()}`,
+     });
+ 
+-- 
+2.50.1 (Apple Git-155)
+

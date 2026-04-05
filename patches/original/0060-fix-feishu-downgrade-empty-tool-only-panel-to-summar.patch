@@ -1,0 +1,150 @@
+From 69e6d0a38d6e1919d1a3da6a2d91da6d8fc7762d Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 09:56:41 +0800
+Subject: [PATCH 60/98] fix(feishu): downgrade empty tool-only panel to summary
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 68 ++++++++++++++++++-
+ extensions/feishu/src/reply-dispatcher.ts     | 18 ++++-
+ 2 files changed, 83 insertions(+), 3 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 1194bf272d..d2e5ec292b 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -548,7 +548,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+ 
+     await options.onIdle?.();
+     expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
+-      note: "Agent: agent",
++      note: "Agent: agent | 🔧 Used 1 tool",
+     });
+   });
+ 
+@@ -649,6 +649,72 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     });
+   });
+ 
++  it("degrades tool-only final panel into a note summary instead of re-rendering an empty panel", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
++
++    const thinkingCallCountBeforeIdle = streamingInstances[0].updateThinking.mock.calls.length;
++    await options.onIdle?.();
++
++    expect(streamingInstances[0].updateThinking).toHaveBeenCalledTimes(thinkingCallCountBeforeIdle);
++    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
++      note: "Agent: agent | 🔧 Used 1 tool",
++    });
++  });
++
++  it("appends tool-only final summary to body when card note is disabled", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++        cardNote: false,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
++    await flushAsyncTasks();
++    await options.onIdle?.();
++
++    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案\n\n🔧 Used 1 tool", {
++      note: undefined,
++    });
++  });
++
+   it("clears running tool status when visible assistant text arrives through block delivery", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index bdabc995e7..3f50570d10 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -115,6 +115,10 @@ function resolveCardNote(
+   return parts.join(" | ");
+ }
+ 
++function resolveToolSummary(toolCallCount: number): string {
++  return `🔧 Used ${toolCallCount} tool${toolCallCount === 1 ? "" : "s"}`;
++}
++
+ export type CreateFeishuReplyDispatcherParams = {
+   cfg: ClawdbotConfig;
+   agentId: string;
+@@ -426,6 +430,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   };
+ 
+   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
++  const hasToolOnlyFinalSummary = (): boolean => !hasReasoningText() && toolCallCount > 0;
+ 
+   const resolveThinkingPanelTitle = (): string => {
+     if (!hasReasoningText() && toolCallCount > 0) {
+@@ -631,16 +636,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       } else {
+         // Store thinking content for the collapsed panel in the final card
+         if (finalThinking.text) {
+-          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
++          if (!hasToolOnlyFinalSummary()) {
++            await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
++          }
+         }
+         let text = finalText;
+         if (mentionTargets?.length) {
+           text = buildMentionedCardContent(mentionTargets, text);
+         }
++        const toolSummary = hasToolOnlyFinalSummary()
++          ? resolveToolSummary(toolCallCount)
++          : undefined;
+         const finalNote = showCardNote
+           ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+           : undefined;
+-        await streaming.close(text, { note: finalNote });
++        const resolvedNote = finalNote && toolSummary ? `${finalNote} | ${toolSummary}` : finalNote;
++        if (toolSummary && !resolvedNote) {
++          text = `${text}\n\n${toolSummary}`;
++        }
++        await streaming.close(text, { note: resolvedNote });
+         hasVisibleTextInReply = true;
+         if (options?.emitFinalText && finalText.trim()) {
+           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+-- 
+2.50.1 (Apple Git-155)
+

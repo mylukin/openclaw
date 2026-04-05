@@ -1,0 +1,54 @@
+From cd7c178a8b105afc4bf8346caf7f510f34d852ed Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 15:16:33 +0800
+Subject: [PATCH 41/98] fix(feishu): strip HTML tags from card summary on close
+
+truncateSummary now removes HTML/XML tags (e.g. <at>, <b>, <a>) before
+truncating, so the card summary in notification lists shows clean text
+instead of raw markup.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/streaming-card.test.ts | 7 ++-----
+ extensions/feishu/src/streaming-card.ts      | 6 +++++-
+ 2 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/extensions/feishu/src/streaming-card.test.ts b/extensions/feishu/src/streaming-card.test.ts
+index 28b637c3f7..860c08ba0c 100644
+--- a/extensions/feishu/src/streaming-card.test.ts
++++ b/extensions/feishu/src/streaming-card.test.ts
+@@ -451,12 +451,9 @@ describe("FeishuStreamingSession.close", () => {
+     const settingsPayload = JSON.parse(settingsBody.settings as string) as {
+       config?: { summary?: { content?: string } };
+     };
+-    // truncateSummary strips newlines and truncates, but doesn't strip HTML tags.
+-    // The actual truncateSummary function just replaces \n with space and truncates to 50 chars.
+-    // So the summary will contain the HTML tags (truncated).
++    // truncateSummary strips HTML tags, newlines, and truncates to 50 chars.
+     const summary = settingsPayload.config?.summary?.content ?? "";
+-    expect(summary.length).toBeLessThanOrEqual(50);
+-    expect(summary).toBeTruthy();
++    expect(summary).toBe("Lukin 已完成 发布请查看 链接");
+   });
+ });
+ 
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index c90dffb225..6b78d6c237 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -111,7 +111,11 @@ function truncateSummary(text: string, max = 50): string {
+   if (!text) {
+     return "";
+   }
+-  const clean = text.replace(/\n/g, " ").trim();
++  // Strip HTML/XML tags (e.g. <at>, <b>, <a href="...">) before truncating
++  const clean = text
++    .replace(/<[^>]*>/g, "")
++    .replace(/\n/g, " ")
++    .trim();
+   return clean.length <= max ? clean : clean.slice(0, max - 3) + "...";
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

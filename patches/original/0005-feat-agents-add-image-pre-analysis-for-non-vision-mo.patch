@@ -1,0 +1,553 @@
+From 734587bf191e5d4c5ae4bb1fc530113c213b04ff Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:29 +0800
+Subject: [PATCH 05/98] feat(agents): add image pre-analysis for non-vision
+ models with graceful fallback
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/agents/pi-embedded-runner/run/attempt.ts  |  63 +++++-
+ .../run/image-pre-analysis.behavior.test.ts   | 110 ++++++++++
+ .../run/image-pre-analysis.test.ts            | 133 ++++++++++++
+ .../run/image-pre-analysis.ts                 | 191 ++++++++++++++++++
+ 4 files changed, 495 insertions(+), 2 deletions(-)
+ create mode 100644 src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts
+ create mode 100644 src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts
+ create mode 100644 src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+
+diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
+index 081d12c9ab..3c01f65715 100644
+--- a/src/agents/pi-embedded-runner/run/attempt.ts
++++ b/src/agents/pi-embedded-runner/run/attempt.ts
+@@ -130,7 +130,8 @@ import {
+   shouldFlagCompactionTimeout,
+ } from "./compaction-timeout.js";
+ import { pruneProcessedHistoryImages } from "./history-image-prune.js";
+-import { detectAndLoadPromptImages } from "./images.js";
++import { shouldUseImagePreAnalysis, analyzeImagesWithImageModel } from "./image-pre-analysis.js";
++import { detectAndLoadPromptImages, modelSupportsImages } from "./images.js";
+ import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
+ 
+ type PromptBuildHookRunner = {
+@@ -1785,7 +1786,65 @@ export async function runEmbeddedAttempt(
+           // Only pass images option if there are actually images to pass
+           // This avoids potential issues with models that don't expect the images parameter
+           if (imageResult.images.length > 0) {
+-            await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
++            const mainModelSupportsImages = modelSupportsImages(params.model);
++            const usePreAnalysis = shouldUseImagePreAnalysis({ config: params.config });
++
++            if (usePreAnalysis) {
++              // Pre-analyze images with imageModel, then pass text analysis to main model
++              log.debug(`Image pre-analysis: using configured imageModel for image analysis`);
++              try {
++                const preAnalysis = await analyzeImagesWithImageModel({
++                  images: imageResult.images,
++                  config: params.config,
++                  agentDir: params.agentDir ?? "",
++                  userPrompt: effectivePrompt,
++                });
++                if (preAnalysis.successfulImageCount > 0 && preAnalysis.analysisText) {
++                  log.debug(
++                    `Image pre-analysis: analyzed ${preAnalysis.imageCount} image(s) with ${preAnalysis.provider}/${preAnalysis.model}`,
++                  );
++                  const promptWithAnalysis = effectivePrompt + preAnalysis.analysisText;
++                  await abortable(activeSession.prompt(promptWithAnalysis));
++                } else {
++                  // No successful analysis produced, fall back to main model with images if supported.
++                  if (mainModelSupportsImages) {
++                    log.debug(
++                      `Image pre-analysis: no successful analyses, falling back to main model with images`,
++                    );
++                    await abortable(
++                      activeSession.prompt(effectivePrompt, { images: imageResult.images }),
++                    );
++                  } else {
++                    await abortable(activeSession.prompt(effectivePrompt));
++                  }
++                }
++              } catch (preAnalysisErr) {
++                log.warn(
++                  `Image pre-analysis failed: ${preAnalysisErr instanceof Error ? preAnalysisErr.message : String(preAnalysisErr)}`,
++                );
++                // Fall back to main model with images if supported
++                if (mainModelSupportsImages) {
++                  log.debug(`Image pre-analysis: failed, falling back to main model with images`);
++                  await abortable(
++                    activeSession.prompt(effectivePrompt, { images: imageResult.images }),
++                  );
++                } else {
++                  await abortable(activeSession.prompt(effectivePrompt));
++                }
++              }
++            } else {
++              // No imageModel configured, use main model directly
++              if (mainModelSupportsImages) {
++                await abortable(
++                  activeSession.prompt(effectivePrompt, { images: imageResult.images }),
++                );
++              } else {
++                log.debug(
++                  `Image pre-analysis: no imageModel configured and main model doesn't support images, ignoring images`,
++                );
++                await abortable(activeSession.prompt(effectivePrompt));
++              }
++            }
+           } else {
+             await abortable(activeSession.prompt(effectivePrompt));
+           }
+diff --git a/src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts b/src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts
+new file mode 100644
+index 0000000000..607303eac0
+--- /dev/null
++++ b/src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts
+@@ -0,0 +1,110 @@
++import type { ImageContent } from "@mariozechner/pi-ai";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const {
++  runWithImageModelFallbackMock,
++  ensureOpenClawModelsJsonMock,
++  discoverAuthStorageMock,
++  discoverModelsMock,
++} = vi.hoisted(() => ({
++  runWithImageModelFallbackMock: vi.fn(),
++  ensureOpenClawModelsJsonMock: vi.fn(),
++  discoverAuthStorageMock: vi.fn(),
++  discoverModelsMock: vi.fn(),
++}));
++
++vi.mock("../../model-fallback.js", () => ({
++  runWithImageModelFallback: runWithImageModelFallbackMock,
++}));
++
++vi.mock("../../models-config.js", () => ({
++  ensureOpenClawModelsJson: ensureOpenClawModelsJsonMock,
++}));
++
++vi.mock("../../pi-model-discovery.js", () => ({
++  discoverAuthStorage: discoverAuthStorageMock,
++  discoverModels: discoverModelsMock,
++}));
++
++import { analyzeImagesWithImageModel } from "./image-pre-analysis.js";
++
++const TEST_IMAGES: ImageContent[] = [
++  {
++    type: "image",
++    data: "aW1hZ2UtMQ==",
++    mimeType: "image/png",
++  },
++  {
++    type: "image",
++    data: "aW1hZ2UtMg==",
++    mimeType: "image/jpeg",
++  },
++];
++
++describe("analyzeImagesWithImageModel", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    ensureOpenClawModelsJsonMock.mockResolvedValue(undefined);
++    discoverAuthStorageMock.mockReturnValue({
++      setRuntimeApiKey: vi.fn(),
++    });
++    discoverModelsMock.mockReturnValue({
++      find: vi.fn(),
++    });
++  });
++
++  it("reports zero successful analyses when all image-model attempts fail", async () => {
++    runWithImageModelFallbackMock.mockRejectedValue(new Error("vision unavailable"));
++
++    const result = await analyzeImagesWithImageModel({
++      images: TEST_IMAGES,
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              primary: "openai/gpt-4o",
++            },
++          },
++        },
++      },
++      agentDir: "/tmp/agent",
++      userPrompt: "what is in these images?",
++    });
++
++    expect(result.imageCount).toBe(2);
++    expect(result.successfulImageCount).toBe(0);
++    expect(result.provider).toBe("");
++    expect(result.model).toBe("");
++    expect(result.analysisText).toContain("(Image analysis failed.)");
++    expect(runWithImageModelFallbackMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("tracks successful analyses when some images are analyzed successfully", async () => {
++    runWithImageModelFallbackMock
++      .mockResolvedValueOnce({
++        result: { text: "A cat on a sofa.", provider: "openai", model: "gpt-4o" },
++      })
++      .mockRejectedValueOnce(new Error("second image failed"));
++
++    const result = await analyzeImagesWithImageModel({
++      images: TEST_IMAGES,
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              primary: "openai/gpt-4o",
++            },
++          },
++        },
++      },
++      agentDir: "/tmp/agent",
++    });
++
++    expect(result.imageCount).toBe(2);
++    expect(result.successfulImageCount).toBe(1);
++    expect(result.provider).toBe("openai");
++    expect(result.model).toBe("gpt-4o");
++    expect(result.analysisText).toContain("[Image 1 Analysis]");
++    expect(result.analysisText).toContain("[Image 2]");
++  });
++});
+diff --git a/src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts b/src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts
+new file mode 100644
+index 0000000000..c4f3311444
+--- /dev/null
++++ b/src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts
+@@ -0,0 +1,133 @@
++import { describe, expect, it } from "vitest";
++import { shouldUseImagePreAnalysis } from "./image-pre-analysis.js";
++
++describe("shouldUseImagePreAnalysis", () => {
++  it("returns true when imageModel.primary is configured", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              primary: "gemini-crs/gemini-3-flash-preview",
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(true);
++  });
++
++  it("returns true when imageModel.fallbacks is configured", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              fallbacks: ["openai/gpt-4o", "anthropic/claude-3-sonnet"],
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(true);
++  });
++
++  it("returns true when both primary and fallbacks are configured", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              primary: "gemini-crs/gemini-3-flash-preview",
++              fallbacks: ["openai/gpt-4o"],
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(true);
++  });
++
++  it("returns false when imageModel is not configured", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            model: {
++              primary: "anthropic/claude-3-opus",
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(false);
++  });
++
++  it("returns false when imageModel is empty object", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {},
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(false);
++  });
++
++  it("returns false when imageModel.primary is empty string", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              primary: "   ",
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(false);
++  });
++
++  it("returns false when imageModel.fallbacks is empty array", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {
++          defaults: {
++            imageModel: {
++              fallbacks: [],
++            },
++          },
++        },
++      },
++    });
++
++    expect(result).toBe(false);
++  });
++
++  it("returns false when config is undefined", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: undefined,
++    });
++
++    expect(result).toBe(false);
++  });
++
++  it("returns false when agents.defaults is undefined", () => {
++    const result = shouldUseImagePreAnalysis({
++      config: {
++        agents: {},
++      },
++    });
++
++    expect(result).toBe(false);
++  });
++});
+diff --git a/src/agents/pi-embedded-runner/run/image-pre-analysis.ts b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+new file mode 100644
+index 0000000000..282e1c95a4
+--- /dev/null
++++ b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+@@ -0,0 +1,191 @@
++/**
++ * Image pre-analysis module.
++ *
++ * When `agents.defaults.imageModel` is configured, this module analyzes images using the
++ * configured imageModel first, then passes the text analysis results to the main model.
++ * The main model's image capability is only used as a fallback.
++ *
++ * This helps models like MiniMax M2.1 or GLM that lack native vision capabilities
++ * to still understand image content through a vision-capable model.
++ */
++
++import type { ImageContent } from "@mariozechner/pi-ai";
++import type { OpenClawConfig } from "../../../config/config.js";
++import { getApiKeyForModel, requireApiKey } from "../../model-auth.js";
++import { runWithImageModelFallback } from "../../model-fallback.js";
++import { ensureOpenClawModelsJson } from "../../models-config.js";
++import { discoverAuthStorage, discoverModels } from "../../pi-model-discovery.js";
++import { coerceImageModelConfig } from "../../tools/image-tool.helpers.js";
++import { log } from "../logger.js";
++
++const DEFAULT_IMAGE_ANALYSIS_PROMPT =
++  "Describe this image in detail. Include all visible text, objects, people, colors, layout, and any other relevant information.";
++
++/**
++ * Check if image pre-analysis should be used.
++ *
++ * Returns true when imageModel is configured (has primary or fallbacks).
++ * When imageModel is explicitly configured, it takes priority over the main model's
++ * image capabilities. The main model's vision capability serves as a fallback only.
++ */
++export function shouldUseImagePreAnalysis(params: { config?: OpenClawConfig }): boolean {
++  const imageModelConfig = coerceImageModelConfig(params.config);
++  const hasImageModel =
++    Boolean(imageModelConfig.primary?.trim()) || (imageModelConfig.fallbacks?.length ?? 0) > 0;
++
++  return hasImageModel;
++}
++
++/**
++ * Analyze images using the configured imageModel.
++ *
++ * @returns Text description of the images that can be appended to the prompt
++ */
++export async function analyzeImagesWithImageModel(params: {
++  images: ImageContent[];
++  config?: OpenClawConfig;
++  agentDir: string;
++  userPrompt?: string;
++}): Promise<{
++  analysisText: string;
++  provider: string;
++  model: string;
++  imageCount: number;
++  successfulImageCount: number;
++}> {
++  const { images, config, agentDir } = params;
++
++  if (images.length === 0) {
++    return {
++      analysisText: "",
++      provider: "",
++      model: "",
++      imageCount: 0,
++      successfulImageCount: 0,
++    };
++  }
++
++  const imageModelConfig = coerceImageModelConfig(config);
++  if (!imageModelConfig.primary && (imageModelConfig.fallbacks?.length ?? 0) === 0) {
++    throw new Error("No imageModel configured for image pre-analysis");
++  }
++
++  await ensureOpenClawModelsJson(config, agentDir);
++  const authStorage = discoverAuthStorage(agentDir);
++  const modelRegistry = discoverModels(authStorage, agentDir);
++
++  // Build analysis prompt
++  const analysisPrompt = params.userPrompt
++    ? `User's question about this image: "${params.userPrompt}"\n\nPlease describe the image in detail to help answer the user's question.`
++    : DEFAULT_IMAGE_ANALYSIS_PROMPT;
++
++  const analyses: string[] = [];
++  let analyzedCount = 0;
++  let successCount = 0;
++  let lastProvider = "";
++  let lastModel = "";
++
++  // Analyze each image
++  for (let i = 0; i < images.length; i++) {
++    const image = images[i];
++    if (!image || image.type !== "image") {
++      continue;
++    }
++
++    analyzedCount += 1;
++    const imageLabel = images.length > 1 ? `Image ${i + 1}` : "Image";
++
++    try {
++      const result = await runWithImageModelFallback({
++        cfg: config,
++        run: async (provider, modelId) => {
++          const model = modelRegistry.find(provider, modelId);
++          if (!model) {
++            throw new Error(`Unknown model: ${provider}/${modelId}`);
++          }
++          if (!model.input?.includes("image")) {
++            throw new Error(`Model does not support images: ${provider}/${modelId}`);
++          }
++
++          const apiKeyInfo = await getApiKeyForModel({
++            model,
++            cfg: config,
++            agentDir,
++          });
++          const apiKey = requireApiKey(apiKeyInfo, model.provider);
++          authStorage.setRuntimeApiKey(model.provider, apiKey);
++
++          // Import complete dynamically to avoid circular dependencies
++          const { complete } = await import("@mariozechner/pi-ai");
++
++          // Build context with image
++          const context = {
++            messages: [
++              {
++                role: "user" as const,
++                timestamp: Date.now(),
++                content: [
++                  { type: "text" as const, text: analysisPrompt },
++                  {
++                    type: "image" as const,
++                    data: image.data,
++                    mimeType: image.mimeType,
++                  },
++                ],
++              },
++            ],
++          };
++
++          const message = await complete(model, context, {
++            apiKey,
++            maxTokens: 1024,
++          });
++
++          // Extract text from response
++          let text = "";
++          if (message.content) {
++            for (const block of message.content) {
++              if (block && typeof block === "object" && "type" in block) {
++                if (block.type === "text" && "text" in block) {
++                  text += block.text;
++                }
++              }
++            }
++          }
++
++          if (!text.trim()) {
++            throw new Error(`Image model returned no text (${provider}/${modelId})`);
++          }
++
++          return { text: text.trim(), provider, model: modelId };
++        },
++      });
++
++      analyses.push(`[${imageLabel} Analysis]\n${result.result.text}`);
++      successCount += 1;
++      lastProvider = result.result.provider;
++      lastModel = result.result.model;
++
++      log.debug(
++        `Image pre-analysis: analyzed ${imageLabel} with ${result.result.provider}/${result.result.model}`,
++      );
++    } catch (err) {
++      const errorMsg = err instanceof Error ? err.message : String(err);
++      log.warn(`Image pre-analysis failed for ${imageLabel}: ${errorMsg}`);
++      analyses.push(`[${imageLabel}]\n(Image analysis failed.)`);
++    }
++  }
++
++  const analysisText =
++    analyses.length > 0
++      ? `\n\n---\n${successCount > 0 ? `The following image analysis was performed by a vision model (${lastProvider}/${lastModel}):\n\n` : ""}${analyses.join("\n\n")}\n---\n`
++      : "";
++
++  return {
++    analysisText,
++    provider: lastProvider,
++    model: lastModel,
++    imageCount: analyzedCount,
++    successfulImageCount: successCount,
++  };
++}
+-- 
+2.50.1 (Apple Git-155)
+

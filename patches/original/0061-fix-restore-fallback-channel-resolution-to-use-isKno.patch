@@ -1,0 +1,48 @@
+From 9ddb07230d81e77f08d2bbc34d6712d12ec687d7 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 10:03:42 +0800
+Subject: [PATCH 61/98] fix: restore fallback channel resolution to use
+ isKnownChannel only
+
+The fallback path was changed to use resolveAvailableKnownChannel which
+requires the channel plugin to be loaded. In isolated agent sessions the
+plugin may not be bootstrapped yet, causing "no configured channels" error
+when sending messages. Fallback channels come from trusted toolContext so
+plugin availability check is unnecessary.
+
+Co-Authored-By: Cody <cody.bot@easymeta.au>
+---
+ src/infra/outbound/channel-selection.ts | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/src/infra/outbound/channel-selection.ts b/src/infra/outbound/channel-selection.ts
+index 569ea343c5..89d44efa6c 100644
+--- a/src/infra/outbound/channel-selection.ts
++++ b/src/infra/outbound/channel-selection.ts
+@@ -158,10 +158,7 @@ export async function resolveMessageChannelSelection(params: {
+       value: normalized,
+     });
+     if (!availableExplicit) {
+-      const fallback = resolveAvailableKnownChannel({
+-        cfg: params.cfg,
+-        value: params.fallbackChannel,
+-      });
++      const fallback = resolveKnownChannel(params.fallbackChannel);
+       if (fallback) {
+         return {
+           channel: fallback,
+@@ -181,10 +178,7 @@ export async function resolveMessageChannelSelection(params: {
+     };
+   }
+ 
+-  const fallback = resolveAvailableKnownChannel({
+-    cfg: params.cfg,
+-    value: params.fallbackChannel,
+-  });
++  const fallback = resolveKnownChannel(params.fallbackChannel);
+   if (fallback) {
+     return {
+       channel: fallback,
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,100 @@
+From 52f6a2c0981c91987d15622565eecd1fa72bda2c Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 5 Apr 2026 17:43:34 +0800
+Subject: [PATCH 98/98] Status: keep verified Claude prompt state on resume
+
+---
+ src/agents/cli-runner.test.ts | 19 ++++++++++++++++++-
+ src/agents/cli-runner.ts      | 11 ++++++++++-
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
+index 9fa3561178..d4fa3d4e1c 100644
+--- a/src/agents/cli-runner.test.ts
++++ b/src/agents/cli-runner.test.ts
+@@ -1281,6 +1281,18 @@ describe("runCliAgent with process supervisor", () => {
+           systemPromptCompactionCount?: number;
+         }
+       | undefined;
++    let resumedPromptLoad:
++      | {
++          sessionPromptFile?: string;
++          loaderMode: "normal" | "strict" | "disabled";
++          verifiedRead: boolean;
++          fallbackReason?:
++            | "write_failed"
++            | "verification_retry"
++            | "direct_injection_fallback"
++            | "direct_fallback_disabled";
++        }
++      | undefined;
+ 
+     try {
+       const firstResult = await runCliAgent({
+@@ -1294,7 +1306,7 @@ describe("runCliAgent with process supervisor", () => {
+         runId: "run-claude-resume-first-seed",
+       });
+       binding = firstResult.meta.agentMeta?.cliSessionBinding;
+-      await runCliAgent({
++      const resumedResult = await runCliAgent({
+         sessionId: "s1",
+         sessionFile,
+         workspaceDir: tempDir,
+@@ -1306,6 +1318,7 @@ describe("runCliAgent with process supervisor", () => {
+         cliSessionId: "existing-claude-session",
+         cliSessionBinding: binding,
+       });
++      resumedPromptLoad = resumedResult.meta.agentMeta?.cliPromptLoad;
+     } finally {
+       await fs.rm(tempDir, { recursive: true, force: true });
+     }
+@@ -1315,6 +1328,10 @@ describe("runCliAgent with process supervisor", () => {
+     expect(input.argv).toContain("--resume");
+     expect(input.argv).toContain("existing-claude-session");
+     expect(input.argv).not.toContain("--append-system-prompt");
++    expect(resumedPromptLoad).toMatchObject({
++      loaderMode: "normal",
++      verifiedRead: true,
++    });
+   });
+ 
+   it("reloads the session prompt file on resume after compaction count increases", async () => {
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 4fdb2a532d..44b5e0299c 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -1148,6 +1148,7 @@ export async function runCliAgent(params: {
+       | "direct_injection_fallback"
+       | "direct_fallback_disabled"
+       | undefined;
++    let promptFileTrustedFromBinding = false;
+     const matchingCliSessionBinding =
+       params.cliSessionBinding &&
+       params.cliSessionBinding.sessionId?.trim() &&
+@@ -1193,6 +1194,12 @@ export async function runCliAgent(params: {
+                   strict: loaderPromptMode === "strict",
+                 })
+               : undefined;
++        promptFileTrustedFromBinding = Boolean(
++          !reloadReason &&
++          cliSystemPromptFile &&
++          matchingCliSessionBinding?.systemPromptFile?.trim() === cliSystemPromptFile.filePath &&
++          matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile.hash,
++        );
+       } catch (error) {
+         log.warn(
+           `failed to write claude session prompt file (${resolveClaudeSystemPromptFilePath(params.sessionFile)}); falling back to direct prompt: ${String(error)}`,
+@@ -1569,7 +1576,9 @@ export async function runCliAgent(params: {
+                     ? { sessionPromptFile: cliSystemPromptFile.filePath }
+                     : {}),
+                   loaderMode: loaderPromptMode,
+-                  verifiedRead: mustVerifyPromptFileRead ? promptFileReadVerified : false,
++                  verifiedRead: mustVerifyPromptFileRead
++                    ? promptFileReadVerified
++                    : promptFileTrustedFromBinding,
+                   ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
+                 }
+               : undefined;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,79 @@
+From 94149ebd6bca61767929f91e5f520b994c2455df Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 21:52:43 +0800
+Subject: [PATCH 51/98] fix(feishu): clear running tool status when assistant
+ text starts streaming
+
+Reset active tool counters on first partial text so the thinking panel
+shows completed tool history instead of perpetual in-progress spinners.
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 34 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     |  7 ++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 567fe26293..f1d32eb5d3 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -618,6 +618,40 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("clears running tool status as soon as assistant text starts streaming", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("⏳ Running Bash..."),
++      { title: "🔧 Tool Activity" },
++    );
++
++    await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      "🔧 Tool calls (1)\n- Bash",
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
+   it("restores the previous running tool when nested tool activity unwinds", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 66d309cbc5..b0e4a7e61c 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -553,6 +553,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     if (options?.dedupeWithLastPartial) {
+       lastPartial = nextText;
+     }
++    if (activeToolRunCount > 0) {
++      activeToolRunCount = 0;
++      lastToolName = undefined;
++      activeToolNames.length = 0;
++      streamPhase = "streaming";
++      queueThinkingPanelUpdate();
++    }
+     // Collapse thinking panel when first assistant text arrives
+     markThinkingDone();
+     queueStreamingRender();
+-- 
+2.50.1 (Apple Git-155)
+

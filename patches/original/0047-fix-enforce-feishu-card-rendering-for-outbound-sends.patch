@@ -1,0 +1,464 @@
+From 50c793b0f960554d9fa0318bb4872743b52f8169 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 18:55:49 +0800
+Subject: [PATCH 47/98] fix: enforce feishu card rendering for outbound sends
+
+---
+ extensions/feishu/src/channel.test.ts  |  51 +++++++--
+ extensions/feishu/src/channel.ts       |  21 ++--
+ extensions/feishu/src/outbound.test.ts |   6 ++
+ extensions/feishu/src/outbound.ts      |  16 +--
+ extensions/feishu/src/send.test.ts     | 143 +++++++++++++++++++++++++
+ extensions/feishu/src/send.ts          |  31 ++++++
+ 6 files changed, 244 insertions(+), 24 deletions(-)
+
+diff --git a/extensions/feishu/src/channel.test.ts b/extensions/feishu/src/channel.test.ts
+index 28dfd8dda0..0a95bd7488 100644
+--- a/extensions/feishu/src/channel.test.ts
++++ b/extensions/feishu/src/channel.test.ts
+@@ -8,6 +8,7 @@ const listReactionsFeishuMock = vi.hoisted(() => vi.fn());
+ const removeReactionFeishuMock = vi.hoisted(() => vi.fn());
+ const sendCardFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
++const feishuOutboundSendTextMock = vi.hoisted(() => vi.fn());
+ const getMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const editMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const createPinFeishuMock = vi.hoisted(() => vi.fn());
+@@ -46,7 +47,7 @@ vi.mock("./channel.runtime.js", () => ({
+     sendCardFeishu: sendCardFeishuMock,
+     sendMessageFeishu: sendMessageFeishuMock,
+     feishuOutbound: {
+-      sendText: vi.fn(),
++      sendText: feishuOutboundSendTextMock,
+       sendMedia: vi.fn(),
+     },
+   },
+@@ -113,6 +114,7 @@ describe("feishuPlugin actions", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     createFeishuClientMock.mockReturnValue({ tag: "client" });
++    feishuOutboundSendTextMock.mockResolvedValue({ channel: "feishu", messageId: "om_sent" });
+   });
+ 
+   it("advertises the expanded Feishu action surface", () => {
+@@ -161,7 +163,11 @@ describe("feishuPlugin actions", () => {
+   });
+ 
+   it("sends text messages", async () => {
+-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_sent", chatId: "oc_group_1" });
++    feishuOutboundSendTextMock.mockResolvedValueOnce({
++      channel: "feishu",
++      messageId: "om_sent",
++      chatId: "oc_group_1",
++    });
+ 
+     const result = await feishuPlugin.actions?.handleAction?.({
+       action: "send",
+@@ -171,13 +177,11 @@ describe("feishuPlugin actions", () => {
+       toolContext: {},
+     } as never);
+ 
+-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
+       cfg,
+       to: "chat:oc_group_1",
+       text: "hello",
+       accountId: undefined,
+-      replyToMessageId: undefined,
+-      replyInThread: false,
+     });
+     expect(result?.details).toMatchObject({ ok: true, messageId: "om_sent", chatId: "oc_group_1" });
+   });
+@@ -266,7 +270,11 @@ describe("feishuPlugin actions", () => {
+   });
+ 
+   it("sends explicit thread replies with reply_in_thread semantics", async () => {
+-    sendMessageFeishuMock.mockResolvedValueOnce({ messageId: "om_reply", chatId: "oc_group_1" });
++    feishuOutboundSendTextMock.mockResolvedValueOnce({
++      channel: "feishu",
++      messageId: "om_reply",
++      chatId: "oc_group_1",
++    });
+ 
+     const result = await feishuPlugin.actions?.handleAction?.({
+       action: "thread-reply",
+@@ -276,13 +284,12 @@ describe("feishuPlugin actions", () => {
+       toolContext: {},
+     } as never);
+ 
+-    expect(sendMessageFeishuMock).toHaveBeenCalledWith({
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith({
+       cfg,
+       to: "chat:oc_group_1",
+       text: "reply body",
+       accountId: undefined,
+-      replyToMessageId: "om_parent",
+-      replyInThread: true,
++      threadId: "om_parent",
+     });
+     expect(result?.details).toMatchObject({
+       ok: true,
+@@ -291,6 +298,32 @@ describe("feishuPlugin actions", () => {
+     });
+   });
+ 
++  it("routes text sends through the renderMode-aware outbound adapter", async () => {
++    await feishuPlugin.actions?.handleAction?.({
++      action: "send",
++      params: { to: "chat:oc_group_1", text: "| a | b |\n| - | - |" },
++      cfg: {
++        channels: {
++          feishu: {
++            enabled: true,
++            appId: "cli_main",
++            appSecret: "secret_main",
++            renderMode: "auto",
++          },
++        },
++      } as OpenClawConfig,
++      accountId: undefined,
++      toolContext: {},
++    } as never);
++
++    expect(feishuOutboundSendTextMock).toHaveBeenCalledWith(
++      expect.objectContaining({
++        to: "chat:oc_group_1",
++        text: "| a | b |\n| - | - |",
++      }),
++    );
++  });
++
+   it("creates pins", async () => {
+     createPinFeishuMock.mockResolvedValueOnce({ messageId: "om_pin", chatId: "oc_group_1" });
+ 
+diff --git a/extensions/feishu/src/channel.ts b/extensions/feishu/src/channel.ts
+index 2bafd590a9..32ce93fde0 100644
+--- a/extensions/feishu/src/channel.ts
++++ b/extensions/feishu/src/channel.ts
+@@ -515,14 +515,19 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
+                   replyToMessageId,
+                   replyInThread: ctx.action === "thread-reply",
+                 })
+-              : await runtime.sendMessageFeishu({
+-                  cfg: ctx.cfg,
+-                  to,
+-                  text: text!,
+-                  accountId: ctx.accountId ?? undefined,
+-                  replyToMessageId,
+-                  replyInThread: ctx.action === "thread-reply",
+-                });
++              : await (async () => {
++                  const sendText = runtime.feishuOutbound.sendText;
++                  if (!sendText) {
++                    throw new Error("Feishu outbound text sender is unavailable.");
++                  }
++                  return sendText({
++                    cfg: ctx.cfg,
++                    to,
++                    text: text!,
++                    accountId: ctx.accountId ?? undefined,
++                    ...(ctx.action === "thread-reply" ? { threadId: replyToMessageId } : {}),
++                  });
++                })();
+             return jsonActionResult({
+               ok: true,
+               channel: "feishu",
+diff --git a/extensions/feishu/src/outbound.test.ts b/extensions/feishu/src/outbound.test.ts
+index 64420f0a57..280db760d3 100644
+--- a/extensions/feishu/src/outbound.test.ts
++++ b/extensions/feishu/src/outbound.test.ts
+@@ -7,6 +7,11 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+ const sendMarkdownCardFeishuMock = vi.hoisted(() => vi.fn());
+ const sendStructuredCardFeishuMock = vi.hoisted(() => vi.fn());
++const shouldUseFeishuMarkdownCardMock = vi.hoisted(() =>
++  vi.fn((text: string) => {
++    return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
++  }),
++);
+ 
+ vi.mock("./media.js", () => ({
+   sendMediaFeishu: sendMediaFeishuMock,
+@@ -16,6 +21,7 @@ vi.mock("./send.js", () => ({
+   sendMessageFeishu: sendMessageFeishuMock,
+   sendMarkdownCardFeishu: sendMarkdownCardFeishuMock,
+   sendStructuredCardFeishu: sendStructuredCardFeishuMock,
++  shouldUseFeishuMarkdownCard: shouldUseFeishuMarkdownCardMock,
+ }));
+ 
+ vi.mock("./runtime.js", () => ({
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index 5357ae925e..2a7f589ed5 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -6,7 +6,12 @@ import { resolveFeishuAccount } from "./accounts.js";
+ import { resolveMediaContentType } from "./media-types.js";
+ import { sendMediaFeishu } from "./media.js";
+ import { getFeishuRuntime } from "./runtime.js";
+-import { sendMarkdownCardFeishu, sendMessageFeishu, sendStructuredCardFeishu } from "./send.js";
++import {
++  sendMarkdownCardFeishu,
++  sendMessageFeishu,
++  sendStructuredCardFeishu,
++  shouldUseFeishuMarkdownCard,
++} from "./send.js";
+ 
+ function normalizePossibleLocalImagePath(text: string | undefined): string | null {
+   const raw = text?.trim();
+@@ -41,10 +46,6 @@ function normalizePossibleLocalImagePath(text: string | undefined): string | nul
+   return raw;
+ }
+ 
+-function shouldUseCard(text: string): boolean {
+-  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+-}
+-
+ function resolveReplyToMessageId(params: {
+   replyToId?: string | null;
+   threadId?: string | number | null;
+@@ -71,7 +72,7 @@ async function sendOutboundText(params: {
+   const account = resolveFeishuAccount({ cfg, accountId });
+   const renderMode = account.config?.renderMode ?? "auto";
+ 
+-  if (renderMode === "card" || (renderMode === "auto" && shouldUseCard(text))) {
++  if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text))) {
+     return sendMarkdownCardFeishu({ cfg, to, text, accountId, replyToMessageId });
+   }
+ 
+@@ -118,7 +119,8 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+ 
+       const account = resolveFeishuAccount({ cfg, accountId: accountId ?? undefined });
+       const renderMode = account.config?.renderMode ?? "auto";
+-      const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
++      const useCard =
++        renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text));
+       if (useCard) {
+         const header = identity
+           ? {
+diff --git a/extensions/feishu/src/send.test.ts b/extensions/feishu/src/send.test.ts
+index cc208bacbd..0ff8b7dc17 100644
+--- a/extensions/feishu/src/send.test.ts
++++ b/extensions/feishu/src/send.test.ts
+@@ -7,6 +7,8 @@ import {
+   getMessageFeishu,
+   listFeishuThreadMessages,
+   resolveFeishuCardTemplate,
++  sendMessageFeishu,
++  shouldUseFeishuMarkdownCard,
+ } from "./send.js";
+ 
+ const {
+@@ -259,6 +261,85 @@ describe("getMessageFeishu", () => {
+   });
+ });
+ 
++describe("sendMessageFeishu", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    mockResolveFeishuAccount.mockImplementation(
++      ({ accountId }: { accountId?: string }) =>
++        ({
++          accountId: accountId ?? "default",
++          configured: true,
++          config: {},
++        }) as never,
++    );
++    mockCreateFeishuClient.mockReturnValue({
++      im: {
++        message: {
++          get: mockClientGet,
++          list: mockClientList,
++          patch: mockClientPatch,
++          create: vi.fn(),
++          reply: vi.fn(),
++        },
++      },
++    });
++  });
++
++  it("routes text sends through interactive cards when renderMode=card", async () => {
++    const create = vi.fn().mockResolvedValue({
++      code: 0,
++      data: { message_id: "om_card" },
++    });
++    mockCreateFeishuClient.mockReturnValue({
++      im: {
++        message: {
++          create,
++          reply: vi.fn(),
++        },
++      },
++    });
++    mockResolveFeishuAccount.mockImplementation(
++      ({ accountId }: { accountId?: string }) =>
++        ({
++          accountId: accountId ?? "default",
++          configured: true,
++          appId: "cli_main",
++          appSecret: "secret_main",
++          config: { renderMode: "card" },
++        }) as never,
++    );
++
++    const result = await sendMessageFeishu({
++      cfg: {
++        channels: {
++          feishu: {
++            renderMode: "card",
++          },
++        },
++      } as ClawdbotConfig,
++      to: "chat:oc_group_1",
++      text: "hello",
++    });
++
++    expect(create).toHaveBeenCalledWith(
++      expect.objectContaining({
++        data: expect.objectContaining({
++          msg_type: "interactive",
++        }),
++      }),
++    );
++    expect(result).toEqual(expect.objectContaining({ messageId: "om_card" }));
++  });
++});
++
++describe("shouldUseFeishuMarkdownCard", () => {
++  it("detects fenced code blocks and tables", () => {
++    expect(shouldUseFeishuMarkdownCard("```ts\nconst x = 1\n```")).toBe(true);
++    expect(shouldUseFeishuMarkdownCard("| a | b |\n| - | - |")).toBe(true);
++    expect(shouldUseFeishuMarkdownCard("plain text")).toBe(false);
++  });
++});
++
+ describe("editMessageFeishu", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+@@ -321,6 +402,68 @@ describe("editMessageFeishu", () => {
+     });
+     expect(result).toEqual({ messageId: "om_card", contentType: "interactive" });
+   });
++
++  it("patches interactive content for text edits when renderMode=card", async () => {
++    mockClientPatch.mockResolvedValueOnce({ code: 0 });
++    mockResolveFeishuAccount.mockReturnValue({
++      accountId: "default",
++      configured: true,
++      config: { renderMode: "card" },
++    });
++
++    const result = await editMessageFeishu({
++      cfg: {} as ClawdbotConfig,
++      messageId: "om_edit_card",
++      text: "updated body",
++    });
++
++    expect(mockClientPatch).toHaveBeenCalledWith({
++      path: { message_id: "om_edit_card" },
++      data: {
++        content: JSON.stringify({
++          schema: "2.0",
++          config: {
++            wide_screen_mode: true,
++          },
++          body: {
++            elements: [{ tag: "markdown", content: "updated body" }],
++          },
++        }),
++      },
++    });
++    expect(result).toEqual({ messageId: "om_edit_card", contentType: "interactive" });
++  });
++
++  it("patches interactive content for text edits in auto mode when markdown needs cards", async () => {
++    mockClientPatch.mockResolvedValueOnce({ code: 0 });
++    mockResolveFeishuAccount.mockReturnValue({
++      accountId: "default",
++      configured: true,
++      config: { renderMode: "auto" },
++    });
++
++    const result = await editMessageFeishu({
++      cfg: {} as ClawdbotConfig,
++      messageId: "om_edit_auto",
++      text: "| a | b |\n| - | - |",
++    });
++
++    expect(mockClientPatch).toHaveBeenCalledWith({
++      path: { message_id: "om_edit_auto" },
++      data: {
++        content: JSON.stringify({
++          schema: "2.0",
++          config: {
++            wide_screen_mode: true,
++          },
++          body: {
++            elements: [{ tag: "markdown", content: "| a | b |\n| - | - |" }],
++          },
++        }),
++      },
++    });
++    expect(result).toEqual({ messageId: "om_edit_auto", contentType: "interactive" });
++  });
+ });
+ 
+ describe("resolveFeishuCardTemplate", () => {
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index 1b5af59bca..4da3678fdb 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -538,6 +538,19 @@ export async function sendMessageFeishu(
+   params: SendFeishuMessageParams,
+ ): Promise<FeishuSendResult> {
+   const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId } = params;
++  const account = resolveFeishuAccount({ cfg, accountId });
++  const renderMode = account.config?.renderMode ?? "auto";
++  if (renderMode === "card") {
++    return sendMarkdownCardFeishu({
++      cfg,
++      to,
++      text,
++      replyToMessageId,
++      replyInThread,
++      mentions,
++      accountId,
++    });
++  }
+   const mentionMeta = buildMentionMeta(mentions);
+   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
+   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
+@@ -631,6 +644,20 @@ export async function editMessageFeishu(params: {
+     return { messageId, contentType: "interactive" };
+   }
+ 
++  const renderMode = account.config?.renderMode ?? "auto";
++  if (renderMode === "card" || (renderMode === "auto" && shouldUseFeishuMarkdownCard(text!))) {
++    const response = await client.im.message.patch({
++      path: { message_id: messageId },
++      data: { content: JSON.stringify(buildMarkdownCard(text!)) },
++    });
++
++    if (response.code !== 0) {
++      throw new Error(`Feishu message edit failed: ${response.msg || `code ${response.code}`}`);
++    }
++
++    return { messageId, contentType: "interactive" };
++  }
++
+   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
+     cfg,
+     channel: "feishu",
+@@ -674,6 +701,10 @@ export async function updateCardFeishu(params: {
+   }
+ }
+ 
++export function shouldUseFeishuMarkdownCard(text: string): boolean {
++  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
++}
++
+ /**
+  * Build a Feishu interactive card with markdown content.
+  * Cards render markdown properly (code blocks, tables, links, etc.)
+-- 
+2.50.1 (Apple Git-155)
+

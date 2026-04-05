@@ -1,0 +1,1501 @@
+From 8f0e36cac901dfb3a781b7f291cdd056d039ded7 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 5 Apr 2026 19:00:15 +0800
+Subject: [PATCH 02/10] feat(gateway): harden node override policy, add MCP
+ HTTP bridge, and security opt-in toggles
+
+- Add MCP HTTP bridge for gateway server
+- Harden node command policy and audit checks
+- Add opt-in toggles to bypass skill symlink and workspace read restrictions
+- Session archive improvements
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/gateway/chat-sanitize.test.ts             |  32 ++
+ src/gateway/chat-sanitize.ts                  |   5 +-
+ src/gateway/gateway-misc.test.ts              | 154 +++++
+ src/gateway/mcp-http.test.ts                  | 158 +++++
+ src/gateway/mcp-http.ts                       | 539 ++++++++++++++++++
+ src/gateway/node-command-policy.ts            |  63 +-
+ src/gateway/server.impl.ts                    |  15 +
+ .../server/ws-connection/message-handler.ts   |   2 +
+ src/gateway/session-archive.fs.ts             |  12 +
+ src/security/audit-extra.sync.ts              | 163 +++++-
+ src/security/audit.test.ts                    | 119 ++++
+ 11 files changed, 1225 insertions(+), 37 deletions(-)
+ create mode 100644 src/gateway/mcp-http.test.ts
+ create mode 100644 src/gateway/mcp-http.ts
+
+diff --git a/src/gateway/chat-sanitize.test.ts b/src/gateway/chat-sanitize.test.ts
+index d287160db1..6d2ba7a2d9 100644
+--- a/src/gateway/chat-sanitize.test.ts
++++ b/src/gateway/chat-sanitize.test.ts
+@@ -22,6 +22,22 @@ describe("stripEnvelopeFromMessage", () => {
+     expect(result.content?.[0]?.text).toBe("hi");
+   });
+ 
++  test("removes inbound metadata from input_text content arrays", () => {
++    const input = {
++      role: "user",
++      content: [
++        {
++          type: "input_text",
++          text: 'Conversation info (untrusted metadata):\n```json\n{"message_id":"123"}\n```\n\nHello there',
++        },
++      ],
++    };
++    const result = stripEnvelopeFromMessage(input) as {
++      content?: Array<{ type: string; text?: string }>;
++    };
++    expect(result.content?.[0]?.text).toBe("Hello there");
++  });
++
+   test("does not strip inline message_id text that is part of a line", () => {
+     const input = {
+       role: "user",
+@@ -50,6 +66,22 @@ describe("stripEnvelopeFromMessage", () => {
+     expect(result.content).toBe("Assistant body");
+   });
+ 
++  test("defensively strips inbound metadata blocks from output_text content arrays", () => {
++    const input = {
++      role: "assistant",
++      content: [
++        {
++          type: "output_text",
++          text: 'Conversation info (untrusted metadata):\n```json\n{"message_id":"123"}\n```\n\nAssistant body',
++        },
++      ],
++    };
++    const result = stripEnvelopeFromMessage(input) as {
++      content?: Array<{ type: string; text?: string }>;
++    };
++    expect(result.content?.[0]?.text).toBe("Assistant body");
++  });
++
+   test("removes inbound un-bracketed conversation info blocks from user messages", () => {
+     const input = {
+       role: "user",
+diff --git a/src/gateway/chat-sanitize.ts b/src/gateway/chat-sanitize.ts
+index 79fe822071..cee21551c1 100644
+--- a/src/gateway/chat-sanitize.ts
++++ b/src/gateway/chat-sanitize.ts
+@@ -44,7 +44,10 @@ function stripEnvelopeFromContentWithRole(
+       return item;
+     }
+     const entry = item as Record<string, unknown>;
+-    if (entry.type !== "text" || typeof entry.text !== "string") {
++    if (
++      (entry.type !== "text" && entry.type !== "input_text" && entry.type !== "output_text") ||
++      typeof entry.text !== "string"
++    ) {
+       return item;
+     }
+     const inboundStripped = stripInboundMetadata(entry.text);
+diff --git a/src/gateway/gateway-misc.test.ts b/src/gateway/gateway-misc.test.ts
+index f25dbd5b4b..2366b077d0 100644
+--- a/src/gateway/gateway-misc.test.ts
++++ b/src/gateway/gateway-misc.test.ts
+@@ -395,6 +395,160 @@ describe("resolveNodeCommandAllowlist", () => {
+     expect(allow.has("system.which")).toBe(false);
+     expect(allow.has("device.info")).toBe(true);
+   });
++
++  it("per-node denyCommands merges with global deny", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "lukin-dev": {
++                denyCommands: ["browser.proxy"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-123", displayName: "lukin-dev" },
++    );
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("per-node allowCommands merges with global allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            allowCommands: ["camera.snap"],
++            overrides: {
++              "my-node": {
++                allowCommands: ["screen.record"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "ios", deviceFamily: "iPhone", nodeId: "n1", displayName: "my-node" },
++    );
++    expect(allow.has("camera.snap")).toBe(true);
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("nodeId match takes priority over displayName", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-display": { denyCommands: ["system.run"] },
++              "node-abc": { denyCommands: ["system.notify"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-abc", displayName: "my-display" },
++    );
++    // nodeId override wins: system.notify denied, system.run allowed
++    expect(allow.has("system.notify")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("matches by nodeId prefix", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("falls back to global config when no override matches", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "other-node": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "my-node", displayName: "my-node" },
++    );
++    // Global deny applies, per-node deny for "other-node" does not
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(true);
++  });
++
++  it("per-node allow and deny coexist; deny wins over allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-node": {
++                allowCommands: ["camera.snap", "screen.record"],
++                denyCommands: ["camera.snap"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "n1", displayName: "my-node" },
++    );
++    // camera.snap added by allow but removed by deny
++    expect(allow.has("camera.snap")).toBe(false);
++    // screen.record only in allow, not denied
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("ignores empty-string override key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "": { denyCommands: ["system.run"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "any-node", displayName: "" },
++    );
++    // Empty key should not match — system.run stays allowed
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("prefix match picks longest matching key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["system.run", "browser.proxy"] },
++              "node-lukin-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    // "node-lukin-" is the longest prefix → only browser.proxy denied
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
+ });
+ 
+ describe("normalizeVoiceWakeTriggers", () => {
+diff --git a/src/gateway/mcp-http.test.ts b/src/gateway/mcp-http.test.ts
+new file mode 100644
+index 0000000000..d5202aaa12
+--- /dev/null
++++ b/src/gateway/mcp-http.test.ts
+@@ -0,0 +1,158 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { getFreePortBlockWithPermissionFallback } from "../test-utils/ports.js";
++import { startMcpLoopbackServer } from "./mcp-http.js";
++
++type MockConfig = {
++  marker: string;
++  session?: { mainKey?: string };
++};
++
++const groupPolicyMock = vi.hoisted(() => vi.fn());
++let runtimeConfig: MockConfig = {
++  marker: "a",
++  session: { mainKey: "main" },
++};
++
++vi.mock("../config/config.js", () => ({
++  loadConfig: () => runtimeConfig,
++}));
++
++vi.mock("../config/sessions.js", () => ({
++  resolveMainSessionKey: (cfg?: { session?: { mainKey?: string } }) =>
++    `agent:main:${cfg?.session?.mainKey ?? "main"}`,
++}));
++
++vi.mock("../agents/openclaw-tools.js", () => ({
++  createOpenClawTools: (options?: { config?: MockConfig }) => {
++    const marker = options?.config?.marker ?? "unknown";
++    return [
++      {
++        name: `tool-${marker}`,
++        description: `tool ${marker}`,
++        parameters: { type: "object", properties: {} },
++        execute: async () => ({
++          content: [{ type: "text", text: `ok-${marker}` }],
++        }),
++      },
++    ];
++  },
++}));
++
++vi.mock("../agents/pi-tools.policy.js", () => ({
++  resolveEffectiveToolPolicy: () => ({
++    agentId: "main",
++    globalPolicy: undefined,
++    globalProviderPolicy: undefined,
++    agentPolicy: undefined,
++    agentProviderPolicy: undefined,
++    profile: undefined,
++    providerProfile: undefined,
++    profileAlsoAllow: undefined,
++    providerProfileAlsoAllow: undefined,
++  }),
++  resolveGroupToolPolicy: (...args: unknown[]) => groupPolicyMock(...args),
++  resolveSubagentToolPolicy: () => undefined,
++}));
++
++vi.mock("../agents/tool-policy-pipeline.js", () => ({
++  applyToolPolicyPipeline: (params: { tools: unknown[] }) => params.tools,
++  buildDefaultToolPolicyPipelineSteps: () => [],
++}));
++
++vi.mock("../agents/tool-policy.js", () => ({
++  collectExplicitAllowlist: () => [],
++  mergeAlsoAllowPolicy: (policy: unknown) => policy,
++  resolveToolProfilePolicy: () => undefined,
++}));
++
++vi.mock("../plugins/tools.js", () => ({
++  getPluginToolMeta: () => undefined,
++}));
++
++vi.mock("../routing/session-key.js", () => ({
++  isSubagentSessionKey: () => false,
++}));
++
++let server: Awaited<ReturnType<typeof startMcpLoopbackServer>> | null = null;
++
++async function sendJsonRpc(params: {
++  port: number;
++  body: Record<string, unknown>;
++  headers?: Record<string, string>;
++}) {
++  const response = await fetch(`http://127.0.0.1:${params.port}/mcp`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      ...params.headers,
++    },
++    body: JSON.stringify(params.body),
++  });
++  return await response.json();
++}
++
++describe("mcp-http", () => {
++  beforeEach(() => {
++    runtimeConfig = {
++      marker: "a",
++      session: { mainKey: "main" },
++    };
++    groupPolicyMock.mockReset();
++    groupPolicyMock.mockReturnValue(undefined);
++  });
++
++  afterEach(async () => {
++    await server?.close();
++    server = null;
++  });
++
++  it("refreshes tool cache when runtime config snapshot changes", async () => {
++    const port = await getFreePortBlockWithPermissionFallback({
++      offsets: [0],
++      fallbackBase: 47_000,
++    });
++    server = await startMcpLoopbackServer(port);
++
++    const first = (await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
++    })) as { result?: { tools?: Array<{ name?: string }> } };
++    expect(first.result?.tools?.[0]?.name).toBe("tool-a");
++
++    runtimeConfig = {
++      marker: "b",
++      session: { mainKey: "main" },
++    };
++
++    const second = (await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 2, method: "tools/list" },
++    })) as { result?: { tools?: Array<{ name?: string }> } };
++    expect(second.result?.tools?.[0]?.name).toBe("tool-b");
++  });
++
++  it("passes message channel and account headers into group tool policy resolution", async () => {
++    const port = await getFreePortBlockWithPermissionFallback({
++      offsets: [0],
++      fallbackBase: 48_000,
++    });
++    server = await startMcpLoopbackServer(port);
++
++    await sendJsonRpc({
++      port,
++      body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
++      headers: {
++        "x-session-key": "agent:main:telegram:group:chat123",
++        "x-openclaw-message-channel": "telegram",
++        "x-openclaw-account-id": "work",
++      },
++    });
++
++    const lastCall = groupPolicyMock.mock.calls.at(-1)?.[0] as
++      | { sessionKey?: string; messageProvider?: string; accountId?: string | null }
++      | undefined;
++    expect(lastCall?.sessionKey).toBe("agent:main:telegram:group:chat123");
++    expect(lastCall?.messageProvider).toBe("telegram");
++    expect(lastCall?.accountId).toBe("work");
++  });
++});
+diff --git a/src/gateway/mcp-http.ts b/src/gateway/mcp-http.ts
+new file mode 100644
+index 0000000000..ef91afa3ca
+--- /dev/null
++++ b/src/gateway/mcp-http.ts
+@@ -0,0 +1,539 @@
++import crypto from "node:crypto";
++import fs from "node:fs";
++import { createServer as createHttpServer } from "node:http";
++import type { IncomingMessage } from "node:http";
++import path from "node:path";
++import { createOpenClawTools } from "../agents/openclaw-tools.js";
++import {
++  resolveEffectiveToolPolicy,
++  resolveGroupToolPolicy,
++  resolveSubagentToolPolicy,
++} from "../agents/pi-tools.policy.js";
++import {
++  applyToolPolicyPipeline,
++  buildDefaultToolPolicyPipelineSteps,
++} from "../agents/tool-policy-pipeline.js";
++import {
++  collectExplicitAllowlist,
++  mergeAlsoAllowPolicy,
++  resolveToolProfilePolicy,
++} from "../agents/tool-policy.js";
++import { loadConfig } from "../config/config.js";
++import { resolveMainSessionKey } from "../config/sessions.js";
++import { logDebug, logWarn } from "../logger.js";
++import { getPluginToolMeta } from "../plugins/tools.js";
++import { isSubagentSessionKey } from "../routing/session-key.js";
++import { normalizeMessageChannel, resolveGatewayMessageChannel } from "../utils/message-channel.js";
++import { getHeader } from "./http-utils.js";
++
++/** MCP loopback server runs on gateway port + this offset. */
++export const MCP_PORT_OFFSET = 1;
++
++const SERVER_NAME = "openclaw";
++const SERVER_VERSION = "0.1.0";
++
++/**
++ * Supported MCP protocol versions (newest first).
++ */
++const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05"];
++
++/**
++ * Tools that Claude Code already provides natively — no point exposing via MCP.
++ */
++const NATIVE_TOOL_EXCLUDE = new Set(["read", "write", "edit", "apply_patch", "exec", "process"]);
++
++// ---------- Tool resolution ----------
++
++function resolveFilteredTools(params: {
++  cfg: ReturnType<typeof loadConfig>;
++  sessionKey: string;
++  messageProvider?: string;
++  accountId?: string;
++  messageTo?: string;
++  messageThreadId?: string;
++}) {
++  const {
++    agentId,
++    globalPolicy,
++    globalProviderPolicy,
++    agentPolicy,
++    agentProviderPolicy,
++    profile,
++    providerProfile,
++    profileAlsoAllow,
++    providerProfileAlsoAllow,
++  } = resolveEffectiveToolPolicy({ config: params.cfg, sessionKey: params.sessionKey });
++
++  const profilePolicy = resolveToolProfilePolicy(profile);
++  const providerProfilePolicy = resolveToolProfilePolicy(providerProfile);
++  const profilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(profilePolicy, profileAlsoAllow);
++  const providerProfilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(
++    providerProfilePolicy,
++    providerProfileAlsoAllow,
++  );
++  const groupPolicy = resolveGroupToolPolicy({
++    config: params.cfg,
++    sessionKey: params.sessionKey,
++    messageProvider: params.messageProvider,
++    accountId: params.accountId ?? null,
++  });
++  const subagentPolicy = isSubagentSessionKey(params.sessionKey)
++    ? resolveSubagentToolPolicy(params.cfg)
++    : undefined;
++
++  const allTools = createOpenClawTools({
++    agentSessionKey: params.sessionKey,
++    agentChannel: resolveGatewayMessageChannel(params.messageProvider),
++    agentAccountId: params.accountId,
++    agentTo: params.messageTo,
++    agentThreadId: params.messageThreadId,
++    config: params.cfg,
++    pluginToolAllowlist: collectExplicitAllowlist([
++      profilePolicy,
++      providerProfilePolicy,
++      globalPolicy,
++      globalProviderPolicy,
++      agentPolicy,
++      agentProviderPolicy,
++      groupPolicy,
++      subagentPolicy,
++    ]),
++  });
++
++  const policyFiltered = applyToolPolicyPipeline({
++    // oxlint-disable-next-line typescript/no-explicit-any
++    tools: allTools as any,
++    // oxlint-disable-next-line typescript/no-explicit-any
++    toolMeta: (tool) => getPluginToolMeta(tool as any),
++    warn: logWarn,
++    steps: [
++      ...buildDefaultToolPolicyPipelineSteps({
++        profilePolicy: profilePolicyWithAlsoAllow,
++        profile,
++        providerProfilePolicy: providerProfilePolicyWithAlsoAllow,
++        providerProfile,
++        globalPolicy,
++        globalProviderPolicy,
++        agentPolicy,
++        agentProviderPolicy,
++        groupPolicy,
++        agentId,
++      }),
++      { policy: subagentPolicy, label: "subagent tools.allow" },
++    ],
++  });
++
++  return policyFiltered.filter((t) => !NATIVE_TOOL_EXCLUDE.has(t.name));
++}
++
++// ---------- JSON-RPC helpers ----------
++
++interface JsonRpcRequest {
++  jsonrpc: "2.0";
++  id?: string | number | null;
++  method: string;
++  params?: Record<string, unknown>;
++}
++
++function jsonRpcResult(id: string | number | null | undefined, result: unknown) {
++  return { jsonrpc: "2.0" as const, id: id ?? null, result };
++}
++
++function jsonRpcError(id: string | number | null | undefined, code: number, message: string) {
++  return { jsonrpc: "2.0" as const, id: id ?? null, error: { code, message } };
++}
++
++// ---------- Request handler ----------
++
++/**
++ * Flatten a top-level `anyOf`/`oneOf` union of objects into a single
++ * `{ type: "object" }` schema by merging all variant properties.
++ *
++ * The Anthropic API rejects `anyOf`/`oneOf`/`allOf` at the input_schema
++ * top level, and Claude Code forwards MCP tool schemas as-is.
++ */
++function flattenUnionSchema(raw: Record<string, unknown>): Record<string, unknown> {
++  const variants = (raw.anyOf ?? raw.oneOf) as Record<string, unknown>[] | undefined;
++  if (!Array.isArray(variants) || variants.length === 0) {
++    return raw;
++  }
++  const mergedProps: Record<string, unknown> = {};
++  const requiredSets: Set<string>[] = [];
++  for (const variant of variants) {
++    const props = variant.properties as Record<string, unknown> | undefined;
++    if (props) {
++      for (const [key, schema] of Object.entries(props)) {
++        // First variant wins for each property definition.
++        if (!(key in mergedProps)) {
++          mergedProps[key] = schema;
++        }
++      }
++    }
++    if (Array.isArray(variant.required)) {
++      requiredSets.push(new Set(variant.required as string[]));
++    }
++  }
++  // Only mark a field as required if ALL variants require it.
++  const required =
++    requiredSets.length > 0
++      ? [...requiredSets.reduce((a, b) => new Set([...a].filter((x) => b.has(x))))]
++      : [];
++  const { anyOf: _a, oneOf: _o, ...rest } = raw;
++  return { ...rest, type: "object", properties: mergedProps, required };
++}
++
++function buildToolSchema(tools: ReturnType<typeof resolveFilteredTools>) {
++  return tools.map((t) => {
++    let raw =
++      t.parameters && typeof t.parameters === "object"
++        ? { ...(t.parameters as Record<string, unknown>) }
++        : {};
++    // Flatten anyOf/oneOf unions — Anthropic API forbids them at top level.
++    if (raw.anyOf || raw.oneOf) {
++      raw = flattenUnionSchema(raw);
++    }
++    if (raw.type !== "object") {
++      raw.type = "object";
++      if (!raw.properties) {
++        raw.properties = {};
++      }
++    }
++    return { name: t.name, description: t.description, inputSchema: raw };
++  });
++}
++
++async function handleJsonRpc(
++  msg: JsonRpcRequest,
++  tools: ReturnType<typeof resolveFilteredTools>,
++  toolSchema: ReturnType<typeof buildToolSchema>,
++): Promise<object | null> {
++  const { id, method, params } = msg;
++
++  switch (method) {
++    // ---- lifecycle ----
++    case "initialize": {
++      const clientVersion = (params?.protocolVersion as string) ?? "";
++      const negotiated =
++        SUPPORTED_PROTOCOL_VERSIONS.find((v) => v === clientVersion) ??
++        SUPPORTED_PROTOCOL_VERSIONS[0];
++      logDebug(`mcp ← initialize (protocol=${clientVersion}, negotiated=${negotiated})`);
++      return jsonRpcResult(id, {
++        protocolVersion: negotiated,
++        capabilities: { tools: {} },
++        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
++      });
++    }
++
++    case "notifications/initialized":
++    case "notifications/cancelled":
++      logDebug(`mcp ← ${method}`);
++      return null; // notification — no response
++
++    // ---- tools ----
++    case "tools/list":
++      logDebug(`mcp ← tools/list (${toolSchema.length} tools)`);
++      return jsonRpcResult(id, { tools: toolSchema });
++
++    case "tools/call": {
++      const toolName = params?.name as string;
++      const toolArgs = (params?.arguments ?? {}) as Record<string, unknown>;
++      const tool = tools.find((t) => t.name === toolName);
++      if (!tool) {
++        logWarn(`mcp ← tools/call: not found: ${toolName}`);
++        return jsonRpcResult(id, {
++          content: [{ type: "text", text: `Tool not available: ${toolName}` }],
++          isError: true,
++        });
++      }
++      const argsSummary = Object.keys(toolArgs).join(",") || "(none)";
++      logDebug(`mcp ← tools/call: ${toolName} [${argsSummary}]`);
++      const t0 = Date.now();
++      try {
++        // oxlint-disable-next-line typescript/no-explicit-any
++        const result = await (tool as any).execute(`mcp-${crypto.randomUUID()}`, toolArgs);
++        const content =
++          result?.content && Array.isArray(result.content)
++            ? result.content.map((block: { type?: string; text?: string }) => ({
++                type: (block.type ?? "text") as "text",
++                text: block.text ?? (typeof block === "string" ? block : JSON.stringify(block)),
++              }))
++            : [
++                {
++                  type: "text",
++                  text: typeof result === "string" ? result : JSON.stringify(result),
++                },
++              ];
++        const elapsed = Date.now() - t0;
++        const snippet = content[0]?.text?.slice(0, 120) ?? "";
++        logDebug(`mcp → ${toolName} OK (${elapsed}ms) ${snippet}`);
++        return jsonRpcResult(id, { content, isError: false });
++      } catch (err) {
++        const message = err instanceof Error ? err.message : String(err);
++        const elapsed = Date.now() - t0;
++        logWarn(`mcp → ${toolName} FAIL (${elapsed}ms): ${message}`);
++        return jsonRpcResult(id, {
++          content: [{ type: "text", text: message || "tool execution failed" }],
++          isError: true,
++        });
++      }
++    }
++
++    default:
++      logDebug(`mcp ← unknown method: ${method}`);
++      return jsonRpcError(id, -32601, `Method not found: ${method}`);
++  }
++}
++
++const MAX_BODY_BYTES = 1_048_576; // 1 MB
++
++const READ_BODY_TIMEOUT_MS = 10_000; // 10 s — guards against slow-loris on loopback
++
++function readBody(req: IncomingMessage): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const chunks: Buffer[] = [];
++    let received = 0;
++    const timer = setTimeout(() => {
++      req.destroy();
++      reject(new Error("Request body read timed out"));
++    }, READ_BODY_TIMEOUT_MS);
++    req.on("data", (chunk: Buffer) => {
++      received += chunk.length;
++      if (received > MAX_BODY_BYTES) {
++        clearTimeout(timer);
++        req.destroy();
++        reject(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`));
++        return;
++      }
++      chunks.push(chunk);
++    });
++    req.on("end", () => {
++      clearTimeout(timer);
++      resolve(Buffer.concat(chunks).toString("utf-8"));
++    });
++    req.on("error", (err) => {
++      clearTimeout(timer);
++      reject(err);
++    });
++  });
++}
++
++// ---------- MCP config file ----------
++
++/**
++ * Ensure the MCP config file exists at `~/.openclaw/mcp.json`.
++ * Returns the absolute path to the config file.
++ */
++export function ensureMcpConfigFile(openclawDir: string, mcpPort: number): string {
++  const filePath = path.join(openclawDir, "mcp.json");
++  const config = {
++    mcpServers: {
++      openclaw: {
++        type: "http",
++        url: `http://127.0.0.1:${mcpPort}/mcp`,
++        headers: {
++          "x-session-key": "${OPENCLAW_MCP_SESSION_KEY}",
++          "x-openclaw-agent-id": "${OPENCLAW_MCP_AGENT_ID}",
++          "x-openclaw-account-id": "${OPENCLAW_MCP_ACCOUNT_ID}",
++          "x-openclaw-message-channel": "${OPENCLAW_MCP_MESSAGE_CHANNEL}",
++          "x-openclaw-message-to": "${OPENCLAW_MCP_TO}",
++          "x-openclaw-thread-id": "${OPENCLAW_MCP_THREAD_ID}",
++        },
++      },
++    },
++  };
++  const content = JSON.stringify(config, null, 2) + "\n";
++
++  try {
++    const existing = fs.readFileSync(filePath, "utf-8");
++    if (existing === content) {
++      return filePath;
++    }
++  } catch (err: unknown) {
++    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
++      throw err;
++    }
++  }
++
++  fs.mkdirSync(openclawDir, { recursive: true });
++  fs.writeFileSync(filePath, content, "utf-8");
++  return filePath;
++}
++
++// ---------- MCP loopback HTTP server ----------
++
++/**
++ * Start a plain HTTP server on 127.0.0.1 dedicated to the MCP endpoint.
++ *
++ * Implements MCP Streamable HTTP transport (stateless mode) with plain
++ * JSON responses — no SSE, no session state.
++ */
++export async function startMcpLoopbackServer(port: number): Promise<{
++  close: () => Promise<void>;
++}> {
++  // Per-tool-context cache with TTL; clears when runtime config snapshot changes.
++  const TOOL_CACHE_TTL_MS = 30_000;
++  const toolCache = new Map<
++    string,
++    {
++      tools: ReturnType<typeof resolveFilteredTools>;
++      schema: ReturnType<typeof buildToolSchema>;
++      time: number;
++    }
++  >();
++  let toolCacheConfigRef: ReturnType<typeof loadConfig> | null = null;
++
++  function getTools(params: {
++    cfg: ReturnType<typeof loadConfig>;
++    sessionKey: string;
++    messageProvider?: string;
++    accountId?: string;
++    messageTo?: string;
++    messageThreadId?: string;
++  }) {
++    if (toolCacheConfigRef && toolCacheConfigRef !== params.cfg) {
++      toolCache.clear();
++    }
++    toolCacheConfigRef = params.cfg;
++    const cacheKey = [
++      params.sessionKey,
++      params.messageProvider ?? "",
++      params.accountId ?? "",
++      params.messageTo ?? "",
++      params.messageThreadId ?? "",
++    ].join("\u0000");
++    const now = Date.now();
++    const cached = toolCache.get(cacheKey);
++    if (cached && now - cached.time < TOOL_CACHE_TTL_MS) {
++      return { tools: cached.tools, toolSchema: cached.schema };
++    }
++    // Evict expired entries to prevent unbounded growth.
++    for (const [key, entry] of toolCache) {
++      if (now - entry.time >= TOOL_CACHE_TTL_MS) {
++        toolCache.delete(key);
++      }
++    }
++    const tools = resolveFilteredTools(params);
++    const schema = buildToolSchema(tools);
++    toolCache.set(cacheKey, { tools, schema, time: now });
++    if (!tools.length) {
++      logWarn("mcp: tool resolution returned 0 tools — plugins may not be loaded yet");
++    }
++    return { tools, toolSchema: schema };
++  }
++
++  const httpServer = createHttpServer((req, res) => {
++    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
++
++    // Fast-path well-known OAuth endpoints — tell clients no auth needed.
++    if (req.method === "GET" && url.pathname.startsWith("/.well-known/")) {
++      res.writeHead(404);
++      res.end();
++      return;
++    }
++
++    if (url.pathname !== "/mcp") {
++      res.writeHead(404, { "Content-Type": "application/json" });
++      res.end(JSON.stringify({ error: "not_found" }));
++      return;
++    }
++
++    // GET = SSE stream — not supported in stateless mode.
++    if (req.method === "GET") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    // DELETE = session termination — not applicable in stateless mode.
++    if (req.method === "DELETE") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    if (req.method !== "POST") {
++      res.writeHead(405, { Allow: "POST" });
++      res.end();
++      return;
++    }
++
++    void (async () => {
++      try {
++        const body = await readBody(req);
++        const parsed: JsonRpcRequest | JsonRpcRequest[] = JSON.parse(body);
++
++        const cfg = loadConfig();
++        const reqSessionKey = getHeader(req, "x-session-key")?.trim() || resolveMainSessionKey(cfg);
++        const messageProvider =
++          normalizeMessageChannel(getHeader(req, "x-openclaw-message-channel")) ?? undefined;
++        const accountId = getHeader(req, "x-openclaw-account-id")?.trim() || undefined;
++        const messageTo = getHeader(req, "x-openclaw-message-to")?.trim() || undefined;
++        const messageThreadId = getHeader(req, "x-openclaw-thread-id")?.trim() || undefined;
++        const { tools, toolSchema } = getTools({
++          cfg,
++          sessionKey: reqSessionKey,
++          messageProvider,
++          accountId,
++          messageTo,
++          messageThreadId,
++        });
++
++        // Handle batch or single request.
++        const messages = Array.isArray(parsed) ? parsed : [parsed];
++        const responses: object[] = [];
++
++        for (const msg of messages) {
++          const result = await handleJsonRpc(msg, tools, toolSchema);
++          if (result !== null) {
++            responses.push(result);
++          }
++        }
++
++        // If all messages were notifications, return 202 Accepted.
++        if (responses.length === 0) {
++          res.writeHead(202);
++          res.end();
++          return;
++        }
++
++        const payload = Array.isArray(parsed)
++          ? JSON.stringify(responses)
++          : JSON.stringify(responses[0]);
++
++        res.writeHead(200, {
++          "Content-Type": "application/json",
++        });
++        res.end(payload);
++      } catch (err) {
++        logWarn(
++          `mcp: request handling failed: ${err instanceof Error ? err.message : String(err)}`,
++        );
++        if (!res.headersSent) {
++          res.writeHead(400, { "Content-Type": "application/json" });
++          res.end(JSON.stringify(jsonRpcError(null, -32700, "Parse error")));
++        }
++      }
++    })();
++  });
++
++  await new Promise<void>((resolve, reject) => {
++    httpServer.once("error", reject);
++    httpServer.listen(port, "127.0.0.1", () => {
++      httpServer.removeListener("error", reject);
++      const cfg = loadConfig();
++      const defaultSessionKey = resolveMainSessionKey(cfg);
++      const { tools: initial } = getTools({ cfg, sessionKey: defaultSessionKey });
++      logDebug(
++        `mcp: loopback server listening on 127.0.0.1:${port} (${initial.length} tools, ttl=${TOOL_CACHE_TTL_MS}ms)`,
++      );
++      resolve();
++    });
++  });
++
++  return {
++    close: () =>
++      new Promise<void>((resolve, reject) => {
++        httpServer.close((err) => (err ? reject(err) : resolve()));
++      }),
++  };
++}
+diff --git a/src/gateway/node-command-policy.ts b/src/gateway/node-command-policy.ts
+index d4ff5c0f04..1e3109b14b 100644
+--- a/src/gateway/node-command-policy.ts
++++ b/src/gateway/node-command-policy.ts
+@@ -1,4 +1,5 @@
+ import type { OpenClawConfig } from "../config/config.js";
++import type { GatewayNodeOverrideConfig } from "../config/types.gateway.js";
+ import {
+   NODE_BROWSER_PROXY_COMMAND,
+   NODE_SYSTEM_NOTIFY_COMMAND,
+@@ -177,22 +178,66 @@ function normalizePlatformId(platform?: string, deviceFamily?: string): Platform
+ 
+ export function resolveNodeCommandAllowlist(
+   cfg: OpenClawConfig,
+-  node?: Pick<NodeSession, "platform" | "deviceFamily">,
++  node?: Pick<NodeSession, "platform" | "deviceFamily"> &
++    Partial<Pick<NodeSession, "nodeId" | "displayName">>,
+ ): Set<string> {
+   const platformId = normalizePlatformId(node?.platform, node?.deviceFamily);
+   const base = PLATFORM_DEFAULTS[platformId] ?? PLATFORM_DEFAULTS.unknown;
+-  const extra = cfg.gateway?.nodes?.allowCommands ?? [];
+-  const deny = new Set(cfg.gateway?.nodes?.denyCommands ?? []);
+-  const allow = new Set([...base, ...extra].map((cmd) => cmd.trim()).filter(Boolean));
+-  for (const blocked of deny) {
+-    const trimmed = blocked.trim();
+-    if (trimmed) {
+-      allow.delete(trimmed);
+-    }
++
++  // Global config
++  const extraGlobal = cfg.gateway?.nodes?.allowCommands ?? [];
++  const denyGlobal = cfg.gateway?.nodes?.denyCommands ?? [];
++
++  // Per-node override lookup
++  const override = resolveNodeOverride(cfg, node);
++  const extraNode = override?.allowCommands ?? [];
++  const denyNode = override?.denyCommands ?? [];
++
++  // Merge: base + global allow + per-node allow
++  const allow = new Set(
++    [...base, ...extraGlobal, ...extraNode].map((cmd) => cmd.trim()).filter(Boolean),
++  );
++
++  // Remove: global deny + per-node deny
++  for (const cmd of [...denyGlobal, ...denyNode].map((c) => c.trim()).filter(Boolean)) {
++    allow.delete(cmd);
+   }
+   return allow;
+ }
+ 
++function resolveNodeOverride(
++  cfg: OpenClawConfig,
++  node?: Partial<Pick<NodeSession, "nodeId" | "displayName">>,
++): GatewayNodeOverrideConfig | undefined {
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides || !node) {
++    return undefined;
++  }
++  // 1. nodeId exact match
++  if (node.nodeId && overrides[node.nodeId]) {
++    return overrides[node.nodeId];
++  }
++  // 2. displayName exact match
++  if (node.displayName && overrides[node.displayName]) {
++    return overrides[node.displayName];
++  }
++  // 3. nodeId prefix match (longest prefix wins; skip empty keys)
++  if (node.nodeId) {
++    let bestKey: string | undefined;
++    for (const key of Object.keys(overrides)) {
++      if (key && node.nodeId.startsWith(key)) {
++        if (!bestKey || key.length > bestKey.length) {
++          bestKey = key;
++        }
++      }
++    }
++    if (bestKey) {
++      return overrides[bestKey];
++    }
++  }
++  return undefined;
++}
++
+ export function isNodeCommandAllowed(params: {
+   command: string;
+   declaredCommands?: string[];
+diff --git a/src/gateway/server.impl.ts b/src/gateway/server.impl.ts
+index b1e249271b..140a27879a 100644
+--- a/src/gateway/server.impl.ts
++++ b/src/gateway/server.impl.ts
+@@ -1,3 +1,4 @@
++import os from "node:os";
+ import path from "node:path";
+ import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
+ import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
+@@ -81,6 +82,7 @@ import {
+   type GatewayUpdateAvailableEventPayload,
+ } from "./events.js";
+ import { ExecApprovalManager } from "./exec-approval-manager.js";
++import { MCP_PORT_OFFSET, ensureMcpConfigFile, startMcpLoopbackServer } from "./mcp-http.js";
+ import { startGatewayModelPricingRefresh } from "./model-pricing-cache.js";
+ import { NodeRegistry } from "./node-registry.js";
+ import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
+@@ -1163,6 +1165,18 @@ export async function startGatewayServer(
+     log,
+     isNixMode,
+   });
++
++  // Start a plain HTTP loopback server for MCP (avoids self-signed TLS issues).
++  const mcpPort = port + MCP_PORT_OFFSET;
++  let mcpServer: { close: () => Promise<void> } | undefined;
++  try {
++    mcpServer = await startMcpLoopbackServer(mcpPort);
++    ensureMcpConfigFile(path.join(os.homedir(), ".openclaw"), mcpPort);
++    log.info(`MCP loopback server listening on http://127.0.0.1:${mcpPort}/mcp`);
++  } catch (err) {
++    log.warn(`MCP loopback server failed to start: ${String(err)}`);
++  }
++
+   const stopGatewayUpdateCheck = minimalTestGateway
+     ? () => {}
+     : scheduleGatewayUpdateCheck({
+@@ -1351,6 +1365,7 @@ export async function startGatewayServer(
+       stopModelPricingRefresh();
+       channelHealthMonitor?.stop();
+       clearSecretsRuntimeSnapshot();
++      await mcpServer?.close().catch(() => {});
+       await close(opts);
+     },
+   };
+diff --git a/src/gateway/server/ws-connection/message-handler.ts b/src/gateway/server/ws-connection/message-handler.ts
+index 9f3a24f925..e09860439b 100644
+--- a/src/gateway/server/ws-connection/message-handler.ts
++++ b/src/gateway/server/ws-connection/message-handler.ts
+@@ -902,6 +902,8 @@ export function attachGatewayWsMessageHandler(params: {
+           const allowlist = resolveNodeCommandAllowlist(cfg, {
+             platform: connectParams.client.platform,
+             deviceFamily: connectParams.client.deviceFamily,
++            nodeId: device?.id ?? connectParams.client.id,
++            displayName: connectParams.client.displayName,
+           });
+           const declared = Array.isArray(connectParams.commands) ? connectParams.commands : [];
+           const filtered = declared
+diff --git a/src/gateway/session-archive.fs.ts b/src/gateway/session-archive.fs.ts
+index 214748730a..c0dc565dac 100644
+--- a/src/gateway/session-archive.fs.ts
++++ b/src/gateway/session-archive.fs.ts
+@@ -4,6 +4,7 @@ import path from "node:path";
+ import {
+   formatSessionArchiveTimestamp,
+   parseSessionArchiveTimestamp,
++  resolveSessionPromptFileNameFromTranscriptFileName,
+   type SessionArchiveReason,
+ } from "../config/sessions/artifacts.js";
+ import {
+@@ -107,6 +108,17 @@ export function archiveSessionTranscripts(opts: {
+     }
+     try {
+       archived.push(archiveFileOnDisk(candidatePath, opts.reason));
++      const promptFileName = resolveSessionPromptFileNameFromTranscriptFileName(
++        path.basename(candidatePath),
++      );
++      if (!promptFileName) {
++        continue;
++      }
++      const promptPath = path.join(path.dirname(candidatePath), promptFileName);
++      if (!fs.existsSync(promptPath)) {
++        continue;
++      }
++      archived.push(archiveFileOnDisk(promptPath, opts.reason));
+     } catch {
+       // Best-effort.
+     }
+diff --git a/src/security/audit-extra.sync.ts b/src/security/audit-extra.sync.ts
+index bebcc44c0d..d654fb02c7 100644
+--- a/src/security/audit-extra.sync.ts
++++ b/src/security/audit-extra.sync.ts
+@@ -197,6 +197,89 @@ function normalizeNodeCommand(value: unknown): string {
+   return typeof value === "string" ? value.trim() : "";
+ }
+ 
++type NodeCommandConfigEntry = {
++  path: string;
++  values: string[];
++  overrideKey?: string;
++};
++
++function formatNodeOverrideConfigPath(
++  key: string,
++  field: "allowCommands" | "denyCommands",
++): string {
++  return `gateway.nodes.overrides[${JSON.stringify(key)}].${field}`;
++}
++
++function listConfiguredNodeAllowCommandEntries(cfg: OpenClawConfig): NodeCommandConfigEntry[] {
++  const out: NodeCommandConfigEntry[] = [];
++  const globalAllow = cfg.gateway?.nodes?.allowCommands;
++  if (Array.isArray(globalAllow)) {
++    const values = globalAllow.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length > 0) {
++      out.push({ path: "gateway.nodes.allowCommands", values });
++    }
++  }
++
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides) {
++    return out;
++  }
++  for (const [key, override] of Object.entries(overrides)) {
++    if (!override) {
++      continue;
++    }
++    const allow = override.allowCommands;
++    if (!Array.isArray(allow)) {
++      continue;
++    }
++    const values = allow.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length === 0) {
++      continue;
++    }
++    out.push({
++      path: formatNodeOverrideConfigPath(key, "allowCommands"),
++      values,
++      overrideKey: key,
++    });
++  }
++  return out;
++}
++
++function listConfiguredNodeDenyCommandEntries(cfg: OpenClawConfig): NodeCommandConfigEntry[] {
++  const out: NodeCommandConfigEntry[] = [];
++  const globalDeny = cfg.gateway?.nodes?.denyCommands;
++  if (Array.isArray(globalDeny)) {
++    const values = globalDeny.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length > 0) {
++      out.push({ path: "gateway.nodes.denyCommands", values });
++    }
++  }
++
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides) {
++    return out;
++  }
++  for (const [key, override] of Object.entries(overrides)) {
++    if (!override) {
++      continue;
++    }
++    const deny = override.denyCommands;
++    if (!Array.isArray(deny)) {
++      continue;
++    }
++    const values = deny.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length === 0) {
++      continue;
++    }
++    out.push({
++      path: formatNodeOverrideConfigPath(key, "denyCommands"),
++      values,
++      overrideKey: key,
++    });
++  }
++  return out;
++}
++
+ function listKnownNodeCommands(cfg: OpenClawConfig): Set<string> {
+   const baseCfg: OpenClawConfig = {
+     ...cfg,
+@@ -981,21 +1064,31 @@ export function collectSandboxDangerousConfigFindings(cfg: OpenClawConfig): Secu
+ 
+ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
+   const findings: SecurityAuditFinding[] = [];
+-  const denyListRaw = cfg.gateway?.nodes?.denyCommands;
+-  if (!Array.isArray(denyListRaw) || denyListRaw.length === 0) {
++  const denyEntries = listConfiguredNodeDenyCommandEntries(cfg);
++  if (denyEntries.length === 0) {
+     return findings;
+   }
+ 
+-  const denyList = denyListRaw.map(normalizeNodeCommand).filter(Boolean);
+-  if (denyList.length === 0) {
+-    return findings;
++  const knownCommands = listKnownNodeCommands(cfg);
++  for (const entry of listConfiguredNodeAllowCommandEntries(cfg)) {
++    for (const value of entry.values) {
++      knownCommands.add(value);
++    }
+   }
+ 
+-  const knownCommands = listKnownNodeCommands(cfg);
+-  const patternLike = denyList.filter((entry) => looksLikeNodeCommandPattern(entry));
+-  const unknownExact = denyList.filter(
+-    (entry) => !looksLikeNodeCommandPattern(entry) && !knownCommands.has(entry),
+-  );
++  const patternLike: string[] = [];
++  const unknownExact: string[] = [];
++  for (const entry of denyEntries) {
++    for (const value of entry.values) {
++      if (looksLikeNodeCommandPattern(value)) {
++        patternLike.push(`${entry.path}: ${value}`);
++        continue;
++      }
++      if (!knownCommands.has(value)) {
++        unknownExact.push(`${entry.path}: ${value}`);
++      }
++    }
++  }
+   if (patternLike.length === 0 && unknownExact.length === 0) {
+     return findings;
+   }
+@@ -1009,7 +1102,10 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
+   if (unknownExact.length > 0) {
+     const unknownDetails = unknownExact
+       .map((entry) => {
+-        const suggestions = suggestKnownNodeCommands(entry, knownCommands);
++        // entry may be "path: commandName"; extract the command name for fuzzy matching.
++        const colonIdx = entry.lastIndexOf(": ");
++        const cmdName = colonIdx >= 0 ? entry.slice(colonIdx + 2) : entry;
++        const suggestions = suggestKnownNodeCommands(cmdName, knownCommands);
+         if (suggestions.length === 0) {
+           return entry;
+         }
+@@ -1024,9 +1120,9 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
+   findings.push({
+     checkId: "gateway.nodes.deny_commands_ineffective",
+     severity: "warn",
+-    title: "Some gateway.nodes.denyCommands entries are ineffective",
++    title: "Some node denyCommands entries are ineffective",
+     detail:
+-      "gateway.nodes.denyCommands uses exact node command-name matching only (for example `system.run`), not shell-text filtering inside a command payload.\n" +
++      "gateway.nodes.denyCommands uses exact node command-name matching only (global and per-node overrides, for example `system.run`), not shell-text filtering inside a command payload.\n" +
+       detailParts.map((entry) => `- ${entry}`).join("\n"),
+     remediation:
+       `Use exact command names (for example: ${examples.join(", ")}). ` +
+@@ -1040,21 +1136,33 @@ export function collectNodeDangerousAllowCommandFindings(
+   cfg: OpenClawConfig,
+ ): SecurityAuditFinding[] {
+   const findings: SecurityAuditFinding[] = [];
+-  const allowRaw = cfg.gateway?.nodes?.allowCommands;
+-  if (!Array.isArray(allowRaw) || allowRaw.length === 0) {
++  const allowEntries = listConfiguredNodeAllowCommandEntries(cfg);
++  if (allowEntries.length === 0) {
+     return findings;
+   }
+ 
+-  const allow = new Set(allowRaw.map(normalizeNodeCommand).filter(Boolean));
+-  if (allow.size === 0) {
+-    return findings;
++  const globalDeny = new Set((cfg.gateway?.nodes?.denyCommands ?? []).map(normalizeNodeCommand));
++  const dangerousEntries: string[] = [];
++  for (const entry of allowEntries) {
++    const allowSet = new Set(entry.values);
++    const denySet = new Set(globalDeny);
++    if (entry.overrideKey) {
++      const overrideDeny = cfg.gateway?.nodes?.overrides?.[entry.overrideKey]?.denyCommands;
++      if (Array.isArray(overrideDeny)) {
++        for (const cmd of overrideDeny.map(normalizeNodeCommand).filter(Boolean)) {
++          denySet.add(cmd);
++        }
++      }
++    }
++    const dangerousAllowed = DEFAULT_DANGEROUS_NODE_COMMANDS.filter(
++      (cmd) => allowSet.has(cmd) && !denySet.has(cmd),
++    );
++    if (dangerousAllowed.length === 0) {
++      continue;
++    }
++    dangerousEntries.push(`${entry.path}: ${dangerousAllowed.join(", ")}`);
+   }
+-
+-  const deny = new Set((cfg.gateway?.nodes?.denyCommands ?? []).map(normalizeNodeCommand));
+-  const dangerousAllowed = DEFAULT_DANGEROUS_NODE_COMMANDS.filter(
+-    (cmd) => allow.has(cmd) && !deny.has(cmd),
+-  );
+-  if (dangerousAllowed.length === 0) {
++  if (dangerousEntries.length === 0) {
+     return findings;
+   }
+ 
+@@ -1063,10 +1171,11 @@ export function collectNodeDangerousAllowCommandFindings(
+     severity: isGatewayRemotelyExposed(cfg) ? "critical" : "warn",
+     title: "Dangerous node commands explicitly enabled",
+     detail:
+-      `gateway.nodes.allowCommands includes: ${dangerousAllowed.join(", ")}. ` +
+-      "These commands can trigger high-impact device actions (camera/screen/contacts/calendar/reminders/SMS).",
++      "Dangerous node commands are enabled by these settings:\n" +
++      dangerousEntries.map((entry) => `- ${entry}`).join("\n") +
++      "\nThese commands can trigger high-impact device actions (camera/screen/contacts/calendar/reminders/SMS).",
+     remediation:
+-      "Remove these entries from gateway.nodes.allowCommands (recommended). " +
++      "Remove these entries from gateway.nodes.allowCommands / gateway.nodes.overrides.*.allowCommands (recommended). " +
+       "If you keep them, treat gateway auth as full operator access and keep gateway exposure local/tailnet-only.",
+   });
+ 
+diff --git a/src/security/audit.test.ts b/src/security/audit.test.ts
+index 76e9fcb70d..8eb0c1cb6c 100644
+--- a/src/security/audit.test.ts
++++ b/src/security/audit.test.ts
+@@ -1517,6 +1517,68 @@ description: test skill
+     );
+   });
+ 
++  it("suggests prefix-matching commands for unknown denyCommands entries", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          denyCommands: ["system.run.prep"],
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.deny_commands_ineffective",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain("system.run.prep");
++    expect(finding?.detail).toContain("did you mean");
++    expect(finding?.detail).toContain("system.run.prepare");
++  });
++
++  it("keeps unknown denyCommands entries without suggestions when no close command exists", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          denyCommands: ["zzzzzzzzzzzzzz"],
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.deny_commands_ineffective",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain("zzzzzzzzzzzzzz");
++    expect(finding?.detail).not.toContain("did you mean");
++  });
++
++  it("flags ineffective gateway.nodes.overrides.*.denyCommands entries", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          overrides: {
++            "node-a": {
++              denyCommands: ["camera.*", "camera.snapx"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.deny_commands_ineffective",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain('gateway.nodes.overrides["node-a"].denyCommands: camera.*');
++    expect(finding?.detail).toContain(
++      'gateway.nodes.overrides["node-a"].denyCommands: camera.snapx',
++    );
++  });
++
+   it("evaluates dangerous gateway.nodes.allowCommands findings", async () => {
+     const cases = [
+       {
+@@ -1576,6 +1638,63 @@ description: test skill
+     );
+   });
+ 
++  it("flags dangerous gateway.nodes.overrides.*.allowCommands entries", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        bind: "loopback",
++        nodes: {
++          overrides: {
++            "node-a": {
++              allowCommands: ["camera.snap", "screen.record"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.allow_commands_dangerous",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain('gateway.nodes.overrides["node-a"].allowCommands');
++    expect(finding?.detail).toContain("camera.snap");
++    expect(finding?.detail).toContain("screen.record");
++  });
++
++  it("does not flag dangerous allowCommands entries when denied again", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          allowCommands: ["camera.snap", "screen.record"],
++          denyCommands: ["camera.snap", "screen.record"],
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    expectNoFinding(res, "gateway.nodes.allow_commands_dangerous");
++  });
++
++  it("does not flag dangerous overrides allowCommands entries when denied again", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          denyCommands: ["camera.snap"],
++          overrides: {
++            "node-a": {
++              allowCommands: ["camera.snap", "screen.record"],
++              denyCommands: ["screen.record"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    expectNoFinding(res, "gateway.nodes.allow_commands_dangerous");
++  });
++
+   it("flags agent profile overrides when global tools.profile is minimal", async () => {
+     const cfg: OpenClawConfig = {
+       tools: {
+-- 
+2.50.1 (Apple Git-155)
+

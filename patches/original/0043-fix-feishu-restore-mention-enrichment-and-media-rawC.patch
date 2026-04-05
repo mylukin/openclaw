@@ -1,0 +1,99 @@
+From e78166190cdf9edce677f49bf8e8b825a58c8bf3 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 16:01:24 +0800
+Subject: [PATCH 43/98] fix(feishu): restore mention enrichment and media
+ rawContent from backup
+
+- Add mentions field to FeishuMessageGetItem and call
+  enrichMentionPlaceholders in parseFeishuMessageItem so quoted
+  messages show real @names instead of @_user_N placeholders
+- Add rawContent to SendMediaResult and return the actual Feishu
+  JSON payload from sendImageFeishu/sendFileFeishu so journal entries
+  contain the real content instead of [image] placeholders
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/media.ts | 10 ++++++----
+ extensions/feishu/src/send.ts  | 10 +++++++++-
+ 2 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/extensions/feishu/src/media.ts b/extensions/feishu/src/media.ts
+index 877986ee9c..936f94c243 100644
+--- a/extensions/feishu/src/media.ts
++++ b/extensions/feishu/src/media.ts
+@@ -260,6 +260,8 @@ export type UploadFileResult = {
+ export type SendMediaResult = {
+   messageId: string;
+   chatId: string;
++  /** Raw Feishu message content JSON (e.g. {"image_key":"..."} or {"file_key":"..."}) */
++  rawContent?: string;
+ };
+ 
+ /**
+@@ -379,7 +381,7 @@ export async function sendImageFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu image reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+   }
+ 
+   const response = await client.im.message.create({
+@@ -391,7 +393,7 @@ export async function sendImageFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu image send failed");
+-  return toFeishuSendResult(response, receiveId);
++  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+ }
+ 
+ /**
+@@ -426,7 +428,7 @@ export async function sendFileFeishu(params: {
+       },
+     });
+     assertFeishuMessageApiSuccess(response, "Feishu file reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+   }
+ 
+   const response = await client.im.message.create({
+@@ -438,7 +440,7 @@ export async function sendFileFeishu(params: {
+     },
+   });
+   assertFeishuMessageApiSuccess(response, "Feishu file send failed");
+-  return toFeishuSendResult(response, receiveId);
++  return { ...toFeishuSendResult(response, receiveId), rawContent: content };
+ }
+ 
+ /**
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index 87d2e3384e..1b5af59bca 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -89,6 +89,11 @@ type FeishuMessageGetItem = {
+   msg_type?: string;
+   body?: { content?: string };
+   sender?: FeishuMessageSender;
++  mentions?: Array<{
++    key?: string;
++    name?: string;
++    id?: { open_id?: string; user_id?: string; union_id?: string };
++  }>;
+   create_time?: string;
+ };
+ 
+@@ -278,7 +283,10 @@ function parseFeishuMessageItem(
+     senderId: item.sender?.id,
+     senderOpenId: item.sender?.id_type === "open_id" ? item.sender?.id : undefined,
+     senderType: item.sender?.sender_type,
+-    content: parseFeishuMessageContent(rawContent, msgType),
++    content: enrichMentionPlaceholders(
++      parseFeishuMessageContent(rawContent, msgType),
++      item.mentions,
++    ),
+     contentType: msgType,
+     createTime: item.create_time ? parseInt(String(item.create_time), 10) : undefined,
+     threadId: item.thread_id || undefined,
+-- 
+2.50.1 (Apple Git-155)
+

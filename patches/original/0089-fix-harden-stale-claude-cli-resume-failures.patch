@@ -1,0 +1,394 @@
+From 8376c76177c4c9277428d77f5ebb93c871c18565 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 29 Mar 2026 22:44:37 +0800
+Subject: [PATCH 89/98] fix: harden stale claude-cli resume failures
+
+---
+ .../cli-runner.helpers.stream-json.test.ts    | 40 +++++++++-
+ src/agents/cli-runner.ts                      | 29 +++++++-
+ src/agents/cli-runner/helpers.ts              | 52 +++++++++++++
+ ...dded-helpers.isbillingerrormessage.test.ts | 11 +++
+ src/agents/pi-embedded-helpers/errors.ts      | 27 +++++++
+ .../reply/agent-runner-execution.ts           | 17 +++--
+ .../agent-runner.misc.runreplyagent.test.ts   | 73 +++++++++++++++++++
+ 7 files changed, 242 insertions(+), 7 deletions(-)
+
+diff --git a/src/agents/cli-runner.helpers.stream-json.test.ts b/src/agents/cli-runner.helpers.stream-json.test.ts
+index 7620f4e01f..020763eb62 100644
+--- a/src/agents/cli-runner.helpers.stream-json.test.ts
++++ b/src/agents/cli-runner.helpers.stream-json.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it, vi } from "vitest";
+ import type { CliBackendConfig } from "../config/types.js";
+-import { createStreamJsonProcessor } from "./cli-runner/helpers.js";
++import { createStreamJsonProcessor, summarizeCliFailure } from "./cli-runner/helpers.js";
+ 
+ function createBackend(overrides: Partial<CliBackendConfig> = {}): CliBackendConfig {
+   return {
+@@ -494,3 +494,41 @@ describe("createStreamJsonProcessor", () => {
+     expect(output.text).toBe("part 2");
+   });
+ });
++
++describe("summarizeCliFailure", () => {
++  it("treats init-only stream-json resume failures as stale sessions", () => {
++    const result = summarizeCliFailure({
++      stdout:
++        '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}\n',
++      stderr: "",
++      outputMode: "stream-json",
++      useResume: true,
++      cliSessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
++      parsedStreamOutput: { text: "", sessionId: "480007d1-b916-417c-b504-71d76bf35f7e" },
++    });
++
++    expect(result).toEqual({
++      message: "CLI resumed session but produced no assistant response before exit.",
++      reason: "session_expired",
++    });
++  });
++
++  it("uses parsed stream text instead of raw transcript history", () => {
++    const result = summarizeCliFailure({
++      stdout: [
++        '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}',
++        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still building"}]}}',
++      ].join("\n"),
++      stderr: "",
++      outputMode: "stream-json",
++      useResume: true,
++      cliSessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
++      parsedStreamOutput: {
++        text: "still building",
++        sessionId: "480007d1-b916-417c-b504-71d76bf35f7e",
++      },
++    });
++
++    expect(result).toEqual({ message: "still building" });
++  });
++});
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 08d6e6ca58..0e2b21d17a 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -48,6 +48,7 @@ import {
+   resolveCliNoOutputTimeoutMs,
+   resolvePromptInput,
+   resolveSessionIdToSend,
++  summarizeCliFailure,
+   resolveSystemPromptUsage,
+   writeCliImages,
+ } from "./cli-runner/helpers.js";
+@@ -1218,6 +1219,32 @@ export async function runCliAgent(params: {
+         }
+ 
+         if (result.exitCode !== 0 || result.reason !== "exit") {
++          const parsedStreamOutput =
++            !stderr && streamProcessor
++              ? (() => {
++                  try {
++                    return streamProcessor.finish();
++                  } catch {
++                    return null;
++                  }
++                })()
++              : null;
++          const cliFailure = summarizeCliFailure({
++            stdout,
++            stderr,
++            outputMode,
++            useResume,
++            cliSessionId: params.cliSessionId,
++            parsedStreamOutput,
++          });
++          if (cliFailure.reason === "session_expired") {
++            throw new FailoverError(cliFailure.message, {
++              reason: cliFailure.reason,
++              provider: params.provider,
++              model: modelId,
++              status: resolveFailoverStatus(cliFailure.reason),
++            });
++          }
+           if (result.reason === "no-output-timeout" || result.noOutputTimedOut) {
+             const timeoutReason = `CLI produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`;
+             log.warn(
+@@ -1250,7 +1277,7 @@ export async function runCliAgent(params: {
+               status: resolveFailoverStatus("timeout"),
+             });
+           }
+-          const err = stderr || stdout || "CLI failed.";
++          const err = cliFailure.message;
+           const reason = classifyFailoverReason(err) ?? "unknown";
+           const status = resolveFailoverStatus(reason);
+           throw new FailoverError(err, {
+diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
+index 61e9d6d24c..07a0b17556 100644
+--- a/src/agents/cli-runner/helpers.ts
++++ b/src/agents/cli-runner/helpers.ts
+@@ -40,6 +40,58 @@ export type CliOutput = {
+   usage?: CliUsage;
+ };
+ 
++export function summarizeCliFailure(params: {
++  stdout: string;
++  stderr: string;
++  outputMode: CliBackendConfig["output"];
++  useResume: boolean;
++  cliSessionId?: string;
++  parsedStreamOutput?: CliOutput | null;
++}): {
++  message: string;
++  reason?: "session_expired";
++} {
++  const stderr = params.stderr.trim();
++  if (stderr) {
++    return { message: stderr };
++  }
++
++  const stdout = params.stdout.trim();
++  const parsedStreamText = params.parsedStreamOutput?.text?.trim();
++  const hasStreamInit =
++    params.outputMode === "stream-json" &&
++    stdout.includes('"type":"system"') &&
++    stdout.includes('"subtype":"init"');
++
++  // Claude CLI can sometimes resume a stale session, replay init/history
++  // frames, then exit before producing a new assistant turn. Treat that as a
++  // stale session so callers can retry with a fresh session.
++  if (
++    params.useResume &&
++    params.cliSessionId &&
++    params.outputMode === "stream-json" &&
++    hasStreamInit
++  ) {
++    if (!parsedStreamText) {
++      return {
++        message: "CLI resumed session but produced no assistant response before exit.",
++        reason: "session_expired",
++      };
++    }
++    return { message: parsedStreamText };
++  }
++
++  if (parsedStreamText) {
++    return { message: parsedStreamText };
++  }
++
++  if (params.outputMode === "stream-json" && hasStreamInit) {
++    return { message: "CLI exited unexpectedly after resuming a prior session." };
++  }
++
++  return { message: stdout || "CLI failed." };
++}
++
+ export function buildSystemPrompt(params: {
+   workspaceDir: string;
+   config?: OpenClawConfig;
+diff --git a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
+index 686cbaf77d..4cecc71e60 100644
+--- a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
++++ b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
+@@ -484,6 +484,17 @@ describe("isLikelyContextOverflowError", () => {
+       expect(isLikelyContextOverflowError(sample)).toBe(false);
+     }
+   });
++
++  it("excludes raw CLI stream transcripts even when they mention historical overflow text", () => {
++    const sample = [
++      '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}',
++      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."}]}}',
++      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Command running in background with ID: bm4efo1mn."}]}}',
++    ].join("\n");
++
++    expect(isContextOverflowError(sample)).toBe(false);
++    expect(isLikelyContextOverflowError(sample)).toBe(false);
++  });
+ });
+ 
+ describe("extractObservedOverflowTokenCount", () => {
+diff --git a/src/agents/pi-embedded-helpers/errors.ts b/src/agents/pi-embedded-helpers/errors.ts
+index cda4e2a5d5..e3d965eaa9 100644
+--- a/src/agents/pi-embedded-helpers/errors.ts
++++ b/src/agents/pi-embedded-helpers/errors.ts
+@@ -134,6 +134,22 @@ function hasRateLimitTpmHint(raw: string): boolean {
+   return /\btpm\b/i.test(lower) || lower.includes("tokens per minute");
+ }
+ 
++function looksLikeCliStreamTranscript(raw: string): boolean {
++  if (!raw || raw.length < 100) {
++    return false;
++  }
++  if (!raw.includes('"type":"system"') || !raw.includes('"subtype":"init"')) {
++    return false;
++  }
++  return (
++    raw.includes('"type":"assistant"') ||
++    raw.includes('"type":"user"') ||
++    raw.includes('"type":"result"') ||
++    raw.includes('"session_id"') ||
++    raw.includes('"sessionId"')
++  );
++}
++
+ export function isContextOverflowError(errorMessage?: string): boolean {
+   if (!errorMessage) {
+     return false;
+@@ -149,6 +165,13 @@ export function isContextOverflowError(errorMessage?: string): boolean {
+     return false;
+   }
+ 
++  // Claude CLI can emit a whole prior session transcript on failure. Historical
++  // mentions of "Context overflow" inside that transcript are not a signal that
++  // the current attempt actually overflowed.
++  if (looksLikeCliStreamTranscript(errorMessage)) {
++    return false;
++  }
++
+   const hasRequestSizeExceeds = lower.includes("request size exceeds");
+   const hasContextWindow =
+     lower.includes("context window") ||
+@@ -211,6 +234,10 @@ export function isLikelyContextOverflowError(errorMessage?: string): boolean {
+     return false;
+   }
+ 
++  if (looksLikeCliStreamTranscript(errorMessage)) {
++    return false;
++  }
++
+   if (CONTEXT_WINDOW_TOO_SMALL_RE.test(errorMessage)) {
+     return false;
+   }
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index 2c8d30a90a..d7aca8703b 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -4,6 +4,7 @@ import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-pay
+ import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
+ import { runCliAgent } from "../../agents/cli-runner.js";
+ import { getCliSessionId } from "../../agents/cli-session.js";
++import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
+ import { runWithModelFallback } from "../../agents/model-fallback.js";
+ import { isCliProvider } from "../../agents/model-selection.js";
+ import {
+@@ -737,8 +738,10 @@ export async function runAgentTurnWithFallback(params: {
+       break;
+     } catch (err) {
+       const message = err instanceof Error ? err.message : String(err);
+-      const isBilling = isBillingErrorMessage(message);
+-      const isContextOverflow = !isBilling && isLikelyContextOverflowError(message);
++      const failoverReason = resolveFailoverReasonFromError(err);
++      const isBilling = failoverReason === "billing" || isBillingErrorMessage(message);
++      const isContextOverflow =
++        !isBilling && !failoverReason && isLikelyContextOverflowError(message);
+       const isCompactionFailure = !isBilling && isCompactionFailureError(message);
+       const isSessionCorruption = /function call turn comes immediately after/i.test(message);
+       const isRoleOrderingError = /incorrect role information|roles must alternate/i.test(message);
+@@ -838,9 +841,13 @@ export async function runAgentTurnWithFallback(params: {
+         ? BILLING_ERROR_USER_MESSAGE
+         : isContextOverflow
+           ? "⚠️ Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."
+-          : isRoleOrderingError
+-            ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
+-            : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
++          : failoverReason === "session_expired"
++            ? "⚠️ Agent session expired before reply. Please try again."
++            : failoverReason === "format"
++              ? "⚠️ Agent returned malformed output before reply. Please try again."
++              : isRoleOrderingError
++                ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
++                : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
+ 
+       return {
+         kind: "final",
+diff --git a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+index f64ef722fb..37a895d366 100644
+--- a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
++++ b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
+@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
+ import os from "node:os";
+ import path from "node:path";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { FailoverError } from "../../agents/failover-error.js";
+ import type { SessionEntry } from "../../config/sessions.js";
+ import { loadSessionStore, saveSessionStore } from "../../config/sessions.js";
+ import { onAgentEvent } from "../../infra/agent-events.js";
+@@ -2131,4 +2132,76 @@ describe("runReplyAgent billing error classification", () => {
+     expect(payload?.text).toContain("billing error");
+     expect(payload?.text).not.toContain("Context overflow");
+   });
++
++  it("does not relabel format FailoverErrors as context overflow when the message is a CLI transcript", async () => {
++    const transcriptMessage = [
++      '{"type":"system","subtype":"init","session_id":"480007d1-b916-417c-b504-71d76bf35f7e"}',
++      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."}]}}',
++    ].join("\n");
++    runEmbeddedPiAgentMock.mockRejectedValueOnce(
++      new FailoverError(transcriptMessage, {
++        reason: "format",
++        provider: "claude-cli",
++        model: "opus[1m]",
++        status: 400,
++      }),
++    );
++
++    const typing = createMockTypingController();
++    const sessionCtx = {
++      Provider: "telegram",
++      MessageSid: "msg",
++    } as unknown as TemplateContext;
++    const resolvedQueue = { mode: "interrupt" } as unknown as QueueSettings;
++    const followupRun = {
++      prompt: "hello",
++      summaryLine: "hello",
++      enqueuedAt: Date.now(),
++      run: {
++        sessionId: "session",
++        sessionKey: "main",
++        messageProvider: "telegram",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        config: {},
++        skillsSnapshot: {},
++        provider: "anthropic",
++        model: "claude",
++        thinkLevel: "low",
++        verboseLevel: "off",
++        elevatedLevel: "off",
++        bashElevated: {
++          enabled: false,
++          allowed: false,
++          defaultLevel: "off",
++        },
++        timeoutMs: 1_000,
++        blockReplyBreak: "message_end",
++      },
++    } as unknown as FollowupRun;
++
++    const result = await runReplyAgent({
++      commandBody: "hello",
++      followupRun,
++      queueKey: "main",
++      resolvedQueue,
++      shouldSteer: false,
++      shouldFollowup: false,
++      isActive: false,
++      isStreaming: false,
++      typing,
++      sessionCtx,
++      defaultModel: "anthropic/claude",
++      resolvedVerboseLevel: "off",
++      isNewSession: false,
++      blockStreamingEnabled: false,
++      resolvedBlockStreamingBreak: "message_end",
++      shouldInjectGroupIntro: false,
++      typingMode: "instant",
++    });
++
++    const payload = Array.isArray(result) ? result[0] : result;
++    expect(payload?.text).toContain("malformed output");
++    expect(payload?.text).not.toContain("Context overflow");
++  });
+ });
+-- 
+2.50.1 (Apple Git-155)
+

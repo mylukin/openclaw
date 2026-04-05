@@ -1,0 +1,666 @@
+From 1300d897347548c852b96954964cb882743a8c0c Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:24 +0800
+Subject: [PATCH 02/98] feat(gateway): harden node override policy and audit
+ checks
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/config/schema.help.ts                     |   4 +
+ src/config/schema.labels.ts                   |   1 +
+ src/config/types.gateway.ts                   |  12 ++
+ src/config/zod-schema.ts                      |  11 ++
+ src/gateway/gateway-misc.test.ts              | 154 +++++++++++++++++
+ src/gateway/node-command-policy.ts            |  63 ++++++-
+ .../server/ws-connection/message-handler.ts   |   2 +
+ src/security/audit-extra.sync.ts              | 158 +++++++++++++++---
+ src/security/audit.test.ts                    |  68 ++++++++
+ 9 files changed, 438 insertions(+), 35 deletions(-)
+
+diff --git a/src/config/schema.help.ts b/src/config/schema.help.ts
+index 908829cbf3..70bd029549 100644
+--- a/src/config/schema.help.ts
++++ b/src/config/schema.help.ts
+@@ -418,6 +418,10 @@ export const FIELD_HELP: Record<string, string> = {
+     "Extra node.invoke commands to allow beyond the gateway defaults (array of command strings). Enabling dangerous commands here is a security-sensitive override and is flagged by `openclaw security audit`.",
+   "gateway.nodes.denyCommands":
+     "Node command names to block even if present in node claims or default allowlist (exact command-name matching only, e.g. `system.run`; does not inspect shell text inside that command).",
++  "gateway.nodes.overrides":
++    "Per-node command policy overrides, keyed by node displayName, nodeId, or nodeId prefix. " +
++    "Each entry may specify allowCommands and denyCommands that merge with the global lists. " +
++    "Match precedence is nodeId exact, then displayName exact, then longest nodeId prefix.",
+   nodeHost:
+     "Node host controls for features exposed from this gateway node to other nodes or clients. Keep defaults unless you intentionally proxy local capabilities across your node network.",
+   "nodeHost.browserProxy":
+diff --git a/src/config/schema.labels.ts b/src/config/schema.labels.ts
+index c643cf91cd..98c7ba1f64 100644
+--- a/src/config/schema.labels.ts
++++ b/src/config/schema.labels.ts
+@@ -274,6 +274,7 @@ export const FIELD_LABELS: Record<string, string> = {
+   "gateway.nodes.browser.node": "Gateway Node Browser Pin",
+   "gateway.nodes.allowCommands": "Gateway Node Allowlist (Extra Commands)",
+   "gateway.nodes.denyCommands": "Gateway Node Denylist",
++  "gateway.nodes.overrides": "Per-Node Command Overrides",
+   nodeHost: "Node Host",
+   "nodeHost.browserProxy": "Node Browser Proxy",
+   "nodeHost.browserProxy.enabled": "Node Browser Proxy Enabled",
+diff --git a/src/config/types.gateway.ts b/src/config/types.gateway.ts
+index 58b061682a..e602353de3 100644
+--- a/src/config/types.gateway.ts
++++ b/src/config/types.gateway.ts
+@@ -345,6 +345,13 @@ export type GatewayHttpConfig = {
+   securityHeaders?: GatewayHttpSecurityHeadersConfig;
+ };
+ 
++export type GatewayNodeOverrideConfig = {
++  /** Additional node.invoke commands to allow for this specific node. */
++  allowCommands?: string[];
++  /** Commands to deny for this specific node (merged with global denyCommands). */
++  denyCommands?: string[];
++};
++
+ export type GatewayNodesConfig = {
+   /** Browser routing policy for node-hosted browser proxies. */
+   browser?: {
+@@ -357,6 +364,11 @@ export type GatewayNodesConfig = {
+   allowCommands?: string[];
+   /** Commands to deny even if they appear in the defaults or node claims. */
+   denyCommands?: string[];
++  /**
++   * Per-node overrides keyed by node displayName, nodeId, or nodeId prefix.
++   * Match precedence: nodeId exact, then displayName exact, then longest nodeId prefix.
++   */
++  overrides?: Record<string, GatewayNodeOverrideConfig>;
+ };
+ 
+ export type GatewayToolsConfig = {
+diff --git a/src/config/zod-schema.ts b/src/config/zod-schema.ts
+index c35d1191b6..d43105949a 100644
+--- a/src/config/zod-schema.ts
++++ b/src/config/zod-schema.ts
+@@ -802,6 +802,17 @@ export const OpenClawSchema = z
+               .optional(),
+             allowCommands: z.array(z.string()).optional(),
+             denyCommands: z.array(z.string()).optional(),
++            overrides: z
++              .record(
++                z.string(),
++                z
++                  .object({
++                    allowCommands: z.array(z.string()).optional(),
++                    denyCommands: z.array(z.string()).optional(),
++                  })
++                  .strict(),
++              )
++              .optional(),
+           })
+           .strict()
+           .optional(),
+diff --git a/src/gateway/gateway-misc.test.ts b/src/gateway/gateway-misc.test.ts
+index f7adcbf512..6ab646e1c5 100644
+--- a/src/gateway/gateway-misc.test.ts
++++ b/src/gateway/gateway-misc.test.ts
+@@ -393,6 +393,160 @@ describe("resolveNodeCommandAllowlist", () => {
+     expect(allow.has("system.which")).toBe(false);
+     expect(allow.has("device.info")).toBe(true);
+   });
++
++  it("per-node denyCommands merges with global deny", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "lukin-dev": {
++                denyCommands: ["browser.proxy"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-123", displayName: "lukin-dev" },
++    );
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("per-node allowCommands merges with global allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            allowCommands: ["camera.snap"],
++            overrides: {
++              "my-node": {
++                allowCommands: ["screen.record"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "ios", deviceFamily: "iPhone", nodeId: "n1", displayName: "my-node" },
++    );
++    expect(allow.has("camera.snap")).toBe(true);
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("nodeId match takes priority over displayName", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-display": { denyCommands: ["system.run"] },
++              "node-abc": { denyCommands: ["system.notify"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-abc", displayName: "my-display" },
++    );
++    // nodeId override wins: system.notify denied, system.run allowed
++    expect(allow.has("system.notify")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("matches by nodeId prefix", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("falls back to global config when no override matches", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "other-node": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "my-node", displayName: "my-node" },
++    );
++    // Global deny applies, per-node deny for "other-node" does not
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(true);
++  });
++
++  it("per-node allow and deny coexist; deny wins over allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-node": {
++                allowCommands: ["camera.snap", "screen.record"],
++                denyCommands: ["camera.snap"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "n1", displayName: "my-node" },
++    );
++    // camera.snap added by allow but removed by deny
++    expect(allow.has("camera.snap")).toBe(false);
++    // screen.record only in allow, not denied
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("ignores empty-string override key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "": { denyCommands: ["system.run"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "any-node", displayName: "" },
++    );
++    // Empty key should not match — system.run stays allowed
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("prefix match picks longest matching key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["system.run", "browser.proxy"] },
++              "node-lukin-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    // "node-lukin-" is the longest prefix → only browser.proxy denied
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
+ });
+ 
+ describe("normalizeVoiceWakeTriggers", () => {
+diff --git a/src/gateway/node-command-policy.ts b/src/gateway/node-command-policy.ts
+index 5f6734f6f7..420c216bc1 100644
+--- a/src/gateway/node-command-policy.ts
++++ b/src/gateway/node-command-policy.ts
+@@ -1,4 +1,5 @@
+ import type { OpenClawConfig } from "../config/config.js";
++import type { GatewayNodeOverrideConfig } from "../config/types.gateway.js";
+ import {
+   NODE_BROWSER_PROXY_COMMAND,
+   NODE_SYSTEM_NOTIFY_COMMAND,
+@@ -172,22 +173,66 @@ function normalizePlatformId(platform?: string, deviceFamily?: string): Platform
+ 
+ export function resolveNodeCommandAllowlist(
+   cfg: OpenClawConfig,
+-  node?: Pick<NodeSession, "platform" | "deviceFamily">,
++  node?: Pick<NodeSession, "platform" | "deviceFamily"> &
++    Partial<Pick<NodeSession, "nodeId" | "displayName">>,
+ ): Set<string> {
+   const platformId = normalizePlatformId(node?.platform, node?.deviceFamily);
+   const base = PLATFORM_DEFAULTS[platformId] ?? PLATFORM_DEFAULTS.unknown;
+-  const extra = cfg.gateway?.nodes?.allowCommands ?? [];
+-  const deny = new Set(cfg.gateway?.nodes?.denyCommands ?? []);
+-  const allow = new Set([...base, ...extra].map((cmd) => cmd.trim()).filter(Boolean));
+-  for (const blocked of deny) {
+-    const trimmed = blocked.trim();
+-    if (trimmed) {
+-      allow.delete(trimmed);
+-    }
++
++  // Global config
++  const extraGlobal = cfg.gateway?.nodes?.allowCommands ?? [];
++  const denyGlobal = cfg.gateway?.nodes?.denyCommands ?? [];
++
++  // Per-node override lookup
++  const override = resolveNodeOverride(cfg, node);
++  const extraNode = override?.allowCommands ?? [];
++  const denyNode = override?.denyCommands ?? [];
++
++  // Merge: base + global allow + per-node allow
++  const allow = new Set(
++    [...base, ...extraGlobal, ...extraNode].map((cmd) => cmd.trim()).filter(Boolean),
++  );
++
++  // Remove: global deny + per-node deny
++  for (const cmd of [...denyGlobal, ...denyNode].map((c) => c.trim()).filter(Boolean)) {
++    allow.delete(cmd);
+   }
+   return allow;
+ }
+ 
++function resolveNodeOverride(
++  cfg: OpenClawConfig,
++  node?: Partial<Pick<NodeSession, "nodeId" | "displayName">>,
++): GatewayNodeOverrideConfig | undefined {
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides || !node) {
++    return undefined;
++  }
++  // 1. nodeId exact match
++  if (node.nodeId && overrides[node.nodeId]) {
++    return overrides[node.nodeId];
++  }
++  // 2. displayName exact match
++  if (node.displayName && overrides[node.displayName]) {
++    return overrides[node.displayName];
++  }
++  // 3. nodeId prefix match (longest prefix wins; skip empty keys)
++  if (node.nodeId) {
++    let bestKey: string | undefined;
++    for (const key of Object.keys(overrides)) {
++      if (key && node.nodeId.startsWith(key)) {
++        if (!bestKey || key.length > bestKey.length) {
++          bestKey = key;
++        }
++      }
++    }
++    if (bestKey) {
++      return overrides[bestKey];
++    }
++  }
++  return undefined;
++}
++
+ export function isNodeCommandAllowed(params: {
+   command: string;
+   declaredCommands?: string[];
+diff --git a/src/gateway/server/ws-connection/message-handler.ts b/src/gateway/server/ws-connection/message-handler.ts
+index f156879619..b1dd6fa06c 100644
+--- a/src/gateway/server/ws-connection/message-handler.ts
++++ b/src/gateway/server/ws-connection/message-handler.ts
+@@ -965,6 +965,8 @@ export function attachGatewayWsMessageHandler(params: {
+           const allowlist = resolveNodeCommandAllowlist(cfg, {
+             platform: connectParams.client.platform,
+             deviceFamily: connectParams.client.deviceFamily,
++            nodeId: device?.id ?? connectParams.client.id,
++            displayName: connectParams.client.displayName,
+           });
+           const declared = Array.isArray(connectParams.commands) ? connectParams.commands : [];
+           const filtered = declared
+diff --git a/src/security/audit-extra.sync.ts b/src/security/audit-extra.sync.ts
+index cf12ac2f9b..bde80240e6 100644
+--- a/src/security/audit-extra.sync.ts
++++ b/src/security/audit-extra.sync.ts
+@@ -198,6 +198,89 @@ function normalizeNodeCommand(value: unknown): string {
+   return typeof value === "string" ? value.trim() : "";
+ }
+ 
++type NodeCommandConfigEntry = {
++  path: string;
++  values: string[];
++  overrideKey?: string;
++};
++
++function formatNodeOverrideConfigPath(
++  key: string,
++  field: "allowCommands" | "denyCommands",
++): string {
++  return `gateway.nodes.overrides[${JSON.stringify(key)}].${field}`;
++}
++
++function listConfiguredNodeAllowCommandEntries(cfg: OpenClawConfig): NodeCommandConfigEntry[] {
++  const out: NodeCommandConfigEntry[] = [];
++  const globalAllow = cfg.gateway?.nodes?.allowCommands;
++  if (Array.isArray(globalAllow)) {
++    const values = globalAllow.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length > 0) {
++      out.push({ path: "gateway.nodes.allowCommands", values });
++    }
++  }
++
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides) {
++    return out;
++  }
++  for (const [key, override] of Object.entries(overrides)) {
++    if (!override) {
++      continue;
++    }
++    const allow = override.allowCommands;
++    if (!Array.isArray(allow)) {
++      continue;
++    }
++    const values = allow.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length === 0) {
++      continue;
++    }
++    out.push({
++      path: formatNodeOverrideConfigPath(key, "allowCommands"),
++      values,
++      overrideKey: key,
++    });
++  }
++  return out;
++}
++
++function listConfiguredNodeDenyCommandEntries(cfg: OpenClawConfig): NodeCommandConfigEntry[] {
++  const out: NodeCommandConfigEntry[] = [];
++  const globalDeny = cfg.gateway?.nodes?.denyCommands;
++  if (Array.isArray(globalDeny)) {
++    const values = globalDeny.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length > 0) {
++      out.push({ path: "gateway.nodes.denyCommands", values });
++    }
++  }
++
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides) {
++    return out;
++  }
++  for (const [key, override] of Object.entries(overrides)) {
++    if (!override) {
++      continue;
++    }
++    const deny = override.denyCommands;
++    if (!Array.isArray(deny)) {
++      continue;
++    }
++    const values = deny.map(normalizeNodeCommand).filter(Boolean);
++    if (values.length === 0) {
++      continue;
++    }
++    out.push({
++      path: formatNodeOverrideConfigPath(key, "denyCommands"),
++      values,
++      overrideKey: key,
++    });
++  }
++  return out;
++}
++
+ function listKnownNodeCommands(cfg: OpenClawConfig): Set<string> {
+   const baseCfg: OpenClawConfig = {
+     ...cfg,
+@@ -969,21 +1052,31 @@ export function collectSandboxDangerousConfigFindings(cfg: OpenClawConfig): Secu
+ 
+ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
+   const findings: SecurityAuditFinding[] = [];
+-  const denyListRaw = cfg.gateway?.nodes?.denyCommands;
+-  if (!Array.isArray(denyListRaw) || denyListRaw.length === 0) {
++  const denyEntries = listConfiguredNodeDenyCommandEntries(cfg);
++  if (denyEntries.length === 0) {
+     return findings;
+   }
+ 
+-  const denyList = denyListRaw.map(normalizeNodeCommand).filter(Boolean);
+-  if (denyList.length === 0) {
+-    return findings;
++  const knownCommands = listKnownNodeCommands(cfg);
++  for (const entry of listConfiguredNodeAllowCommandEntries(cfg)) {
++    for (const value of entry.values) {
++      knownCommands.add(value);
++    }
+   }
+ 
+-  const knownCommands = listKnownNodeCommands(cfg);
+-  const patternLike = denyList.filter((entry) => looksLikeNodeCommandPattern(entry));
+-  const unknownExact = denyList.filter(
+-    (entry) => !looksLikeNodeCommandPattern(entry) && !knownCommands.has(entry),
+-  );
++  const patternLike: string[] = [];
++  const unknownExact: string[] = [];
++  for (const entry of denyEntries) {
++    for (const value of entry.values) {
++      if (looksLikeNodeCommandPattern(value)) {
++        patternLike.push(`${entry.path}: ${value}`);
++        continue;
++      }
++      if (!knownCommands.has(value)) {
++        unknownExact.push(`${entry.path}: ${value}`);
++      }
++    }
++  }
+   if (patternLike.length === 0 && unknownExact.length === 0) {
+     return findings;
+   }
+@@ -1012,9 +1105,9 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
+   findings.push({
+     checkId: "gateway.nodes.deny_commands_ineffective",
+     severity: "warn",
+-    title: "Some gateway.nodes.denyCommands entries are ineffective",
++    title: "Some node denyCommands entries are ineffective",
+     detail:
+-      "gateway.nodes.denyCommands uses exact node command-name matching only (for example `system.run`), not shell-text filtering inside a command payload.\n" +
++      "gateway.nodes.denyCommands uses exact node command-name matching only (global and per-node overrides, for example `system.run`), not shell-text filtering inside a command payload.\n" +
+       detailParts.map((entry) => `- ${entry}`).join("\n"),
+     remediation:
+       `Use exact command names (for example: ${examples.join(", ")}). ` +
+@@ -1028,21 +1121,33 @@ export function collectNodeDangerousAllowCommandFindings(
+   cfg: OpenClawConfig,
+ ): SecurityAuditFinding[] {
+   const findings: SecurityAuditFinding[] = [];
+-  const allowRaw = cfg.gateway?.nodes?.allowCommands;
+-  if (!Array.isArray(allowRaw) || allowRaw.length === 0) {
++  const allowEntries = listConfiguredNodeAllowCommandEntries(cfg);
++  if (allowEntries.length === 0) {
+     return findings;
+   }
+ 
+-  const allow = new Set(allowRaw.map(normalizeNodeCommand).filter(Boolean));
+-  if (allow.size === 0) {
+-    return findings;
++  const globalDeny = new Set((cfg.gateway?.nodes?.denyCommands ?? []).map(normalizeNodeCommand));
++  const dangerousEntries: string[] = [];
++  for (const entry of allowEntries) {
++    const allowSet = new Set(entry.values);
++    const denySet = new Set(globalDeny);
++    if (entry.overrideKey) {
++      const overrideDeny = cfg.gateway?.nodes?.overrides?.[entry.overrideKey]?.denyCommands;
++      if (Array.isArray(overrideDeny)) {
++        for (const cmd of overrideDeny.map(normalizeNodeCommand).filter(Boolean)) {
++          denySet.add(cmd);
++        }
++      }
++    }
++    const dangerousAllowed = DEFAULT_DANGEROUS_NODE_COMMANDS.filter(
++      (cmd) => allowSet.has(cmd) && !denySet.has(cmd),
++    );
++    if (dangerousAllowed.length === 0) {
++      continue;
++    }
++    dangerousEntries.push(`${entry.path}: ${dangerousAllowed.join(", ")}`);
+   }
+-
+-  const deny = new Set((cfg.gateway?.nodes?.denyCommands ?? []).map(normalizeNodeCommand));
+-  const dangerousAllowed = DEFAULT_DANGEROUS_NODE_COMMANDS.filter(
+-    (cmd) => allow.has(cmd) && !deny.has(cmd),
+-  );
+-  if (dangerousAllowed.length === 0) {
++  if (dangerousEntries.length === 0) {
+     return findings;
+   }
+ 
+@@ -1051,10 +1156,11 @@ export function collectNodeDangerousAllowCommandFindings(
+     severity: isGatewayRemotelyExposed(cfg) ? "critical" : "warn",
+     title: "Dangerous node commands explicitly enabled",
+     detail:
+-      `gateway.nodes.allowCommands includes: ${dangerousAllowed.join(", ")}. ` +
+-      "These commands can trigger high-impact device actions (camera/screen/contacts/calendar/reminders/SMS).",
++      "Dangerous node commands are enabled by these settings:\n" +
++      dangerousEntries.map((entry) => `- ${entry}`).join("\n") +
++      "\nThese commands can trigger high-impact device actions (camera/screen/contacts/calendar/reminders/SMS).",
+     remediation:
+-      "Remove these entries from gateway.nodes.allowCommands (recommended). " +
++      "Remove these entries from gateway.nodes.allowCommands / gateway.nodes.overrides.*.allowCommands (recommended). " +
+       "If you keep them, treat gateway auth as full operator access and keep gateway exposure local/tailnet-only.",
+   });
+ 
+diff --git a/src/security/audit.test.ts b/src/security/audit.test.ts
+index 1c696bf6e1..f82e9e70f1 100644
+--- a/src/security/audit.test.ts
++++ b/src/security/audit.test.ts
+@@ -1201,6 +1201,31 @@ description: test skill
+     expect(finding?.detail).not.toContain("did you mean");
+   });
+ 
++  it("flags ineffective gateway.nodes.overrides.*.denyCommands entries", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          overrides: {
++            "node-a": {
++              denyCommands: ["camera.*", "camera.snapx"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.deny_commands_ineffective",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain('gateway.nodes.overrides["node-a"].denyCommands: camera.*');
++    expect(finding?.detail).toContain(
++      'gateway.nodes.overrides["node-a"].denyCommands: camera.snapx',
++    );
++  });
++
+   it("scores dangerous gateway.nodes.allowCommands by exposure", async () => {
+     const cases: Array<{
+       name: string;
+@@ -1242,6 +1267,30 @@ description: test skill
+     );
+   });
+ 
++  it("flags dangerous gateway.nodes.overrides.*.allowCommands entries", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        bind: "loopback",
++        nodes: {
++          overrides: {
++            "node-a": {
++              allowCommands: ["camera.snap", "screen.record"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    const finding = res.findings.find(
++      (f) => f.checkId === "gateway.nodes.allow_commands_dangerous",
++    );
++    expect(finding?.severity).toBe("warn");
++    expect(finding?.detail).toContain('gateway.nodes.overrides["node-a"].allowCommands');
++    expect(finding?.detail).toContain("camera.snap");
++    expect(finding?.detail).toContain("screen.record");
++  });
++
+   it("does not flag dangerous allowCommands entries when denied again", async () => {
+     const cfg: OpenClawConfig = {
+       gateway: {
+@@ -1256,6 +1305,25 @@ description: test skill
+     expectNoFinding(res, "gateway.nodes.allow_commands_dangerous");
+   });
+ 
++  it("does not flag dangerous overrides allowCommands entries when denied again", async () => {
++    const cfg: OpenClawConfig = {
++      gateway: {
++        nodes: {
++          denyCommands: ["camera.snap"],
++          overrides: {
++            "node-a": {
++              allowCommands: ["camera.snap", "screen.record"],
++              denyCommands: ["screen.record"],
++            },
++          },
++        },
++      },
++    };
++
++    const res = await audit(cfg);
++    expectNoFinding(res, "gateway.nodes.allow_commands_dangerous");
++  });
++
+   it("flags agent profile overrides when global tools.profile is minimal", async () => {
+     const cfg: OpenClawConfig = {
+       tools: {
+-- 
+2.50.1 (Apple Git-155)
+

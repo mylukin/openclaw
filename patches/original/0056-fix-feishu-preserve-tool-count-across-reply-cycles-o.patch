@@ -1,0 +1,168 @@
+From 369cc0885bd0d8c1fd308343d1e22e2194847f4c Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 23:33:50 +0800
+Subject: [PATCH 56/98] fix(feishu): preserve tool count across reply cycles,
+ only show running status during tool phase
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 46 +++++++++++++++++--
+ extensions/feishu/src/reply-dispatcher.ts     | 44 +++++++++---------
+ 2 files changed, 63 insertions(+), 27 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index 3a8581f9a6..3263cbc1a1 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -495,7 +495,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+     await flushAsyncTasks();
+     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+-      "step\n\n🔧 Tool calls (2)",
++      "step\n\n🔧 Tool calls (2)\n\n⏳ Running Grep...",
+       { title: "💭 Thinking" },
+     );
+ 
+@@ -684,7 +684,40 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     });
+   });
+ 
+-  it("preserves tool call count without restoring running status after text streaming", async () => {
++  it("does not reset cumulative tool count when onReplyStart fires again mid-reply", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++
++    await options.onReplyStart?.();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
++    await flushAsyncTasks();
++    await options.onReplyStart?.();
++    await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("🔧 Tool calls (2)"),
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
++  it("shows running status again when a new tool starts after earlier text streaming", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+       appId: "app_id",
+@@ -710,9 +743,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await dispatcher.replyOptions.onToolStart?.({ name: "Grep", phase: "start" });
+     await flushAsyncTasks();
+ 
+-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("🔧 Tool calls (2)", {
+-      title: "🔧 Tool Activity",
+-    });
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      "🔧 Tool calls (2)\n\n⏳ Running Grep...",
++      {
++        title: "🔧 Tool Activity",
++      },
++    );
+   });
+ 
+   it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 20efdaecba..a800b76b69 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -306,6 +306,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let lastRenderedStreamContent = "";
+   let hasThinkingPrelude = false;
+   let thinkingCollapsed = false;
++  let replyCycleInitialized = false;
+ 
+   /**
+    * Deliver media files and emit persistence signals for media-only final payloads.
+@@ -431,9 +432,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return "💭 Thinking";
+   };
+ 
+-  /** Build the full thinking panel content from reasoning text and tool status.
+-   *  When `final` is true, show completed status instead of in-progress status
+-   *  so the closed card doesn't perpetually display "Using...". */
++  /** Build the full thinking panel content from reasoning text and tool status. */
+   const composeThinkingContent = (options?: {
+     final?: boolean;
+   }): { title: string; text: string } => {
+@@ -444,14 +443,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       sections.push(plain);
+     }
+     if (toolCallCount > 0) {
+-      const currentRunningTool = !streamText.trim() ? getActiveRunningToolName() : undefined;
+-      const toolStatus = options?.final
+-        ? `✅ Completed ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`
+-        : currentRunningTool
+-          ? `⏳ Running ${currentRunningTool}...`
+-          : !streamText.trim() && activeTools.length > 0
+-            ? "⏳ Running tool..."
+-            : "";
++      const currentRunningTool =
++        !options?.final && streamPhase === "tool" ? getActiveRunningToolName() : undefined;
++      const toolStatus = currentRunningTool
++        ? `⏳ Running ${currentRunningTool}...`
++        : !options?.final && streamPhase === "tool" && activeTools.length > 0
++          ? "⏳ Running tool..."
++          : "";
+       sections.push(
+         [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
+       );
+@@ -651,7 +649,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     reasoningText = "";
+     thinkingCollapsed = false;
+     activeTools.length = 0;
+-    toolCallCount = 0;
+   };
+ 
+   const sendChunkedTextReply = async (params: {
+@@ -695,16 +692,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
+       onReplyStart: async () => {
+-        deliveredFinalTexts.clear();
+-        hasVisibleTextInReply = false;
+-        finalTextEmitted = false;
+-        hasThinkingPrelude = false;
+-        thinkingCollapsed = false;
+-        streamPhase = "idle";
+-        activeTools.length = 0;
+-        toolCallCount = 0;
+-        lastRenderedStreamContent = "";
+-        replaceNextPartialAfterTool = false;
++        if (!replyCycleInitialized) {
++          replyCycleInitialized = true;
++          deliveredFinalTexts.clear();
++          hasVisibleTextInReply = false;
++          finalTextEmitted = false;
++          hasThinkingPrelude = false;
++          thinkingCollapsed = false;
++          streamPhase = "idle";
++          activeTools.length = 0;
++          toolCallCount = 0;
++          lastRenderedStreamContent = "";
++          replaceNextPartialAfterTool = false;
++        }
+         if (streamingEnabled && renderMode === "card") {
+           startStreaming();
+         }
+-- 
+2.50.1 (Apple Git-155)
+

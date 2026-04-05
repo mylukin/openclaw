@@ -1,0 +1,201 @@
+From eaa8586982233198a78c0a75a745e35f356b1156 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 14:59:08 +0800
+Subject: [PATCH 40/98] fix(feishu): avoid mid-stream full card updates and
+ discard empty cards
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Remove collapseThinking and mid-stream full card updates that caused
+  thinking panel flickering on Feishu clients
+- updateThinking now only stores state; thinking panel is materialized
+  once in the final close() full card update
+- Discard streaming card entirely when no assistant text was produced,
+  preventing stale "⏳ Thinking..." cards from lingering after errors
+  or timeouts
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 67 ++++++++++++-----------
+ extensions/feishu/src/streaming-card.ts   | 52 +-----------------
+ 2 files changed, 37 insertions(+), 82 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index f78683842c..d555ddc91e 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -484,20 +484,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     });
+   };
+ 
+-  /** Collapse thinking panel when assistant text starts flowing. */
+-  const collapseThinkingIfNeeded = () => {
+-    if (thinkingCollapsed) {
+-      return;
+-    }
++  /** Mark that assistant text has started flowing — thinking panel will be
++   *  collapsed on close() rather than mid-stream to avoid Feishu full-card
++   *  update flickering during streaming. */
++  const markThinkingDone = () => {
+     thinkingCollapsed = true;
+-    partialUpdateQueue = partialUpdateQueue.then(async () => {
+-      if (streamingStartPromise) {
+-        await streamingStartPromise;
+-      }
+-      if (streaming?.isActive()) {
+-        await streaming.collapseThinking(composeThinkingContent());
+-      }
+-    });
+   };
+ 
+   const queueStreamingUpdate = (
+@@ -528,7 +519,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       lastPartial = nextText;
+     }
+     // Collapse thinking panel when first assistant text arrives
+-    collapseThinkingIfNeeded();
++    markThinkingDone();
+     queueStreamingRender();
+   };
+ 
+@@ -581,25 +572,35 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     await partialUpdateQueue;
+     const streamMessageId = streaming?.getMessageId();
+     if (streaming?.isActive()) {
+-      // Close with assistant text only — thinking is in the collapsible panel
+-      let text = streamText;
+-      const finalText = text;
+-      if (mentionTargets?.length) {
+-        text = buildMentionedCardContent(mentionTargets, text);
+-      }
+-      const finalNote = showCardNote
+-        ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+-        : undefined;
+-      await streaming.close(text, { note: finalNote });
+-      hasVisibleTextInReply = true;
+-      // Emit hooks for non-discarded streaming cards so downstream consumers
+-      // (e.g. bot-company journal) can record the delivered text.
+-      if (options?.emitFinalText && finalText.trim()) {
+-        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+-        await emitFinalTextIfNeeded(
+-          finalText,
+-          streamMessageId ? { messageId: streamMessageId } : undefined,
+-        );
++      const finalText = streamText;
++      if (!finalText.trim()) {
++        // No visible content was produced — discard the card entirely
++        // to avoid leaving a stale "⏳ Thinking..." placeholder.
++        await streaming.discard();
++      } else {
++        // Set final thinking content before close so the collapsed panel has it
++        const finalThinking = composeThinkingContent();
++        if (finalThinking) {
++          await streaming.updateThinking(finalThinking);
++        }
++        let text = finalText;
++        if (mentionTargets?.length) {
++          text = buildMentionedCardContent(mentionTargets, text);
++        }
++        const finalNote = showCardNote
++          ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
++          : undefined;
++        await streaming.close(text, { note: finalNote });
++        hasVisibleTextInReply = true;
++        // Emit hooks for non-discarded streaming cards so downstream consumers
++        // (e.g. bot-company journal) can record the delivered text.
++        if (options?.emitFinalText) {
++          emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
++          await emitFinalTextIfNeeded(
++            finalText,
++            streamMessageId ? { messageId: streamMessageId } : undefined,
++          );
++        }
+       }
+     }
+     streaming = null;
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index 6ea77ccc1c..c90dffb225 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -18,8 +18,6 @@ type CardState = {
+   header?: StreamingCardHeader;
+   thinkingText: string;
+   thinkingExpanded: boolean;
+-  /** Whether the thinking panel has been injected into the card via full update. */
+-  thinkingInjected: boolean;
+ };
+ 
+ /** Options for customising the initial streaming card appearance. */
+@@ -302,7 +300,6 @@ export class FeishuStreamingSession {
+       header: options?.header,
+       thinkingText: "",
+       thinkingExpanded: true,
+-      thinkingInjected: false,
+     };
+     this.lastStreamingModeRenewAt = Date.now();
+     this.startRenewTimer();
+@@ -546,57 +543,14 @@ export class FeishuStreamingSession {
+     await this.queue;
+   }
+ 
+-  /** Update thinking panel content (non-streaming, immediate).
+-   *  On first call, injects the collapsible_panel via full card update. */
++  /** Store thinking content for inclusion in the final card on close().
++   *  No API call during streaming — the thinking panel is only materialized
++   *  in the single full-card update at close() to avoid mid-stream flickering. */
+   async updateThinking(text: string): Promise<void> {
+     if (!this.state || this.closed || !text) {
+       return;
+     }
+     this.state.thinkingText = text;
+-    this.queue = this.queue.then(async () => {
+-      if (!this.state || this.closed) {
+-        return;
+-      }
+-      if (!this.state.thinkingInjected) {
+-        // First thinking update — inject the collapsible_panel via full card update
+-        const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
+-        if (ok) {
+-          this.state.thinkingInjected = true;
+-        } else {
+-          // Injection failed — reset thinkingText so next call retries injection
+-          this.state.thinkingText = "";
+-          this.log?.("Thinking panel injection failed; will retry on next update");
+-        }
+-      } else {
+-        await this.updateElementContent("thinking_content", text, (e) =>
+-          this.log?.(`Thinking update failed: ${String(e)}`),
+-        );
+-      }
+-    });
+-    await this.queue;
+-  }
+-
+-  /** Collapse the thinking panel via full card replacement. */
+-  async collapseThinking(finalThinkingText?: string): Promise<void> {
+-    if (!this.state || this.closed) {
+-      return;
+-    }
+-    if (finalThinkingText !== undefined) {
+-      this.state.thinkingText = finalThinkingText;
+-    }
+-    this.state.thinkingExpanded = false;
+-    this.queue = this.queue.then(async () => {
+-      if (!this.state || this.closed) {
+-        return;
+-      }
+-      // Must use full card update to change the expanded property.
+-      // keepStreaming so that subsequent element API updates still work.
+-      const ok = await this.updateCardFull(this.state.currentText, { keepStreaming: true });
+-      if (ok) {
+-        this.state.thinkingInjected = true;
+-      }
+-    });
+-    await this.queue;
+   }
+ 
+   private async updateNoteContent(note: string): Promise<void> {
+-- 
+2.50.1 (Apple Git-155)
+

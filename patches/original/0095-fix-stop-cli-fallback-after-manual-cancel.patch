@@ -1,0 +1,68 @@
+From 12f88921c64da50bf3214dc7a1293cd618bc30fd Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Thu, 2 Apr 2026 20:43:19 +0800
+Subject: [PATCH 95/98] fix: stop cli fallback after manual cancel
+
+---
+ src/agents/cli-runner.test.ts | 28 ++++++++++++++++++++++++++++
+ src/agents/cli-runner.ts      |  5 ++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
+index b72528309b..822f78a586 100644
+--- a/src/agents/cli-runner.test.ts
++++ b/src/agents/cli-runner.test.ts
+@@ -1454,6 +1454,34 @@ describe("runCliAgent with process supervisor", () => {
+     await expect(runPromise).rejects.toMatchObject({ name: "AbortError" });
+     expect(managedRun.cancel).toHaveBeenCalledWith("manual-cancel");
+   });
++
++  it("treats supervisor-driven manual session cancels as aborts", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "manual-cancel",
++        exitCode: null,
++        exitSignal: "SIGTERM",
++        durationMs: 25,
++        stdout: "",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await expect(
++      runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-session-cancel",
++      }),
++    ).rejects.toMatchObject({ name: "AbortError" });
++  });
+ });
+ 
+ describe("resolveCliNoOutputTimeoutMs", () => {
+diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
+index 0e2b21d17a..dbc0c2ebd0 100644
+--- a/src/agents/cli-runner.ts
++++ b/src/agents/cli-runner.ts
+@@ -1195,7 +1195,10 @@ export async function runCliAgent(params: {
+         } finally {
+           params.abortSignal?.removeEventListener("abort", onAbort);
+         }
+-        if (result.reason === "manual-cancel" && params.abortSignal?.aborted) {
++        if (result.reason === "manual-cancel") {
++          // Manual cancels can originate from this run's AbortSignal or from
++          // external session control (/stop, scope replacement, etc.). Treat
++          // both as terminal aborts so model fallback does not restart them.
+           throw createAbortError(params.abortSignal);
+         }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

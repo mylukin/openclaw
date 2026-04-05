@@ -1,0 +1,278 @@
+From eaf20066fb08be8715b3ede12f36d890027cb16b Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 22:51:16 +0800
+Subject: [PATCH 54/98] fix(feishu): track active tools by ID for correct
+ out-of-order removal
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 107 ++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     |  75 ++++++------
+ 2 files changed, 148 insertions(+), 34 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index bbd2f26c83..0ccfd3298a 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -652,6 +652,41 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("clears running tool status when visible assistant text arrives through block delivery", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("⏳ Running Bash..."),
++      { title: "🔧 Tool Activity" },
++    );
++
++    await options.deliver({ text: "visible block text" }, { kind: "block" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      "🔧 Tool calls (1)\n- Bash",
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
+   it("preserves prior tool history and count without restoring running status after text streaming", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+@@ -684,6 +719,78 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     );
+   });
+ 
++  it("tracks unnamed tool starts as generic tool entries instead of reusing the previous name", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
++    await dispatcher.replyOptions.onToolStart?.({ phase: "start" });
++    await flushAsyncTasks();
++
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("🔧 Tool calls (2)\n- Bash\n- tool\n\n⏳ Running tool..."),
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
++  it("removes the correct active tool when tool results arrive out of order", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const dispatcher = createFeishuReplyDispatcher({
++      cfg: {} as never,
++      agentId: "agent",
++      runtime: { log: vi.fn(), error: vi.fn() } as never,
++      chatId: "oc_chat",
++    });
++
++    await dispatcher.replyOptions.onToolStart?.({
++      name: "memory_search",
++      phase: "start",
++      toolCallId: "tool-memory",
++    });
++    await dispatcher.replyOptions.onToolStart?.({
++      name: "exec",
++      phase: "start",
++      toolCallId: "tool-exec",
++    });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("⏳ Running exec..."),
++      { title: "🔧 Tool Activity" },
++    );
++
++    await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tool-memory" });
++    await flushAsyncTasks();
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
++      expect.stringContaining("🔧 Tool calls (2)\n- memory_search\n- exec\n\n⏳ Running exec..."),
++      { title: "🔧 Tool Activity" },
++    );
++  });
++
+   it("restores the previous running tool when nested tool activity unwinds", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 401d17cb17..c48dfc12d5 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -301,10 +301,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let hasVisibleTextInReply = false;
+   let replaceNextPartialAfterTool = false;
+   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
+-  let activeToolRunCount = 0;
+-  let lastToolName: string | undefined;
+-  let runningToolStatusVisible = false;
+-  const activeToolNames: string[] = [];
++  const activeTools: Array<{ toolCallId?: string; name: string }> = [];
+   const toolCallHistory: string[] = [];
+   let lastRenderedStreamContent = "";
+   let hasThinkingPrelude = false;
+@@ -404,6 +401,29 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return TOOL_DISPLAY_NAMES[stripped] ?? stripped.replace(/\s+/g, " ");
+   };
+ 
++  const resolveTrackedToolName = (name: string | undefined): string =>
++    normalizeToolName(name) ?? "tool";
++
++  const getActiveRunningToolName = (): string | undefined => {
++    const current = activeTools[activeTools.length - 1];
++    return current?.name?.trim() ? current.name.trim() : undefined;
++  };
++
++  const removeActiveTool = (toolCallId: string | undefined): void => {
++    if (activeTools.length === 0) {
++      return;
++    }
++    const normalizedId = toolCallId?.trim();
++    if (normalizedId) {
++      const index = activeTools.findIndex((entry) => entry.toolCallId === normalizedId);
++      if (index >= 0) {
++        activeTools.splice(index, 1);
++        return;
++      }
++    }
++    activeTools.pop();
++  };
++
+   const formatToolHistoryLines = (): string[] => {
+     const ordered: Array<{ name: string; count: number }> = [];
+     for (const name of toolCallHistory) {
+@@ -438,11 +458,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     }
+     if (toolCallHistory.length > 0) {
+       const toolLines = formatToolHistoryLines();
++      const currentRunningTool = !streamText.trim() ? getActiveRunningToolName() : undefined;
+       const toolStatus = options?.final
+         ? `✅ Completed ${toolCallHistory.length} tool call${toolCallHistory.length === 1 ? "" : "s"}`
+-        : runningToolStatusVisible && activeToolRunCount > 0 && lastToolName?.trim()
+-          ? `⏳ Running ${lastToolName.trim()}...`
+-          : runningToolStatusVisible && activeToolRunCount > 0
++        : currentRunningTool
++          ? `⏳ Running ${currentRunningTool}...`
++          : !streamText.trim() && activeTools.length > 0
+             ? "⏳ Running tool..."
+             : "";
+       sections.push(
+@@ -553,8 +574,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     if (options?.dedupeWithLastPartial) {
+       lastPartial = nextText;
+     }
+-    if (activeToolRunCount > 0) {
+-      runningToolStatusVisible = false;
++    if (activeTools.length > 0) {
+       streamPhase = "streaming";
+       queueThinkingPanelUpdate();
+     }
+@@ -648,10 +668,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     lastPartial = "";
+     reasoningText = "";
+     thinkingCollapsed = false;
+-    activeToolRunCount = 0;
+-    lastToolName = undefined;
+-    runningToolStatusVisible = false;
+-    activeToolNames.length = 0;
++    activeTools.length = 0;
+     toolCallHistory.length = 0;
+   };
+ 
+@@ -702,10 +719,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         hasThinkingPrelude = false;
+         thinkingCollapsed = false;
+         streamPhase = "idle";
+-        activeToolRunCount = 0;
+-        lastToolName = undefined;
+-        runningToolStatusVisible = false;
+-        activeToolNames.length = 0;
++        activeTools.length = 0;
+         toolCallHistory.length = 0;
+         lastRenderedStreamContent = "";
+         replaceNextPartialAfterTool = false;
+@@ -898,14 +912,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           }
+         : undefined,
+       onToolStart: streamingEnabled
+-        ? (payload: { name?: string; phase?: string }) => {
++        ? (payload: { name?: string; phase?: string; toolCallId?: string }) => {
+             const isStartPhase = !payload?.phase || payload.phase === "start";
+             if (isStartPhase) {
+-              activeToolRunCount += 1;
+-              lastToolName = normalizeToolName(payload?.name) ?? lastToolName;
+-              runningToolStatusVisible = !streamText.trim();
+-              activeToolNames.push(lastToolName ?? "tool");
+-              toolCallHistory.push(lastToolName ?? "tool");
++              const trackedName = resolveTrackedToolName(payload?.name);
++              activeTools.push({
++                name: trackedName,
++                toolCallId: payload.toolCallId?.trim() || undefined,
++              });
++              toolCallHistory.push(trackedName);
+               replaceNextPartialAfterTool = Boolean(streamText);
+             }
+             queueThinkingPrelude();
+@@ -918,17 +933,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           }
+         : undefined,
+       onToolResult: streamingEnabled
+-        ? (_payload: ReplyPayload) => {
+-            if (activeToolRunCount > 0) {
+-              activeToolRunCount -= 1;
+-            }
+-            if (activeToolNames.length > 0) {
+-              activeToolNames.pop();
+-            }
+-            lastToolName = activeToolNames[activeToolNames.length - 1];
+-            runningToolStatusVisible =
+-              runningToolStatusVisible && activeToolRunCount > 0 && Boolean(lastToolName?.trim());
+-            if (activeToolRunCount === 0 && streamPhase === "tool") {
++        ? (payload: ReplyPayload) => {
++            removeActiveTool(payload.toolCallId);
++            if (activeTools.length === 0 && streamPhase === "tool") {
+               streamPhase = streamText ? "streaming" : "idle";
+             }
+             if (!shouldRenderStreamingStatus()) {
+-- 
+2.50.1 (Apple Git-155)
+

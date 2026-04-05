@@ -1,0 +1,448 @@
+From 7e17c03398c5cc7677102a61437b77b167ca8304 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 07:12:18 +0800
+Subject: [PATCH 28/98] fix: restore 5 features lost during upstream merge
+
+1. reply-dispatcher: restore emitMessageSent hooks for text replies
+   (streaming close + non-streaming chunk delivery)
+2. streaming-card: restore updateCardFull() fallback for Feishu 10-min
+   auto-close survival
+3. bot-content: fix normalizeMentions to use sorted-keys longest-match
+   one-pass regex (prevents @_user_1 corrupting @_user_10)
+4. session-memory/transcript: restore delivery-mirror skip filter in
+   getRecentSessionContent
+5. streaming-card: restore sequence snapshot pattern (only commit on
+   success)
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot-content.ts          |  16 ++-
+ extensions/feishu/src/reply-dispatcher.ts     |  60 ++++++++--
+ extensions/feishu/src/streaming-card.ts       | 111 +++++++++++++++---
+ .../bundled/session-memory/transcript.ts      |   5 +
+ 4 files changed, 163 insertions(+), 29 deletions(-)
+
+diff --git a/extensions/feishu/src/bot-content.ts b/extensions/feishu/src/bot-content.ts
+index d8dcc1c0aa..73ab285b69 100644
+--- a/extensions/feishu/src/bot-content.ts
++++ b/extensions/feishu/src/bot-content.ts
+@@ -271,8 +271,13 @@ export function normalizeMentions(
+   }
+   const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+   const escapeName = (value: string) => value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+-  let result = text;
+-  for (const mention of mentions) {
++
++  // Sort by key length descending so longer keys match first (e.g. @_user_10 before @_user_1)
++  const sorted = [...mentions].sort((a, b) => b.key.length - a.key.length);
++
++  // Build a single regex with alternation of all keys, longest first
++  const mentionMap = new Map<string, string>();
++  for (const mention of sorted) {
+     const mentionId = mention.id.open_id;
+     const replacement =
+       botStripId && mentionId === botStripId
+@@ -280,9 +285,12 @@ export function normalizeMentions(
+         : mentionId
+           ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
+           : `@${mention.name}`;
+-    result = result.replace(new RegExp(escaped(mention.key), "g"), () => replacement).trim();
++    mentionMap.set(mention.key, replacement);
+   }
+-  return result;
++
++  const combinedPattern = sorted.map((m) => escaped(m.key)).join("|");
++  const combinedRegex = new RegExp(combinedPattern, "g");
++  return text.replace(combinedRegex, (match) => mentionMap.get(match) ?? match).trim();
+ }
+ 
+ export function normalizeFeishuCommandProbeBody(text: string): string {
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index d14f2a1e21..4269bddbf4 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -565,13 +565,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       await streamingStartPromise;
+     }
+     await partialUpdateQueue;
++    const streamMessageId = streaming?.getMessageId();
+     if (streaming?.isActive()) {
+       let text = buildCombinedStreamText(reasoningText, streamText);
++      const finalText = text;
+       if (mentionTargets?.length) {
+         text = buildMentionedCardContent(mentionTargets, text);
+       }
+       const finalNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+       await streaming.close(text, { note: finalNote });
++      hasVisibleTextInReply = true;
++      // Emit hooks for non-discarded streaming cards so downstream consumers
++      // (e.g. bot-company journal) can record the delivered text.
++      if (options?.emitFinalText && finalText.trim()) {
++        emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
++        await emitFinalTextIfNeeded(
++          finalText,
++          streamMessageId ? { messageId: streamMessageId } : undefined,
++        );
++      }
+     }
+     streaming = null;
+     streamingStartPromise = null;
+@@ -584,8 +596,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     text: string;
+     useCard: boolean;
+     infoKind?: string;
+-    sendChunk: (params: { chunk: string; isFirst: boolean }) => Promise<void>;
+-  }) => {
++    sendChunk: (params: {
++      chunk: string;
++      isFirst: boolean;
++    }) => Promise<{ messageId?: string } | void>;
++  }): Promise<{ lastMessageId?: string; deliveredMessageIds: string[] }> => {
++    const deliveredMessageIds: string[] = [];
++    let lastMessageId: string | undefined;
+     const chunkSource = params.useCard
+       ? params.text
+       : core.channel.text.convertMarkdownTables(params.text, tableMode);
+@@ -594,14 +611,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       core.channel.text.chunkTextWithMode(chunkSource, textChunkLimit, chunkMode),
+     );
+     for (const [index, chunk] of chunks.entries()) {
+-      await params.sendChunk({
++      const result = await params.sendChunk({
+         chunk,
+         isFirst: index === 0,
+       });
++      const sentId = result?.messageId;
++      if (typeof sentId === "string" && sentId.trim()) {
++        lastMessageId = sentId;
++        deliveredMessageIds.push(sentId);
++      }
+     }
+     if (params.infoKind === "final") {
+       deliveredFinalTexts.add(params.text);
+     }
++    return { lastMessageId, deliveredMessageIds };
+   };
+ 
+   const sendMediaReplies = async (payload: ReplyPayload) => {
+@@ -691,15 +714,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             return;
+           }
+ 
++          let chunkResult: { lastMessageId?: string; deliveredMessageIds: string[] };
+           if (useCard) {
+             const cardHeader = resolveCardHeader(agentId, identity);
+             const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+-            await sendChunkedTextReply({
++            chunkResult = await sendChunkedTextReply({
+               text,
+               useCard: true,
+               infoKind: info?.kind,
+               sendChunk: async ({ chunk, isFirst }) => {
+-                await sendStructuredCardFeishu({
++                const sent = await sendStructuredCardFeishu({
+                   cfg,
+                   to: chatId,
+                   text: chunk,
+@@ -710,15 +734,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                   header: cardHeader,
+                   note: cardNote,
+                 });
++                return { messageId: sent?.messageId };
+               },
+             });
+           } else {
+-            await sendChunkedTextReply({
++            chunkResult = await sendChunkedTextReply({
+               text,
+               useCard: false,
+               infoKind: info?.kind,
+               sendChunk: async ({ chunk, isFirst }) => {
+-                await sendMessageFeishu({
++                const sent = await sendMessageFeishu({
+                   cfg,
+                   to: chatId,
+                   text: chunk,
+@@ -727,9 +752,26 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+                   mentions: isFirst ? mentionTargets : undefined,
+                   accountId,
+                 });
++                return { messageId: sent?.messageId };
+               },
+             });
+           }
++          if (chunkResult.deliveredMessageIds.length > 0) {
++            hasVisibleTextInReply = true;
++          }
++          if (info?.kind === "final") {
++            emitMessageSent({
++              content: text,
++              success: true,
++              messageId: chunkResult.lastMessageId,
++            });
++            await emitFinalTextIfNeeded(text, {
++              ...(chunkResult.lastMessageId ? { messageId: chunkResult.lastMessageId } : {}),
++              ...(chunkResult.deliveredMessageIds.length > 0
++                ? { messageIds: chunkResult.deliveredMessageIds }
++                : {}),
++            });
++          }
+         }
+ 
+         if (hasMedia) {
+@@ -740,11 +782,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         params.runtime.error?.(
+           `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
+         );
+-        await closeStreaming();
++        await closeStreaming({ emitFinalText: false });
+         typingCallbacks?.onIdle?.();
+       },
+       onIdle: async () => {
+-        await closeStreaming();
++        await closeStreaming({ emitFinalText: true });
+         typingCallbacks?.onIdle?.();
+       },
+       onCleanup: () => {
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index dbc5db4ede..d2c12c25d2 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -14,6 +14,7 @@ type CardState = {
+   sequence: number;
+   currentText: string;
+   hasNote: boolean;
++  header?: StreamingCardHeader;
+ };
+ 
+ /** Options for customising the initial streaming card appearance. */
+@@ -292,6 +293,7 @@ export class FeishuStreamingSession {
+       sequence: 1,
+       currentText: "",
+       hasNote: !!options?.note,
++      header: options?.header,
+     };
+     this.lastStreamingModeRenewAt = Date.now();
+     this.startRenewTimer();
+@@ -325,7 +327,9 @@ export class FeishuStreamingSession {
+       return;
+     }
+     const apiBase = resolveApiBase(this.creds.domain);
+-    this.state.sequence += 1;
++    // Snapshot the candidate sequence but only commit it to state on success,
++    // so a failed renewal does not leave a permanent hole in the sequence.
++    const nextSeq = this.state.sequence + 1;
+     try {
+       const { release } = await fetchWithSsrFGuard({
+         url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
+@@ -337,14 +341,15 @@ export class FeishuStreamingSession {
+           },
+           body: JSON.stringify({
+             settings: JSON.stringify({ config: { streaming_mode: true } }),
+-            sequence: this.state.sequence,
+-            uuid: `r_${this.state.cardId}_${this.state.sequence}`,
++            sequence: nextSeq,
++            uuid: `r_${this.state.cardId}_${nextSeq}`,
+           }),
+         },
+         policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+         auditContext: "feishu.streaming-card.renew",
+       });
+       await release();
++      this.state.sequence = nextSeq;
+       this.lastStreamingModeRenewAt = Date.now();
+       this.log?.(`Renewed streaming mode: cardId=${this.state.cardId}`);
+     } catch (e) {
+@@ -352,12 +357,19 @@ export class FeishuStreamingSession {
+     }
+   }
+ 
+-  private async updateCardContent(text: string, onError?: (error: unknown) => void): Promise<void> {
++  /** Push text via the streaming element API. Returns true on success, false on failure. */
++  private async updateCardContent(
++    text: string,
++    onError?: (error: unknown) => void,
++  ): Promise<boolean> {
+     if (!this.state) {
+-      return;
++      return false;
+     }
+     const apiBase = resolveApiBase(this.creds.domain);
+-    this.state.sequence += 1;
++    // Snapshot the candidate sequence but only commit it to state on success,
++    // so a failed update does not leave a permanent hole in the sequence.
++    const nextSeq = this.state.sequence + 1;
++    let ok = true;
+     await fetchWithSsrFGuard({
+       url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
+       init: {
+@@ -368,8 +380,8 @@ export class FeishuStreamingSession {
+         },
+         body: JSON.stringify({
+           content: text,
+-          sequence: this.state.sequence,
+-          uuid: `s_${this.state.cardId}_${this.state.sequence}`,
++          sequence: nextSeq,
++          uuid: `s_${this.state.cardId}_${nextSeq}`,
+         }),
+       },
+       policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+@@ -377,8 +389,64 @@ export class FeishuStreamingSession {
+     })
+       .then(async ({ release }) => {
+         await release();
++        this.state!.sequence = nextSeq;
+       })
+-      .catch((error) => onError?.(error));
++      .catch((error) => {
++        ok = false;
++        onError?.(error);
++      });
++    return ok;
++  }
++
++  /**
++   * Fallback: full card replacement via card update API.
++   * Works regardless of streaming_mode state -- used when the streaming
++   * element API fails (e.g. after the 10-minute auto-close).
++   */
++  private async updateCardFull(text: string): Promise<boolean> {
++    if (!this.state) {
++      return false;
++    }
++    const apiBase = resolveApiBase(this.creds.domain);
++    const cardJson: Record<string, unknown> = {
++      schema: "2.0",
++      config: { update_multi: true },
++      body: {
++        elements: [{ tag: "markdown", content: text, element_id: "content" }],
++      },
++    };
++    if (this.state.header) {
++      cardJson.header = {
++        title: { tag: "plain_text", content: this.state.header.title },
++        template: resolveFeishuCardTemplate(this.state.header.template) ?? "blue",
++      };
++    }
++    const nextSeq = this.state.sequence + 1;
++    try {
++      const { release } = await fetchWithSsrFGuard({
++        url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}`,
++        init: {
++          method: "PUT",
++          headers: {
++            Authorization: `Bearer ${await getToken(this.creds)}`,
++            "Content-Type": "application/json",
++          },
++          body: JSON.stringify({
++            card: { type: "card_json", data: JSON.stringify(cardJson) },
++            sequence: nextSeq,
++            uuid: `u_${this.state.cardId}_${nextSeq}`,
++          }),
++        },
++        policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
++        auditContext: "feishu.streaming-card.full-update",
++      });
++      await release();
++      this.state.sequence = nextSeq;
++      return true;
++    } catch (e) {
++      this.log?.(`Full card update failed: ${String(e)}`);
++      return false;
++    }
+   }
+ 
+   async update(text: string): Promise<void> {
+@@ -422,7 +490,7 @@ export class FeishuStreamingSession {
+       return;
+     }
+     const apiBase = resolveApiBase(this.creds.domain);
+-    this.state.sequence += 1;
++    const nextSeq = this.state.sequence + 1;
+     await fetchWithSsrFGuard({
+       url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/note/content`,
+       init: {
+@@ -433,8 +501,8 @@ export class FeishuStreamingSession {
+         },
+         body: JSON.stringify({
+           content: `<font color='grey'>${note}</font>`,
+-          sequence: this.state.sequence,
+-          uuid: `n_${this.state.cardId}_${this.state.sequence}`,
++          sequence: nextSeq,
++          uuid: `n_${this.state.cardId}_${nextSeq}`,
+         }),
+       },
+       policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+@@ -442,6 +510,7 @@ export class FeishuStreamingSession {
+     })
+       .then(async ({ release }) => {
+         await release();
++        this.state!.sequence = nextSeq;
+       })
+       .catch((e) => this.log?.(`Note update failed: ${String(e)}`));
+   }
+@@ -464,7 +533,13 @@ export class FeishuStreamingSession {
+ 
+     // Only send final update if content differs from what's already displayed
+     if (text && text !== this.state.currentText) {
+-      await this.updateCardContent(text);
++      const streamOk = await this.updateCardContent(text);
++      if (!streamOk) {
++        // Streaming element API failed (likely 10-min auto-close) -- fall back
++        // to a full card replacement which works regardless of streaming state.
++        this.log?.("Streaming content update failed on close; falling back to full card update");
++        await this.updateCardFull(text);
++      }
+       this.state.currentText = text;
+     }
+ 
+@@ -474,7 +549,7 @@ export class FeishuStreamingSession {
+     }
+ 
+     // Close streaming mode
+-    this.state.sequence += 1;
++    const closeSeq = this.state.sequence + 1;
+     await fetchWithSsrFGuard({
+       url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/settings`,
+       init: {
+@@ -487,8 +562,8 @@ export class FeishuStreamingSession {
+           settings: JSON.stringify({
+             config: { streaming_mode: false, summary: { content: truncateSummary(text) } },
+           }),
+-          sequence: this.state.sequence,
+-          uuid: `c_${this.state.cardId}_${this.state.sequence}`,
++          sequence: closeSeq,
++          uuid: `c_${this.state.cardId}_${closeSeq}`,
+         }),
+       },
+       policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+@@ -532,6 +607,10 @@ export class FeishuStreamingSession {
+     }
+   }
+ 
++  getMessageId(): string | undefined {
++    return this.state?.messageId;
++  }
++
+   isActive(): boolean {
+     return this.state !== null && !this.closed;
+   }
+diff --git a/src/hooks/bundled/session-memory/transcript.ts b/src/hooks/bundled/session-memory/transcript.ts
+index f3be21d795..774ba7e22f 100644
+--- a/src/hooks/bundled/session-memory/transcript.ts
++++ b/src/hooks/bundled/session-memory/transcript.ts
+@@ -21,6 +21,11 @@ export async function getRecentSessionContent(
+             if (role === "user" && hasInterSessionUserProvenance(msg)) {
+               continue;
+             }
++            const provider = typeof msg.provider === "string" ? msg.provider : "";
++            const model = typeof msg.model === "string" ? msg.model : "";
++            if (role === "assistant" && provider === "openclaw" && model === "delivery-mirror") {
++              continue;
++            }
+             const text = Array.isArray(msg.content)
+               ? // oxlint-disable-next-line typescript/no-explicit-any
+                 msg.content.find((c: any) => c.type === "text")?.text
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,155 @@
+From a99588f3b789281330576123999c26a5b0ba27b3 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sun, 29 Mar 2026 22:45:51 +0800
+Subject: [PATCH 90/98] fix: restore outbound target handling regressions
+
+---
+ src/channels/plugins/registry.ts        | 14 +++++++++-
+ src/infra/outbound/conversation-id.ts   |  9 +-----
+ src/memory/manager.async-search.test.ts | 37 +++++++++++++++++--------
+ 3 files changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/src/channels/plugins/registry.ts b/src/channels/plugins/registry.ts
+index 3f170cbfb9..7ccb0d5ae7 100644
+--- a/src/channels/plugins/registry.ts
++++ b/src/channels/plugins/registry.ts
+@@ -21,23 +21,34 @@ function dedupeChannels(channels: ChannelPlugin[]): ChannelPlugin[] {
+ 
+ type CachedChannelPlugins = {
+   registryVersion: number;
++  sourceSignature: string;
+   sorted: ChannelPlugin[];
+   byId: Map<string, ChannelPlugin>;
+ };
+ 
+ const EMPTY_CHANNEL_PLUGIN_CACHE: CachedChannelPlugins = {
+   registryVersion: -1,
++  sourceSignature: "",
+   sorted: [],
+   byId: new Map(),
+ };
+ 
+ let cachedChannelPlugins = EMPTY_CHANNEL_PLUGIN_CACHE;
+ 
++function buildChannelPluginSourceSignature(
++  registry: ReturnType<typeof requireActivePluginRegistry>,
++) {
++  return registry.channels
++    .map((entry) => `${String(entry.plugin.id).trim()}:${entry.plugin.meta.order ?? ""}`)
++    .join("\u0000");
++}
++
+ function resolveCachedChannelPlugins(): CachedChannelPlugins {
+   const registry = requireActivePluginRegistry();
+   const registryVersion = getActivePluginRegistryVersion();
++  const sourceSignature = buildChannelPluginSourceSignature(registry);
+   const cached = cachedChannelPlugins;
+-  if (cached.registryVersion === registryVersion) {
++  if (cached.registryVersion === registryVersion && cached.sourceSignature === sourceSignature) {
+     return cached;
+   }
+ 
+@@ -58,6 +69,7 @@ function resolveCachedChannelPlugins(): CachedChannelPlugins {
+ 
+   const next: CachedChannelPlugins = {
+     registryVersion,
++    sourceSignature,
+     sorted,
+     byId,
+   };
+diff --git a/src/infra/outbound/conversation-id.ts b/src/infra/outbound/conversation-id.ts
+index 26a6f8c062..e90d5098c8 100644
+--- a/src/infra/outbound/conversation-id.ts
++++ b/src/infra/outbound/conversation-id.ts
+@@ -7,7 +7,7 @@ function normalizeConversationId(value: unknown): string | undefined {
+ }
+ 
+ function resolveExplicitConversationTargetId(target: string): string | undefined {
+-  for (const prefix of ["channel:", "conversation:", "group:", "room:", "dm:"]) {
++  for (const prefix of ["channel:", "conversation:", "group:", "room:", "dm:", "chat:"]) {
+     if (target.toLowerCase().startsWith(prefix)) {
+       return normalizeConversationId(target.slice(prefix.length));
+     }
+@@ -37,13 +37,6 @@ export function resolveConversationIdFromTargets(params: {
+     if (target.includes(":") && explicitConversationId === undefined) {
+       continue;
+     }
+-    if (target.startsWith("chat:")) {
+-      const chatId = normalizeConversationId(target.slice("chat:".length));
+-      if (chatId) {
+-        return chatId;
+-      }
+-      continue;
+-    }
+     const mentionMatch = target.match(/^<#(\d+)>$/);
+     if (mentionMatch?.[1]) {
+       return mentionMatch[1];
+diff --git a/src/memory/manager.async-search.test.ts b/src/memory/manager.async-search.test.ts
+index 7968c4e129..69cb566b37 100644
+--- a/src/memory/manager.async-search.test.ts
++++ b/src/memory/manager.async-search.test.ts
+@@ -3,21 +3,16 @@ import os from "node:os";
+ import path from "node:path";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { OpenClawConfig } from "../config/config.js";
+-import type { MemoryIndexManager } from "./index.js";
+-import { closeAllMemorySearchManagers } from "./index.js";
++import "./test-runtime-mocks.js";
+ import { createOpenAIEmbeddingProviderMock } from "./test-embeddings-mock.js";
+-import { createMemoryManagerOrThrow } from "./test-manager.js";
++
++type MemoryIndexManager = import("./index.js").MemoryIndexManager;
++type MemoryIndexModule = typeof import("./index.js");
+ 
+ const embedBatch = vi.fn(async (_input: string[]): Promise<number[][]> => []);
+ const embedQuery = vi.fn(async (_input: string): Promise<number[]> => [0.2, 0.2, 0.2]);
+-
+-vi.mock("./embeddings.js", () => ({
+-  createEmbeddingProvider: async (_options: unknown) =>
+-    createOpenAIEmbeddingProviderMock({
+-      embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
+-      embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
+-    }),
+-}));
++let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
++let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
+ 
+ describe("memory search async sync", () => {
+   let workspaceDir: string;
+@@ -43,6 +38,15 @@ describe("memory search async sync", () => {
+     }) as OpenClawConfig;
+ 
+   beforeEach(async () => {
++    vi.resetModules();
++    vi.doMock("./embeddings.js", () => ({
++      createEmbeddingProvider: async (_options: unknown) =>
++        createOpenAIEmbeddingProviderMock({
++          embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
++          embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
++        }),
++    }));
++    ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
+     await closeAllMemorySearchManagers();
+     embedBatch.mockClear();
+     embedBatch.mockImplementation(async (input: string[]) => input.map(() => [0.2, 0.2, 0.2]));
+@@ -62,6 +66,17 @@ describe("memory search async sync", () => {
+     await fs.rm(workspaceDir, { recursive: true, force: true });
+   });
+ 
++  async function createMemoryManagerOrThrow(
++    cfg: OpenClawConfig,
++    agentId = "main",
++  ): Promise<MemoryIndexManager> {
++    const result = await getMemorySearchManager({ cfg, agentId });
++    if (!result.manager) {
++      throw new Error("manager missing");
++    }
++    return result.manager as unknown as MemoryIndexManager;
++  }
++
+   it("does not await sync when searching", async () => {
+     const cfg = buildConfig();
+     manager = await createMemoryManagerOrThrow(cfg);
+-- 
+2.50.1 (Apple Git-155)
+

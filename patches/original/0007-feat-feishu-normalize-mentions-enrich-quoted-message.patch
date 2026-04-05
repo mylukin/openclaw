@@ -1,0 +1,528 @@
+From 6d0ed4994a15391b8019dcaa9d7c15b424c38013 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:43:18 +0800
+Subject: [PATCH 07/98] feat(feishu): normalize mentions, enrich quoted-message
+ placeholders, and harden sender lookup
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ .../feishu/src/bot.checkBotMentioned.test.ts  |  13 ++
+ .../feishu/src/bot.stripBotMention.test.ts    |  17 +++
+ extensions/feishu/src/bot.ts                  |  32 +++--
+ extensions/feishu/src/mention.test.ts         |  28 +++++
+ extensions/feishu/src/mention.ts              |  43 +++++++
+ extensions/feishu/src/send.test.ts            |  46 ++++++-
+ extensions/feishu/src/send.ts                 | 118 ++++++++++++++++--
+ extensions/feishu/src/types.ts                |   1 +
+ 8 files changed, 281 insertions(+), 17 deletions(-)
+ create mode 100644 extensions/feishu/src/mention.test.ts
+
+diff --git a/extensions/feishu/src/bot.checkBotMentioned.test.ts b/extensions/feishu/src/bot.checkBotMentioned.test.ts
+index a7ea679227..589f4ecaff 100644
+--- a/extensions/feishu/src/bot.checkBotMentioned.test.ts
++++ b/extensions/feishu/src/bot.checkBotMentioned.test.ts
+@@ -128,6 +128,19 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
+     expect(ctx.content).toBe("hello world");
+   });
+ 
++  it("strips only bot mention and preserves human mention text", () => {
++    const event = makeEvent(
++      "group",
++      [
++        { key: "@_bot_1", name: "Bot", id: { open_id: BOT_OPEN_ID } },
++        { key: "@_user_1", name: "Luke", id: { open_id: "ou_luke" } },
++      ],
++      "@Bot @_bot_1 请 @Luke @_user_1 review",
++    );
++    const ctx = parseFeishuMessageEvent(event as any, BOT_OPEN_ID);
++    expect(ctx.content).toBe("请 @Luke @_user_1 review");
++  });
++
+   it("returns mentionedBot=true for post message with at (no top-level mentions)", () => {
+     const BOT_OPEN_ID = "ou_bot_123";
+     const event = makePostEvent({
+diff --git a/extensions/feishu/src/bot.stripBotMention.test.ts b/extensions/feishu/src/bot.stripBotMention.test.ts
+index 1c23c8fced..5c3fe7e1a9 100644
+--- a/extensions/feishu/src/bot.stripBotMention.test.ts
++++ b/extensions/feishu/src/bot.stripBotMention.test.ts
+@@ -111,6 +111,23 @@ describe("normalizeMentions (via parseFeishuMessageEvent)", () => {
+     );
+   });
+ 
++  it("avoids cascading rewrite when mention keys overlap by prefix", () => {
++    const ctx = parseFeishuMessageEvent(
++      makeEvent(
++        "请 @_user_10 处理，再请 @_user_1 复核",
++        [
++          { key: "@_user_1", name: "One", id: { open_id: "ou_user_1" } },
++          { key: "@_user_10", name: "Ten", id: { open_id: "ou_user_10" } },
++        ],
++        "group",
++      ) as any,
++      BOT_OPEN_ID,
++    );
++    expect(ctx.content).toBe(
++      '请 <at user_id="ou_user_10">Ten</at> 处理，再请 <at user_id="ou_user_1">One</at> 复核',
++    );
++  });
++
+   it("treats $ in display name as literal (no replacement-pattern interpolation)", () => {
+     const ctx = parseFeishuMessageEvent(
+       makeEvent("@_user_1 hi", [
+diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
+index ac36a83e2e..b08388c634 100644
+--- a/extensions/feishu/src/bot.ts
++++ b/extensions/feishu/src/bot.ts
+@@ -302,8 +302,9 @@ function resolveFeishuGroupSession(params: {
+   const normalizedRootId = rootId?.trim();
+   const threadReply = Boolean(normalizedThreadId || normalizedRootId);
+   const replyInThread =
+-    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled" ||
+-    threadReply;
++    (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
++  const streamingInThread =
++    (groupConfig?.streamingInThread ?? feishuCfg?.streamingInThread ?? "disabled") === "enabled";
+ 
+   const legacyTopicSessionMode =
+     groupConfig?.topicSessionMode ?? feishuCfg?.topicSessionMode ?? "disabled";
+@@ -529,9 +530,13 @@ function normalizeMentions(
+ 
+   const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+   const escapeName = (value: string) => value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+-  let result = text;
++  const replacementByKey = new Map<string, string>();
+ 
+   for (const mention of mentions) {
++    const key = mention.key?.trim();
++    if (!key || replacementByKey.has(key)) {
++      continue;
++    }
+     const mentionId = mention.id.open_id;
+     const replacement =
+       botStripId && mentionId === botStripId
+@@ -539,11 +544,18 @@ function normalizeMentions(
+         : mentionId
+           ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
+           : `@${mention.name}`;
++    replacementByKey.set(key, replacement);
++  }
+ 
+-    result = result.replace(new RegExp(escaped(mention.key), "g"), () => replacement).trim();
++  if (replacementByKey.size === 0) {
++    return text;
+   }
+ 
+-  return result;
++  // One-pass replacement avoids recursive/cascading rewrites when keys overlap,
++  // e.g. "@_user_1" and "@_user_10".
++  const sortedKeys = [...replacementByKey.keys()].sort((left, right) => right.length - left.length);
++  const keyPattern = new RegExp(sortedKeys.map((key) => escaped(key)).join("|"), "g");
++  return text.replace(keyPattern, (matched) => replacementByKey.get(matched) ?? matched).trim();
+ }
+ 
+ function normalizeFeishuCommandProbeBody(text: string): string {
+@@ -1485,8 +1497,9 @@ export async function handleFeishuMessage(params: {
+             replyToMessageId: replyTargetMessageId,
+             skipReplyToInMessages: !isGroup,
+             replyInThread,
+-            rootId: ctx.rootId,
+-            threadReply,
++            streamingInThread,
++            rootId: replyInThread ? ctx.rootId : undefined,
++            threadReply: replyInThread && threadReply,
+             mentionTargets: ctx.mentionTargets,
+             accountId: account.accountId,
+             botOpenId,
+@@ -1584,8 +1597,9 @@ export async function handleFeishuMessage(params: {
+         replyToMessageId: replyTargetMessageId,
+         skipReplyToInMessages: !isGroup,
+         replyInThread,
+-        rootId: ctx.rootId,
+-        threadReply,
++        streamingInThread,
++        rootId: replyInThread ? ctx.rootId : undefined,
++        threadReply: replyInThread && threadReply,
+         mentionTargets: ctx.mentionTargets,
+         accountId: account.accountId,
+         botOpenId,
+diff --git a/extensions/feishu/src/mention.test.ts b/extensions/feishu/src/mention.test.ts
+new file mode 100644
+index 0000000000..e5fcbb2cc8
+--- /dev/null
++++ b/extensions/feishu/src/mention.test.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, it } from "vitest";
++import { normalizeMentionTagsForCard, normalizeMentionTagsForText } from "./mention.js";
++
++describe("mention tag normalization", () => {
++  it("converts text-style mentions to card-style mentions", () => {
++    const input = `<at user_id="ou_123">Emma</at> hello <at user_id='all'>Everyone</at>`;
++    const output = normalizeMentionTagsForCard(input);
++    expect(output).toBe("<at id=ou_123></at> hello <at id=all></at>");
++  });
++
++  it("converts card-style mentions to text-style mentions with display names", () => {
++    const input = "<at id=ou_123></at> hi";
++    const output = normalizeMentionTagsForText(input, { ou_123: "Emma" });
++    expect(output).toBe('<at user_id="ou_123">Emma</at> hi');
++  });
++
++  it("falls back to id when card mention has no mapped display name", () => {
++    const input = "<at id=ou_999></at>";
++    const output = normalizeMentionTagsForText(input);
++    expect(output).toBe('<at user_id="ou_999">ou_999</at>');
++  });
++
++  it("keeps non-mention text unchanged", () => {
++    const input = "plain text";
++    expect(normalizeMentionTagsForCard(input)).toBe(input);
++    expect(normalizeMentionTagsForText(input)).toBe(input);
++  });
++});
+diff --git a/extensions/feishu/src/mention.ts b/extensions/feishu/src/mention.ts
+index 9c0fd96e35..82c8a9c3d6 100644
+--- a/extensions/feishu/src/mention.ts
++++ b/extensions/feishu/src/mention.ts
+@@ -16,6 +16,49 @@ export type MentionTarget = {
+   key: string; // Placeholder in original message, e.g. @_user_1
+ };
+ 
++const AT_USER_ID_TAG_RE =
++  /<at\s+user_id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))\s*>[\s\S]*?<\/at>/gi;
++const AT_ID_TAG_RE = /<at\s+id\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>/]+))\s*(?:\/>|>\s*<\/at>)/gi;
++
++function pickMentionId(
++  quotedDouble?: string,
++  quotedSingle?: string,
++  unquoted?: string,
++): string | null {
++  const value = (quotedDouble ?? quotedSingle ?? unquoted ?? "").trim();
++  return value ? value : null;
++}
++
++export function normalizeMentionTagsForCard(content: string): string {
++  if (!content.includes("<at")) {
++    return content;
++  }
++  return content.replace(AT_USER_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
++    const id = pickMentionId(quotedDouble, quotedSingle, unquoted);
++    if (!id) {
++      return full;
++    }
++    return `<at id=${id}></at>`;
++  });
++}
++
++export function normalizeMentionTagsForText(
++  content: string,
++  displayNameByOpenId?: Record<string, string>,
++): string {
++  if (!content.includes("<at")) {
++    return content;
++  }
++  return content.replace(AT_ID_TAG_RE, (full, quotedDouble, quotedSingle, unquoted) => {
++    const id = pickMentionId(quotedDouble, quotedSingle, unquoted);
++    if (!id) {
++      return full;
++    }
++    const displayName = displayNameByOpenId?.[id] ?? (id === "all" ? "Everyone" : id);
++    return `<at user_id="${id}">${displayName}</at>`;
++  });
++}
++
+ /**
+  * Extract mention targets from message event (excluding the bot itself)
+  */
+diff --git a/extensions/feishu/src/send.test.ts b/extensions/feishu/src/send.test.ts
+index 18e14b20d7..6f8c1ad4dd 100644
+--- a/extensions/feishu/src/send.test.ts
++++ b/extensions/feishu/src/send.test.ts
+@@ -1,6 +1,6 @@
+ import type { ClawdbotConfig } from "openclaw/plugin-sdk/feishu";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+-import { getMessageFeishu } from "./send.js";
++import { enrichMentionPlaceholders, getMessageFeishu } from "./send.js";
+ 
+ const { mockClientGet, mockCreateFeishuClient, mockResolveFeishuAccount } = vi.hoisted(() => ({
+   mockClientGet: vi.fn(),
+@@ -166,3 +166,47 @@ describe("getMessageFeishu", () => {
+     );
+   });
+ });
++
++describe("enrichMentionPlaceholders", () => {
++  it("replaces @_user_N placeholders with @name", () => {
++    const content = "@_user_1 登陆了，@_user_2 也来了";
++    const mentions = [
++      { key: "@_user_1", name: "张三" },
++      { key: "@_user_2", name: "李四" },
++    ];
++    expect(enrichMentionPlaceholders(content, mentions)).toBe("@张三 登陆了，@李四 也来了");
++  });
++
++  it("handles prefix collision: @_user_1 vs @_user_10", () => {
++    const content = "@_user_1 和 @_user_10 都在";
++    const mentions = [
++      { key: "@_user_1", name: "Alice" },
++      { key: "@_user_10", name: "Bob" },
++    ];
++    expect(enrichMentionPlaceholders(content, mentions)).toBe("@Alice 和 @Bob 都在");
++  });
++
++  it("returns content unchanged when mentions is empty or undefined", () => {
++    expect(enrichMentionPlaceholders("hello @_user_1", undefined)).toBe("hello @_user_1");
++    expect(enrichMentionPlaceholders("hello @_user_1", [])).toBe("hello @_user_1");
++  });
++
++  it("skips entries with missing key or name", () => {
++    const content = "@_user_1 和 @_user_2 在";
++    const mentions = [
++      { key: "@_user_1", name: "Alice" },
++      { key: "@_user_2", name: undefined },
++      { key: undefined, name: "Ghost" },
++    ] as Array<{ key?: string; name?: string }>;
++    expect(enrichMentionPlaceholders(content, mentions)).toBe("@Alice 和 @_user_2 在");
++  });
++
++  it("trims whitespace-only keys and names", () => {
++    const content = "@_user_1 hi";
++    const mentions = [
++      { key: "  ", name: "Alice" },
++      { key: "@_user_1", name: "  " },
++    ];
++    expect(enrichMentionPlaceholders(content, mentions)).toBe("@_user_1 hi");
++  });
++});
+diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
+index 928ef07f94..92d15a321b 100644
+--- a/extensions/feishu/src/send.ts
++++ b/extensions/feishu/src/send.ts
+@@ -2,7 +2,12 @@ import type { ClawdbotConfig } from "openclaw/plugin-sdk/feishu";
+ import { resolveFeishuAccount } from "./accounts.js";
+ import { createFeishuClient } from "./client.js";
+ import type { MentionTarget } from "./mention.js";
+-import { buildMentionedMessage, buildMentionedCardContent } from "./mention.js";
++import {
++  buildMentionedMessage,
++  buildMentionedCardContent,
++  normalizeMentionTagsForCard,
++  normalizeMentionTagsForText,
++} from "./mention.js";
+ import { parsePostContent } from "./post.js";
+ import { getFeishuRuntime } from "./runtime.js";
+ import { assertFeishuMessageApiSuccess, toFeishuSendResult } from "./send-result.js";
+@@ -157,6 +162,32 @@ function parseQuotedMessageContent(rawContent: string, msgType: string): string
+   return `[${msgType || "unknown"} message]`;
+ }
+ 
++/**
++ * Replace `@_user_N` placeholders with `@name` using the mentions array
++ * returned by the Feishu message API.
++ */
++export function enrichMentionPlaceholders(
++  content: string,
++  mentions?: Array<{ key?: string; name?: string }>,
++): string {
++  if (!mentions || mentions.length === 0) return content;
++
++  const entries: Array<[string, string]> = [];
++  for (const m of mentions) {
++    const key = m.key?.trim();
++    const name = m.name?.trim();
++    if (key && name) entries.push([key, `@${name}`]);
++  }
++  if (entries.length === 0) return content;
++
++  // Sort by key length descending to prevent @_user_1 matching @_user_10
++  entries.sort((a, b) => b[0].length - a[0].length);
++
++  const pattern = entries.map(([k]) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
++  const map = new Map(entries);
++  return content.replace(new RegExp(pattern, "g"), (match) => map.get(match) ?? match);
++}
++
+ /**
+  * Get a message by its ID.
+  * Useful for fetching quoted/replied message content.
+@@ -191,6 +222,11 @@ export async function getMessageFeishu(params: {
+             id_type?: string;
+             sender_type?: string;
+           };
++          mentions?: Array<{
++            key?: string;
++            name?: string;
++            id?: { open_id?: string; user_id?: string; union_id?: string };
++          }>;
+           create_time?: string;
+         }>;
+         message_id?: string;
+@@ -225,6 +261,8 @@ export async function getMessageFeishu(params: {
+     const rawContent = item.body?.content ?? "";
+     const content = parseQuotedMessageContent(rawContent, msgType);
+ 
++    content = enrichMentionPlaceholders(content, item.mentions);
++
+     return {
+       messageId: item.message_id ?? messageId,
+       chatId: item.chat_id ?? "",
+@@ -253,6 +291,57 @@ export type SendFeishuMessageParams = {
+   accountId?: string;
+ };
+ 
++function buildMentionMeta(
++  mentions?: MentionTarget[],
++): { mentions: Array<{ id: string; name?: string }> } | undefined {
++  if (!mentions || mentions.length === 0) {
++    return undefined;
++  }
++  return {
++    mentions: mentions.map((mention) => ({
++      id: mention.openId,
++      name: mention.name,
++    })),
++  };
++}
++
++function buildMentionDisplayNameMap(
++  mentions?: MentionTarget[],
++): Record<string, string> | undefined {
++  if (!mentions || mentions.length === 0) {
++    return undefined;
++  }
++  const map: Record<string, string> = {};
++  for (const mention of mentions) {
++    const openId = mention.openId?.trim();
++    if (!openId) {
++      continue;
++    }
++    const name = mention.name?.trim();
++    if (name) {
++      map[openId] = name;
++    }
++  }
++  return Object.keys(map).length > 0 ? map : undefined;
++}
++
++function normalizeCardMentionTags(value: unknown): unknown {
++  if (typeof value === "string") {
++    return normalizeMentionTagsForCard(value);
++  }
++  if (Array.isArray(value)) {
++    return value.map((item) => normalizeCardMentionTags(item));
++  }
++  if (value && typeof value === "object") {
++    const normalized: Record<string, unknown> = {};
++    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
++      normalized[key] = normalizeCardMentionTags(item);
++    }
++    return normalized;
++  }
++  return value;
++}
++
+ function buildFeishuPostMessagePayload(params: { messageText: string }): {
+   content: string;
+   msgType: string;
+@@ -279,6 +368,7 @@ export async function sendMessageFeishu(
+   params: SendFeishuMessageParams,
+ ): Promise<FeishuSendResult> {
+   const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId } = params;
++  const mentionMeta = buildMentionMeta(mentions);
+   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
+   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
+     cfg,
+@@ -290,6 +380,7 @@ export async function sendMessageFeishu(
+   if (mentions && mentions.length > 0) {
+     rawText = buildMentionedMessage(mentions, rawText);
+   }
++  rawText = normalizeMentionTagsForText(rawText, buildMentionDisplayNameMap(mentions));
+   const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(rawText, tableMode);
+ 
+   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
+@@ -317,7 +408,10 @@ export async function sendMessageFeishu(
+       return sendFallbackDirect(client, directParams, "Feishu send failed");
+     }
+     assertFeishuMessageApiSuccess(response, "Feishu reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return {
++      ...toFeishuSendResult(response, receiveId),
++      ...(mentionMeta ? { meta: mentionMeta } : {}),
++    };
+   }
+ 
+   return sendFallbackDirect(client, directParams, "Feishu send failed");
+@@ -330,11 +424,13 @@ export type SendFeishuCardParams = {
+   replyToMessageId?: string;
+   /** When true, reply creates a Feishu topic thread instead of an inline reply */
+   replyInThread?: boolean;
++  mentions?: MentionTarget[];
+   accountId?: string;
+ };
+ 
+ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<FeishuSendResult> {
+-  const { cfg, to, card, replyToMessageId, replyInThread, accountId } = params;
++  const { cfg, to, card, replyToMessageId, replyInThread, mentions, accountId } = params;
++  const mentionMeta = buildMentionMeta(mentions);
+   const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
+   const content = JSON.stringify(card);
+ 
+@@ -361,7 +457,10 @@ export async function sendCardFeishu(params: SendFeishuCardParams): Promise<Feis
+       return sendFallbackDirect(client, directParams, "Feishu card send failed");
+     }
+     assertFeishuMessageApiSuccess(response, "Feishu card reply failed");
+-    return toFeishuSendResult(response, receiveId);
++    return {
++      ...toFeishuSendResult(response, receiveId),
++      ...(mentionMeta ? { meta: mentionMeta } : {}),
++    };
+   }
+ 
+   return sendFallbackDirect(client, directParams, "Feishu card send failed");
+@@ -380,7 +479,7 @@ export async function updateCardFeishu(params: {
+   }
+ 
+   const client = createFeishuClient(account);
+-  const content = JSON.stringify(card);
++  const content = JSON.stringify(normalizeCardMentionTags(card));
+ 
+   const response = await client.im.message.patch({
+     path: { message_id: messageId },
+@@ -434,8 +533,9 @@ export async function sendMarkdownCardFeishu(params: {
+   if (mentions && mentions.length > 0) {
+     cardText = buildMentionedCardContent(mentions, text);
+   }
++  cardText = normalizeMentionTagsForCard(cardText);
+   const card = buildMarkdownCard(cardText);
+-  return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, accountId });
++  return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, mentions, accountId });
+ }
+ 
+ /**
+@@ -459,7 +559,11 @@ export async function editMessageFeishu(params: {
+     cfg,
+     channel: "feishu",
+   });
+-  const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(text ?? "", tableMode);
++  const normalizedText = normalizeMentionTagsForText(text ?? "");
++  const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(
++    normalizedText,
++    tableMode,
++  );
+ 
+   const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
+ 
+diff --git a/extensions/feishu/src/types.ts b/extensions/feishu/src/types.ts
+index 2160ae05c2..76dd771351 100644
+--- a/extensions/feishu/src/types.ts
++++ b/extensions/feishu/src/types.ts
+@@ -58,6 +58,7 @@ export type FeishuMessageContext = {
+ export type FeishuSendResult = {
+   messageId: string;
+   chatId: string;
++  meta?: Record<string, unknown>;
+ };
+ 
+ export type FeishuProbeResult = BaseProbeResult<string> & {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,30 @@
+From b0b4528bd45d3b12ceb0d60c66a225a23d059e46 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 10 Mar 2026 22:52:51 +0800
+Subject: [PATCH 20/98] fix(failover): detect OpenAI generic 500 retry error as
+ transient failure
+
+Adds pattern for OpenAI's "you can retry your request" error message so
+it is classified as an abort/error stop reason and triggers failover.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ src/agents/pi-embedded-helpers/failover-matches.ts | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/agents/pi-embedded-helpers/failover-matches.ts b/src/agents/pi-embedded-helpers/failover-matches.ts
+index f2e0e3870a..362dcf7f2d 100644
+--- a/src/agents/pi-embedded-helpers/failover-matches.ts
++++ b/src/agents/pi-embedded-helpers/failover-matches.ts
+@@ -43,6 +43,8 @@ const ERROR_PATTERNS = {
+     /\bstop reason:\s*(?:abort|error)\b/i,
+     /\breason:\s*(?:abort|error)\b/i,
+     /\bunhandled stop reason:\s*(?:abort|error)\b/i,
++    // OpenAI generic 500: "An error occurred while processing your request. You can retry your request..."
++    /you can retry your request/i,
+   ],
+   billing: [
+     /["']?(?:status|code)["']?\s*[:=]\s*402\b|\bhttp\s*402\b|\berror(?:\s+code)?\s*[:=]?\s*402\b|\b(?:got|returned|received)\s+(?:a\s+)?402\b|^\s*402\s+payment/i,
+-- 
+2.50.1 (Apple Git-155)
+

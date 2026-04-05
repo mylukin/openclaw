@@ -1,0 +1,274 @@
+From 4bdb0c12a2132b8f7d5fff8c17dae09e05000267 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Wed, 25 Mar 2026 09:08:53 +0800
+Subject: [PATCH 57/98] fix(plugins): prevent late plugin reloads from
+ destroying global hook runner
+
+maybeBootstrapChannelPlugin and other runtime provider registries call
+loadOpenClawPlugins(activate:true) with a different cache key than
+gateway startup, triggering a full registry rebuild that replaces the
+global hook runner.  The new registry lacks hooks registered during
+startup (e.g. message_received from feishu_chat), silently dropping
+all group messages.
+
+Layer 1: maybeBootstrapChannelPlugin now returns early when any channel
+plugins are already loaded, preventing the most common trigger.
+
+Layer 2: initializeGlobalHookRunner carries forward hooks (and their
+plugin records) from the previous registry when the new one lacks them,
+guarding against ALL activate:true callers.  The merged registry is a
+shallow copy to avoid polluting the loader cache.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/infra/outbound/channel-resolution.test.ts | 24 +++++------
+ src/infra/outbound/channel-resolution.ts      | 34 +++------------
+ src/plugins/hook-runner-global.test.ts        | 31 ++++++++++++++
+ src/plugins/hook-runner-global.ts             | 42 ++++++++++++++++++-
+ 4 files changed, 88 insertions(+), 43 deletions(-)
+
+diff --git a/src/infra/outbound/channel-resolution.test.ts b/src/infra/outbound/channel-resolution.test.ts
+index 30480fd004..2fca12663a 100644
+--- a/src/infra/outbound/channel-resolution.test.ts
++++ b/src/infra/outbound/channel-resolution.test.ts
+@@ -93,7 +93,7 @@ describe("outbound channel resolution", () => {
+     expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
+   });
+ 
+-  it("falls back to the active registry when getChannelPlugin misses", async () => {
++  it("skips bootstrap when active registry already has channels", async () => {
+     const plugin = { id: "telegram" };
+     getChannelPluginMock.mockReturnValue(undefined);
+     getActivePluginRegistryMock.mockReturnValue({
+@@ -101,12 +101,15 @@ describe("outbound channel resolution", () => {
+     });
+     const channelResolution = await importChannelResolution("direct-registry");
+ 
++    // Even though getChannelPlugin returns undefined, bootstrap is skipped
++    // because the active registry already has channels loaded.
+     expect(
+       channelResolution.resolveOutboundChannelPlugin({
+         channel: "telegram",
+         cfg: {} as never,
+       }),
+-    ).toBe(plugin);
++    ).toBeUndefined();
++    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
+   });
+ 
+   it("bootstraps plugins once per registry key and returns the newly loaded plugin", async () => {
+@@ -123,9 +126,6 @@ describe("outbound channel resolution", () => {
+     expect(loadOpenClawPluginsMock).toHaveBeenCalledWith({
+       config: { autoEnabled: true },
+       workspaceDir: "/tmp/workspace",
+-      runtimeOptions: {
+-        allowGatewaySubagentBinding: true,
+-      },
+     });
+ 
+     getChannelPluginMock.mockReturnValue(undefined);
+@@ -137,27 +137,25 @@ describe("outbound channel resolution", () => {
+     expect(loadOpenClawPluginsMock).toHaveBeenLastCalledWith({
+       config: { autoEnabled: true },
+       workspaceDir: "/tmp/workspace",
+-      runtimeOptions: {
+-        allowGatewaySubagentBinding: true,
+-      },
+     });
+   });
+ 
+-  it("bootstraps when the active registry has other channels but not the requested one", async () => {
+-    const plugin = { id: "telegram" };
+-    getChannelPluginMock.mockReturnValueOnce(undefined).mockReturnValueOnce(plugin);
++  it("skips bootstrap when the active registry has other channels but not the requested one", async () => {
++    getChannelPluginMock.mockReturnValue(undefined);
+     getActivePluginRegistryMock.mockReturnValue({
+       channels: [{ plugin: { id: "discord" } }],
+     });
+     const channelResolution = await importChannelResolution("bootstrap-missing-target");
+ 
++    // Bootstrap is skipped to protect the existing hook runner — gateway
++    // startup should have loaded all needed channel plugins already.
+     expect(
+       channelResolution.resolveOutboundChannelPlugin({
+         channel: "telegram",
+         cfg: { channels: {} } as never,
+       }),
+-    ).toBe(plugin);
+-    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(1);
++    ).toBeUndefined();
++    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
+   });
+ 
+   it("retries bootstrap after a transient load failure", async () => {
+diff --git a/src/infra/outbound/channel-resolution.ts b/src/infra/outbound/channel-resolution.ts
+index 15372daa2a..5c2e70e1d0 100644
+--- a/src/infra/outbound/channel-resolution.ts
++++ b/src/infra/outbound/channel-resolution.ts
+@@ -33,10 +33,11 @@ function maybeBootstrapChannelPlugin(params: {
+   }
+ 
+   const activeRegistry = getActivePluginRegistry();
+-  const activeHasRequestedChannel = activeRegistry?.channels?.some(
+-    (entry) => entry?.plugin?.id === params.channel,
+-  );
+-  if (activeHasRequestedChannel) {
++  // If any channel plugins are already loaded (from gateway startup), do not
++  // attempt a full plugin reload.  A reload builds a new registry with a
++  // different cache key, which replaces the global hook runner and silently
++  // drops hooks registered during startup (e.g. message_received).
++  if ((activeRegistry?.channels?.length ?? 0) > 0) {
+     return;
+   }
+ 
+@@ -54,9 +55,6 @@ function maybeBootstrapChannelPlugin(params: {
+     loadOpenClawPlugins({
+       config: autoEnabled,
+       workspaceDir,
+-      runtimeOptions: {
+-        allowGatewaySubagentBinding: true,
+-      },
+     });
+   } catch {
+     // Allow a follow-up resolution attempt if bootstrap failed transiently.
+@@ -64,22 +62,6 @@ function maybeBootstrapChannelPlugin(params: {
+   }
+ }
+ 
+-function resolveDirectFromActiveRegistry(
+-  channel: DeliverableMessageChannel,
+-): ChannelPlugin | undefined {
+-  const activeRegistry = getActivePluginRegistry();
+-  if (!activeRegistry) {
+-    return undefined;
+-  }
+-  for (const entry of activeRegistry.channels) {
+-    const plugin = entry?.plugin;
+-    if (plugin?.id === channel) {
+-      return plugin;
+-    }
+-  }
+-  return undefined;
+-}
+-
+ export function resolveOutboundChannelPlugin(params: {
+   channel: string;
+   cfg?: OpenClawConfig;
+@@ -94,11 +76,7 @@ export function resolveOutboundChannelPlugin(params: {
+   if (current) {
+     return current;
+   }
+-  const directCurrent = resolveDirectFromActiveRegistry(normalized);
+-  if (directCurrent) {
+-    return directCurrent;
+-  }
+ 
+   maybeBootstrapChannelPlugin({ channel: normalized, cfg: params.cfg });
+-  return resolve() ?? resolveDirectFromActiveRegistry(normalized);
++  return resolve();
+ }
+diff --git a/src/plugins/hook-runner-global.test.ts b/src/plugins/hook-runner-global.test.ts
+index 8089feff43..c445a06683 100644
+--- a/src/plugins/hook-runner-global.test.ts
++++ b/src/plugins/hook-runner-global.test.ts
+@@ -46,4 +46,35 @@ describe("hook-runner-global", () => {
+     expect(modC.getGlobalHookRunner()).toBeNull();
+     expect(modC.getGlobalPluginRegistry()).toBeNull();
+   });
++
++  it("carries forward hooks from the previous registry when the new one lacks them", async () => {
++    const mod = await importHookRunnerGlobalModule();
++    const handler = vi.fn();
++    const oldRegistry = createMockPluginRegistry([{ hookName: "message_received", handler }]);
++    mod.initializeGlobalHookRunner(oldRegistry);
++    expect(mod.getGlobalHookRunner()?.hasHooks("message_received")).toBe(true);
++
++    // Simulate a late plugin reload that produces a registry without the hook.
++    const newRegistry = createMockPluginRegistry([]);
++    // Give the new registry a different plugin id so it's clearly distinct.
++    newRegistry.plugins = [{ ...newRegistry.plugins[0], id: "other-plugin" }];
++    newRegistry.typedHooks = [];
++    mod.initializeGlobalHookRunner(newRegistry);
++
++    // The message_received hook from the old registry must survive.
++    expect(mod.getGlobalHookRunner()?.hasHooks("message_received")).toBe(true);
++  });
++
++  it("does not duplicate hooks when the new registry already contains the same plugin", async () => {
++    const mod = await importHookRunnerGlobalModule();
++    const handler = vi.fn();
++    const registry1 = createMockPluginRegistry([{ hookName: "message_received", handler }]);
++    mod.initializeGlobalHookRunner(registry1);
++
++    // Re-initialize with a registry that has the same plugin id's hooks.
++    const registry2 = createMockPluginRegistry([{ hookName: "message_received", handler }]);
++    mod.initializeGlobalHookRunner(registry2);
++
++    expect(mod.getGlobalHookRunner()?.getHookCount("message_received")).toBe(1);
++  });
+ });
+diff --git a/src/plugins/hook-runner-global.ts b/src/plugins/hook-runner-global.ts
+index 43d212025e..3fe5055bc8 100644
+--- a/src/plugins/hook-runner-global.ts
++++ b/src/plugins/hook-runner-global.ts
+@@ -26,9 +26,47 @@ const state = resolveGlobalSingleton<HookRunnerGlobalState>(hookRunnerGlobalStat
+ 
+ /**
+  * Initialize the global hook runner with a plugin registry.
+- * Called once when plugins are loaded during gateway startup.
++ * Called when plugins are loaded during gateway startup and potentially
++ * again by runtime provider registries or channel bootstrap paths.
++ *
++ * When the new registry lacks plugin hooks that were present in the
++ * previous registry, those hooks are carried forward so that late
++ * plugin reloads (e.g. provider resolution, channel bootstrap) do not
++ * silently drop hooks registered during gateway startup.
+  */
+ export function initializeGlobalHookRunner(registry: PluginRegistry): void {
++  const prev = state.registry;
++  if (prev && prev !== registry && prev.typedHooks.length > 0) {
++    const newPluginIds = new Set(registry.typedHooks.map((h) => h.pluginId));
++    const missingPluginIds = new Set<string>();
++    for (const hook of prev.typedHooks) {
++      if (!newPluginIds.has(hook.pluginId)) {
++        missingPluginIds.add(hook.pluginId);
++      }
++    }
++    if (missingPluginIds.size > 0) {
++      // Build a merged registry instead of mutating the (potentially cached)
++      // new registry in place.  This avoids polluting the plugin-loader cache.
++      const mergedTypedHooks = [
++        ...registry.typedHooks,
++        ...prev.typedHooks.filter((h) => missingPluginIds.has(h.pluginId)),
++      ];
++      const existingPluginIds = new Set(registry.plugins.map((p) => p.id));
++      const mergedPlugins = [
++        ...registry.plugins,
++        ...prev.plugins.filter((p) => missingPluginIds.has(p.id) && !existingPluginIds.has(p.id)),
++      ];
++      registry = {
++        ...registry,
++        typedHooks: mergedTypedHooks,
++        plugins: mergedPlugins,
++      };
++      log.info(
++        `hook runner: carried forward hooks from ${missingPluginIds.size} plugin(s) missing in the new registry: ${[...missingPluginIds].join(", ")}`,
++      );
++    }
++  }
++
+   state.registry = registry;
+   state.hookRunner = createHookRunner(registry, {
+     logger: {
+@@ -39,7 +77,7 @@ export function initializeGlobalHookRunner(registry: PluginRegistry): void {
+     catchErrors: true,
+   });
+ 
+-  const hookCount = registry.hooks.length;
++  const hookCount = registry.typedHooks.length;
+   if (hookCount > 0) {
+     log.info(`hook runner initialized with ${hookCount} registered hooks`);
+   }
+-- 
+2.50.1 (Apple Git-155)
+

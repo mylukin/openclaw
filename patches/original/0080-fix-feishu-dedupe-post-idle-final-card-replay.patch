@@ -1,0 +1,71 @@
+From e9b7cf38d431ab2a51de55d88afd1da6fa4b6955 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 28 Mar 2026 15:48:26 +0800
+Subject: [PATCH 80/98] fix(feishu): dedupe post-idle final card replay
+
+---
+ .../feishu/src/reply-dispatcher.test.ts       | 28 +++++++++++++++++++
+ extensions/feishu/src/reply-dispatcher.ts     |  8 ++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
+index b06624abfc..002ed0b7f1 100644
+--- a/extensions/feishu/src/reply-dispatcher.test.ts
++++ b/extensions/feishu/src/reply-dispatcher.test.ts
+@@ -1381,6 +1381,34 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("deduplicates a duplicate final after streaming card already closed on idle", async () => {
++    resolveFeishuAccountMock.mockReturnValue({
++      accountId: "main",
++      appId: "app_id",
++      appSecret: "app_secret",
++      domain: "feishu",
++      config: {
++        renderMode: "card",
++        streaming: true,
++      },
++    });
++
++    const { result, options } = createDispatcherHarness({
++      runtime: createRuntimeLogger(),
++      replyToMessageId: "om_msg",
++      replyInThread: false,
++    });
++
++    await options.onReplyStart?.();
++    await result.replyOptions.onPartialReply?.({ text: "same final text" });
++    await options.onIdle?.();
++    await options.deliver({ text: "same final text" }, { kind: "final" });
++
++    expect(streamingInstances).toHaveLength(1);
++    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
++    expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
++  });
++
+   it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
+     resolveFeishuAccountMock.mockReturnValue({
+       accountId: "main",
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index d88f309192..3fc2bd20da 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -758,6 +758,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           ...(finalNote !== undefined ? { note: finalNote } : {}),
+         });
+         hasVisibleTextInReply = true;
++        deliveredFinalTexts.add(finalText);
++        const deliveredKey = buildFinalDeliveryContentKey({
++          text: finalText,
++          useCard: true,
++        });
++        if (deliveredKey) {
++          deliveredFinalContentKeys.add(deliveredKey);
++        }
+         if (options?.emitFinalText && finalText.trim()) {
+           emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+           await emitFinalTextIfNeeded(
+-- 
+2.50.1 (Apple Git-155)
+

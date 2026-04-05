@@ -1,0 +1,44 @@
+From ad6044c59ce899159d0b4eb3a554cdf32dd80b43 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Fri, 6 Mar 2026 20:40:26 +0800
+Subject: [PATCH 03/98] fix(transcript): isolate delivery-mirror leafId from
+ main chain
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/config/sessions/transcript.ts | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/config/sessions/transcript.ts b/src/config/sessions/transcript.ts
+index e6a8044f5c..dae2cbf266 100644
+--- a/src/config/sessions/transcript.ts
++++ b/src/config/sessions/transcript.ts
+@@ -180,6 +180,9 @@ export async function appendAssistantMessageToSessionTranscript(params: {
+   await ensureSessionHeader({ sessionFile, sessionId: entry.sessionId });
+ 
+   const sessionManager = SessionManager.open(sessionFile);
++  // Save current leafId before appending delivery-mirror
++  // This prevents delivery-mirror from affecting the main chain (leafId)
++  const savedLeafId = sessionManager.getLeafId();
+   sessionManager.appendMessage({
+     role: "assistant",
+     content: [{ type: "text", text: mirrorText }],
+@@ -203,6 +206,15 @@ export async function appendAssistantMessageToSessionTranscript(params: {
+     stopReason: "stop",
+     timestamp: Date.now(),
+   });
++  // Restore leafId so delivery-mirror doesn't affect the main chain.
++  // branch() only updates in-memory leafId; on next SessionManager.open(),
++  // _buildIndex() would set leafId to the delivery-mirror entry (last in JSONL).
++  // branchWithSummary() persists a branch_summary entry to JSONL, so _buildIndex()
++  // picks it up as leafId. buildSessionContext() walks from its parentId (savedLeafId),
++  // skipping delivery-mirror. Empty summary is filtered by the "entry.summary" guard.
++  if (savedLeafId !== null) {
++    sessionManager.branchWithSummary(savedLeafId, "", undefined, false);
++  }
+ 
+   emitSessionTranscriptUpdate(sessionFile);
+   return { ok: true, sessionFile };
+-- 
+2.50.1 (Apple Git-155)
+

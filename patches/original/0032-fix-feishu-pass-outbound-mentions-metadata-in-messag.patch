@@ -1,0 +1,33 @@
+From e175768d47c755616e2616eeea68b5a49ee38bec Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 10:49:22 +0800
+Subject: [PATCH 32/98] fix(feishu): pass outbound mentions metadata in
+ message_sent hook
+
+The emitMessageSent wrapper now includes mentionTargets as structured
+{id, name} pairs in the metadata.mentions field. This lets bot-company
+correlate bot-to-bot @mentions via Phase 1 structured resolution instead
+of falling back to fragile AT-tag text parsing.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 98bbc8bcd5..e8fcb4c26b 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -188,6 +188,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         metadata: {
+           chatId,
+           ...(sendReplyToMessageId ? { replyToId: sendReplyToMessageId } : {}),
++          ...(mentionTargets?.length
++            ? { mentions: mentionTargets.map((m) => ({ id: m.openId, name: m.name })) }
++            : {}),
+           ...(event.metadata ?? {}),
+         },
+       },
+-- 
+2.50.1 (Apple Git-155)
+

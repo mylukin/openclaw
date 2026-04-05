@@ -1,0 +1,108 @@
+From a807b00d252ca41a44ee359306fecd1ff6a96abe Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Tue, 24 Mar 2026 09:27:40 +0800
+Subject: [PATCH 30/98] fix(feishu): replace streaming card content instead of
+ merging to prevent duplication
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+flushStreamingCardUpdate and queueStreamingRender both produce complete
+content snapshots (reasoning blockquote / status line + answer), but
+streaming.update() merged them via mergeStreamingText which concatenated
+incompatible formats — causing Thinking blocks and tool status lines to
+accumulate instead of replacing each other.
+
+Add { replace: true } option to FeishuStreamingSession.update() that
+bypasses mergeStreamingText, and use it for both update paths in the
+reply dispatcher.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/reply-dispatcher.ts |  8 ++++++--
+ extensions/feishu/src/streaming-card.ts   | 21 +++++++++++++--------
+ 2 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 3efe9f575a..794607def4 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -445,7 +445,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         return;
+       }
+       lastRenderedStreamContent = renderedForCard;
+-      await streaming.update(renderedForCard);
++      await streaming.update(renderedForCard, { replace: true });
+       // Only mark visible when real assistant text exists — status-only renders
+       // (e.g. "💭 思考中...") are discarded by closeStreaming() and should not
+       // suppress media-only final persistence.
+@@ -490,7 +490,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+         await streamingStartPromise;
+       }
+       if (streaming?.isActive()) {
+-        await streaming.update(combined);
++        // Replace mode: buildCombinedStreamText produces the full card content
++        // each time (reasoning + answer), so we replace rather than merge to
++        // avoid mergeStreamingText concatenating incompatible formats (e.g.
++        // status line "💭 思考中..." vs blockquote "💭 **Thinking**").
++        await streaming.update(combined, { replace: true });
+       }
+     });
+   };
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index d2c12c25d2..1adf4b637c 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -449,19 +449,21 @@ export class FeishuStreamingSession {
+     }
+   }
+ 
+-  async update(text: string): Promise<void> {
++  async update(text: string, options?: { replace?: boolean }): Promise<void> {
+     if (!this.state || this.closed) {
+       return;
+     }
+-    const mergedInput = mergeStreamingText(this.pendingText ?? this.state.currentText, text);
+-    if (!mergedInput || mergedInput === this.state.currentText) {
++    const resolvedInput = options?.replace
++      ? text
++      : mergeStreamingText(this.pendingText ?? this.state.currentText, text);
++    if (!resolvedInput || resolvedInput === this.state.currentText) {
+       return;
+     }
+ 
+     // Throttle: skip if updated recently, but remember pending text
+     const now = Date.now();
+     if (now - this.lastUpdateTime < this.updateThrottleMs) {
+-      this.pendingText = mergedInput;
++      this.pendingText = resolvedInput;
+       return;
+     }
+     this.pendingText = null;
+@@ -471,16 +473,19 @@ export class FeishuStreamingSession {
+       this.flushTimer = null;
+     }
+ 
++    const replace = options?.replace === true;
+     this.queue = this.queue.then(async () => {
+       if (!this.state || this.closed) {
+         return;
+       }
+-      const mergedText = mergeStreamingText(this.state.currentText, mergedInput);
+-      if (!mergedText || mergedText === this.state.currentText) {
++      const finalText = replace
++        ? resolvedInput
++        : mergeStreamingText(this.state.currentText, resolvedInput);
++      if (!finalText || finalText === this.state.currentText) {
+         return;
+       }
+-      this.state.currentText = mergedText;
+-      await this.updateCardContent(mergedText, (e) => this.log?.(`Update failed: ${String(e)}`));
++      this.state.currentText = finalText;
++      await this.updateCardContent(finalText, (e) => this.log?.(`Update failed: ${String(e)}`));
+     });
+     await this.queue;
+   }
+-- 
+2.50.1 (Apple Git-155)
+
