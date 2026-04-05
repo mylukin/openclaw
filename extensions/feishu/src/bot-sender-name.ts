@@ -17,7 +17,9 @@ const FEISHU_SCOPE_CORRECTIONS: Record<string, string> = {
   "contact:contact.base:readonly": "contact:user.base:readonly",
 };
 const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
+const SENDER_NAME_NOAUTH_BACKOFF_MS = 10 * 60 * 1000;
 const senderNameCache = new Map<string, { name: string; expireAt: number }>();
+const senderLookupBackoff = new Map<string, number>();
 
 function correctFeishuScopeInUrl(url: string): string {
   let corrected = url;
@@ -66,6 +68,30 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
   return "user_id";
 }
 
+function buildSenderLookupKey(account: ResolvedFeishuAccount, senderId: string): string {
+  return `${account.appId ?? account.accountId}:${senderId}`;
+}
+
+function isNoUserAuthorityError(err: unknown): boolean {
+  if (!err || typeof err !== "object") {
+    return false;
+  }
+  const axiosErr = err as { response?: { data?: unknown } };
+  const data = axiosErr.response?.data;
+  if (!data || typeof data !== "object") {
+    return false;
+  }
+  const feishuErr = data as { code?: number; msg?: string };
+  return (
+    feishuErr.code === 41050 || feishuErr.msg?.toLowerCase().includes("no user authority") === true
+  );
+}
+
+export function resetFeishuSenderNameCacheForTests(): void {
+  senderNameCache.clear();
+  senderLookupBackoff.clear();
+}
+
 export async function resolveFeishuSenderName(params: {
   account: ResolvedFeishuAccount;
   senderId: string;
@@ -86,6 +112,11 @@ export async function resolveFeishuSenderName(params: {
   if (cached && cached.expireAt > now) {
     return { name: cached.name };
   }
+  const lookupKey = buildSenderLookupKey(account, normalizedSenderId);
+  const backoffUntil = senderLookupBackoff.get(lookupKey) ?? 0;
+  if (backoffUntil > now) {
+    return {};
+  }
 
   try {
     const client = createFeishuClient(account);
@@ -101,11 +132,17 @@ export async function resolveFeishuSenderName(params: {
       res?.data?.user?.en_name;
 
     if (name && typeof name === "string") {
+      senderLookupBackoff.delete(lookupKey);
       senderNameCache.set(normalizedSenderId, { name, expireAt: now + SENDER_NAME_TTL_MS });
       return { name };
     }
     return {};
   } catch (err) {
+    if (isNoUserAuthorityError(err)) {
+      senderLookupBackoff.set(lookupKey, now + SENDER_NAME_NOAUTH_BACKOFF_MS);
+      log(`feishu: backing off sender lookup for ${normalizedSenderId} after no user authority`);
+      return {};
+    }
     const permErr = extractPermissionError(err);
     if (permErr) {
       if (shouldSuppressPermissionErrorNotice(permErr)) {
