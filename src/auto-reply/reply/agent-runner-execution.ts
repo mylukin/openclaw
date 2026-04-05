@@ -5,7 +5,11 @@ import {
   resolveSendableOutboundReplyParts,
 } from "openclaw/plugin-sdk/reply-payload";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
+import { runCliAgent } from "../../agents/cli-runner.js";
+import { getCliSessionBinding } from "../../agents/cli-session.js";
+import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
+import { isCliProvider } from "../../agents/model-selection.js";
 import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
 import {
   BILLING_ERROR_USER_MESSAGE,
@@ -27,7 +31,7 @@ import {
   updateSessionStore,
 } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
-import { registerAgentRunContext } from "../../infra/agent-events.js";
+import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
 import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
 import { defaultRuntime } from "../../runtime.js";
 import { sanitizeForLog } from "../../terminal/ansi.js";
@@ -40,6 +44,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
 import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
 import {
+  couldBeSilentTokenStart,
   HEARTBEAT_TOKEN,
   isSilentReplyPrefixText,
   isSilentReplyText,
@@ -56,6 +61,7 @@ import type { FollowupRun } from "./queue.js";
 import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
 import { createReplyMediaPathNormalizer } from "./reply-media-paths.runtime.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
+import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
 // Maximum number of LiveSessionModelSwitchError retries before surfacing a
@@ -90,6 +96,7 @@ export type AgentRunLoopResult =
       /** Payload keys sent directly (not via pipeline) during tool flush. */
       directlySentBlockKeys?: Set<string>;
     }
+  | { kind: "aborted" }
   | { kind: "final"; payload: ReplyPayload };
 
 type FallbackSelectionState = Pick<
@@ -641,11 +648,24 @@ export async function runAgentTurnWithFallback(params: {
         }
         return { text: sanitized, skip: false };
       };
+      // Buffer potential silent-token prefix from BPE-split streaming chunks (e.g. "NO" + "_REPLY").
+      // Only buffers SILENT_REPLY_TOKEN; HEARTBEAT_TOKEN is handled by normalizeStreamingText
+      // via string includes() which works on partial text without prefix-buffering.
+      let silentPrefixBuf = "";
       const handlePartialForTyping = async (payload: ReplyPayload): Promise<string | undefined> => {
-        if (isSilentReplyPrefixText(payload.text, SILENT_REPLY_TOKEN)) {
+        const combinedText = silentPrefixBuf + (payload.text ?? "");
+        silentPrefixBuf = "";
+        if (isSilentReplyText(combinedText, SILENT_REPLY_TOKEN)) {
           return undefined;
         }
-        const { text, skip } = normalizeStreamingText(payload);
+        if (isSilentReplyPrefixText(combinedText, SILENT_REPLY_TOKEN)) {
+          return undefined;
+        }
+        if (couldBeSilentTokenStart(combinedText, SILENT_REPLY_TOKEN)) {
+          silentPrefixBuf = combinedText;
+          return undefined;
+        }
+        const { text, skip } = normalizeStreamingText({ ...payload, text: combinedText });
         if (skip || !text) {
           return undefined;
         }
@@ -694,6 +714,181 @@ export async function runAgentTurnWithFallback(params: {
             );
           }
 
+          if (isCliProvider(provider, params.followupRun.run.config)) {
+            const startedAt = Date.now();
+            notifyAgentRunStart();
+            emitAgentEvent({
+              runId,
+              stream: "lifecycle",
+              data: {
+                phase: "start",
+                startedAt,
+              },
+            });
+            const cliSessionBinding = getCliSessionBinding(
+              params.getActiveSessionEntry(),
+              provider,
+            );
+            const authProfileId =
+              provider === params.followupRun.run.provider
+                ? params.followupRun.run.authProfileId
+                : undefined;
+            const cliSessionId = cliSessionBinding?.sessionId;
+            return (async () => {
+              let lifecycleTerminalEmitted = false;
+              // Serialized chain for streaming card updates.  Each onAssistantTurn
+              // appends an async step that mirrors the embedded path: first await
+              // signalTextDelta (which triggers startStreaming on first call), then
+              // forward to onPartialReply.  Awaiting this chain after the CLI run
+              // ensures markRunComplete() isn't called before streaming initialises.
+              let streamingChain: Promise<void> = Promise.resolve();
+              const streamingDirectiveAccumulator = createStreamingDirectiveAccumulator();
+              let cliReasoningOpen = false;
+              let assistantMessageStartQueued = false;
+              const queueStreamingStep = (step: () => Promise<void>) => {
+                streamingChain = streamingChain.then(step).catch((err) => {
+                  defaultRuntime.error(
+                    `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                });
+              };
+              const queueAssistantMessageStart = () => {
+                if (assistantMessageStartQueued) {
+                  return;
+                }
+                assistantMessageStartQueued = true;
+                queueStreamingStep(async () => {
+                  await params.typingSignals.signalMessageStart();
+                  await params.opts?.onAssistantMessageStart?.();
+                });
+              };
+              const escapeMarkdownItalic = (value: string): string =>
+                value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
+              const formatReasoningPayload = (text: string): string => {
+                const trimmed = text.trim();
+                if (!trimmed) {
+                  return "";
+                }
+                const lines = escapeMarkdownItalic(trimmed)
+                  .split("\n")
+                  .map((line) => line.trim());
+                const italicized = lines.map((line) => (line ? `_${line}_` : "")).join("\n");
+                return `Reasoning:\n${italicized}`;
+              };
+              const queueReasoningEndIfNeeded = () => {
+                if (!cliReasoningOpen) {
+                  return;
+                }
+                cliReasoningOpen = false;
+                queueStreamingStep(async () => {
+                  await params.opts?.onReasoningEnd?.();
+                });
+              };
+              try {
+                const result = await runCliAgent({
+                  sessionId: params.followupRun.run.sessionId,
+                  sessionKey: params.sessionKey,
+                  agentId: params.followupRun.run.agentId,
+                  sessionFile: params.followupRun.run.sessionFile,
+                  workspaceDir: params.followupRun.run.workspaceDir,
+                  config: params.followupRun.run.config,
+                  prompt: params.commandBody,
+                  provider,
+                  model,
+                  thinkLevel: params.followupRun.run.thinkLevel,
+                  timeoutMs: params.followupRun.run.timeoutMs,
+                  runId,
+                  extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                  ownerNumbers: params.followupRun.run.ownerNumbers,
+                  cliSessionId,
+                  cliSessionBinding,
+                  authProfileId,
+                  bootstrapPromptWarningSignaturesSeen,
+                  bootstrapPromptWarningSignature:
+                    bootstrapPromptWarningSignaturesSeen[
+                      bootstrapPromptWarningSignaturesSeen.length - 1
+                    ],
+                  images: params.opts?.images,
+                  imageOrder: params.opts?.imageOrder,
+                  messageProvider: params.followupRun.run.messageProvider,
+                  agentAccountId: params.followupRun.run.agentAccountId,
+                });
+                bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
+                  result.meta?.systemPromptReport,
+                );
+                queueReasoningEndIfNeeded();
+
+                // Drain all pending streaming card updates before returning.
+                // This must happen before the caller's markRunComplete() so the
+                // typing controller's startGuard doesn't block startStreaming().
+                await streamingChain;
+
+                // Emit the final/authoritative assistant text so server-chat can
+                // populate its buffer. For stream-json backends this supplements
+                // the intermediate onAssistantTurn events with the definitive result.
+                const cliText = result.payloads?.[0]?.text?.trim();
+                if (cliText) {
+                  emitAgentEvent({
+                    runId,
+                    stream: "assistant",
+                    data: { text: cliText },
+                  });
+                }
+
+                emitAgentEvent({
+                  runId,
+                  stream: "lifecycle",
+                  data: {
+                    phase: "end",
+                    startedAt,
+                    endedAt: Date.now(),
+                  },
+                });
+                lifecycleTerminalEmitted = true;
+
+                return result;
+              } catch (err) {
+                queueReasoningEndIfNeeded();
+                await streamingChain;
+                if (rollbackFallbackCandidateSelection) {
+                  try {
+                    await rollbackFallbackCandidateSelection();
+                  } catch (rollbackError) {
+                    logVerbose(
+                      `failed to roll back fallback candidate selection (non-fatal): ${String(rollbackError)}`,
+                    );
+                  }
+                }
+                emitAgentEvent({
+                  runId,
+                  stream: "lifecycle",
+                  data: {
+                    phase: "error",
+                    startedAt,
+                    endedAt: Date.now(),
+                    error: String(err),
+                  },
+                });
+                lifecycleTerminalEmitted = true;
+                throw err;
+              } finally {
+                // Defensive backstop: never let a CLI run complete without a terminal
+                // lifecycle event, otherwise downstream consumers can hang.
+                if (!lifecycleTerminalEmitted) {
+                  emitAgentEvent({
+                    runId,
+                    stream: "lifecycle",
+                    data: {
+                      phase: "error",
+                      startedAt,
+                      endedAt: Date.now(),
+                      error: "CLI run completed without lifecycle terminal event",
+                    },
+                  });
+                }
+              }
+            })();
+          }
           const { embeddedContext, senderContext, runBaseParams } = buildEmbeddedRunExecutionParams(
             {
               run: params.followupRun.run,
@@ -779,9 +974,11 @@ export async function runAgentTurnWithFallback(params: {
                   if (evt.stream === "tool") {
                     const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
                     const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
+                    const toolCallId =
+                      typeof evt.data.toolUseId === "string" ? evt.data.toolUseId : undefined;
                     if (phase === "start" || phase === "update") {
                       await params.typingSignals.signalToolStart();
-                      await params.opts?.onToolStart?.({ name, phase });
+                      await params.opts?.onToolStart?.({ name, phase, toolCallId });
                     }
                   }
                   if (evt.stream === "item") {
@@ -1085,8 +1282,12 @@ export async function runAgentTurnWithFallback(params: {
         continue;
       }
       const message = err instanceof Error ? err.message : String(err);
-      const isBilling = isBillingErrorMessage(message);
-      const isContextOverflow = !isBilling && isLikelyContextOverflowError(message);
+      const failoverReason = resolveFailoverReasonFromError(err);
+      const isExpectedAbort =
+        err instanceof Error && err.name === "AbortError" && failoverReason == null;
+      const isBilling = failoverReason === "billing" || isBillingErrorMessage(message);
+      const isContextOverflow =
+        !isBilling && !failoverReason && isLikelyContextOverflowError(message);
       const isCompactionFailure = !isBilling && isCompactionFailureError(message);
       const isSessionCorruption = /function call turn comes immediately after/i.test(message);
       const isRoleOrderingError = /incorrect role information|roles must alternate/i.test(message);
@@ -1219,6 +1420,14 @@ export async function runAgentTurnWithFallback(params: {
         continue;
       }
 
+      if (isExpectedAbort) {
+        // A plain AbortError here means the run was intentionally cancelled
+        // (for example by a newer inbound turn or session control), not that
+        // the user needs an extra failure message in chat.
+        logVerbose(`Embedded agent aborted before reply (suppressed): ${message}`);
+        return { kind: "aborted" };
+      }
+
       defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
       // Only classify as rate-limit when we have concrete evidence from the
       // underlying error. FallbackSummaryError messages embed per-attempt
@@ -1237,11 +1446,15 @@ export async function runAgentTurnWithFallback(params: {
           ? buildRateLimitCooldownMessage(err)
           : isContextOverflow
             ? "⚠️ Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."
-            : isRoleOrderingError
-              ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
-              : shouldSurfaceToControlUi
-                ? `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`
-                : buildExternalRunFailureText(message);
+            : failoverReason === "session_expired"
+              ? "⚠️ Agent session expired before reply. Please try again."
+              : failoverReason === "format"
+                ? "⚠️ Agent returned malformed output before reply. Please try again."
+                : isRoleOrderingError
+                  ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
+                  : shouldSurfaceToControlUi
+                    ? `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`
+                    : buildExternalRunFailureText(message);
 
       params.replyOperation?.fail("run_failed", err);
       return {
