@@ -205,6 +205,29 @@ describe("process supervisor", () => {
     expect(secondExit.stdout).toBe("new");
   });
 
+  it("cancels active runs by sessionId", async () => {
+    const supervisor = createProcessSupervisor();
+    const first = await spawnChild(supervisor, {
+      sessionId: "session-a",
+      argv: [process.execPath, "-e", "setTimeout(() => {}, 80)"],
+      timeoutMs: 1_000,
+      stdinMode: "pipe-open",
+    });
+    const second = await spawnChild(supervisor, {
+      sessionId: "session-b",
+      argv: [process.execPath, "-e", "setTimeout(() => {}, 80)"],
+      timeoutMs: 1_000,
+      stdinMode: "pipe-open",
+    });
+
+    expect(supervisor.cancelSession("session-a")).toBe(1);
+    const firstExit = await first.wait();
+    expect(firstExit.reason === "manual-cancel" || firstExit.reason === "signal").toBe(true);
+
+    supervisor.cancelSession("session-b");
+    await second.wait();
+  });
+
   it("applies overall timeout even for near-immediate timer firing", async () => {
     vi.useFakeTimers();
     const adapter = createStubChildAdapter({

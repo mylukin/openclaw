@@ -71,6 +71,18 @@ export async function updateSessionStoreAfterAgentRun(params: {
     provider: providerUsed,
     model: modelUsed,
   });
+  if (isCliProvider(providerUsed, cfg)) {
+    const cliSessionBinding = result.meta.agentMeta?.cliSessionBinding;
+    if (cliSessionBinding?.sessionId?.trim()) {
+      setCliSessionBinding(next, providerUsed, cliSessionBinding);
+    } else {
+      const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
+      if (cliSessionId) {
+        setCliSessionId(next, providerUsed, cliSessionId);
+      }
+    }
+    next.cliPromptLoad = result.meta.agentMeta?.cliPromptLoad;
+  }
   next.abortedLastRun = result.meta.aborted ?? false;
   if (result.meta.systemPromptReport) {
     next.systemPromptReport = result.meta.systemPromptReport;
