@@ -65,6 +65,24 @@ export type AcpSessionRuntimeOptions = {
   backendExtras?: Record<string, string>;
 };
 
+export type CliSessionBinding = {
+  sessionId: string;
+  systemPromptFile?: string;
+  systemPromptHash?: string;
+  systemPromptCompactionCount?: number;
+};
+
+export type CliPromptLoadStatus = {
+  sessionPromptFile?: string;
+  loaderMode: "normal" | "strict" | "disabled";
+  verifiedRead: boolean;
+  fallbackReason?:
+    | "write_failed"
+    | "verification_retry"
+    | "direct_injection_fallback"
+    | "direct_fallback_disabled";
+};
+
 export type SessionEntry = {
   /**
    * Last delivered heartbeat payload (used to suppress duplicate heartbeat notifications).
@@ -165,8 +183,10 @@ export type SessionEntry = {
   memoryFlushAt?: number;
   memoryFlushCompactionCount?: number;
   memoryFlushContextHash?: string;
+  cliSessionBindings?: Record<string, CliSessionBinding>;
   cliSessionIds?: Record<string, string>;
   claudeCliSessionId?: string;
+  cliPromptLoad?: CliPromptLoadStatus;
   label?: string;
   displayName?: string;
   channel?: string;

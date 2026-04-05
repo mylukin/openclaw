@@ -17,6 +17,7 @@ import {
   resolveMainSessionKey,
   resolveSessionFilePath,
   resolveSessionFilePathOptions,
+  type CliPromptLoadStatus,
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
@@ -411,6 +412,21 @@ const formatVoiceModeLine = (
   return `🔊 Voice: ${autoMode} · provider=${provider} · limit=${maxLength} · summary=${summarize}`;
 };
 
+const formatCliPromptLoadLine = (status?: CliPromptLoadStatus): string | null => {
+  if (!status) {
+    return null;
+  }
+  const modeLabel =
+    status.loaderMode === "disabled"
+      ? "direct"
+      : status.loaderMode === "strict"
+        ? "file/strict"
+        : "file";
+  const stateLabel = status.verifiedRead ? "verified" : "unverified";
+  const fallbackLabel = status.fallbackReason ? ` · fallback=${status.fallbackReason}` : "";
+  return `📄 CLI prompt: ${modeLabel} · ${stateLabel}${fallbackLabel}`;
+};
+
 export function buildStatusMessage(args: StatusArgs): string {
   const now = args.now ?? Date.now();
   const entry = args.sessionEntry;
@@ -781,6 +797,7 @@ export function buildStatusMessage(args: StatusArgs): string {
     usagePair && costLine ? `${usagePair} · ${costLine}` : (usagePair ?? costLine);
   const mediaLine = formatMediaUnderstandingLine(args.mediaDecisions);
   const voiceLine = formatVoiceModeLine(args.config, args.sessionEntry);
+  const cliPromptLoadLine = formatCliPromptLoadLine(args.sessionEntry?.cliPromptLoad);
 
   return [
     versionLine,
@@ -791,6 +808,7 @@ export function buildStatusMessage(args: StatusArgs): string {
     cacheLine,
     `📚 ${contextLine}`,
     mediaLine,
+    cliPromptLoadLine,
     args.usageLine,
     `🧵 ${sessionLine}`,
     args.subagentsLine,

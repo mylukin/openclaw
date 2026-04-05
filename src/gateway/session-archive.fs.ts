@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   formatSessionArchiveTimestamp,
   parseSessionArchiveTimestamp,
+  resolveSessionPromptFileNameFromTranscriptFileName,
   type SessionArchiveReason,
 } from "../config/sessions/artifacts.js";
 import {
@@ -107,6 +108,17 @@ export function archiveSessionTranscripts(opts: {
     }
     try {
       archived.push(archiveFileOnDisk(candidatePath, opts.reason));
+      const promptFileName = resolveSessionPromptFileNameFromTranscriptFileName(
+        path.basename(candidatePath),
+      );
+      if (!promptFileName) {
+        continue;
+      }
+      const promptPath = path.join(path.dirname(candidatePath), promptFileName);
+      if (!fs.existsSync(promptPath)) {
+        continue;
+      }
+      archived.push(archiveFileOnDisk(promptPath, opts.reason));
     } catch {
       // Best-effort.
     }

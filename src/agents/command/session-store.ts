@@ -6,7 +6,7 @@ import {
   updateSessionStore,
 } from "../../config/sessions.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
-import { setCliSessionId } from "../cli-session.js";
+import { setCliSessionBinding, setCliSessionId } from "../cli-session.js";
 import { resolveContextTokensForModel } from "../context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { isCliProvider } from "../model-selection.js";
@@ -73,10 +73,16 @@ export async function updateSessionStoreAfterAgentRun(params: {
     model: modelUsed,
   });
   if (isCliProvider(providerUsed, cfg)) {
-    const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
-    if (cliSessionId) {
-      setCliSessionId(next, providerUsed, cliSessionId);
+    const cliSessionBinding = result.meta.agentMeta?.cliSessionBinding;
+    if (cliSessionBinding?.sessionId?.trim()) {
+      setCliSessionBinding(next, providerUsed, cliSessionBinding);
+    } else {
+      const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
+      if (cliSessionId) {
+        setCliSessionId(next, providerUsed, cliSessionId);
+      }
     }
+    next.cliPromptLoad = result.meta.agentMeta?.cliPromptLoad;
   }
   next.abortedLastRun = result.meta.aborted ?? false;
   if (result.meta.systemPromptReport) {

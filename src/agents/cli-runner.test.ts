@@ -3,10 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { runCliAgent } from "./cli-runner.js";
-import { resolveCliNoOutputTimeoutMs } from "./cli-runner/helpers.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
+
+let runCliAgent: typeof import("./cli-runner.js").runCliAgent;
+let resolveCliNoOutputTimeoutMs: typeof import("./cli-runner/helpers.js").resolveCliNoOutputTimeoutMs;
 
 const supervisorSpawnMock = vi.fn();
 const enqueueSystemEventMock = vi.fn();
@@ -38,7 +39,26 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
 
 vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({
-    spawn: (...args: unknown[]) => supervisorSpawnMock(...args),
+    spawn: async (...args: unknown[]) => {
+      const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
+      const managedRun = (await supervisorSpawnMock(...args)) as
+        | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
+        | undefined;
+      if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
+        input.onStdout(managedRun.__stdoutForStreaming);
+      }
+      if (input?.onStdout && managedRun?.wait) {
+        const originalWait = managedRun.wait.bind(managedRun);
+        managedRun.wait = async () => {
+          const result = await originalWait();
+          if (typeof result?.stdout === "string") {
+            input.onStdout?.(result.stdout);
+          }
+          return result;
+        };
+      }
+      return managedRun;
+    },
     cancel: vi.fn(),
     cancelScope: vi.fn(),
     cancelSession: vi.fn(() => 0),
@@ -83,13 +103,107 @@ function createManagedRun(exit: MockRunExit, pid = 1234) {
     pid,
     startedAtMs: Date.now(),
     stdin: undefined,
+    __stdoutForStreaming: exit.stdout,
     wait: vi.fn().mockResolvedValue(exit),
     cancel: vi.fn(),
   };
 }
 
+function resolveClaudePromptFilePath(sessionFile: string): string {
+  const ext = path.extname(sessionFile);
+  const base = path.basename(sessionFile, ext);
+  return path.join(path.dirname(sessionFile), `${base}.claude-system-prompt.txt`);
+}
+
+function createClaudeStreamSuccess(sessionFile: string, text = "ok", sessionId = "sid-1"): string {
+  const promptFilePath = resolveClaudePromptFilePath(sessionFile);
+  const toolUseId = "toolu_test_read";
+  return [
+    JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }),
+    JSON.stringify({
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: toolUseId, name: "Read", input: { file_path: promptFilePath } },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      session_id: sessionId,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolUseId, content: "prompt file" }],
+      },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      session_id: sessionId,
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }),
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: text,
+      session_id: sessionId,
+    }),
+  ].join("\n");
+}
+
 describe("runCliAgent with process supervisor", () => {
   beforeEach(async () => {
+    vi.resetModules();
+    vi.doMock("../gateway/mcp-http.js", () => ({
+      MCP_PORT_OFFSET: 1,
+      ensureMcpConfigFile: (...args: unknown[]) => (ensureMcpConfigFileMock as Function)(...args),
+    }));
+    vi.doMock("../plugins/hook-runner-global.js", () => ({
+      getGlobalHookRunner: (...args: unknown[]) => (getGlobalHookRunnerMock as Function)(...args),
+    }));
+    vi.doMock("../process/supervisor/index.js", () => ({
+      getProcessSupervisor: () => ({
+        spawn: async (...args: unknown[]) => {
+          const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
+          const managedRun = (await supervisorSpawnMock(...args)) as
+            | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
+            | undefined;
+          if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
+            input.onStdout(managedRun.__stdoutForStreaming);
+          }
+          if (input?.onStdout && managedRun?.wait) {
+            const originalWait = managedRun.wait.bind(managedRun);
+            managedRun.wait = async () => {
+              const result = await originalWait();
+              if (typeof result?.stdout === "string") {
+                input.onStdout?.(result.stdout);
+              }
+              return result;
+            };
+          }
+          return managedRun;
+        },
+        cancel: vi.fn(),
+        cancelScope: vi.fn(),
+        cancelSession: vi.fn(() => 0),
+        reconcileOrphans: vi.fn(),
+        getRecord: vi.fn(),
+      }),
+    }));
+    vi.doMock("../infra/system-events.js", () => ({
+      enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
+    }));
+    vi.doMock("../infra/heartbeat-wake.js", () => ({
+      requestHeartbeatNow: (...args: unknown[]) => requestHeartbeatNowMock(...args),
+    }));
+    vi.doMock("./bootstrap-files.js", () => ({
+      makeBootstrapWarn: () => () => {},
+      resolveBootstrapContextForRun: hoisted.resolveBootstrapContextForRunMock,
+    }));
+    ({ runCliAgent } = await import("./cli-runner.js"));
+    ({ resolveCliNoOutputTimeoutMs } = await import("./cli-runner/helpers.js"));
     supervisorSpawnMock.mockClear();
     enqueueSystemEventMock.mockClear();
     requestHeartbeatNowMock.mockClear();
@@ -102,6 +216,9 @@ describe("runCliAgent with process supervisor", () => {
     getGlobalHookRunnerMock.mockReset();
     getGlobalHookRunnerMock.mockReturnValue(null);
     await fs.rm("/tmp/session.jsonl", { force: true }).catch(() => undefined);
+    await fs
+      .rm(resolveClaudePromptFilePath("/tmp/session.jsonl"), { force: true })
+      .catch(() => undefined);
   });
 
   it("runs CLI through supervisor and returns payload", async () => {
@@ -263,7 +380,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -307,7 +424,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -352,7 +469,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -420,7 +537,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -491,7 +608,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -583,7 +700,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -684,7 +801,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -751,7 +868,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -778,8 +895,12 @@ describe("runCliAgent with process supervisor", () => {
     const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
     expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
     const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
-    expect(systemPrompt).toContain("<available_skills>");
-    expect(systemPrompt).toContain("demo-skill");
+    expect(systemPrompt).toContain("Read tool");
+    const promptFile = resolveClaudePromptFilePath("/tmp/session.jsonl");
+    expect(systemPrompt).toContain(promptFile);
+    const fileContents = await fs.readFile(promptFile, "utf-8");
+    expect(fileContents).toContain("<available_skills>");
+    expect(fileContents).toContain("demo-skill");
   });
 
   it("uses provided skillsSnapshot prompt for claude runs", async () => {
@@ -791,7 +912,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -822,8 +943,10 @@ describe("runCliAgent with process supervisor", () => {
     expect(input.argv).toContain("--append-system-prompt");
     const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
     expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
-    const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
-    expect(systemPrompt).toContain("snapshot-skill");
+    const promptFile = resolveClaudePromptFilePath("/tmp/session.jsonl");
+    expect(input.argv?.[systemPromptIndex + 1]).toContain(promptFile);
+    const fileContents = await fs.readFile(promptFile, "utf-8");
+    expect(fileContents).toContain("snapshot-skill");
   });
 
   it("applies before_prompt_build hooks in CLI mode", async () => {
@@ -844,7 +967,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"type":"result","result":"ok"}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -869,7 +992,10 @@ describe("runCliAgent with process supervisor", () => {
     expect(input.argv).toContain("HOOK_CONTEXT\n\nhi");
     const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
     expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
-    expect(input.argv?.[systemPromptIndex + 1]).toBe("HOOK_SYSTEM");
+    const promptFile = resolveClaudePromptFilePath("/tmp/session.jsonl");
+    expect(input.argv?.[systemPromptIndex + 1]).toContain(promptFile);
+    const fileContents = await fs.readFile(promptFile, "utf-8");
+    expect(fileContents).toBe("HOOK_SYSTEM\n");
     expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledWith(
       {
         prompt: "hi",
@@ -916,7 +1042,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"type":"result","result":"ok"}',
+        stdout: createClaudeStreamSuccess(sessionFile),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -1018,7 +1144,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: "ok",
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -1044,7 +1170,7 @@ describe("runCliAgent with process supervisor", () => {
     );
   });
 
-  it("resends system prompt on resumed claude sessions by default", async () => {
+  it("reloads the session prompt file on resumed claude sessions when binding metadata is missing", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-"));
     const skillDir = path.join(tempDir, "skills", "resume-skill");
     await fs.mkdir(skillDir, { recursive: true });
@@ -1067,7 +1193,7 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl", "ok", "existing-claude-session"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
@@ -1097,12 +1223,16 @@ describe("runCliAgent with process supervisor", () => {
     const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
     expect(systemPromptIndex).toBeGreaterThanOrEqual(0);
     const systemPrompt = input.argv?.[systemPromptIndex + 1] ?? "";
-    expect(systemPrompt).toContain("<available_skills>");
-    expect(systemPrompt).toContain("resume-skill");
+    expect(systemPrompt).toContain("Read tool");
+    const promptFile = resolveClaudePromptFilePath("/tmp/session.jsonl");
+    expect(systemPrompt).toContain(promptFile);
+    const fileContents = await fs.readFile(promptFile, "utf-8");
+    expect(fileContents).toContain("resume-skill");
   });
 
-  it("skips system prompt on resumed claude sessions when configured with first", async () => {
+  it("skips loader prompt on resumed claude sessions when binding metadata is current", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-first-"));
+    const sessionFile = "/tmp/session.jsonl";
     const skillDir = path.join(tempDir, "skills", "resume-skill-first");
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(
@@ -1124,30 +1254,49 @@ describe("runCliAgent with process supervisor", () => {
         exitCode: 0,
         exitSignal: null,
         durationMs: 50,
-        stdout: '{"content":[{"type":"text","text":"ok"}]}',
+        stdout: createClaudeStreamSuccess(sessionFile, "ok", "existing-claude-session"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: createClaudeStreamSuccess(sessionFile, "ok", "existing-claude-session"),
         stderr: "",
         timedOut: false,
         noOutputTimedOut: false,
       }),
     );
 
-    const cfg = {
-      agents: {
-        defaults: {
-          cliBackends: {
-            "claude-cli": {
-              command: "claude",
-              systemPromptWhen: "first",
-            },
-          },
-        },
-      },
-    } satisfies OpenClawConfig;
+    let binding:
+      | {
+          sessionId: string;
+          systemPromptFile?: string;
+          systemPromptHash?: string;
+          systemPromptCompactionCount?: number;
+        }
+      | undefined;
 
     try {
+      const firstResult = await runCliAgent({
+        sessionId: "s1",
+        sessionFile,
+        workspaceDir: tempDir,
+        prompt: "hi",
+        provider: "claude-cli",
+        model: "sonnet",
+        timeoutMs: 1_000,
+        runId: "run-claude-resume-first-seed",
+      });
+      binding = firstResult.meta.agentMeta?.cliSessionBinding;
       await runCliAgent({
         sessionId: "s1",
-        sessionFile: "/tmp/session.jsonl",
+        sessionFile,
         workspaceDir: tempDir,
         prompt: "hi",
         provider: "claude-cli",
@@ -1155,16 +1304,90 @@ describe("runCliAgent with process supervisor", () => {
         timeoutMs: 1_000,
         runId: "run-claude-resume-first",
         cliSessionId: "existing-claude-session",
-        config: cfg,
+        cliSessionBinding: binding,
       });
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
 
-    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
+    expect(binding?.sessionId).toBe("existing-claude-session");
+    const input = supervisorSpawnMock.mock.calls[1]?.[0] as { argv?: string[] };
     expect(input.argv).toContain("--resume");
     expect(input.argv).toContain("existing-claude-session");
     expect(input.argv).not.toContain("--append-system-prompt");
+  });
+
+  it("reloads the session prompt file on resume after compaction count increases", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-resume-compact-"));
+
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl", "ok", "existing-claude-session"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: createClaudeStreamSuccess("/tmp/session.jsonl", "ok", "existing-claude-session"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    let binding:
+      | {
+          sessionId: string;
+          systemPromptFile?: string;
+          systemPromptHash?: string;
+          systemPromptCompactionCount?: number;
+        }
+      | undefined;
+    try {
+      const firstResult = await runCliAgent({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.jsonl",
+        workspaceDir: tempDir,
+        prompt: "hi",
+        provider: "claude-cli",
+        model: "sonnet",
+        timeoutMs: 1_000,
+        runId: "run-claude-resume-compact-seed",
+      });
+      binding = firstResult.meta.agentMeta?.cliSessionBinding;
+
+      await runCliAgent({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.jsonl",
+        workspaceDir: tempDir,
+        prompt: "hi again",
+        provider: "claude-cli",
+        model: "sonnet",
+        timeoutMs: 1_000,
+        runId: "run-claude-resume-compact",
+        cliSessionId: "existing-claude-session",
+        cliSessionBinding: binding,
+        sessionCompactionCount: 1,
+      });
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+
+    const input = supervisorSpawnMock.mock.calls[1]?.[0] as { argv?: string[] };
+    expect(input.argv).toContain("--resume");
+    expect(input.argv).toContain("--append-system-prompt");
+    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
+    expect(input.argv?.[systemPromptIndex + 1]).toContain("compacted or summarized");
   });
 
   it("prepends bootstrap warnings to the CLI prompt body", async () => {

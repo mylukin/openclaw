@@ -52,6 +52,7 @@ import {
   resolveSystemPromptUsage,
   writeCliImages,
 } from "./cli-runner/helpers.js";
+import { hashCliSessionText } from "./cli-session.js";
 import { resolveContextWindowInfo } from "./context-window-guard.js";
 import { resolveOpenClawDocsPath } from "./docs-path.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
@@ -93,6 +94,7 @@ const MERGED_MCP_CONFIG_MIN_AGE_MS = 60 * 60 * 1000;
 const CLI_OUTPUT_LOG_HEAD_CHARS = 240;
 const CLI_OUTPUT_LOG_TAIL_CHARS = 160;
 const CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS = CLI_OUTPUT_LOG_HEAD_CHARS + CLI_OUTPUT_LOG_TAIL_CHARS;
+const ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK = false;
 
 function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): string {
   if (!text) {
@@ -116,6 +118,84 @@ function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): stri
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
+  const resolvedSessionFile = path.resolve(sessionFile);
+  const sessionDir = path.dirname(resolvedSessionFile);
+  const ext = path.extname(resolvedSessionFile);
+  const baseName = path.basename(resolvedSessionFile, ext);
+  return path.join(sessionDir, `${baseName}.claude-system-prompt.txt`);
+}
+
+async function writeClaudeSystemPromptFile(params: {
+  sessionFile: string;
+  systemPrompt: string;
+}): Promise<{ filePath: string; hash: string }> {
+  const filePath = resolveClaudeSystemPromptFilePath(params.sessionFile);
+  const normalizedPrompt = params.systemPrompt.endsWith("\n")
+    ? params.systemPrompt
+    : `${params.systemPrompt}\n`;
+  const hash = hashCliSessionText(normalizedPrompt) ?? "";
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    const existing = await fs.readFile(filePath, "utf-8");
+    if (existing === normalizedPrompt) {
+      return { filePath, hash };
+    }
+  } catch {
+    // file may not exist yet
+  }
+  await fs.writeFile(filePath, normalizedPrompt, { mode: 0o600 });
+  return { filePath, hash };
+}
+
+function buildClaudeSystemPromptLoaderPrompt(params: {
+  filePath: string;
+  reason: "new-session" | "prompt-changed" | "compaction";
+  strict?: boolean;
+}): string {
+  const baseLines = [
+    `MANDATORY FIRST STEP: use the Read tool to read the full session prompt file at ${params.filePath} before you do anything else.`,
+    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until you have read that file in this run.",
+    "The file's contents are the authoritative OpenClaw system prompt for this session and override any remembered summaries or stale context.",
+    "You must follow that file strictly for this turn and all subsequent turns in the session.",
+  ];
+  if (params.strict) {
+    baseLines.unshift(
+      "Your previous attempt did not verify a successful read of the session prompt file. You must read it in this run before you answer.",
+    );
+  }
+  if (params.reason === "compaction") {
+    baseLines.unshift(
+      "Session context may have been compacted or summarized. You must re-read the session prompt file now before continuing.",
+    );
+  } else if (params.reason === "prompt-changed") {
+    baseLines.unshift(
+      "The session prompt file changed. You must re-read it completely before continuing.",
+    );
+  }
+  return baseLines.join("\n");
+}
+
+class PromptFileReadRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PromptFileReadRequiredError";
+  }
+}
+
+function resolveReadToolFilePath(input: unknown): string | undefined {
+  if (!isRecord(input)) {
+    return undefined;
+  }
+  const candidates = [input.file_path, input.filePath, input.path];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return path.resolve(candidate.trim());
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -443,6 +523,8 @@ export async function runCliAgent(params: {
   streamParams?: import("./command/types.js").AgentStreamParams;
   ownerNumbers?: string[];
   cliSessionId?: string;
+  cliSessionBinding?: import("../config/sessions.js").CliSessionBinding;
+  sessionCompactionCount?: number;
   bootstrapPromptWarningSignaturesSeen?: string[];
   /** Backward-compat fallback when only the previous signature is available. */
   bootstrapPromptWarningSignature?: string;
@@ -933,6 +1015,11 @@ export async function runCliAgent(params: {
       files_injected: activeContextFiles.length,
       files_truncated: logActiveAnalysis.truncatedFiles.length,
       files_skipped: bootstrapFiles.length - activeContextFiles.length,
+      ...(isClaude
+        ? {
+            session_prompt_file: resolveClaudeSystemPromptFilePath(params.sessionFile),
+          }
+        : {}),
       compaction_attempted: compactionAttempted,
       ...(compactionAttempted && {
         compacted_files: compactedFilesList,
@@ -996,12 +1083,35 @@ export async function runCliAgent(params: {
     });
   };
   let systemPromptReport = buildReportForActiveContext();
+  let compactionsThisRun = 0;
+  let latestCliSessionBinding:
+    | {
+        sessionId: string;
+        systemPromptFile?: string;
+        systemPromptHash?: string;
+        systemPromptCompactionCount?: number;
+      }
+    | undefined;
+  let latestCliPromptLoad:
+    | {
+        sessionPromptFile?: string;
+        loaderMode: "normal" | "strict" | "disabled";
+        verifiedRead: boolean;
+        fallbackReason?:
+          | "write_failed"
+          | "verification_retry"
+          | "direct_injection_fallback"
+          | "direct_fallback_disabled";
+      }
+    | undefined;
 
   // Helper function to execute CLI with given session ID
   const executeCliWithSession = async (
     cliSessionIdToUse?: string,
     promptOverride?: string,
     isSystemCall?: boolean,
+    forceReloadSystemPromptFile?: boolean,
+    loaderPromptMode: "normal" | "strict" | "disabled" = "normal",
   ): Promise<{
     text: string;
     sessionId?: string;
@@ -1016,6 +1126,8 @@ export async function runCliAgent(params: {
     if (params.abortSignal?.aborted) {
       throw createAbortError(params.abortSignal);
     }
+    const currentCompactionCount =
+      Math.max(0, params.sessionCompactionCount ?? 0) + compactionsThisRun;
     const { sessionId: resolvedSessionId, isNew } = resolveSessionIdToSend({
       backend,
       cliSessionId: cliSessionIdToUse,
@@ -1023,17 +1135,96 @@ export async function runCliAgent(params: {
     const useResume = Boolean(
       cliSessionIdToUse && resolvedSessionId && backend.resumeArgs && backend.resumeArgs.length > 0,
     );
-    const systemPromptArg = resolveSystemPromptUsage({
-      backend,
-      isNewSession: isNew,
-      systemPrompt,
-    });
+    let systemPromptToSend: string | undefined = systemPrompt;
+    let cliSystemPromptFile:
+      | {
+          filePath: string;
+          hash: string;
+        }
+      | undefined;
+    let loaderFallbackReason:
+      | "write_failed"
+      | "verification_retry"
+      | "direct_injection_fallback"
+      | "direct_fallback_disabled"
+      | undefined;
+    const matchingCliSessionBinding =
+      params.cliSessionBinding &&
+      params.cliSessionBinding.sessionId?.trim() &&
+      params.cliSessionBinding.sessionId.trim() === cliSessionIdToUse?.trim()
+        ? params.cliSessionBinding
+        : undefined;
+    if (isClaude && !isSystemCall) {
+      try {
+        cliSystemPromptFile = await writeClaudeSystemPromptFile({
+          sessionFile: params.sessionFile,
+          systemPrompt,
+        });
+        const reloadReason = (() => {
+          if (!resolvedSessionId || !cliSystemPromptFile) {
+            return undefined;
+          }
+          if (!useResume || !matchingCliSessionBinding?.sessionId?.trim()) {
+            return "new-session" as const;
+          }
+          if (forceReloadSystemPromptFile) {
+            return "compaction" as const;
+          }
+          if (matchingCliSessionBinding.systemPromptFile?.trim() !== cliSystemPromptFile.filePath) {
+            return "prompt-changed" as const;
+          }
+          if (matchingCliSessionBinding.systemPromptHash?.trim() !== cliSystemPromptFile.hash) {
+            return "prompt-changed" as const;
+          }
+          if (
+            (matchingCliSessionBinding.systemPromptCompactionCount ?? 0) < currentCompactionCount
+          ) {
+            return "compaction" as const;
+          }
+          return undefined;
+        })();
+        systemPromptToSend =
+          loaderPromptMode === "disabled"
+            ? systemPrompt
+            : reloadReason && cliSystemPromptFile
+              ? buildClaudeSystemPromptLoaderPrompt({
+                  filePath: cliSystemPromptFile.filePath,
+                  reason: reloadReason,
+                  strict: loaderPromptMode === "strict",
+                })
+              : undefined;
+      } catch (error) {
+        log.warn(
+          `failed to write claude session prompt file (${resolveClaudeSystemPromptFilePath(params.sessionFile)}); falling back to direct prompt: ${String(error)}`,
+        );
+        systemPromptToSend = systemPrompt;
+        cliSystemPromptFile = undefined;
+        loaderFallbackReason = "write_failed";
+      }
+    }
+    const systemPromptArg =
+      isClaude && !isSystemCall
+        ? systemPromptToSend?.trim() || null
+        : resolveSystemPromptUsage({
+            backend,
+            isNewSession: isNew,
+            systemPrompt: systemPromptToSend,
+          });
+    const mustVerifyPromptFileRead = Boolean(
+      isClaude &&
+      !isSystemCall &&
+      cliSystemPromptFile &&
+      systemPromptToSend &&
+      loaderPromptMode !== "disabled",
+    );
+    let promptFileReadToolUseId: string | undefined;
+    let promptFileReadVerified = false;
 
     let imagePaths: string[] | undefined;
     let cleanupImages: (() => Promise<void>) | undefined;
     let prompt =
       promptOverride ??
-      prependBootstrapPromptWarning(params.prompt, bootstrapPromptWarning.lines, {
+      prependBootstrapPromptWarning(promptForRun, bootstrapPromptWarning.lines, {
         preserveExactPrompt: heartbeatPrompt,
       });
     if (!promptOverride && params.images && params.images.length > 0) {
@@ -1080,6 +1271,16 @@ export async function runCliAgent(params: {
         log.info(
           `cli exec: provider=${params.provider} model=${normalizedModel} promptChars=${promptForRun.length}`,
         );
+        if (cliSystemPromptFile && !isSystemCall) {
+          log.info("cli session prompt file", {
+            session_prompt_file: cliSystemPromptFile.filePath,
+            session_prompt_hash: cliSystemPromptFile.hash,
+            loader_mode: loaderPromptMode,
+            requires_verified_read: mustVerifyPromptFileRead,
+            force_reload: forceReloadSystemPromptFile === true,
+            use_resume: useResume,
+          });
+        }
         const logOutputText = isTruthyEnvValue(process.env.OPENCLAW_CLAUDE_CLI_LOG_OUTPUT);
         if (logOutputText) {
           const logArgs: string[] = [];
@@ -1159,8 +1360,50 @@ export async function runCliAgent(params: {
                       onAssistantTurn: params.onAssistantTurn,
                       onToolUse: params.onToolUse,
                       onThinkingTurn: params.onThinkingTurn,
-                      onToolUseEvent: params.onToolUseEvent,
-                      onToolResult: params.onToolResult,
+                      onToolUseEvent: (payload) => {
+                        if (
+                          mustVerifyPromptFileRead &&
+                          payload.name === "Read" &&
+                          cliSystemPromptFile &&
+                          resolveReadToolFilePath(payload.input) === cliSystemPromptFile.filePath
+                        ) {
+                          promptFileReadToolUseId = payload.toolUseId;
+                          if (!promptFileReadToolUseId) {
+                            promptFileReadVerified = true;
+                            log.info("cli session prompt read detected", {
+                              session_prompt_file: cliSystemPromptFile.filePath,
+                              loader_mode: loaderPromptMode,
+                              verified_read: true,
+                              verification_source: "tool_use_without_id",
+                            });
+                          } else {
+                            log.info("cli session prompt read tool call matched", {
+                              session_prompt_file: cliSystemPromptFile.filePath,
+                              loader_mode: loaderPromptMode,
+                              tool_use_id: promptFileReadToolUseId,
+                            });
+                          }
+                        }
+                        params.onToolUseEvent?.(payload);
+                      },
+                      onToolResult: (payload) => {
+                        if (
+                          mustVerifyPromptFileRead &&
+                          !payload.isError &&
+                          ((promptFileReadToolUseId &&
+                            payload.toolUseId === promptFileReadToolUseId) ||
+                            (!promptFileReadToolUseId && payload.toolUseId == null))
+                        ) {
+                          promptFileReadVerified = true;
+                          log.info("cli session prompt read verified", {
+                            session_prompt_file: cliSystemPromptFile?.filePath,
+                            loader_mode: loaderPromptMode,
+                            tool_use_id: payload.toolUseId ?? promptFileReadToolUseId,
+                            verified_read: true,
+                          });
+                        }
+                        params.onToolResult?.(payload);
+                      },
                     },
               )
             : undefined;
@@ -1313,7 +1556,47 @@ export async function runCliAgent(params: {
           const parsed = parseCliJson(stdout, backend);
           output = parsed ?? { text: stdout };
         }
+        if (mustVerifyPromptFileRead && !promptFileReadVerified) {
+          throw new PromptFileReadRequiredError(
+            `Claude session did not verify a successful Read of ${cliSystemPromptFile?.filePath ?? "the session prompt file"}.`,
+          );
+        }
         if (!isSystemCall) {
+          latestCliPromptLoad =
+            isClaude && !isSystemCall
+              ? {
+                  ...(cliSystemPromptFile
+                    ? { sessionPromptFile: cliSystemPromptFile.filePath }
+                    : {}),
+                  loaderMode: loaderPromptMode,
+                  verifiedRead: mustVerifyPromptFileRead ? promptFileReadVerified : false,
+                  ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
+                }
+              : undefined;
+          const persistPromptFileMetadata =
+            loaderPromptMode !== "disabled" &&
+            Boolean(cliSystemPromptFile) &&
+            (promptFileReadVerified ||
+              (!mustVerifyPromptFileRead &&
+                matchingCliSessionBinding?.systemPromptFile?.trim() ===
+                  cliSystemPromptFile?.filePath &&
+                matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile?.hash));
+          latestCliSessionBinding =
+            output.sessionId || resolvedSessionId
+              ? {
+                  sessionId: output.sessionId ?? resolvedSessionId ?? "",
+                  ...(persistPromptFileMetadata && cliSystemPromptFile
+                    ? {
+                        systemPromptFile: cliSystemPromptFile.filePath,
+                        systemPromptHash: cliSystemPromptFile.hash,
+                        systemPromptCompactionCount:
+                          forceReloadSystemPromptFile || currentCompactionCount > 0
+                            ? currentCompactionCount
+                            : undefined,
+                      }
+                    : {}),
+                }
+              : undefined;
           try {
             const appendResult = await appendCliTurnToSessionTranscript({
               sessionFile: params.sessionFile,
@@ -1353,10 +1636,107 @@ export async function runCliAgent(params: {
     }
   };
 
+  const executeCliWithLoaderFallback = async (paramsForRun: {
+    cliSessionId?: string;
+    promptOverride?: string;
+    isSystemCall?: boolean;
+    forceReloadSystemPromptFile?: boolean;
+  }) => {
+    try {
+      return await executeCliWithSession(
+        paramsForRun.cliSessionId,
+        paramsForRun.promptOverride,
+        paramsForRun.isSystemCall,
+        paramsForRun.forceReloadSystemPromptFile,
+        "normal",
+      );
+    } catch (error) {
+      if (!(error instanceof PromptFileReadRequiredError)) {
+        throw error;
+      }
+      log.warn(
+        `cli loader prompt verification failed; retrying with strict loader prompt (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
+      );
+      latestCliPromptLoad = {
+        sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+        loaderMode: "normal",
+        verifiedRead: false,
+        fallbackReason: "verification_retry",
+      };
+    }
+
+    try {
+      const output = await executeCliWithSession(
+        paramsForRun.cliSessionId,
+        paramsForRun.promptOverride,
+        paramsForRun.isSystemCall,
+        paramsForRun.forceReloadSystemPromptFile,
+        "strict",
+      );
+      if (latestCliPromptLoad?.loaderMode === "strict") {
+        latestCliPromptLoad = {
+          ...latestCliPromptLoad,
+          fallbackReason: "verification_retry",
+        };
+      }
+      return output;
+    } catch (error) {
+      if (!(error instanceof PromptFileReadRequiredError)) {
+        throw error;
+      }
+      if (!ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK) {
+        latestCliPromptLoad = {
+          sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+          loaderMode: "strict",
+          verifiedRead: false,
+          fallbackReason: "direct_fallback_disabled",
+        };
+        log.warn(
+          `cli loader prompt verification failed again; direct system prompt injection fallback is disabled (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
+        );
+        throw new FailoverError(
+          `Claude session failed to verify a successful Read of ${resolveClaudeSystemPromptFilePath(params.sessionFile)} after strict retry; direct system prompt injection fallback is disabled.`,
+          {
+            reason: "unknown",
+            provider: params.provider,
+            model: modelId,
+            status: resolveFailoverStatus("unknown"),
+          },
+        );
+      }
+      log.warn(
+        `cli loader prompt verification failed again; falling back to direct system prompt injection (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
+      );
+      latestCliPromptLoad = {
+        sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+        loaderMode: "strict",
+        verifiedRead: false,
+        fallbackReason: "direct_injection_fallback",
+      };
+      const output = await executeCliWithSession(
+        paramsForRun.cliSessionId,
+        paramsForRun.promptOverride,
+        paramsForRun.isSystemCall,
+        paramsForRun.forceReloadSystemPromptFile,
+        "disabled",
+      );
+      latestCliPromptLoad = {
+        ...(latestCliPromptLoad ?? {
+          sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+          verifiedRead: false,
+        }),
+        loaderMode: "disabled",
+        verifiedRead: false,
+        fallbackReason: "direct_injection_fallback",
+      };
+      return output;
+    }
+  };
+
   // Try with the provided CLI session ID first
   try {
     try {
-      const output = await executeCliWithSession(params.cliSessionId);
+      const output = await executeCliWithLoaderFallback({ cliSessionId: params.cliSessionId });
       const text = output.text?.trim();
       const payloads = text ? [{ text }] : undefined;
 
@@ -1370,6 +1750,9 @@ export async function runCliAgent(params: {
             provider: params.provider,
             model: modelId,
             usage: output.usage,
+            ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
+            ...(latestCliSessionBinding ? { cliSessionBinding: latestCliSessionBinding } : {}),
+            ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
           },
         },
       };
@@ -1397,6 +1780,7 @@ export async function runCliAgent(params: {
               });
               await executeCliWithSession(sessionToCompact, "/compact", true /* isSystemCall */);
               compactSucceeded = true;
+              compactionsThisRun += 1;
               log.warn("cli-runner: /compact succeeded, will retry with minimal profile");
             } catch (compactErr) {
               // If compact failed because the session expired, re-throw immediately so the
@@ -1471,7 +1855,10 @@ export async function runCliAgent(params: {
           //   skipping re-injection on resume when the profile was just downgraded to minimal).
           const sessionForRetry = compactSucceeded ? params.cliSessionId : undefined;
           try {
-            const output = await executeCliWithSession(sessionForRetry);
+            const output = await executeCliWithLoaderFallback({
+              cliSessionId: sessionForRetry,
+              forceReloadSystemPromptFile: compactSucceeded,
+            });
             const text = output.text?.trim();
             const payloads = text ? [{ text }] : undefined;
             return {
@@ -1484,6 +1871,11 @@ export async function runCliAgent(params: {
                   provider: params.provider,
                   model: modelId,
                   usage: output.usage,
+                  ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
+                  ...(latestCliSessionBinding
+                    ? { cliSessionBinding: latestCliSessionBinding }
+                    : {}),
+                  ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
                 },
               },
             };
@@ -1518,7 +1910,7 @@ export async function runCliAgent(params: {
           // We'll need to modify the caller to handle this case
 
           // For now, retry without the session ID to create a new session
-          const output = await executeCliWithSession(undefined);
+          const output = await executeCliWithLoaderFallback({ cliSessionId: undefined });
           const text = output.text?.trim();
           const payloads = text ? [{ text }] : undefined;
 
@@ -1532,6 +1924,9 @@ export async function runCliAgent(params: {
                 provider: params.provider,
                 model: modelId,
                 usage: output.usage,
+                ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
+                ...(latestCliSessionBinding ? { cliSessionBinding: latestCliSessionBinding } : {}),
+                ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
               },
             },
           };

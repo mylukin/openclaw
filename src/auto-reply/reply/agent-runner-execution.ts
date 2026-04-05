@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { runCliAgent } from "../../agents/cli-runner.js";
-import { getCliSessionId } from "../../agents/cli-session.js";
+import { getCliSessionBinding } from "../../agents/cli-session.js";
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { isCliProvider } from "../../agents/model-selection.js";
@@ -257,7 +257,11 @@ export async function runAgentTurnWithFallback(params: {
                 startedAt,
               },
             });
-            const cliSessionId = getCliSessionId(params.getActiveSessionEntry(), provider);
+            const cliSessionBinding = getCliSessionBinding(
+              params.getActiveSessionEntry(),
+              provider,
+            );
+            const cliSessionId = cliSessionBinding?.sessionId;
             return (async () => {
               let lifecycleTerminalEmitted = false;
               // Serialized chain for streaming card updates.  Each onAssistantTurn
@@ -326,6 +330,8 @@ export async function runAgentTurnWithFallback(params: {
                   skillsSnapshot: params.followupRun.run.skillsSnapshot,
                   ownerNumbers: params.followupRun.run.ownerNumbers,
                   cliSessionId,
+                  cliSessionBinding,
+                  sessionCompactionCount: params.getActiveSessionEntry()?.compactionCount,
                   bootstrapPromptWarningSignaturesSeen,
                   bootstrapPromptWarningSignature:
                     bootstrapPromptWarningSignaturesSeen[
