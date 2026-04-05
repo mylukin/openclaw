@@ -1281,6 +1281,18 @@ describe("runCliAgent with process supervisor", () => {
           systemPromptCompactionCount?: number;
         }
       | undefined;
+    let resumedPromptLoad:
+      | {
+          sessionPromptFile?: string;
+          loaderMode: "normal" | "strict" | "disabled";
+          verifiedRead: boolean;
+          fallbackReason?:
+            | "write_failed"
+            | "verification_retry"
+            | "direct_injection_fallback"
+            | "direct_fallback_disabled";
+        }
+      | undefined;
 
     try {
       const firstResult = await runCliAgent({
@@ -1294,7 +1306,7 @@ describe("runCliAgent with process supervisor", () => {
         runId: "run-claude-resume-first-seed",
       });
       binding = firstResult.meta.agentMeta?.cliSessionBinding;
-      await runCliAgent({
+      const resumedResult = await runCliAgent({
         sessionId: "s1",
         sessionFile,
         workspaceDir: tempDir,
@@ -1306,6 +1318,7 @@ describe("runCliAgent with process supervisor", () => {
         cliSessionId: "existing-claude-session",
         cliSessionBinding: binding,
       });
+      resumedPromptLoad = resumedResult.meta.agentMeta?.cliPromptLoad;
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -1315,6 +1328,10 @@ describe("runCliAgent with process supervisor", () => {
     expect(input.argv).toContain("--resume");
     expect(input.argv).toContain("existing-claude-session");
     expect(input.argv).not.toContain("--append-system-prompt");
+    expect(resumedPromptLoad).toMatchObject({
+      loaderMode: "normal",
+      verifiedRead: true,
+    });
   });
 
   it("reloads the session prompt file on resume after compaction count increases", async () => {

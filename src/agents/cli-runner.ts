@@ -1148,6 +1148,7 @@ export async function runCliAgent(params: {
       | "direct_injection_fallback"
       | "direct_fallback_disabled"
       | undefined;
+    let promptFileTrustedFromBinding = false;
     const matchingCliSessionBinding =
       params.cliSessionBinding &&
       params.cliSessionBinding.sessionId?.trim() &&
@@ -1193,6 +1194,12 @@ export async function runCliAgent(params: {
                   strict: loaderPromptMode === "strict",
                 })
               : undefined;
+        promptFileTrustedFromBinding = Boolean(
+          !reloadReason &&
+          cliSystemPromptFile &&
+          matchingCliSessionBinding?.systemPromptFile?.trim() === cliSystemPromptFile.filePath &&
+          matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile.hash,
+        );
       } catch (error) {
         log.warn(
           `failed to write claude session prompt file (${resolveClaudeSystemPromptFilePath(params.sessionFile)}); falling back to direct prompt: ${String(error)}`,
@@ -1569,7 +1576,9 @@ export async function runCliAgent(params: {
                     ? { sessionPromptFile: cliSystemPromptFile.filePath }
                     : {}),
                   loaderMode: loaderPromptMode,
-                  verifiedRead: mustVerifyPromptFileRead ? promptFileReadVerified : false,
+                  verifiedRead: mustVerifyPromptFileRead
+                    ? promptFileReadVerified
+                    : promptFileTrustedFromBinding,
                   ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
                 }
               : undefined;
