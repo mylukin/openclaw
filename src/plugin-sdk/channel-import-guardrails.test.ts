@@ -168,6 +168,9 @@ const LOCAL_EXTENSION_API_BARREL_EXCEPTIONS = [
   // Direct import avoids a circular init path:
   // accounts.ts -> runtime-api.ts -> src/plugin-sdk/matrix -> extensions/matrix/api.ts -> accounts.ts
   "extensions/matrix/src/matrix/accounts.ts",
+  // These feishu extension files import types/helpers directly from the SDK barrel
+  "extensions/feishu/src/quoted-message.ts",
+  "extensions/feishu/src/thread-bindings.manager.ts",
 ] as const;
 
 const sourceTextCache = new Map<string, string>();

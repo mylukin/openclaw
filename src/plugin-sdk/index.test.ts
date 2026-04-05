@@ -89,13 +89,33 @@ describe("plugin-sdk exports", () => {
   it("keeps the root runtime surface intentionally small", async () => {
     const runtimeExports = await collectRuntimeExports(path.join(import.meta.dirname, "index.ts"));
     expect([...runtimeExports].toSorted()).toEqual([
+      "SessionBindingError",
       "buildFalImageGenerationProvider",
       "buildGoogleImageGenerationProvider",
       "buildOpenAIImageGenerationProvider",
+      "clamp",
       "delegateCompactionToRuntime",
+      "detectMime",
+      "emitDiagnosticEvent",
       "emptyPluginConfigSchema",
+      "escapeRegExp",
+      "extensionForMime",
+      "extractOriginalFilename",
+      "getFileExtension",
+      "getSessionBindingService",
+      "isDiagnosticsEnabled",
+      "isSessionBindingError",
+      "listSkillCommandsForAgents",
+      "missingTargetError",
+      "normalizeE164",
       "onDiagnosticEvent",
       "registerContextEngine",
+      "registerLogTransport",
+      "registerSessionBindingAdapter",
+      "safeParseJson",
+      "sleep",
+      "stripAnsi",
+      "unregisterSessionBindingAdapter",
     ]);
   });
 
