@@ -110,6 +110,10 @@ describe("broadcast dispatch", () => {
         upsertPairingRequest: vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false }),
         buildPairingReply: vi.fn(() => "Pairing response"),
       },
+      session: {
+        resolveStorePath: vi.fn(() => "/tmp/sessions.json"),
+        readSessionUpdatedAt: vi.fn(() => undefined),
+      },
     },
     media: {
       detectMime: vi.fn(async () => "application/octet-stream"),
