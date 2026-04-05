@@ -512,6 +512,7 @@ export function createSessionStatusTool(opts?: {
           sessionKey: resolved.key,
           changedModel,
           statusText: fullStatusText,
+          cliPromptLoad: resolved.entry.cliPromptLoad,
         },
       };
     },
