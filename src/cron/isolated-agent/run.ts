@@ -8,7 +8,11 @@ import {
 import { resolveSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { runCliAgent } from "../../agents/cli-runner.js";
-import { getCliSessionId, setCliSessionId } from "../../agents/cli-session.js";
+import {
+  getCliSessionBinding,
+  setCliSessionBinding,
+  setCliSessionId,
+} from "../../agents/cli-session.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { resolveCronStyleNow } from "../../agents/current-time.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
@@ -463,15 +467,16 @@ export async function runCronIsolatedAgentTurn(params: {
           }
           const bootstrapPromptWarningSignature =
             bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
+          // Fresh isolated cron sessions must not reuse a stored CLI session ID.
+          // Passing an existing ID activates the resume watchdog profile
+          // (noOutputTimeoutRatio 0.3, maxMs 180 s) instead of the fresh profile
+          // (ratio 0.8, maxMs 600 s), causing jobs to time out at roughly 1/3 of
+          // the configured timeoutSeconds. See: https://github.com/openclaw/openclaw/issues/29774
+          const cliSessionBinding = cronSession.isNewSession
+            ? undefined
+            : getCliSessionBinding(cronSession.sessionEntry, providerOverride);
+          const cliSessionId = cliSessionBinding?.sessionId;
           if (isCliProvider(providerOverride, cfgWithAgentDefaults)) {
-            // Fresh isolated cron sessions must not reuse a stored CLI session ID.
-            // Passing an existing ID activates the resume watchdog profile
-            // (noOutputTimeoutRatio 0.3, maxMs 180 s) instead of the fresh profile
-            // (ratio 0.8, maxMs 600 s), causing jobs to time out at roughly 1/3 of
-            // the configured timeoutSeconds. See: https://github.com/openclaw/openclaw/issues/29774
-            const cliSessionId = cronSession.isNewSession
-              ? undefined
-              : getCliSessionId(cronSession.sessionEntry, providerOverride);
             const result = await runCliAgent({
               sessionId: cronSession.sessionEntry.sessionId,
               sessionKey: agentSessionKey,
@@ -486,6 +491,8 @@ export async function runCronIsolatedAgentTurn(params: {
               timeoutMs,
               runId: cronSession.sessionEntry.sessionId,
               cliSessionId,
+              cliSessionBinding,
+              sessionCompactionCount: cronSession.sessionEntry.compactionCount,
               bootstrapPromptWarningSignaturesSeen,
               bootstrapPromptWarningSignature,
             });
@@ -632,9 +639,14 @@ export async function runCronIsolatedAgentTurn(params: {
     });
     cronSession.sessionEntry.contextTokens = contextTokens;
     if (isCliProvider(providerUsed, cfgWithAgentDefaults)) {
-      const cliSessionId = finalRunResult.meta?.agentMeta?.sessionId?.trim();
-      if (cliSessionId) {
-        setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
+      const cliSessionBinding = finalRunResult.meta?.agentMeta?.cliSessionBinding;
+      if (cliSessionBinding?.sessionId?.trim()) {
+        setCliSessionBinding(cronSession.sessionEntry, providerUsed, cliSessionBinding);
+      } else {
+        const cliSessionId = finalRunResult.meta?.agentMeta?.sessionId?.trim();
+        if (cliSessionId) {
+          setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
+        }
       }
     }
     if (hasNonzeroUsage(usage)) {

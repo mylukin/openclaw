@@ -204,12 +204,18 @@ function resolveContainedSkillPath(params: {
   rootDir: string;
   rootRealPath: string;
   candidatePath: string;
+  /** When true, allow symlinks that resolve outside the root (opt-in). */
+  allowSymlinksOutsideRoot?: boolean;
 }): string | null {
   const candidateRealPath = tryRealpath(params.candidatePath);
   if (!candidateRealPath) {
     return null;
   }
   if (isPathInside(params.rootRealPath, candidateRealPath)) {
+    return candidateRealPath;
+  }
+  if (params.allowSymlinksOutsideRoot) {
+    // Opted in: accept the resolved real path even though it escapes the root.
     return candidateRealPath;
   }
   warnEscapedSkillPath({
@@ -226,6 +232,7 @@ function filterLoadedSkillsInsideRoot(params: {
   source: string;
   rootDir: string;
   rootRealPath: string;
+  allowSymlinksOutsideRoot?: boolean;
 }): Skill[] {
   return params.skills.filter((skill) => {
     const baseDirRealPath = resolveContainedSkillPath({
@@ -233,6 +240,7 @@ function filterLoadedSkillsInsideRoot(params: {
       rootDir: params.rootDir,
       rootRealPath: params.rootRealPath,
       candidatePath: skill.baseDir,
+      allowSymlinksOutsideRoot: params.allowSymlinksOutsideRoot,
     });
     if (!baseDirRealPath) {
       return false;
@@ -242,6 +250,7 @@ function filterLoadedSkillsInsideRoot(params: {
       rootDir: params.rootDir,
       rootRealPath: params.rootRealPath,
       candidatePath: skill.filePath,
+      allowSymlinksOutsideRoot: params.allowSymlinksOutsideRoot,
     });
     return Boolean(skillFileRealPath);
   });
@@ -299,6 +308,7 @@ function loadSkillEntries(
   },
 ): SkillEntry[] {
   const limits = resolveSkillsLimits(opts?.config);
+  const allowSymlinksOutsideRoot = opts?.config?.skills?.load?.allowSymlinksOutsideRoot ?? false;
 
   const loadSkills = (params: { dir: string; source: string }): Skill[] => {
     const rootDir = path.resolve(params.dir);
@@ -312,6 +322,7 @@ function loadSkillEntries(
       rootDir,
       rootRealPath,
       candidatePath: baseDir,
+      allowSymlinksOutsideRoot,
     });
     if (!baseDirRealPath) {
       return [];
@@ -325,6 +336,7 @@ function loadSkillEntries(
         rootDir,
         rootRealPath: baseDirRealPath,
         candidatePath: rootSkillMd,
+        allowSymlinksOutsideRoot,
       });
       if (!rootSkillRealPath) {
         return [];
@@ -350,6 +362,7 @@ function loadSkillEntries(
         source: params.source,
         rootDir,
         rootRealPath: baseDirRealPath,
+        allowSymlinksOutsideRoot,
       });
     }
 
@@ -386,6 +399,7 @@ function loadSkillEntries(
         rootDir,
         rootRealPath: baseDirRealPath,
         candidatePath: skillDir,
+        allowSymlinksOutsideRoot,
       });
       if (!skillDirRealPath) {
         continue;
@@ -399,6 +413,7 @@ function loadSkillEntries(
         rootDir,
         rootRealPath: baseDirRealPath,
         candidatePath: skillMd,
+        allowSymlinksOutsideRoot,
       });
       if (!skillMdRealPath) {
         continue;
@@ -425,6 +440,7 @@ function loadSkillEntries(
           source: params.source,
           rootDir,
           rootRealPath: baseDirRealPath,
+          allowSymlinksOutsideRoot,
         }),
       );
 

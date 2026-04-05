@@ -65,7 +65,12 @@ import { ensureAuthProfileStore } from "./auth-profiles.js";
 import { clearSessionAuthProfileOverride } from "./auth-profiles/session-override.js";
 import { resolveBootstrapWarningSignaturesSeen } from "./bootstrap-budget.js";
 import { runCliAgent } from "./cli-runner.js";
-import { getCliSessionId, setCliSessionId } from "./cli-session.js";
+import {
+  clearCliSession,
+  getCliSessionBinding,
+  setCliSessionBinding,
+  setCliSessionId,
+} from "./cli-session.js";
 import { deliverAgentCommandResult } from "./command/delivery.js";
 import { resolveAgentRunContext } from "./command/run-context.js";
 import { updateSessionStoreAfterAgentRun } from "./command/session-store.js";
@@ -82,7 +87,6 @@ import {
   isCliProvider,
   modelKey,
   normalizeModelRef,
-  normalizeProviderId,
   parseModelRef,
   resolveConfiguredModelRef,
   resolveDefaultModelForAgent,
@@ -387,7 +391,8 @@ function runAgentAttempt(params: {
   const bootstrapPromptWarningSignature =
     bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
   if (isCliProvider(params.providerOverride, params.cfg)) {
-    const cliSessionId = getCliSessionId(params.sessionEntry, params.providerOverride);
+    const cliSessionBinding = getCliSessionBinding(params.sessionEntry, params.providerOverride);
+    const cliSessionId = cliSessionBinding?.sessionId;
     const runCliWithSession = (nextCliSessionId: string | undefined) =>
       runCliAgent({
         sessionId: params.sessionId,
@@ -404,6 +409,11 @@ function runAgentAttempt(params: {
         runId: params.runId,
         extraSystemPrompt: params.opts.extraSystemPrompt,
         cliSessionId: nextCliSessionId,
+        cliSessionBinding:
+          nextCliSessionId && cliSessionBinding?.sessionId === nextCliSessionId
+            ? cliSessionBinding
+            : undefined,
+        sessionCompactionCount: params.sessionEntry?.compactionCount,
         bootstrapPromptWarningSignaturesSeen,
         bootstrapPromptWarningSignature,
         images: params.isFallbackRetry ? undefined : params.opts.images,
@@ -427,15 +437,7 @@ function runAgentAttempt(params: {
         const entry = params.sessionStore[params.sessionKey];
         if (entry) {
           const updatedEntry = { ...entry };
-          if (params.providerOverride === "claude-cli") {
-            delete updatedEntry.claudeCliSessionId;
-          }
-          if (updatedEntry.cliSessionIds) {
-            const normalizedProvider = normalizeProviderId(params.providerOverride);
-            const newCliSessionIds = { ...updatedEntry.cliSessionIds };
-            delete newCliSessionIds[normalizedProvider];
-            updatedEntry.cliSessionIds = newCliSessionIds;
-          }
+          clearCliSession(updatedEntry, params.providerOverride);
           updatedEntry.updatedAt = Date.now();
 
           await persistSessionEntry({
@@ -461,11 +463,16 @@ function runAgentAttempt(params: {
             const entry = params.sessionStore[params.sessionKey];
             if (entry) {
               const updatedEntry = { ...entry };
-              setCliSessionId(
-                updatedEntry,
-                params.providerOverride,
-                result.meta.agentMeta.sessionId,
-              );
+              const nextBinding = result.meta.agentMeta?.cliSessionBinding;
+              if (nextBinding?.sessionId?.trim()) {
+                setCliSessionBinding(updatedEntry, params.providerOverride, nextBinding);
+              } else {
+                setCliSessionId(
+                  updatedEntry,
+                  params.providerOverride,
+                  result.meta.agentMeta.sessionId,
+                );
+              }
               updatedEntry.updatedAt = Date.now();
 
               await persistSessionEntry({
