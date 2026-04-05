@@ -411,14 +411,15 @@ export function parseCliOutput(params: {
   raw: string;
   backend: CliBackendConfig;
   providerId: string;
-  outputMode?: "json" | "jsonl" | "text";
+  outputMode?: "json" | "jsonl" | "stream-json" | "text";
   fallbackSessionId?: string;
 }): CliOutput {
   const outputMode = params.outputMode ?? "text";
   if (outputMode === "text") {
     return { text: params.raw.trim(), sessionId: params.fallbackSessionId };
   }
-  if (outputMode === "jsonl") {
+  // stream-json output is line-delimited JSON; fall back to JSONL parsing for the raw output.
+  if (outputMode === "jsonl" || outputMode === "stream-json") {
     return (
       parseCliJsonl(params.raw, params.backend, params.providerId) ?? {
         text: params.raw.trim(),

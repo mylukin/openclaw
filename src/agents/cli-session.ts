@@ -4,6 +4,7 @@ import { normalizeProviderId } from "./model-selection.js";
 
 const CLAUDE_CLI_BACKEND_ID = "claude-cli";
 
+
 function trimOptional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
@@ -34,6 +35,14 @@ export function getCliSessionBinding(
       authEpoch: trimOptional(fromBindings?.authEpoch),
       extraSystemPromptHash: trimOptional(fromBindings?.extraSystemPromptHash),
       mcpConfigHash: trimOptional(fromBindings?.mcpConfigHash),
+      systemPromptFile: trimOptional(fromBindings?.systemPromptFile),
+      systemPromptHash: trimOptional(fromBindings?.systemPromptHash),
+      systemPromptCompactionCount:
+        typeof fromBindings?.systemPromptCompactionCount === "number" &&
+        Number.isFinite(fromBindings.systemPromptCompactionCount) &&
+        fromBindings.systemPromptCompactionCount >= 0
+          ? fromBindings.systemPromptCompactionCount
+          : undefined,
     };
   }
   const fromMap = entry.cliSessionIds?.[normalized];
@@ -83,6 +92,19 @@ export function setCliSessionBinding(
         : {}),
       ...(trimOptional(binding.mcpConfigHash)
         ? { mcpConfigHash: trimOptional(binding.mcpConfigHash) }
+        : {}),
+      ...(trimOptional(binding.systemPromptFile)
+        ? { systemPromptFile: trimOptional(binding.systemPromptFile) }
+        : {}),
+      ...(trimOptional(binding.systemPromptHash)
+        ? { systemPromptHash: trimOptional(binding.systemPromptHash) }
+        : {}),
+      ...(typeof binding.systemPromptCompactionCount === "number" &&
+      Number.isFinite(binding.systemPromptCompactionCount) &&
+      binding.systemPromptCompactionCount >= 0
+        ? {
+            systemPromptCompactionCount: Math.floor(binding.systemPromptCompactionCount),
+          }
         : {}),
     },
   };

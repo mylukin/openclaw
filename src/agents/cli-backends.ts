@@ -5,6 +5,10 @@ import {
 } from "../../extensions/anthropic/cli-backend-api.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { CliBackendConfig } from "../config/types.js";
+import {
+  CLI_FRESH_WATCHDOG_DEFAULTS,
+  CLI_RESUME_WATCHDOG_DEFAULTS,
+} from "./cli-watchdog-defaults.js";
 import { resolveRuntimeCliBackends } from "../plugins/cli-backends.runtime.js";
 import { normalizeProviderId } from "./model-selection.js";
 
@@ -23,14 +27,85 @@ type FallbackCliBackendPolicy = {
   normalizeConfig?: (config: CliBackendConfig) => CliBackendConfig;
 };
 
+const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+  opus: "opus",
+  "opus-4.6": "opus",
+  "opus-4.5": "opus",
+  "opus-4": "opus",
+  "claude-opus-4-6": "opus",
+  "claude-opus-4-5": "opus",
+  "claude-opus-4": "opus",
+  sonnet: "sonnet",
+  "sonnet-4.6": "sonnet",
+  "sonnet-4.5": "sonnet",
+  "sonnet-4.1": "sonnet",
+  "sonnet-4.0": "sonnet",
+  "claude-sonnet-4-6": "sonnet",
+  "claude-sonnet-4-5": "sonnet",
+  "claude-sonnet-4-1": "sonnet",
+  "claude-sonnet-4-0": "sonnet",
+  haiku: "haiku",
+  "haiku-3.5": "haiku",
+  "claude-haiku-3-5": "haiku",
+};
+
+const CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG = "--dangerously-skip-permissions";
+const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
+const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
+
+const DEFAULT_CODEX_BACKEND: CliBackendConfig = {
+  command: "codex",
+  args: [
+    "exec",
+    "--json",
+    "--color",
+    "never",
+    "--sandbox",
+    "workspace-write",
+    "--skip-git-repo-check",
+  ],
+  resumeArgs: [
+    "exec",
+    "resume",
+    "{sessionId}",
+    "--color",
+    "never",
+    "--sandbox",
+    "workspace-write",
+    "--skip-git-repo-check",
+  ],
+  output: "jsonl",
+  resumeOutput: "text",
+  input: "arg",
+  modelArg: "--model",
+  sessionIdFields: ["thread_id"],
+  sessionMode: "existing",
+  imageArg: "--image",
+  imageMode: "repeat",
+  reliability: {
+    watchdog: {
+      fresh: { ...CLI_FRESH_WATCHDOG_DEFAULTS },
+      resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
+    },
+  },
+  serialize: true,
+};
+
 const FALLBACK_CLI_BACKEND_POLICIES: Record<string, FallbackCliBackendPolicy> = {
   [CLAUDE_CLI_BACKEND_ID]: {
     // Claude CLI consumes explicit MCP config overlays even when the runtime
     // plugin registry is not initialized yet (for example direct runner tests
     // or narrow non-gateway entrypoints).
     bundleMcp: true,
-    baseConfig: buildAnthropicCliBackend().config,
+    baseConfig: {
+      ...buildAnthropicCliBackend().config,
+      modelAliases: CLAUDE_MODEL_ALIASES,
+    },
     normalizeConfig: normalizeClaudeBackendConfig,
+  },
+  "codex-cli": {
+    bundleMcp: false,
+    baseConfig: DEFAULT_CODEX_BACKEND,
   },
 };
 
@@ -71,6 +146,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
   const baseResume = base.reliability?.watchdog?.resume ?? {};
   const overrideFresh = override.reliability?.watchdog?.fresh ?? {};
   const overrideResume = override.reliability?.watchdog?.resume ?? {};
+  const baseMcp = base.mcp ?? {};
+  const overrideMcp = override.mcp ?? {};
+  const mergedMcp = (() => {
+    const mergedServers = {
+      ...baseMcp.servers,
+      ...overrideMcp.servers,
+    };
+    const next = {
+      ...baseMcp,
+      ...overrideMcp,
+      ...(Object.keys(mergedServers).length ? { servers: mergedServers } : {}),
+    };
+    return Object.keys(next).length ? next : undefined;
+  })();
   return {
     ...base,
     ...override,
@@ -97,13 +186,52 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
         },
       },
     },
+    mcp: mergedMcp,
   };
+}
+
+function normalizeClaudePermissionArgs(args?: string[]): string[] | undefined {
+  if (!args) {
+    return args;
+  }
+  const normalized: string[] = [];
+  let sawLegacySkip = false;
+  let hasPermissionMode = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG) {
+      sawLegacySkip = true;
+      continue;
+    }
+    if (arg === CLAUDE_PERMISSION_MODE_ARG) {
+      hasPermissionMode = true;
+      normalized.push(arg);
+      const maybeValue = args[i + 1];
+      if (typeof maybeValue === "string") {
+        normalized.push(maybeValue);
+        i += 1;
+      }
+      continue;
+    }
+    if (arg.startsWith(`${CLAUDE_PERMISSION_MODE_ARG}=`)) {
+      hasPermissionMode = true;
+    }
+    normalized.push(arg);
+  }
+  if (sawLegacySkip && !hasPermissionMode) {
+    normalized.push(CLAUDE_PERMISSION_MODE_ARG, CLAUDE_BYPASS_PERMISSIONS_MODE);
+  }
+  return normalized;
 }
 
 export function resolveCliBackendIds(cfg?: OpenClawConfig): Set<string> {
   const ids = new Set<string>();
   for (const backend of resolveRuntimeCliBackends()) {
     ids.add(normalizeBackendKey(backend.id));
+  }
+  // Always include built-in fallback backends
+  for (const key of Object.keys(FALLBACK_CLI_BACKEND_POLICIES)) {
+    ids.add(normalizeBackendKey(key));
   }
   const configured = cfg?.agents?.defaults?.cliBackends ?? {};
   for (const key of Object.keys(configured)) {
@@ -143,13 +271,22 @@ export function resolveCliBackendConfig(
     const baseConfig = fallbackPolicy.normalizeConfig
       ? fallbackPolicy.normalizeConfig(fallbackPolicy.baseConfig)
       : fallbackPolicy.baseConfig;
-    const command = baseConfig.command?.trim();
+    // Apply permission arg normalization for claude-cli even in fallback mode
+    const normalizedBase =
+      normalized === normalizeBackendKey(CLAUDE_CLI_BACKEND_ID)
+        ? {
+            ...baseConfig,
+            args: normalizeClaudePermissionArgs(baseConfig.args),
+            resumeArgs: normalizeClaudePermissionArgs(baseConfig.resumeArgs),
+          }
+        : baseConfig;
+    const command = normalizedBase.command?.trim();
     if (!command) {
       return null;
     }
     return {
       id: normalized,
-      config: { ...baseConfig, command },
+      config: { ...normalizedBase, command },
       bundleMcp: fallbackPolicy.bundleMcp,
     };
   }

@@ -83,6 +83,7 @@ export async function updateSessionStoreAfterAgentRun(params: {
         setCliSessionId(next, providerUsed, cliSessionId);
       }
     }
+    next.cliPromptLoad = result.meta.agentMeta?.cliPromptLoad;
   }
   next.abortedLastRun = result.meta.aborted ?? false;
   if (result.meta.systemPromptReport) {

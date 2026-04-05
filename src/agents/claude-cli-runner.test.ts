@@ -31,6 +31,7 @@ function createManagedRun(
     runId: "run-test",
     pid: 12345,
     startedAtMs: Date.now(),
+    __stdoutForStreaming: undefined as string | undefined,
     wait: async () => await exit,
     cancel: vi.fn(),
   };
@@ -48,7 +49,46 @@ function successExit(payload: { message: string; session_id: string }) {
     exitCode: 0,
     exitSignal: null,
     durationMs: 1,
-    stdout: JSON.stringify(payload),
+    stdout: [
+      JSON.stringify({ type: "system", subtype: "init", session_id: payload.session_id }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: payload.session_id,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_test_read",
+              name: "Read",
+              input: { file_path: "/tmp/session.claude-system-prompt.txt" },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        session_id: payload.session_id,
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_test_read", content: "prompt file" },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: payload.session_id,
+        message: { role: "assistant", content: [{ type: "text", text: payload.message }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: payload.message,
+        session_id: payload.session_id,
+      }),
+    ].join("\n"),
     stderr: "",
     timedOut: false,
     noOutputTimedOut: false,
