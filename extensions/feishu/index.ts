@@ -11,7 +11,6 @@ import { registerFeishuWikiTools } from "./src/wiki.js";
 
 export { feishuPlugin } from "./src/channel.js";
 export { setFeishuRuntime } from "./src/runtime.js";
-export { monitorFeishuProvider } from "./src/monitor.js";
 export { getBotOpenId } from "./src/monitor.js";
 export { createFeishuReplyDispatcher } from "./src/reply-dispatcher.js";
 export {

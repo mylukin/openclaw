@@ -5,13 +5,13 @@ import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type * as ConversationRuntime from "openclaw/plugin-sdk/conversation-runtime";
 import type { ResolvedAgentRoute } from "openclaw/plugin-sdk/routing";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
-import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
-import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
 import {
   registerLiveSessionTranscript,
   resetLiveSessionTranscriptRegistryForTests,
 } from "../../../src/agents/pi-embedded-runner/live-session-registry.js";
+import { createRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
+import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
+import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
 import type { FeishuMessageEvent } from "./bot.js";
 import {
   buildBroadcastSessionKey,
@@ -563,8 +563,8 @@ describe("handleFeishuMessage command authorization", () => {
     mockGetMessageFeishu.mockReset().mockResolvedValue(null);
     mockListFeishuThreadMessages.mockReset().mockResolvedValue([]);
     mockReadSessionUpdatedAt.mockReturnValue(undefined);
-    mockResolveStorePath.mockImplementation(
-      (store?: string) => store ?? "/tmp/feishu-sessions.json",
+    mockResolveStorePath.mockImplementation((store?: unknown) =>
+      typeof store === "string" ? store : "/tmp/feishu-sessions.json",
     );
     mockResolveConfiguredBindingRoute.mockReset().mockImplementation(
       ({

@@ -285,6 +285,7 @@ export function createCliJsonlStreamingParser(params: {
   backend: CliBackendConfig;
   providerId: string;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onToolUse?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
 }) {
   let lineBuffer = "";
   let assistantText = "";
@@ -298,6 +299,21 @@ export function createCliJsonlStreamingParser(params: {
     }
     if (isRecord(parsed.usage)) {
       usage = toCliUsage(parsed.usage) ?? usage;
+    }
+
+    // Detect tool_use events from content_block_start
+    if (params.onToolUse && isClaudeCliProvider(params.providerId)) {
+      const event = isRecord(parsed.event) ? parsed.event : parsed;
+      if (event.type === "content_block_start" && isRecord(event.content_block)) {
+        const block = event.content_block;
+        if (block.type === "tool_use" && typeof block.name === "string") {
+          params.onToolUse({
+            name: block.name,
+            toolUseId: typeof block.id === "string" ? block.id : undefined,
+            input: block.input,
+          });
+        }
+      }
     }
 
     const delta = parseClaudeCliStreamingDelta({

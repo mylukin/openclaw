@@ -44,6 +44,7 @@ export { readJsonFileWithFallback } from "openclaw/plugin-sdk/json-store";
 export { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 export { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 export { chunkTextForOutbound } from "openclaw/plugin-sdk/text-chunking";
+export { getGlobalHookRunner } from "openclaw/plugin-sdk/feishu";
 export {
   isRequestBodyLimitError,
   readRequestBodyWithLimit,

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
+import { completeSimple } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../../auto-reply/heartbeat.js";
 import {
   createMcpLoopbackServerConfig,
@@ -330,12 +330,10 @@ export async function prepareCliRunContext(
     ? (params.images?.length ?? 0) * ESTIMATED_TOKENS_PER_IMAGE
     : 0;
 
-  if (true) {
+  {
     const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
     let estimatedTokens =
-      estimatePromptTokens(systemPrompt) +
-      estimatePromptTokens(params.prompt) +
-      imageTokenEstimate;
+      estimatePromptTokens(systemPrompt) + estimatePromptTokens(params.prompt) + imageTokenEstimate;
 
     if (estimatedTokens > hardLimitTokens) {
       const warnForProfile = prepareDeps.makeBootstrapWarn({

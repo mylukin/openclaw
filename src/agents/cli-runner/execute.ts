@@ -377,7 +377,12 @@ export async function executeWithOverflowProtection(
   systemPromptReport: typeof context.systemPromptReport;
 }> {
   const params = context.params;
-  let { systemPrompt, activeProfile, activeContextFiles, systemPromptReport } = context;
+  let {
+    systemPrompt,
+    activeProfile,
+    activeContextFiles: _activeContextFiles,
+    systemPromptReport,
+  } = context;
   let compactionsThisRun = 0;
   let latestCliSessionBinding: CliSessionBindingResult | undefined;
   let latestCliPromptLoad: CliPromptLoadResult | undefined;
@@ -403,9 +408,7 @@ export async function executeWithOverflowProtection(
     );
 
     let systemPromptToSend: string | undefined = systemPrompt;
-    let cliSystemPromptFile:
-      | { filePath: string; hash: string }
-      | undefined;
+    let cliSystemPromptFile: { filePath: string; hash: string } | undefined;
     let loaderFallbackReason:
       | "write_failed"
       | "verification_retry"
@@ -493,7 +496,6 @@ export async function executeWithOverflowProtection(
       systemPromptToSend &&
       loaderPromptMode !== "disabled",
     );
-    let promptFileReadToolUseId: string | undefined;
     let promptFileReadVerified = false;
 
     // Build images and prompt
@@ -602,6 +604,24 @@ export async function executeWithOverflowProtection(
                     data: { text, delta },
                   });
                 },
+                onToolUse:
+                  mustVerifyPromptFileRead && cliSystemPromptFile
+                    ? ({ name, input }) => {
+                        if (promptFileReadVerified) {
+                          return;
+                        }
+                        if (name !== "Read" && name !== "read") {
+                          return;
+                        }
+                        const filePath = resolveReadToolFilePath(input);
+                        if (
+                          filePath &&
+                          path.resolve(filePath) === path.resolve(cliSystemPromptFile.filePath)
+                        ) {
+                          promptFileReadVerified = true;
+                        }
+                      }
+                    : undefined,
               })
             : null;
         const supervisor = executeDeps.getProcessSupervisor();
@@ -631,12 +651,20 @@ export async function executeWithOverflowProtection(
         const stdout = result.stdout.trim();
         const stderr = result.stderr.trim();
         if (logOutputText) {
-          if (stdout) cliBackendLog.info(`cli stdout:\n${stdout}`);
-          if (stderr) cliBackendLog.info(`cli stderr:\n${stderr}`);
+          if (stdout) {
+            cliBackendLog.info(`cli stdout:\n${stdout}`);
+          }
+          if (stderr) {
+            cliBackendLog.info(`cli stderr:\n${stderr}`);
+          }
         }
         if (shouldLogVerbose()) {
-          if (stdout) cliBackendLog.debug(`cli stdout:\n${stdout}`);
-          if (stderr) cliBackendLog.debug(`cli stderr:\n${stderr}`);
+          if (stdout) {
+            cliBackendLog.debug(`cli stdout:\n${stdout}`);
+          }
+          if (stderr) {
+            cliBackendLog.debug(`cli stderr:\n${stderr}`);
+          }
         }
 
         if (result.exitCode !== 0 || result.reason !== "exit") {
@@ -724,19 +752,16 @@ export async function executeWithOverflowProtection(
                     : {}),
                 }
               : undefined;
-          latestCliPromptLoad =
-            context.isClaude
-              ? {
-                  ...(cliSystemPromptFile
-                    ? { sessionPromptFile: cliSystemPromptFile.filePath }
-                    : {}),
-                  loaderMode: loaderPromptMode,
-                  verifiedRead: mustVerifyPromptFileRead
-                    ? promptFileReadVerified
-                    : promptFileTrustedFromBinding,
-                  ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
-                }
-              : undefined;
+          latestCliPromptLoad = context.isClaude
+            ? {
+                ...(cliSystemPromptFile ? { sessionPromptFile: cliSystemPromptFile.filePath } : {}),
+                loaderMode: loaderPromptMode,
+                verifiedRead: mustVerifyPromptFileRead
+                  ? promptFileReadVerified
+                  : promptFileTrustedFromBinding,
+                ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
+              }
+            : undefined;
         }
 
         return cliOutput;
@@ -869,9 +894,7 @@ export async function executeWithOverflowProtection(
       let compactSucceeded = false;
       if (sessionToCompact && context.isClaude) {
         try {
-          cliBackendLog.warn(
-            `cli-runner: context overflow detected, sending /compact to session`,
-          );
+          cliBackendLog.warn(`cli-runner: context overflow detected, sending /compact to session`);
           await executeCliWithSession(sessionToCompact, "/compact", true, false, "normal");
           compactSucceeded = true;
           compactionsThisRun += 1;
@@ -927,7 +950,7 @@ export async function executeWithOverflowProtection(
           }),
           minimalWarning.lines,
         );
-        activeContextFiles = minimalContextFiles;
+        _activeContextFiles = minimalContextFiles;
         activeProfile = "minimal";
       }
 
