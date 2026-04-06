@@ -186,6 +186,7 @@ export async function executeWithOverflowProtection(
       | "direct_fallback_disabled"
       | undefined;
     let promptFileTrustedFromBinding = false;
+    const cliDebugEnabled = cliBackendLog.isEnabled("debug");
 
     const matchingCliSessionBinding =
       params.cliSessionBinding &&
@@ -224,6 +225,24 @@ export async function executeWithOverflowProtection(
           }
           return undefined;
         })();
+        if (cliDebugEnabled) {
+          cliBackendLog.debug("cli prompt file prepared", {
+            sessionId: resolvedSessionId ?? sessionId ?? null,
+            useResume,
+            isSystemCall,
+            loaderPromptMode,
+            currentCompactionCount,
+            forceReloadSystemPromptFile,
+            promptFile: cliSystemPromptFile.filePath,
+            promptHash: cliSystemPromptFile.hash,
+            promptChars: systemPrompt.length,
+            reloadReason: reloadReason ?? null,
+            bindingSessionId: matchingCliSessionBinding?.sessionId ?? null,
+            bindingPromptFile: matchingCliSessionBinding?.systemPromptFile ?? null,
+            bindingPromptHash: matchingCliSessionBinding?.systemPromptHash ?? null,
+            bindingCompactionCount: matchingCliSessionBinding?.systemPromptCompactionCount ?? null,
+          });
+        }
         systemPromptToSend =
           loaderPromptMode === "disabled"
             ? systemPrompt
@@ -240,6 +259,17 @@ export async function executeWithOverflowProtection(
           matchingCliSessionBinding?.systemPromptFile?.trim() === cliSystemPromptFile.filePath &&
           matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile.hash,
         );
+        if (cliDebugEnabled) {
+          cliBackendLog.debug("cli loader prompt decision", {
+            sessionId: resolvedSessionId ?? sessionId ?? null,
+            loaderPromptMode,
+            promptFile: cliSystemPromptFile.filePath,
+            reloadReason: reloadReason ?? null,
+            trustedFromBinding: promptFileTrustedFromBinding,
+            systemPromptToSendChars: systemPromptToSend?.length ?? 0,
+            directPromptInjection: loaderPromptMode === "disabled",
+          });
+        }
       } catch (error) {
         cliBackendLog.warn(
           `failed to write claude session prompt file (${resolveClaudeSystemPromptFilePath(params.sessionFile)}); falling back to direct prompt: ${String(error)}`,
@@ -267,6 +297,22 @@ export async function executeWithOverflowProtection(
       loaderPromptMode !== "disabled",
     );
     let promptFileReadVerified = false;
+    if (cliDebugEnabled && context.isClaude && !isSystemCall) {
+      cliBackendLog.debug("cli prompt verification state", {
+        sessionId: resolvedSessionId ?? sessionId ?? null,
+        loaderPromptMode,
+        systemPromptArgMode:
+          systemPromptArg === null
+            ? "null"
+            : typeof systemPromptArg === "string"
+              ? "string"
+              : "other",
+        systemPromptArgChars: typeof systemPromptArg === "string" ? systemPromptArg.length : 0,
+        mustVerifyPromptFileRead,
+        promptFile: cliSystemPromptFile?.filePath ?? null,
+        promptFileTrustedFromBinding,
+      });
+    }
 
     // Build images and prompt
     let imagePaths: string[] | undefined;
@@ -318,12 +364,20 @@ export async function executeWithOverflowProtection(
 
     try {
       const output = await enqueueCliRun(queueKey, async () => {
-        cliBackendLog.info(
-          `cli exec: provider=${params.provider} model=${context.normalizedModel} promptChars=${params.prompt.length}`,
-        );
+        cliBackendLog.debug("cli exec start", {
+          provider: params.provider,
+          model: context.normalizedModel,
+          promptChars: params.prompt.length,
+          useResume,
+          sessionId: resolvedSessionId ?? sessionId ?? null,
+          loaderPromptMode,
+          promptFile: cliSystemPromptFile?.filePath ?? null,
+          mustVerifyPromptFileRead,
+        });
         const logOutputText =
           isTruthyEnvValue(process.env[CLI_BACKEND_LOG_OUTPUT_ENV]) ||
           isTruthyEnvValue(process.env[LEGACY_CLAUDE_CLI_LOG_OUTPUT_ENV]);
+        const logStreamingOutput = logOutputText || cliDebugEnabled;
         if (logOutputText) {
           const logArgs = buildCliLogArgs({
             args,
@@ -333,7 +387,33 @@ export async function executeWithOverflowProtection(
             imageArg: backend.imageArg,
             argsPrompt,
           });
-          cliBackendLog.info(`cli argv: ${backend.command} ${logArgs.join(" ")}`);
+          cliBackendLog.debug("cli argv", {
+            command: backend.command,
+            argv: logArgs,
+            sessionId: resolvedSessionId ?? sessionId ?? null,
+          });
+        } else if (cliDebugEnabled) {
+          const logArgs = buildCliLogArgs({
+            args,
+            systemPromptArg: backend.systemPromptArg,
+            sessionArg: backend.sessionArg,
+            modelArg: backend.modelArg,
+            imageArg: backend.imageArg,
+            argsPrompt,
+          });
+          cliBackendLog.debug("cli argv prepared", {
+            command: backend.command,
+            argv: logArgs,
+            useResume,
+            resolvedSessionId: resolvedSessionId ?? null,
+            cwd: context.workspaceDir,
+            stdinChars: stdinPayload.length,
+            promptArgChars: argsPrompt?.length ?? 0,
+            imageCount: imagePaths?.length ?? 0,
+            loaderPromptMode,
+            promptFile: cliSystemPromptFile?.filePath ?? null,
+            mustVerifyPromptFileRead,
+          });
         }
 
         const env = (() => {
@@ -368,6 +448,14 @@ export async function executeWithOverflowProtection(
                 backend,
                 providerId: context.backendResolved.id,
                 onAssistantDelta: ({ text, delta }) => {
+                  if (cliDebugEnabled) {
+                    cliBackendLog.debug("cli assistant delta", {
+                      sessionId: resolvedSessionId ?? sessionId ?? null,
+                      deltaChars: delta.length,
+                      totalChars: text.length,
+                      delta,
+                    });
+                  }
                   emitAgentEvent({
                     runId: params.runId,
                     stream: "assistant",
@@ -377,18 +465,37 @@ export async function executeWithOverflowProtection(
                 onToolUse:
                   mustVerifyPromptFileRead && cliSystemPromptFile
                     ? ({ name, input }) => {
+                        const filePath = resolveReadToolFilePath(input);
+                        const normalizedFilePath = filePath ? path.resolve(filePath) : undefined;
+                        const expectedPromptFile = path.resolve(cliSystemPromptFile.filePath);
+                        const matchedPromptFile =
+                          normalizedFilePath !== undefined &&
+                          normalizedFilePath === expectedPromptFile;
+                        if (cliDebugEnabled) {
+                          cliBackendLog.debug("cli loader verifier saw tool use", {
+                            sessionId: resolvedSessionId ?? sessionId ?? null,
+                            toolName: name,
+                            filePath: normalizedFilePath ?? null,
+                            expectedPromptFile,
+                            matchedPromptFile,
+                            input,
+                          });
+                        }
                         if (promptFileReadVerified) {
                           return;
                         }
                         if (name !== "Read" && name !== "read") {
                           return;
                         }
-                        const filePath = resolveReadToolFilePath(input);
-                        if (
-                          filePath &&
-                          path.resolve(filePath) === path.resolve(cliSystemPromptFile.filePath)
-                        ) {
+                        if (matchedPromptFile) {
                           promptFileReadVerified = true;
+                          if (cliDebugEnabled) {
+                            cliBackendLog.debug("cli loader verifier matched prompt file read", {
+                              sessionId: resolvedSessionId ?? sessionId ?? null,
+                              toolName: name,
+                              promptFile: expectedPromptFile,
+                            });
+                          }
                         }
                       }
                     : undefined,
@@ -413,27 +520,54 @@ export async function executeWithOverflowProtection(
           cwd: context.workspaceDir,
           env,
           input: stdinPayload,
-          onStdout: streamingParser ? (chunk: string) => streamingParser.push(chunk) : undefined,
+          onStdout: streamingParser
+            ? (chunk: string) => {
+                if (logStreamingOutput) {
+                  cliBackendLog.debug("cli stdout chunk", {
+                    sessionId: resolvedSessionId ?? sessionId ?? null,
+                    chars: chunk.length,
+                    chunk,
+                  });
+                }
+                streamingParser.push(chunk);
+              }
+            : undefined,
         });
         const result = await managedRun.wait();
         streamingParser?.finish();
+        if (cliDebugEnabled && mustVerifyPromptFileRead) {
+          cliBackendLog.debug("cli loader verifier completed", {
+            sessionId: resolvedSessionId ?? sessionId ?? null,
+            loaderPromptMode,
+            promptFile: cliSystemPromptFile?.filePath ?? null,
+            promptFileReadVerified,
+          });
+        }
 
         const stdout = result.stdout.trim();
         const stderr = result.stderr.trim();
         if (logOutputText) {
           if (stdout) {
-            cliBackendLog.info(`cli stdout:\n${stdout}`);
+            cliBackendLog.debug(`cli stdout:\n${stdout}`);
           }
           if (stderr) {
-            cliBackendLog.info(`cli stderr:\n${stderr}`);
+            cliBackendLog.debug(`cli stderr:\n${stderr}`);
           }
         }
         if (shouldLogVerbose()) {
           if (stdout) {
             cliBackendLog.debug(`cli stdout:\n${stdout}`);
+          } else if (cliDebugEnabled) {
+            cliBackendLog.debug("cli stdout was empty", {
+              sessionId: resolvedSessionId ?? sessionId ?? null,
+            });
           }
           if (stderr) {
             cliBackendLog.debug(`cli stderr:\n${stderr}`);
+          } else if (cliDebugEnabled) {
+            cliBackendLog.debug("cli stderr was empty", {
+              sessionId: resolvedSessionId ?? sessionId ?? null,
+            });
           }
         }
 

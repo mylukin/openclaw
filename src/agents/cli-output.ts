@@ -292,6 +292,27 @@ export function createCliJsonlStreamingParser(params: {
   let sessionId: string | undefined;
   let usage: CliUsage | undefined;
 
+  const emitToolUseFromBlock = (block: Record<string, unknown>) => {
+    if (!params.onToolUse) {
+      return;
+    }
+    if (block.type === "tool_use" && typeof block.name === "string") {
+      params.onToolUse({
+        name: block.name,
+        toolUseId: typeof block.id === "string" ? block.id : undefined,
+        input: block.input,
+      });
+      return;
+    }
+    if (block.type === "toolCall" && typeof block.name === "string") {
+      params.onToolUse({
+        name: block.name,
+        toolUseId: typeof block.id === "string" ? block.id : undefined,
+        input: block.arguments,
+      });
+    }
+  };
+
   const handleParsedRecord = (parsed: Record<string, unknown>) => {
     sessionId = pickCliSessionId(parsed, params.backend) ?? sessionId;
     if (!sessionId && typeof parsed.thread_id === "string") {
@@ -305,13 +326,23 @@ export function createCliJsonlStreamingParser(params: {
     if (params.onToolUse && isClaudeCliProvider(params.providerId)) {
       const event = isRecord(parsed.event) ? parsed.event : parsed;
       if (event.type === "content_block_start" && isRecord(event.content_block)) {
-        const block = event.content_block;
-        if (block.type === "tool_use" && typeof block.name === "string") {
-          params.onToolUse({
-            name: block.name,
-            toolUseId: typeof block.id === "string" ? block.id : undefined,
-            input: block.input,
-          });
+        emitToolUseFromBlock(event.content_block);
+      }
+
+      const message = isRecord(parsed.message) ? parsed.message : undefined;
+      if (message?.role === "assistant" && Array.isArray(message.content)) {
+        for (const entry of message.content) {
+          if (isRecord(entry)) {
+            emitToolUseFromBlock(entry);
+          }
+        }
+      }
+
+      if (Array.isArray(parsed.content)) {
+        for (const entry of parsed.content) {
+          if (isRecord(entry)) {
+            emitToolUseFromBlock(entry);
+          }
         }
       }
     }

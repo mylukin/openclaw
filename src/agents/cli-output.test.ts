@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parseCliJson, parseCliJsonl } from "./cli-output.js";
+import { describe, expect, it, vi } from "vitest";
+import { createCliJsonlStreamingParser, parseCliJson, parseCliJsonl } from "./cli-output.js";
 
 describe("parseCliJson", () => {
   it("recovers mixed-output Claude session metadata from embedded JSON objects", () => {
@@ -207,6 +207,50 @@ describe("parseCliJsonl", () => {
       text: "done",
       sessionId: "session-999",
       usage: undefined,
+    });
+  });
+});
+
+describe("createCliJsonlStreamingParser", () => {
+  it("emits Claude Read tool calls from assistant message content blocks", () => {
+    const onToolUse = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: {
+        command: "claude",
+        output: "jsonl",
+        sessionIdFields: ["session_id"],
+      },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onToolUse,
+    });
+
+    parser.push(
+      [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "session-123" }),
+        JSON.stringify({
+          type: "message",
+          session_id: "session-123",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "call_function_1",
+                name: "read",
+                arguments: { path: "/tmp/session.claude-system-prompt.txt" },
+              },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+    parser.finish();
+
+    expect(onToolUse).toHaveBeenCalledWith({
+      name: "read",
+      toolUseId: "call_function_1",
+      input: { path: "/tmp/session.claude-system-prompt.txt" },
     });
   });
 });

@@ -79,6 +79,7 @@ describe("buildStatusMessage", () => {
 
     expect(normalized).toContain("OpenClaw");
     expect(normalized).toContain("Model: anthropic/pi:opus");
+    expect(normalized).not.toContain("Last runtime:");
     expect(normalized).toContain("api-key");
     expect(normalized).toContain("Tokens: 1.2k in / 800 out");
     expect(normalized).toContain("Cost: $0.0020");
@@ -115,6 +116,34 @@ describe("buildStatusMessage", () => {
     const normalized = normalizeTestText(text);
     expect(normalized).toContain("CLI prompt: file/strict");
     expect(normalized).toContain("fallback=verification_retry");
+  });
+
+  it("distinguishes configured model from last runtime model", () => {
+    const text = buildStatusMessage({
+      agent: {
+        model: "minimax/minimax",
+      },
+      sessionEntry: {
+        sessionId: "runtime-diff",
+        updatedAt: 0,
+        modelProvider: "claude-cli",
+        model: "sonnet",
+        cliPromptLoad: {
+          sessionPromptFile: "/tmp/runtime-diff.claude-system-prompt.txt",
+          loaderMode: "normal",
+          verifiedRead: true,
+        },
+      },
+      sessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      queue: { mode: "collect", depth: 0 },
+      now: 10 * 60_000,
+    });
+    const normalized = normalizeTestText(text);
+
+    expect(normalized).toContain("Model: minimax/minimax");
+    expect(normalized).toContain("Last runtime: claude-cli/sonnet");
+    expect(normalized).toContain("CLI prompt: file");
   });
 
   it("falls back to sessionEntry levels when resolved levels are not passed", () => {

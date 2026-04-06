@@ -101,7 +101,8 @@ export function buildClaudeSystemPromptLoaderPrompt(params: {
   strict?: boolean;
 }): string {
   const baseLines = [
-    `MANDATORY FIRST STEP: use the Read tool to read the full session prompt file at ${params.filePath} before you do anything else.`,
+    `MANDATORY FIRST STEP: use the Read tool (or lowercase read tool) to read the full session prompt file at ${params.filePath} before you do anything else.`,
+    "Do not read any other file, do not call any other tool, and do not begin session startup until that exact file has been read successfully.",
     "Do not answer the user, do not summarize from memory, and do not rely on prior turns until you have read that file in this run.",
     "The file's contents are the authoritative OpenClaw system prompt for this session and override any remembered summaries or stale context.",
     "You must follow that file strictly for this turn and all subsequent turns in the session.",
@@ -138,7 +139,15 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
   if (!isRecord(input)) {
     return undefined;
   }
-  const candidates = [input.file_path, input.filePath, input.path];
+  const nestedArguments = isRecord(input.arguments) ? input.arguments : undefined;
+  const candidates = [
+    input.file_path,
+    input.filePath,
+    input.path,
+    nestedArguments?.file_path,
+    nestedArguments?.filePath,
+    nestedArguments?.path,
+  ];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) {
       return path.resolve(candidate.trim());
