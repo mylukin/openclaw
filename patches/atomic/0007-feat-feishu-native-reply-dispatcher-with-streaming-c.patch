@@ -1,40 +1,25 @@
-From ad80673e9e729d8b7a12d4f38e917a25aeea343a Mon Sep 17 00:00:00 2001
+From bc5f57ca8fe672b674074d393b0083cd5027d701 Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:04:43 +0800
-Subject: [PATCH 07/10] feat(feishu): native reply dispatcher with streaming
+Date: Mon, 6 Apr 2026 01:43:13 +0800
+Subject: [PATCH 07/12] feat(feishu): native reply dispatcher with streaming
  cards, thinking panels, and tool tracking
 
-- Add native reply dispatcher with full streaming card lifecycle
-- Integrate CLI stream-json mode with streaming cards
-- Migrate streaming-card from raw HTTP to Lark SDK with Card Kit API
-- Implement collapsible thinking panel in streaming cards
-- Track tool execution by count with dynamic panel display
-- Dedupe final card replies (onIdle/deliver race, hook rewrites, mention variants)
-- Renew streaming_mode every 8 min to prevent Feishu 10-min timeout
-- Recover streaming cards after timeout and detect closed streaming mode
-- Force final card sync after stream failures
-- Accumulate thinking panel updates and preserve hook metadata
-- Normalize card mentions before send and persist in final card
-- Support media/image content in streaming card output
-- Register createFeishuReplyDispatcher on plugin runtime
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
- .../feishu/src/reply-dispatcher.test.ts       | 1200 +++++++++++++++--
+ .../feishu/src/reply-dispatcher.test.ts       | 1197 +++++++++++++++--
  extensions/feishu/src/reply-dispatcher.ts     |  924 +++++++++++--
  extensions/feishu/src/send-result.ts          |   14 +-
  .../feishu/src/send.reply-fallback.test.ts    |    1 +
- extensions/feishu/src/send.test.ts            |  363 +++++
- extensions/feishu/src/send.ts                 |  224 ++-
+ extensions/feishu/src/send.test.ts            |  389 +++++-
+ extensions/feishu/src/send.ts                 |  226 +++-
  extensions/feishu/src/streaming-card.test.ts  |  885 +++++++++++-
- extensions/feishu/src/streaming-card.ts       |  679 +++++++---
- 8 files changed, 3877 insertions(+), 413 deletions(-)
+ extensions/feishu/src/streaming-card.ts       |  678 +++++++---
+ 8 files changed, 3879 insertions(+), 435 deletions(-)
 
 diff --git a/extensions/feishu/src/reply-dispatcher.test.ts b/extensions/feishu/src/reply-dispatcher.test.ts
-index c7b2f9af28..570bfe9725 100644
+index 94561f3f06..1f9da23068 100644
 --- a/extensions/feishu/src/reply-dispatcher.test.ts
 +++ b/extensions/feishu/src/reply-dispatcher.test.ts
-@@ -9,6 +9,8 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
+@@ -17,6 +17,8 @@ const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
  const createFeishuClientMock = vi.hoisted(() => vi.fn());
  const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
  const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
@@ -42,9 +27,9 @@ index c7b2f9af28..570bfe9725 100644
 +const runMessageSendingMock = vi.hoisted(() => vi.fn());
  const addTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => ({ messageId: "om_msg" })));
  const removeTypingIndicatorMock = vi.hoisted(() => vi.fn(async () => {}));
- const streamingInstances = vi.hoisted(() => [] as any[]);
-@@ -33,14 +35,20 @@ vi.mock("./streaming-card.js", async () => {
-     mergeStreamingText: actual.mergeStreamingText,
+ const streamingInstances = vi.hoisted((): StreamingSessionStub[] => []);
+@@ -70,14 +72,20 @@ vi.mock("./streaming-card.js", () => {
+     mergeStreamingText,
      FeishuStreamingSession: class {
        active = false;
 +      messageId = "stream-message-id";
@@ -64,7 +49,7 @@ index c7b2f9af28..570bfe9725 100644
  
        constructor() {
          streamingInstances.push(this);
-@@ -51,6 +59,12 @@ vi.mock("./streaming-card.js", async () => {
+@@ -88,6 +96,12 @@ vi.mock("./streaming-card.js", () => {
  
  import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
  
@@ -77,7 +62,7 @@ index c7b2f9af28..570bfe9725 100644
  describe("createFeishuReplyDispatcher streaming behavior", () => {
    type ReplyDispatcherArgs = Parameters<typeof createFeishuReplyDispatcher>[0];
  
-@@ -95,7 +109,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -132,7 +146,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
            resolveHumanDelayConfig: vi.fn(() => undefined),
          },
        },
@@ -91,7 +76,7 @@ index c7b2f9af28..570bfe9725 100644
    });
  
    function setupNonStreamingAutoDispatcher() {
-@@ -120,6 +140,51 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -157,6 +177,51 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      return createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
    }
  
@@ -143,7 +128,7 @@ index c7b2f9af28..570bfe9725 100644
    function createRuntimeLogger() {
      return { log: vi.fn(), error: vi.fn() } as never;
    }
-@@ -238,15 +303,56 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -275,15 +340,56 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      expect(sendMediaFeishuMock).not.toHaveBeenCalled();
    });
  
@@ -204,7 +189,7 @@ index c7b2f9af28..570bfe9725 100644
    });
  
    it("uses streaming session for auto mode markdown payloads", async () => {
-@@ -349,6 +455,56 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -386,6 +492,56 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      );
    });
  
@@ -261,7 +246,7 @@ index c7b2f9af28..570bfe9725 100644
    it("keeps distinct non-streaming final payloads", async () => {
      const options = setupNonStreamingAutoDispatcher();
      await options.deliver({ text: "notice header" }, { kind: "final" });
-@@ -365,7 +521,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -402,7 +558,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      );
    });
  
@@ -270,7 +255,7 @@ index c7b2f9af28..570bfe9725 100644
      resolveFeishuAccountMock.mockReturnValue({
        accountId: "main",
        appId: "app_id",
-@@ -384,81 +540,77 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -421,81 +577,77 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      await result.replyOptions.onPartialReply?.({ text: "hello" });
      await options.deliver({ text: "lo world" }, { kind: "block" });
      await options.onIdle?.();
@@ -405,7 +390,7 @@ index c7b2f9af28..570bfe9725 100644
      resolveFeishuAccountMock.mockReturnValue({
        accountId: "main",
        appId: "app_id",
-@@ -466,106 +618,624 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -503,104 +655,612 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
        domain: "feishu",
        config: {
          renderMode: "card",
@@ -431,6 +416,7 @@ index c7b2f9af28..570bfe9725 100644
 -  it("streams reasoning content as blockquote before answer", async () => {
 -    const { result, options } = createDispatcherHarness({
 -      runtime: createRuntimeLogger(),
+-      allowReasoningPreview: true,
 +    const dispatcher = createFeishuReplyDispatcher({
 +      cfg: {} as never,
 +      agentId: "agent",
@@ -452,40 +438,49 @@ index c7b2f9af28..570bfe9725 100644
 +    await flushAsyncTasks();
  
      expect(streamingInstances).toHaveLength(1);
--    const updateCalls = streamingInstances[0].update.mock.calls.map((c: unknown[]) => c[0]);
--    const reasoningUpdate = updateCalls.find((c: string) => c.includes("Thinking"));
+-    const updateCalls = streamingInstances[0].update.mock.calls.map((c: unknown[]) =>
+-      String(c[0] ?? ""),
+-    );
+-    const reasoningUpdate = updateCalls.find((c) => c.includes("Thinking"));
 -    expect(reasoningUpdate).toContain("> 💭 **Thinking**");
 -    // formatReasoningPrefix strips "Reasoning:" prefix and italic markers
 -    expect(reasoningUpdate).toContain("> thinking step");
 -    expect(reasoningUpdate).not.toContain("Reasoning:");
 -    expect(reasoningUpdate).not.toMatch(/> _.*_/);
 -
--    const combinedUpdate = updateCalls.find(
--      (c: string) => c.includes("Thinking") && c.includes("---"),
--    );
+-    const combinedUpdate = updateCalls.find((c) => c.includes("Thinking") && c.includes("---"));
 -    expect(combinedUpdate).toBeDefined();
-+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("⏳ Running Read...", {
-+      title: "🔧 Tool calls (1)",
-+    });
- 
+-
 -    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
 -    const closeArg = streamingInstances[0].close.mock.calls[0][0] as string;
 -    expect(closeArg).toContain("> 💭 **Thinking**");
 -    expect(closeArg).toContain("---");
 -    expect(closeArg).toContain("answer part final");
 -  });
+-
+-  it("provides onReasoningStream and onReasoningEnd when reasoning previews are allowed", () => {
+-    const { result } = createDispatcherHarness({
+-      runtime: createRuntimeLogger(),
+-      allowReasoningPreview: true,
++    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("⏳ Running Read...", {
++      title: "🔧 Tool calls (1)",
+     });
+ 
+-    expect(result.replyOptions.onReasoningStream).toBeTypeOf("function");
+-    expect(result.replyOptions.onReasoningEnd).toBeTypeOf("function");
+-  });
 +    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
 +    await flushAsyncTasks();
  
--  it("provides onReasoningStream and onReasoningEnd when streaming is enabled", () => {
+-  it("omits reasoning callbacks unless reasoning previews are allowed", () => {
 -    const { result } = createDispatcherHarness({
 -      runtime: createRuntimeLogger(),
 +    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案", {
 +      replace: true,
      });
  
--    expect(result.replyOptions.onReasoningStream).toBeTypeOf("function");
--    expect(result.replyOptions.onReasoningEnd).toBeTypeOf("function");
+-    expect(result.replyOptions.onReasoningStream).toBeUndefined();
+-    expect(result.replyOptions.onReasoningEnd).toBeUndefined();
 +    await options.onIdle?.();
 +    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
 +      note: "Agent: agent",
@@ -509,15 +504,6 @@ index c7b2f9af28..570bfe9725 100644
  
 -    const { result } = createDispatcherHarness({
 -      runtime: createRuntimeLogger(),
--    });
--
--    expect(result.replyOptions.onReasoningStream).toBeUndefined();
--    expect(result.replyOptions.onReasoningEnd).toBeUndefined();
--  });
--
--  it("renders reasoning-only card when no answer text arrives", async () => {
--    const { result, options } = createDispatcherHarness({
--      runtime: createRuntimeLogger(),
 +    const dispatcher = createFeishuReplyDispatcher({
 +      cfg: {} as never,
 +      agentId: "agent",
@@ -525,28 +511,24 @@ index c7b2f9af28..570bfe9725 100644
 +      chatId: "oc_chat",
      });
  
--    await options.onReplyStart?.();
--    result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_deep thought_" });
--    result.replyOptions.onReasoningEnd?.();
--    await options.onIdle?.();
+-    expect(result.replyOptions.onReasoningStream).toBeUndefined();
+-    expect(result.replyOptions.onReasoningEnd).toBeUndefined();
 +    await dispatcher.replyOptions.onToolStart?.({ name: "exec", phase: "start" });
 +    await dispatcher.replyOptions.onToolStart?.({ name: "exec", phase: "start" });
 +    await dispatcher.replyOptions.onToolStart?.({ name: "exec", phase: "start" });
 +    await flushAsyncTasks();
- 
-     expect(streamingInstances).toHaveLength(1);
--    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
--    const closeArg = streamingInstances[0].close.mock.calls[0][0] as string;
--    expect(closeArg).toContain("> 💭 **Thinking**");
--    expect(closeArg).toContain("> deep thought");
--    expect(closeArg).not.toContain("Reasoning:");
--    expect(closeArg).not.toContain("---");
++
++    expect(streamingInstances).toHaveLength(1);
 +    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
 +      expect.stringContaining("⏳ Running exec..."),
 +      { title: "🔧 Tool calls (3)" },
 +    );
-+  });
-+
+   });
+ 
+-  it("renders reasoning-only card when no answer text arrives", async () => {
+-    const { result, options } = createDispatcherHarness({
+-      runtime: createRuntimeLogger(),
+-      allowReasoningPreview: true,
 +  it("clears running tool status once a tool result arrives", async () => {
 +    resolveFeishuAccountMock.mockReturnValue({
 +      accountId: "main",
@@ -1008,6 +990,7 @@ index c7b2f9af28..570bfe9725 100644
 +  it("streams reasoning content into the live thinking panel before the answer", async () => {
 +    const { result, options } = createDispatcherHarness({
 +      runtime: createRuntimeLogger(),
++      allowReasoningPreview: true,
 +    });
 +
 +    await options.onReplyStart?.();
@@ -1054,9 +1037,10 @@ index c7b2f9af28..570bfe9725 100644
 +    expect(thinkingCalls.at(-1)).toContain("step three");
 +  });
 +
-+  it("provides onReasoningStream and onReasoningEnd when streaming is enabled", () => {
++  it("provides onReasoningStream and onReasoningEnd when reasoning previews are allowed", () => {
 +    const { result } = createDispatcherHarness({
 +      runtime: createRuntimeLogger(),
++      allowReasoningPreview: true,
 +    });
 +
 +    expect(result.replyOptions.onReasoningStream).toBeTypeOf("function");
@@ -1086,14 +1070,20 @@ index c7b2f9af28..570bfe9725 100644
 +  it("preserves reasoning-only streaming cards when no answer text arrives", async () => {
 +    const { result, options } = createDispatcherHarness({
 +      runtime: createRuntimeLogger(),
-+    });
-+
-+    await options.onReplyStart?.();
-+    result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_deep thought_" });
-+    result.replyOptions.onReasoningEnd?.();
-+    await options.onIdle?.();
-+
-+    expect(streamingInstances).toHaveLength(1);
++      allowReasoningPreview: true,
+     });
+ 
+     await options.onReplyStart?.();
+@@ -609,12 +1269,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+     await options.onIdle?.();
+ 
+     expect(streamingInstances).toHaveLength(1);
+-    expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
+-    const closeArg = streamingInstances[0].close.mock.calls[0][0] as string;
+-    expect(closeArg).toContain("> 💭 **Thinking**");
+-    expect(closeArg).toContain("> deep thought");
+-    expect(closeArg).not.toContain("Reasoning:");
+-    expect(closeArg).not.toContain("---");
 +    expect(streamingInstances[0].updateThinking).toHaveBeenCalledWith("deep thought", {
 +      title: "💭 Thinking",
 +    });
@@ -1104,7 +1094,7 @@ index c7b2f9af28..570bfe9725 100644
    });
  
    it("ignores empty reasoning payloads", async () => {
-@@ -644,6 +1314,264 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
+@@ -695,6 +1356,264 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
      );
    });
  
@@ -1370,30 +1360,29 @@ index c7b2f9af28..570bfe9725 100644
      const { options } = createDispatcherHarness({
        replyToMessageId: "om_msg",
 diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
-index 6ab7184c8e..35961108fc 100644
+index 12cc3a0698..33afa12f32 100644
 --- a/extensions/feishu/src/reply-dispatcher.ts
 +++ b/extensions/feishu/src/reply-dispatcher.ts
-@@ -1,7 +1,7 @@
+@@ -1,15 +1,16 @@
 +import path from "node:path";
+ import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
+ import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
  import {
    resolveSendableOutboundReplyParts,
    resolveTextChunksWithFallback,
 -  sendMediaWithLeadingCaption,
  } from "openclaw/plugin-sdk/reply-payload";
- import {
-   createChannelReplyPipeline,
-@@ -14,15 +14,28 @@ import {
- } from "../runtime-api.js";
- import { resolveFeishuAccount } from "./accounts.js";
+ import { resolveFeishuRuntimeAccount } from "./accounts.js";
  import { createFeishuClient } from "./client.js";
 +import { resolveMediaContentType } from "./media-types.js";
  import { sendMediaFeishu } from "./media.js";
  import type { MentionTarget } from "./mention.js";
 -import { buildMentionedCardContent } from "./mention.js";
 +import { buildMentionedCardContent, normalizeMentionTagsForCard } from "./mention.js";
- import { getFeishuRuntime } from "./runtime.js";
- import { sendMessageFeishu, sendStructuredCardFeishu, type CardHeaderConfig } from "./send.js";
- import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js";
+ import {
+   createReplyPrefixContext,
+   type ClawdbotConfig,
+@@ -23,6 +24,18 @@ import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js"
  import { resolveReceiveIdType } from "./targets.js";
  import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
  
@@ -1461,7 +1450,7 @@ index 6ab7184c8e..35961108fc 100644
  function normalizeEpochMs(timestamp: number | undefined): number | undefined {
    if (!Number.isFinite(timestamp) || timestamp === undefined || timestamp <= 0) {
      return undefined;
-@@ -81,15 +136,27 @@ export type CreateFeishuReplyDispatcherParams = {
+@@ -82,15 +137,27 @@ export type CreateFeishuReplyDispatcherParams = {
    /** When true, preserve typing indicator on reply target but send messages without reply metadata */
    skipReplyToInMessages?: boolean;
    replyInThread?: boolean;
@@ -1489,7 +1478,7 @@ index 6ab7184c8e..35961108fc 100644
  };
  
  export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams) {
-@@ -101,16 +168,101 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -102,16 +169,101 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
      replyToMessageId,
      skipReplyToInMessages,
      replyInThread,
@@ -1505,7 +1494,7 @@ index 6ab7184c8e..35961108fc 100644
    const sendReplyToMessageId = skipReplyToInMessages ? undefined : replyToMessageId;
    const threadReplyMode = threadReply === true;
    const effectiveReplyInThread = threadReplyMode ? true : replyInThread;
-   const account = resolveFeishuAccount({ cfg, accountId });
+   const account = resolveFeishuRuntimeAccount({ cfg, accountId });
 +  const dispatcherDebugId = `fd-${++replyDispatcherDebugSeq}`;
 +  const logDispatcher = (message: string) => {
 +    params.runtime.log?.(`feishu[${account.accountId}] ${dispatcherDebugId} ${message}`);
@@ -1591,7 +1580,7 @@ index 6ab7184c8e..35961108fc 100644
    const prefixContext = createReplyPrefixContext({ cfg, agentId });
  
    let typingState: TypingIndicatorState | null = null;
-@@ -184,10 +336,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -185,11 +337,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
    });
    const chunkMode = core.channel.text.resolveChunkMode(cfg, "feishu");
    const tableMode = core.channel.text.resolveMarkdownTableMode({ cfg, channel: "feishu" });
@@ -1611,6 +1600,7 @@ index 6ab7184c8e..35961108fc 100644
 +    account.config?.streaming !== false &&
 +    renderMode !== "raw" &&
 +    (!threadReplyMode || streamingInThread === true);
+   const reasoningPreviewEnabled = streamingEnabled && params.allowReasoningPreview === true;
 +  // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
 +  // replies without streamingInThread) so reasoningText gets accumulated and can
 +  // be included in non-streaming card output.  Only skip for raw text mode.
@@ -1618,7 +1608,7 @@ index 6ab7184c8e..35961108fc 100644
  
    let streaming: FeishuStreamingSession | null = null;
    let streamText = "";
-@@ -196,40 +362,310 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -198,40 +364,310 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
    const deliveredFinalTexts = new Set<string>();
    let partialUpdateQueue: Promise<void> = Promise.resolve();
    let streamingStartPromise: Promise<void> | null = null;
@@ -1946,7 +1936,7 @@ index 6ab7184c8e..35961108fc 100644
      },
    ) => {
      if (!nextText) {
-@@ -238,25 +674,43 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -240,25 +676,43 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
      if (options?.dedupeWithLastPartial && nextText === lastPartial) {
        return;
      }
@@ -1996,7 +1986,7 @@ index 6ab7184c8e..35961108fc 100644
      streamingStartPromise = (async () => {
        const creds =
          account.appId && account.appSecret
-@@ -270,8 +724,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -272,8 +726,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
          params.runtime.log?.(`feishu[${account.accountId}] ${message}`),
        );
        try {
@@ -2009,7 +1999,7 @@ index 6ab7184c8e..35961108fc 100644
          await streaming.start(chatId, resolveReceiveIdType(chatId), {
            replyToMessageId,
            replyInThread: effectiveReplyInThread,
-@@ -279,6 +735,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -281,6 +737,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
            header: cardHeader,
            note: cardNote,
          });
@@ -2017,7 +2007,7 @@ index 6ab7184c8e..35961108fc 100644
        } catch (error) {
          params.runtime.error?.(`feishu: streaming start failed: ${String(error)}`);
          streaming = null;
-@@ -287,32 +744,124 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -289,32 +746,124 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
      })();
    };
  
@@ -2150,7 +2140,7 @@ index 6ab7184c8e..35961108fc 100644
      const chunkSource = params.useCard
        ? params.text
        : core.channel.text.convertMarkdownTables(params.text, tableMode);
-@@ -321,31 +870,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -323,31 +872,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
        core.channel.text.chunkTextWithMode(chunkSource, textChunkLimit, chunkMode),
      );
      for (const [index, chunk] of chunks.entries()) {
@@ -2189,7 +2179,7 @@ index 6ab7184c8e..35961108fc 100644
    };
  
    const { dispatcher, replyOptions, markDispatchIdle } =
-@@ -354,28 +889,88 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -356,28 +891,88 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
        responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
        humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
        onReplyStart: async () => {
@@ -2286,7 +2276,7 @@ index 6ab7184c8e..35961108fc 100644
            if (info?.kind === "block") {
              // Drop internal block chunks unless we can safely consume them as
              // streaming-card fallback content.
-@@ -395,33 +990,75 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -397,33 +992,75 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
              }
            }
  
@@ -2374,7 +2364,7 @@ index 6ab7184c8e..35961108fc 100644
                    cfg,
                    to: chatId,
                    text: chunk,
-@@ -431,16 +1068,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -433,16 +1070,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                    accountId,
                    header: cardHeader,
                    note: cardNote,
@@ -2401,7 +2391,7 @@ index 6ab7184c8e..35961108fc 100644
                    cfg,
                    to: chatId,
                    text: chunk,
-@@ -449,24 +1094,62 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -451,24 +1096,62 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                    mentions: isFirst ? mentionTargets : undefined,
                    accountId,
                  });
@@ -2467,7 +2457,7 @@ index 6ab7184c8e..35961108fc 100644
          typingCallbacks?.onIdle?.();
        },
        onCleanup: () => {
-@@ -479,28 +1162,83 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+@@ -481,28 +1164,83 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
      replyOptions: {
        ...replyOptions,
        onModelSelected: prefixContext.onModelSelected,
@@ -2539,7 +2529,7 @@ index 6ab7184c8e..35961108fc 100644
 +            queueThinkingPanelUpdate();
            }
          : undefined,
--      onReasoningStream: streamingEnabled
+-      onReasoningStream: reasoningPreviewEnabled
 +      onPartialReply: streamingEnabled
          ? (payload: ReplyPayload) => {
              if (!payload.text) {
@@ -2557,7 +2547,7 @@ index 6ab7184c8e..35961108fc 100644
 +            queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
            }
          : undefined,
--      onReasoningEnd: streamingEnabled ? () => {} : undefined,
+-      onReasoningEnd: reasoningPreviewEnabled ? () => {} : undefined,
      },
      markDispatchIdle,
    };
@@ -2600,10 +2590,10 @@ index b9ba39ba0b..42ce565c6a 100644
    };
  }
 diff --git a/extensions/feishu/src/send.reply-fallback.test.ts b/extensions/feishu/src/send.reply-fallback.test.ts
-index d4a2f023ac..98e20696f5 100644
+index 7148b98284..93e541db90 100644
 --- a/extensions/feishu/src/send.reply-fallback.test.ts
 +++ b/extensions/feishu/src/send.reply-fallback.test.ts
-@@ -107,6 +107,7 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
+@@ -118,6 +118,7 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
          to: "user:ou_target",
          text: "hello",
          replyToMessageId: "om_parent",
@@ -2612,27 +2602,55 @@ index d4a2f023ac..98e20696f5 100644
      ).rejects.toThrow("Feishu reply failed");
  
 diff --git a/extensions/feishu/src/send.test.ts b/extensions/feishu/src/send.test.ts
-index a7af456068..4ad6087ecc 100644
+index 6f7052c388..f43b18abc0 100644
 --- a/extensions/feishu/src/send.test.ts
 +++ b/extensions/feishu/src/send.test.ts
-@@ -1,11 +1,16 @@
- import { beforeEach, describe, expect, it, vi } from "vitest";
+@@ -1,6 +1,17 @@
+ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
  import type { ClawdbotConfig } from "../runtime-api.js";
- import {
+-import { buildMarkdownCard } from "./send.js";
++import {
 +  buildMarkdownCard,
-   buildStructuredCard,
-   editMessageFeishu,
++  buildStructuredCard,
++  editMessageFeishu,
 +  enrichMentionPlaceholders,
-   getMessageFeishu,
-   listFeishuThreadMessages,
-   resolveFeishuCardTemplate,
++  getMessageFeishu,
++  listFeishuThreadMessages,
++  resolveFeishuCardTemplate,
 +  sendCardFeishu,
 +  sendMessageFeishu,
 +  shouldUseFeishuMarkdownCard,
- } from "./send.js";
++} from "./send.js";
  
  const {
-@@ -258,6 +263,139 @@ describe("getMessageFeishu", () => {
+   mockConvertMarkdownTables,
+@@ -52,25 +63,7 @@ vi.mock("./runtime.js", () => ({
+   }),
+ }));
+ 
+-let buildStructuredCard: typeof import("./send.js").buildStructuredCard;
+-let editMessageFeishu: typeof import("./send.js").editMessageFeishu;
+-let getMessageFeishu: typeof import("./send.js").getMessageFeishu;
+-let listFeishuThreadMessages: typeof import("./send.js").listFeishuThreadMessages;
+-let resolveFeishuCardTemplate: typeof import("./send.js").resolveFeishuCardTemplate;
+-let sendMessageFeishu: typeof import("./send.js").sendMessageFeishu;
+-
+ describe("getMessageFeishu", () => {
+-  beforeAll(async () => {
+-    ({
+-      buildStructuredCard,
+-      editMessageFeishu,
+-      getMessageFeishu,
+-      listFeishuThreadMessages,
+-      resolveFeishuCardTemplate,
+-      sendMessageFeishu,
+-    } = await import("./send.js"));
+-  });
+-
+   beforeEach(() => {
+     vi.clearAllMocks();
+     mockResolveMarkdownTableMode.mockReturnValue("preserve");
+@@ -326,6 +319,139 @@ describe("getMessageFeishu", () => {
    });
  });
  
@@ -2772,7 +2790,7 @@ index a7af456068..4ad6087ecc 100644
  describe("editMessageFeishu", () => {
    beforeEach(() => {
      vi.clearAllMocks();
-@@ -320,6 +458,127 @@ describe("editMessageFeishu", () => {
+@@ -394,6 +520,127 @@ describe("editMessageFeishu", () => {
      });
      expect(result).toEqual({ messageId: "om_card", contentType: "interactive" });
    });
@@ -2825,7 +2843,7 @@ index a7af456068..4ad6087ecc 100644
 +        content: JSON.stringify({
 +          schema: "2.0",
 +          config: {
-+            wide_screen_mode: true,
++            width_mode: "fill",
 +          },
 +          body: {
 +            elements: [{ tag: "markdown", content: "updated body" }],
@@ -2856,7 +2874,7 @@ index a7af456068..4ad6087ecc 100644
 +        content: JSON.stringify({
 +          schema: "2.0",
 +          config: {
-+            wide_screen_mode: true,
++            width_mode: "fill",
 +          },
 +          body: {
 +            elements: [{ tag: "markdown", content: "<at id=ou_123></at> updated body" }],
@@ -2887,7 +2905,7 @@ index a7af456068..4ad6087ecc 100644
 +        content: JSON.stringify({
 +          schema: "2.0",
 +          config: {
-+            wide_screen_mode: true,
++            width_mode: "fill",
 +          },
 +          body: {
 +            elements: [{ tag: "markdown", content: "| a | b |\n| - | - |" }],
@@ -2900,7 +2918,7 @@ index a7af456068..4ad6087ecc 100644
  });
  
  describe("resolveFeishuCardTemplate", () => {
-@@ -350,4 +609,108 @@ describe("buildStructuredCard", () => {
+@@ -438,6 +685,110 @@ describe("buildStructuredCard", () => {
        }),
      );
    });
@@ -2957,7 +2975,7 @@ index a7af456068..4ad6087ecc 100644
 +    expect(card).toEqual({
 +      schema: "2.0",
 +      config: {
-+        wide_screen_mode: true,
++        width_mode: "fill",
 +      },
 +      body: {
 +        elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
@@ -3009,12 +3027,18 @@ index a7af456068..4ad6087ecc 100644
 +    expect(enrichMentionPlaceholders(content, mentions)).toBe("@_user_1 hi");
 +  });
  });
+ 
+ describe("buildMarkdownCard", () => {
 diff --git a/extensions/feishu/src/send.ts b/extensions/feishu/src/send.ts
-index 7ea5395010..f4819228ff 100644
+index 95b235b2d4..529609de19 100644
 --- a/extensions/feishu/src/send.ts
 +++ b/extensions/feishu/src/send.ts
-@@ -2,7 +2,12 @@ import type { ClawdbotConfig } from "../runtime-api.js";
- import { resolveFeishuAccount } from "./accounts.js";
+@@ -1,10 +1,15 @@
+ import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/config-runtime";
+ import { convertMarkdownTables } from "openclaw/plugin-sdk/text-runtime";
+ import type { ClawdbotConfig } from "../runtime-api.js";
+-import { resolveFeishuRuntimeAccount } from "./accounts.js";
++import { resolveFeishuAccount, resolveFeishuRuntimeAccount } from "./accounts.js";
  import { createFeishuClient } from "./client.js";
  import type { MentionTarget } from "./mention.js";
 -import { buildMentionedMessage, buildMentionedCardContent } from "./mention.js";
@@ -3027,7 +3051,7 @@ index 7ea5395010..f4819228ff 100644
  import { parsePostContent } from "./post.js";
  import { getFeishuRuntime } from "./runtime.js";
  import { assertFeishuMessageApiSuccess, toFeishuSendResult } from "./send-result.js";
-@@ -84,6 +89,11 @@ type FeishuMessageGetItem = {
+@@ -86,6 +91,11 @@ type FeishuMessageGetItem = {
    msg_type?: string;
    body?: { content?: string };
    sender?: FeishuMessageSender;
@@ -3039,7 +3063,7 @@ index 7ea5395010..f4819228ff 100644
    create_time?: string;
  };
  
-@@ -105,6 +115,7 @@ async function sendFallbackDirect(
+@@ -107,6 +117,7 @@ async function sendFallbackDirect(
      msgType: string;
    },
    errorPrefix: string,
@@ -3047,7 +3071,7 @@ index 7ea5395010..f4819228ff 100644
  ): Promise<FeishuSendResult> {
    const response = await client.im.message.create({
      params: { receive_id_type: params.receiveIdType },
-@@ -115,7 +126,10 @@ async function sendFallbackDirect(
+@@ -117,7 +128,10 @@ async function sendFallbackDirect(
      },
    });
    assertFeishuMessageApiSuccess(response, errorPrefix);
@@ -3059,7 +3083,7 @@ index 7ea5395010..f4819228ff 100644
  }
  
  async function sendReplyOrFallbackDirect(
-@@ -135,7 +149,11 @@ async function sendReplyOrFallbackDirect(
+@@ -137,7 +151,11 @@ async function sendReplyOrFallbackDirect(
      replyErrorPrefix: string;
    },
  ): Promise<FeishuSendResult> {
@@ -3071,7 +3095,7 @@ index 7ea5395010..f4819228ff 100644
      return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
    }
  
-@@ -147,6 +165,9 @@ async function sendReplyOrFallbackDirect(
+@@ -149,6 +167,9 @@ async function sendReplyOrFallbackDirect(
  
    let response: { code?: number; msg?: string; data?: { message_id?: string } };
    try {
@@ -3081,7 +3105,7 @@ index 7ea5395010..f4819228ff 100644
      response = await client.im.message.reply({
        path: { message_id: params.replyToMessageId },
        data: {
-@@ -159,18 +180,27 @@ async function sendReplyOrFallbackDirect(
+@@ -161,18 +182,27 @@ async function sendReplyOrFallbackDirect(
      if (!isWithdrawnReplyError(err)) {
        throw err;
      }
@@ -3109,7 +3133,7 @@ index 7ea5395010..f4819228ff 100644
    return toFeishuSendResult(response, params.directParams.receiveId);
  }
  
-@@ -269,13 +299,42 @@ function parseFeishuMessageItem(
+@@ -271,13 +301,42 @@ function parseFeishuMessageItem(
      senderId: item.sender?.id,
      senderOpenId: item.sender?.id_type === "open_id" ? item.sender?.id : undefined,
      senderType: item.sender?.sender_type,
@@ -3153,7 +3177,7 @@ index 7ea5395010..f4819228ff 100644
  /**
   * Get a message by its ID.
   * Useful for fetching quoted/replied message content.
-@@ -418,6 +477,57 @@ export type SendFeishuMessageParams = {
+@@ -420,6 +479,57 @@ export type SendFeishuMessageParams = {
    accountId?: string;
  };
  
@@ -3211,7 +3235,7 @@ index 7ea5395010..f4819228ff 100644
  export function buildFeishuPostMessagePayload(params: { messageText: string }): {
    content: string;
    msgType: string;
-@@ -444,6 +554,20 @@ export async function sendMessageFeishu(
+@@ -446,6 +556,20 @@ export async function sendMessageFeishu(
    params: SendFeishuMessageParams,
  ): Promise<FeishuSendResult> {
    const { cfg, to, text, replyToMessageId, replyInThread, mentions, accountId } = params;
@@ -3230,17 +3254,17 @@ index 7ea5395010..f4819228ff 100644
 +  }
 +  const mentionMeta = buildMentionMeta(mentions);
    const { client, receiveId, receiveIdType } = resolveFeishuSendTarget({ cfg, to, accountId });
-   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
+   const tableMode = resolveMarkdownTableMode({
      cfg,
-@@ -455,6 +579,7 @@ export async function sendMessageFeishu(
+@@ -457,6 +581,7 @@ export async function sendMessageFeishu(
    if (mentions && mentions.length > 0) {
      rawText = buildMentionedMessage(mentions, rawText);
    }
 +  rawText = normalizeMentionTagsForText(rawText, buildMentionDisplayNameMap(mentions));
-   const messageText = getFeishuRuntime().channel.text.convertMarkdownTables(rawText, tableMode);
+   const messageText = convertMarkdownTables(rawText, tableMode);
  
    const { content, msgType } = buildFeishuPostMessagePayload({ messageText });
-@@ -478,13 +603,15 @@ export type SendFeishuCardParams = {
+@@ -480,13 +605,15 @@ export type SendFeishuCardParams = {
    replyToMessageId?: string;
    /** When true, reply creates a Feishu topic thread instead of an inline reply */
    replyInThread?: boolean;
@@ -3258,7 +3282,7 @@ index 7ea5395010..f4819228ff 100644
  
    const directParams = { receiveId, receiveIdType, content, msgType: "interactive" };
    return sendReplyOrFallbackDirect(client, {
-@@ -520,7 +647,7 @@ export async function editMessageFeishu(params: {
+@@ -522,7 +649,7 @@ export async function editMessageFeishu(params: {
    const client = createFeishuClient(account);
  
    if (card) {
@@ -3267,7 +3291,7 @@ index 7ea5395010..f4819228ff 100644
      const response = await client.im.message.patch({
        path: { message_id: messageId },
        data: { content },
-@@ -533,6 +660,21 @@ export async function editMessageFeishu(params: {
+@@ -535,6 +662,21 @@ export async function editMessageFeishu(params: {
      return { messageId, contentType: "interactive" };
    }
  
@@ -3286,10 +3310,10 @@ index 7ea5395010..f4819228ff 100644
 +    return { messageId, contentType: "interactive" };
 +  }
 +
-   const tableMode = getFeishuRuntime().channel.text.resolveMarkdownTableMode({
+   const tableMode = resolveMarkdownTableMode({
      cfg,
      channel: "feishu",
-@@ -564,7 +706,7 @@ export async function updateCardFeishu(params: {
+@@ -566,7 +708,7 @@ export async function updateCardFeishu(params: {
    }
  
    const client = createFeishuClient(account);
@@ -3298,7 +3322,7 @@ index 7ea5395010..f4819228ff 100644
  
    const response = await client.im.message.patch({
      path: { message_id: messageId },
-@@ -576,12 +718,17 @@ export async function updateCardFeishu(params: {
+@@ -578,12 +720,17 @@ export async function updateCardFeishu(params: {
    }
  }
  
@@ -3316,7 +3340,7 @@ index 7ea5395010..f4819228ff 100644
    return {
      schema: "2.0",
      config: {
-@@ -591,7 +738,7 @@ export function buildMarkdownCard(text: string): Record<string, unknown> {
+@@ -593,7 +740,7 @@ export function buildMarkdownCard(text: string): Record<string, unknown> {
        elements: [
          {
            tag: "markdown",
@@ -3325,7 +3349,7 @@ index 7ea5395010..f4819228ff 100644
          },
        ],
      },
-@@ -623,9 +770,32 @@ export function buildStructuredCard(
+@@ -625,9 +772,32 @@ export function buildStructuredCard(
    options?: {
      header?: CardHeaderConfig;
      note?: string;
@@ -3359,7 +3383,7 @@ index 7ea5395010..f4819228ff 100644
    if (options?.note) {
      elements.push({ tag: "hr" });
      elements.push({ tag: "markdown", content: `<font color='grey'>${options.note}</font>` });
-@@ -658,14 +828,35 @@ export async function sendStructuredCardFeishu(params: {
+@@ -660,14 +830,35 @@ export async function sendStructuredCardFeishu(params: {
    accountId?: string;
    header?: CardHeaderConfig;
    note?: string;
@@ -3401,7 +3425,7 @@ index 7ea5395010..f4819228ff 100644
    return sendCardFeishu({ cfg, to, card, replyToMessageId, replyInThread, accountId });
  }
  
-@@ -689,6 +880,7 @@ export async function sendMarkdownCardFeishu(params: {
+@@ -691,6 +882,7 @@ export async function sendMarkdownCardFeishu(params: {
    if (mentions && mentions.length > 0) {
      cardText = buildMentionedCardContent(mentions, text);
    }
@@ -4308,18 +4332,10 @@ index bb12feab61..8d96fac950 100644
 +  });
 +});
 diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
-index c7ca0c4a44..f8548af817 100644
+index ee4964e441..ce8f178b7d 100644
 --- a/extensions/feishu/src/streaming-card.ts
 +++ b/extensions/feishu/src/streaming-card.ts
-@@ -3,7 +3,6 @@
-  */
- 
- import type { Client } from "@larksuiteoapi/node-sdk";
--import { fetchWithSsrFGuard } from "../runtime-api.js";
- import { resolveFeishuCardTemplate, type CardHeaderConfig } from "./send.js";
- import type { FeishuDomain } from "./types.js";
- 
-@@ -14,6 +13,12 @@ type CardState = {
+@@ -14,6 +14,12 @@ type CardState = {
    sequence: number;
    currentText: string;
    hasNote: boolean;
@@ -4332,7 +4348,7 @@ index c7ca0c4a44..f8548af817 100644
  };
  
  /** Options for customising the initial streaming card appearance. */
-@@ -38,79 +43,91 @@ type StreamingStartOptions = {
+@@ -38,79 +44,91 @@ type StreamingStartOptions = {
    header?: StreamingCardHeader;
  };
  
@@ -4478,7 +4494,7 @@ index c7ca0c4a44..f8548af817 100644
  export function mergeStreamingText(
    previousText: string | undefined,
    nextText: string | undefined,
-@@ -160,19 +177,22 @@ export function resolveStreamingCardSendMode(options?: StreamingStartOptions) {
+@@ -160,19 +178,22 @@ export function resolveStreamingCardSendMode(options?: StreamingStartOptions) {
  /** Streaming card session manager */
  export class FeishuStreamingSession {
    private client: Client;
@@ -4504,7 +4520,7 @@ index c7ca0c4a44..f8548af817 100644
      this.log = log;
    }
  
-@@ -185,7 +205,6 @@ export class FeishuStreamingSession {
+@@ -185,7 +206,6 @@ export class FeishuStreamingSession {
        return;
      }
  
@@ -4512,7 +4528,7 @@ index c7ca0c4a44..f8548af817 100644
      const elements: Record<string, unknown>[] = [
        { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
      ];
-@@ -213,31 +232,14 @@ export class FeishuStreamingSession {
+@@ -213,31 +233,14 @@ export class FeishuStreamingSession {
        };
      }
  
@@ -4550,7 +4566,7 @@ index c7ca0c4a44..f8548af817 100644
        throw new Error(`Create card failed: ${createData.msg}`);
      }
      const cardId = createData.data.card_id;
-@@ -288,52 +290,284 @@ export class FeishuStreamingSession {
+@@ -288,52 +291,284 @@ export class FeishuStreamingSession {
        sequence: 1,
        currentText: "",
        hasNote: !!options?.note,
@@ -4862,7 +4878,7 @@ index c7ca0c4a44..f8548af817 100644
        return;
      }
      this.pendingText = null;
-@@ -343,16 +577,70 @@ export class FeishuStreamingSession {
+@@ -343,16 +578,70 @@ export class FeishuStreamingSession {
        this.flushTimer = null;
      }
  
@@ -4937,7 +4953,7 @@ index c7ca0c4a44..f8548af817 100644
      });
      await this.queue;
    }
-@@ -361,32 +649,36 @@ export class FeishuStreamingSession {
+@@ -361,32 +650,36 @@ export class FeishuStreamingSession {
      if (!this.state || !this.state.hasNote) {
        return;
      }
@@ -4995,7 +5011,7 @@ index c7ca0c4a44..f8548af817 100644
      if (!this.state || this.closed) {
        return;
      }
-@@ -395,46 +687,72 @@ export class FeishuStreamingSession {
+@@ -395,46 +688,72 @@ export class FeishuStreamingSession {
        clearTimeout(this.flushTimer);
        this.flushTimer = null;
      }
@@ -5099,7 +5115,7 @@ index c7ca0c4a44..f8548af817 100644
        })
        .catch((e) => this.log?.(`Close failed: ${String(e)}`));
      const finalState = this.state;
-@@ -444,6 +762,37 @@ export class FeishuStreamingSession {
+@@ -444,6 +763,37 @@ export class FeishuStreamingSession {
      this.log?.(`Closed streaming: cardId=${finalState.cardId}`);
    }
  

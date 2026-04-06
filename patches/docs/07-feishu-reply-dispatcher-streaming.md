@@ -29,6 +29,7 @@
 | `extensions/feishu/src/reply-dispatcher.test.ts` | 大量新增测试：思考面板、工具追踪、hook 集成、去重 |
 | `extensions/feishu/src/streaming-card.test.ts` | 大量新增测试：Card Kit API 调用、续期、超时恢复 |
 | `extensions/feishu/src/send.test.ts` | 新增卡片构建和 mention 规范化测试 |
+| `extensions/feishu/src/send.reply-fallback.test.ts` | 回复 fallback 路径测试（微小改动） |
 
 ---
 
@@ -432,12 +433,12 @@ deliveredFinalTexts.add(strip("答案"))  # 剥离 mention 后比较
 | 342-350 | 配置解析：`renderMode`、`hasMessageSendingHooks`、`streamingEnabled` |
 | 364 | `deliveredFinalTexts = new Set<string>()` — 去重集合 |
 | 374-376 | 流式阶段和工具追踪状态变量：`streamPhase`、`activeTools`、`toolCallCount` |
-| 385 | `deliverMediaAndEmitIfNeeded()` — media 发送和事件发射 |
+| 381 | `deliverMediaAndEmitIfNeeded()` — media 发送和事件发射 |
 | 433 | `emitFinalTextIfNeeded()` — 最终文本交付回调 |
-| 568 | `composeThinkingContent()` — 思考面板内容组合 |
-| 601 | `stripIncompleteAtTag()` — 防止不完整标签破坏卡片 |
-| 614 | `queueStreamingRender()` — 主内容元素更新队列 |
-| 648 | `queueThinkingPanelUpdate()` — 思考面板更新队列 |
+| 567 | `composeThinkingContent()` — 思考面板内容组合 |
+| 600 | `stripIncompleteAtTag()` — 防止不完整标签破坏卡片 |
+| 613 | `queueStreamingRender()` — 主内容元素更新队列 |
+| 647 | `queueThinkingPanelUpdate()` — 思考面板更新队列 |
 | 667 | `queueStreamingUpdate()` — 合并增量文本并触发渲染 |
 | 709 | `startStreaming()` — 创建流式卡片会话 |
 | 753 | `closeStreaming()` — 关闭流式卡片，处理空文本/仅思考/正常关闭 |
@@ -455,12 +456,14 @@ deliveredFinalTexts.add(strip("答案"))  # 剥离 mention 后比较
 | 303 | `start()` 末尾调用 `startRenewTimer()` |
 | 308-316 | `startRenewTimer()` / `stopRenewTimer()` |
 | 335 | `setStreamingModeEnabled()` — 续期/重新打开 streaming_mode |
-| 384 | `pushElementContent()` — element-level API 推送 |
-| 407 | `updateElementContent()` — element-level API + 超时恢复逻辑 |
-| 454 | `buildFullElements()` — 含思考面板的全量元素数组 |
-| 491 | `updateCardFull()` — 全量卡片替换（fallback） |
-| 542-588 | `update()` 内容合并逻辑（含 `mergeStreamingText`） |
-| 600 | `updateThinking()` — 思考面板更新 |
+| 406 | `pushElementContent()` — element-level API 推送 |
+| 449 | `updateElementContent()` — element-level API + 超时恢复逻辑 |
+| 453 | `buildFullElements()` — 含思考面板的全量元素数组 |
+| 486 | `updateCardFull()` — 全量卡片替换（fallback） |
+| 537-596 | `update()` 内容合并逻辑（含 `mergeStreamingText`） |
+| 598 | `updateThinking()` — 思考面板更新 |
+| — | `discard()` — 丢弃流式卡片（不发送最终内容） |
+| — | `getMessageId()` — 获取当前卡片消息 ID |
 | 679 | `close()` — 最终卡片输出（折叠思考面板） |
 
 ### `extensions/feishu/src/send.ts`

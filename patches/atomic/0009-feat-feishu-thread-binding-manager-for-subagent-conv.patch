@@ -1,15 +1,9 @@
-From 821db8b7c72adbe13acef35fe128ac129b25dae5 Mon Sep 17 00:00:00 2001
+From 855ca07e9dd346bf6074acec72a8bfc093ea6c51 Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:06:25 +0800
-Subject: [PATCH 09/10] feat(feishu): thread binding manager for subagent
+Date: Mon, 6 Apr 2026 01:43:13 +0800
+Subject: [PATCH 09/12] feat(feishu): thread binding manager for subagent
  conversation lifecycle
 
-- Add thread binding manager with per-account idle/max-age timeouts
-- Persistent thread binding state with disk-backed storage
-- Session binding adapter for SDK integration
-- Track bindings between Feishu conversations and agent sessions
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
  .../src/thread-bindings.manager.test.ts       | 399 ++++++++++++++
  .../feishu/src/thread-bindings.manager.ts     | 512 ++++++++++++++++++

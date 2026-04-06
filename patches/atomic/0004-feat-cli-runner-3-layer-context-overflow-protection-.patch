@@ -1,48 +1,42 @@
-From 39b3761a3a630c4434a1226d652c4950e751252f Mon Sep 17 00:00:00 2001
+From 3bf73dddc2ae12226b51b9db0a09d62869213073 Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:02:01 +0800
-Subject: [PATCH 04/10] feat(cli-runner): 3-layer context overflow protection,
+Date: Mon, 6 Apr 2026 01:42:56 +0800
+Subject: [PATCH 04/12] feat(cli-runner): 3-layer context overflow protection,
  session persistence, and process management
 
-- Add 3-layer context overflow protection with /compact recovery
-- Harden stale claude-cli resume failures
-- Force stop active claude-cli runs on abort
-- Stop cli fallback after manual cancel
-- Suppress noisy abort reply failures
-- Persist Claude prompt binding metadata and keep verified state on resume
-- Improve backend routing and session rotation memory
-- Stream-json mode integration for CLI runner
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
  ...sh-tools.exec.pty-fallback-failure.test.ts |    1 +
  .../bash-tools.process.supervisor.test.ts     |    1 +
- src/agents/claude-cli-runner.test.ts          |  100 +-
+ src/agents/claude-cli-runner.test.ts          |   42 +-
  src/agents/cli-backends.test.ts               |   36 +
- src/agents/cli-backends.ts                    |   35 +-
- .../cli-runner.helpers.stream-json.test.ts    |  534 ++++++
- src/agents/cli-runner.test.ts                 | 1430 ++++++++++++++-
- src/agents/cli-runner.ts                      | 1626 ++++++++++++++++-
- src/agents/cli-runner/helpers.ts              |  534 +++++-
- src/agents/cli-session.test.ts                |   51 +
- src/agents/cli-session.ts                     |   92 +-
- src/agents/command/session-store.ts           |   14 +-
+ src/agents/cli-backends.ts                    |  143 +-
+ src/agents/cli-output.ts                      |    5 +-
+ .../cli-runner.helpers.stream-json.test.ts    |  534 +++++
+ src/agents/cli-runner.test.ts                 | 1745 +++++++++++++++++
+ src/agents/cli-runner.ts                      |  149 +-
+ src/agents/cli-runner/execute.ts              |  659 ++++++-
+ src/agents/cli-runner/helpers.ts              |  670 ++++++-
+ src/agents/cli-runner/prepare.ts              |  456 ++++-
+ src/agents/cli-runner/types.ts                |   49 +
+ src/agents/cli-session.test.ts                |   44 +
+ src/agents/cli-session.ts                     |   22 +
+ src/agents/command/session-store.ts           |    1 +
  src/config/sessions/artifacts.ts              |   14 +
  src/config/sessions/disk-budget.test.ts       |   42 +
  src/config/sessions/disk-budget.ts            |   90 +-
- src/config/sessions/sessions.test.ts          |   87 +-
+ src/config/sessions/sessions.test.ts          |  246 +++
  src/process/supervisor/supervisor.test.ts     |   23 +
  src/process/supervisor/supervisor.ts          |   22 +
  src/process/supervisor/types.ts               |    1 +
- 19 files changed, 4608 insertions(+), 125 deletions(-)
+ 23 files changed, 4912 insertions(+), 83 deletions(-)
  create mode 100644 src/agents/cli-runner.helpers.stream-json.test.ts
- create mode 100644 src/agents/cli-session.test.ts
+ create mode 100644 src/agents/cli-runner.test.ts
 
 diff --git a/src/agents/bash-tools.exec.pty-fallback-failure.test.ts b/src/agents/bash-tools.exec.pty-fallback-failure.test.ts
-index 64861e2199..0687b47568 100644
+index b678672ab2..a1404dca24 100644
 --- a/src/agents/bash-tools.exec.pty-fallback-failure.test.ts
 +++ b/src/agents/bash-tools.exec.pty-fallback-failure.test.ts
-@@ -12,6 +12,7 @@ const makeSupervisor = () => {
+@@ -13,6 +13,7 @@ const makeSupervisor = () => {
      spawn: (...args: unknown[]) => supervisorSpawnMock(...args),
      cancel: noop,
      cancelScope: noop,
@@ -51,10 +45,10 @@ index 64861e2199..0687b47568 100644
      getRecord: noop,
    };
 diff --git a/src/agents/bash-tools.process.supervisor.test.ts b/src/agents/bash-tools.process.supervisor.test.ts
-index 44770a47c6..33e36ce86b 100644
+index 61cae6b440..d144177a20 100644
 --- a/src/agents/bash-tools.process.supervisor.test.ts
 +++ b/src/agents/bash-tools.process.supervisor.test.ts
-@@ -13,6 +13,7 @@ const { supervisorMock } = vi.hoisted(() => ({
+@@ -5,6 +5,7 @@ const { supervisorMock } = vi.hoisted(() => ({
      spawn: vi.fn(),
      cancel: vi.fn(),
      cancelScope: vi.fn(),
@@ -63,49 +57,10 @@ index 44770a47c6..33e36ce86b 100644
      getRecord: vi.fn(),
    },
 diff --git a/src/agents/claude-cli-runner.test.ts b/src/agents/claude-cli-runner.test.ts
-index 2b45a91258..8b86a67429 100644
+index 5eb713476e..76b2f4b162 100644
 --- a/src/agents/claude-cli-runner.test.ts
 +++ b/src/agents/claude-cli-runner.test.ts
-@@ -1,5 +1,6 @@
- import { beforeEach, describe, expect, it, vi } from "vitest";
--import { runClaudeCliAgent } from "./claude-cli-runner.js";
-+
-+let runClaudeCliAgent: typeof import("./claude-cli-runner.js").runClaudeCliAgent;
- 
- const mocks = vi.hoisted(() => ({
-   spawn: vi.fn(),
-@@ -7,9 +8,29 @@ const mocks = vi.hoisted(() => ({
- 
- vi.mock("../process/supervisor/index.js", () => ({
-   getProcessSupervisor: () => ({
--    spawn: (...args: unknown[]) => mocks.spawn(...args),
-+    spawn: async (...args: unknown[]) => {
-+      const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
-+      const managedRun = (await mocks.spawn(...args)) as
-+        | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
-+        | undefined;
-+      if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
-+        input.onStdout(managedRun.__stdoutForStreaming);
-+      }
-+      if (input?.onStdout && managedRun?.wait) {
-+        const originalWait = managedRun.wait.bind(managedRun);
-+        managedRun.wait = async () => {
-+          const result = await originalWait();
-+          if (typeof result?.stdout === "string") {
-+            input.onStdout?.(result.stdout);
-+          }
-+          return result;
-+        };
-+      }
-+      return managedRun;
-+    },
-     cancel: vi.fn(),
-     cancelScope: vi.fn(),
-+    cancelSession: vi.fn(() => 0),
-     reconcileOrphans: async () => {},
-     getRecord: vi.fn(),
-   }),
-@@ -45,6 +66,7 @@ function createManagedRun(
+@@ -31,6 +31,7 @@ function createManagedRun(
      runId: "run-test",
      pid: 12345,
      startedAtMs: Date.now(),
@@ -113,7 +68,7 @@ index 2b45a91258..8b86a67429 100644
      wait: async () => await exit,
      cancel: vi.fn(),
    };
-@@ -56,7 +78,46 @@ function successExit(payload: { message: string; session_id: string }) {
+@@ -48,7 +49,46 @@ function successExit(payload: { message: string; session_id: string }) {
      exitCode: 0,
      exitSignal: null,
      durationMs: 1,
@@ -161,51 +116,11 @@ index 2b45a91258..8b86a67429 100644
      stderr: "",
      timedOut: false,
      noOutputTimedOut: false,
-@@ -73,7 +134,38 @@ async function waitForCalls(mockFn: { mock: { calls: unknown[][] } }, count: num
- }
- 
- describe("runClaudeCliAgent", () => {
--  beforeEach(() => {
-+  beforeEach(async () => {
-+    vi.resetModules();
-+    vi.doMock("../process/supervisor/index.js", () => ({
-+      getProcessSupervisor: () => ({
-+        spawn: async (...args: unknown[]) => {
-+          const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
-+          const managedRun = (await mocks.spawn(...args)) as
-+            | { __stdoutForStreaming?: string; wait?: () => Promise<{ stdout?: string }> }
-+            | undefined;
-+          if (input?.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
-+            input.onStdout(managedRun.__stdoutForStreaming);
-+          }
-+          if (input?.onStdout && managedRun?.wait) {
-+            const originalWait = managedRun.wait.bind(managedRun);
-+            managedRun.wait = async () => {
-+              const result = await originalWait();
-+              if (typeof result?.stdout === "string") {
-+                input.onStdout?.(result.stdout);
-+              }
-+              return result;
-+            };
-+          }
-+          return managedRun;
-+        },
-+        cancel: vi.fn(),
-+        cancelScope: vi.fn(),
-+        cancelSession: vi.fn(() => 0),
-+        reconcileOrphans: async () => {},
-+        getRecord: vi.fn(),
-+      }),
-+    }));
-+    ({ runClaudeCliAgent } = await import("./claude-cli-runner.js"));
-     mocks.spawn.mockClear();
-   });
- 
 diff --git a/src/agents/cli-backends.test.ts b/src/agents/cli-backends.test.ts
-index 6dde78797c..fa093b8478 100644
+index 32b7482ba9..c8e9287480 100644
 --- a/src/agents/cli-backends.test.ts
 +++ b/src/agents/cli-backends.test.ts
-@@ -58,6 +58,42 @@ describe("resolveCliBackendConfig reliability merge", () => {
+@@ -195,6 +195,42 @@ describe("resolveCliBackendConfig reliability merge", () => {
      expect(resolved?.config.reliability?.watchdog?.resume?.maxMs).toBe(180_000);
      expect(resolved?.config.reliability?.watchdog?.fresh?.noOutputTimeoutRatio).toBe(0.8);
    });
@@ -249,59 +164,109 @@ index 6dde78797c..fa093b8478 100644
  
  describe("resolveCliBackendConfig claude-cli defaults", () => {
 diff --git a/src/agents/cli-backends.ts b/src/agents/cli-backends.ts
-index 1b19c4a508..94f87e9910 100644
+index e543cd2029..3a54ea819d 100644
 --- a/src/agents/cli-backends.ts
 +++ b/src/agents/cli-backends.ts
-@@ -39,17 +39,25 @@ const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
+@@ -5,6 +5,10 @@ import {
+ } from "../../extensions/anthropic/cli-backend-api.js";
+ import type { OpenClawConfig } from "../config/config.js";
+ import type { CliBackendConfig } from "../config/types.js";
++import {
++  CLI_FRESH_WATCHDOG_DEFAULTS,
++  CLI_RESUME_WATCHDOG_DEFAULTS,
++} from "./cli-watchdog-defaults.js";
+ import { resolveRuntimeCliBackends } from "../plugins/cli-backends.runtime.js";
+ import { normalizeProviderId } from "./model-selection.js";
  
- const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
-   command: "claude",
--  args: ["-p", "--output-format", "json", "--permission-mode", "bypassPermissions"],
-+  args: [
-+    "-p",
-+    "--verbose",
-+    "--output-format",
-+    "stream-json",
-+    "--permission-mode",
-+    "bypassPermissions",
-+  ],
-   resumeArgs: [
-     "-p",
-+    "--verbose",
-     "--output-format",
--    "json",
-+    "stream-json",
-     "--permission-mode",
-     "bypassPermissions",
-     "--resume",
-     "{sessionId}",
-   ],
--  output: "json",
-+  output: "stream-json",
-   input: "arg",
-   modelArg: "--model",
-   modelAliases: CLAUDE_MODEL_ALIASES,
-@@ -58,7 +66,7 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
-   sessionIdFields: ["session_id", "sessionId", "conversation_id", "conversationId"],
-   systemPromptArg: "--append-system-prompt",
-   systemPromptMode: "append",
--  systemPromptWhen: "first",
-+  systemPromptWhen: "always",
-   clearEnv: ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_OLD"],
-   reliability: {
-     watchdog: {
-@@ -66,6 +74,10 @@ const DEFAULT_CLAUDE_BACKEND: CliBackendConfig = {
-       resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
-     },
-   },
-+  mcp: {
-+    enabled: true,
-+    strict: true,
-+  },
-   serialize: true,
+@@ -23,15 +27,86 @@ type FallbackCliBackendPolicy = {
+   normalizeConfig?: (config: CliBackendConfig) => CliBackendConfig;
  };
  
-@@ -131,6 +143,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
++const CLAUDE_MODEL_ALIASES: Record<string, string> = {
++  opus: "opus",
++  "opus-4.6": "opus",
++  "opus-4.5": "opus",
++  "opus-4": "opus",
++  "claude-opus-4-6": "opus",
++  "claude-opus-4-5": "opus",
++  "claude-opus-4": "opus",
++  sonnet: "sonnet",
++  "sonnet-4.6": "sonnet",
++  "sonnet-4.5": "sonnet",
++  "sonnet-4.1": "sonnet",
++  "sonnet-4.0": "sonnet",
++  "claude-sonnet-4-6": "sonnet",
++  "claude-sonnet-4-5": "sonnet",
++  "claude-sonnet-4-1": "sonnet",
++  "claude-sonnet-4-0": "sonnet",
++  haiku: "haiku",
++  "haiku-3.5": "haiku",
++  "claude-haiku-3-5": "haiku",
++};
++
++const CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG = "--dangerously-skip-permissions";
++const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
++const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
++
++const DEFAULT_CODEX_BACKEND: CliBackendConfig = {
++  command: "codex",
++  args: [
++    "exec",
++    "--json",
++    "--color",
++    "never",
++    "--sandbox",
++    "workspace-write",
++    "--skip-git-repo-check",
++  ],
++  resumeArgs: [
++    "exec",
++    "resume",
++    "{sessionId}",
++    "--color",
++    "never",
++    "--sandbox",
++    "workspace-write",
++    "--skip-git-repo-check",
++  ],
++  output: "jsonl",
++  resumeOutput: "text",
++  input: "arg",
++  modelArg: "--model",
++  sessionIdFields: ["thread_id"],
++  sessionMode: "existing",
++  imageArg: "--image",
++  imageMode: "repeat",
++  reliability: {
++    watchdog: {
++      fresh: { ...CLI_FRESH_WATCHDOG_DEFAULTS },
++      resume: { ...CLI_RESUME_WATCHDOG_DEFAULTS },
++    },
++  },
++  serialize: true,
++};
++
+ const FALLBACK_CLI_BACKEND_POLICIES: Record<string, FallbackCliBackendPolicy> = {
+   [CLAUDE_CLI_BACKEND_ID]: {
+     // Claude CLI consumes explicit MCP config overlays even when the runtime
+     // plugin registry is not initialized yet (for example direct runner tests
+     // or narrow non-gateway entrypoints).
+     bundleMcp: true,
+-    baseConfig: buildAnthropicCliBackend().config,
++    baseConfig: {
++      ...buildAnthropicCliBackend().config,
++      modelAliases: CLAUDE_MODEL_ALIASES,
++    },
+     normalizeConfig: normalizeClaudeBackendConfig,
+   },
++  "codex-cli": {
++    bundleMcp: false,
++    baseConfig: DEFAULT_CODEX_BACKEND,
++  },
+ };
+ 
+ function resolveFallbackCliBackendPolicy(provider: string): FallbackCliBackendPolicy | undefined {
+@@ -71,6 +146,20 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
    const baseResume = base.reliability?.watchdog?.resume ?? {};
    const overrideFresh = override.reliability?.watchdog?.fresh ?? {};
    const overrideResume = override.reliability?.watchdog?.resume ?? {};
@@ -322,7 +287,7 @@ index 1b19c4a508..94f87e9910 100644
    return {
      ...base,
      ...override,
-@@ -157,6 +183,7 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
+@@ -97,14 +186,53 @@ function mergeBackendConfig(base: CliBackendConfig, override?: CliBackendConfig)
          },
        },
      },
@@ -330,6 +295,99 @@ index 1b19c4a508..94f87e9910 100644
    };
  }
  
++function normalizeClaudePermissionArgs(args?: string[]): string[] | undefined {
++  if (!args) {
++    return args;
++  }
++  const normalized: string[] = [];
++  let sawLegacySkip = false;
++  let hasPermissionMode = false;
++  for (let i = 0; i < args.length; i += 1) {
++    const arg = args[i];
++    if (arg === CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG) {
++      sawLegacySkip = true;
++      continue;
++    }
++    if (arg === CLAUDE_PERMISSION_MODE_ARG) {
++      hasPermissionMode = true;
++      normalized.push(arg);
++      const maybeValue = args[i + 1];
++      if (typeof maybeValue === "string") {
++        normalized.push(maybeValue);
++        i += 1;
++      }
++      continue;
++    }
++    if (arg.startsWith(`${CLAUDE_PERMISSION_MODE_ARG}=`)) {
++      hasPermissionMode = true;
++    }
++    normalized.push(arg);
++  }
++  if (sawLegacySkip && !hasPermissionMode) {
++    normalized.push(CLAUDE_PERMISSION_MODE_ARG, CLAUDE_BYPASS_PERMISSIONS_MODE);
++  }
++  return normalized;
++}
++
+ export function resolveCliBackendIds(cfg?: OpenClawConfig): Set<string> {
+   const ids = new Set<string>();
+   for (const backend of resolveRuntimeCliBackends()) {
+     ids.add(normalizeBackendKey(backend.id));
+   }
++  // Always include built-in fallback backends
++  for (const key of Object.keys(FALLBACK_CLI_BACKEND_POLICIES)) {
++    ids.add(normalizeBackendKey(key));
++  }
+   const configured = cfg?.agents?.defaults?.cliBackends ?? {};
+   for (const key of Object.keys(configured)) {
+     ids.add(normalizeBackendKey(key));
+@@ -143,13 +271,22 @@ export function resolveCliBackendConfig(
+     const baseConfig = fallbackPolicy.normalizeConfig
+       ? fallbackPolicy.normalizeConfig(fallbackPolicy.baseConfig)
+       : fallbackPolicy.baseConfig;
+-    const command = baseConfig.command?.trim();
++    // Apply permission arg normalization for claude-cli even in fallback mode
++    const normalizedBase =
++      normalized === normalizeBackendKey(CLAUDE_CLI_BACKEND_ID)
++        ? {
++            ...baseConfig,
++            args: normalizeClaudePermissionArgs(baseConfig.args),
++            resumeArgs: normalizeClaudePermissionArgs(baseConfig.resumeArgs),
++          }
++        : baseConfig;
++    const command = normalizedBase.command?.trim();
+     if (!command) {
+       return null;
+     }
+     return {
+       id: normalized,
+-      config: { ...baseConfig, command },
++      config: { ...normalizedBase, command },
+       bundleMcp: fallbackPolicy.bundleMcp,
+     };
+   }
+diff --git a/src/agents/cli-output.ts b/src/agents/cli-output.ts
+index 66f114830b..5ea1a29364 100644
+--- a/src/agents/cli-output.ts
++++ b/src/agents/cli-output.ts
+@@ -411,14 +411,15 @@ export function parseCliOutput(params: {
+   raw: string;
+   backend: CliBackendConfig;
+   providerId: string;
+-  outputMode?: "json" | "jsonl" | "text";
++  outputMode?: "json" | "jsonl" | "stream-json" | "text";
+   fallbackSessionId?: string;
+ }): CliOutput {
+   const outputMode = params.outputMode ?? "text";
+   if (outputMode === "text") {
+     return { text: params.raw.trim(), sessionId: params.fallbackSessionId };
+   }
+-  if (outputMode === "jsonl") {
++  // stream-json output is line-delimited JSON; fall back to JSONL parsing for the raw output.
++  if (outputMode === "jsonl" || outputMode === "stream-json") {
+     return (
+       parseCliJsonl(params.raw, params.backend, params.providerId) ?? {
+         text: params.raw.trim(),
 diff --git a/src/agents/cli-runner.helpers.stream-json.test.ts b/src/agents/cli-runner.helpers.stream-json.test.ts
 new file mode 100644
 index 0000000000..020763eb62
@@ -871,28 +929,38 @@ index 0000000000..020763eb62
 +  });
 +});
 diff --git a/src/agents/cli-runner.test.ts b/src/agents/cli-runner.test.ts
-index e77ac021fd..d4fa3d4e1c 100644
---- a/src/agents/cli-runner.test.ts
+new file mode 100644
+index 0000000000..d4fa3d4e1c
+--- /dev/null
 +++ b/src/agents/cli-runner.test.ts
-@@ -3,11 +3,12 @@ import os from "node:os";
- import path from "node:path";
- import { beforeEach, describe, expect, it, vi } from "vitest";
- import type { OpenClawConfig } from "../config/config.js";
--import { runCliAgent } from "./cli-runner.js";
--import { resolveCliNoOutputTimeoutMs } from "./cli-runner/helpers.js";
- import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
- import type { WorkspaceBootstrapFile } from "./workspace.js";
- 
+@@ -0,0 +1,1745 @@
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { OpenClawConfig } from "../config/config.js";
++import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
++import type { WorkspaceBootstrapFile } from "./workspace.js";
++
 +let runCliAgent: typeof import("./cli-runner.js").runCliAgent;
 +let resolveCliNoOutputTimeoutMs: typeof import("./cli-runner/helpers.js").resolveCliNoOutputTimeoutMs;
 +
- const supervisorSpawnMock = vi.fn();
- const enqueueSystemEventMock = vi.fn();
- const requestHeartbeatNowMock = vi.fn();
-@@ -24,12 +25,43 @@ const hoisted = vi.hoisted(() => {
-     })),
-   };
- });
++const supervisorSpawnMock = vi.fn();
++const enqueueSystemEventMock = vi.fn();
++const requestHeartbeatNowMock = vi.fn();
++const hoisted = vi.hoisted(() => {
++  type BootstrapContext = {
++    bootstrapFiles: WorkspaceBootstrapFile[];
++    contextFiles: EmbeddedContextFile[];
++  };
++
++  return {
++    resolveBootstrapContextForRunMock: vi.fn<() => Promise<BootstrapContext>>(async () => ({
++      bootstrapFiles: [],
++      contextFiles: [],
++    })),
++  };
++});
 +const ensureMcpConfigFileMock = vi.hoisted(() => vi.fn(() => "/tmp/openclaw-mcp.json"));
 +const getGlobalHookRunnerMock = vi.hoisted(() => vi.fn(() => null));
 +
@@ -904,10 +972,9 @@ index e77ac021fd..d4fa3d4e1c 100644
 +vi.mock("../plugins/hook-runner-global.js", () => ({
 +  getGlobalHookRunner: (...args: unknown[]) => (getGlobalHookRunnerMock as Function)(...args),
 +}));
- 
- vi.mock("../process/supervisor/index.js", () => ({
-   getProcessSupervisor: () => ({
--    spawn: (...args: unknown[]) => supervisorSpawnMock(...args),
++
++vi.mock("../process/supervisor/index.js", () => ({
++  getProcessSupervisor: () => ({
 +    spawn: async (...args: unknown[]) => {
 +      const input = args[0] as { onStdout?: (chunk: string) => void } | undefined;
 +      const managedRun = (await supervisorSpawnMock(...args)) as
@@ -928,26 +995,44 @@ index e77ac021fd..d4fa3d4e1c 100644
 +      }
 +      return managedRun;
 +    },
-     cancel: vi.fn(),
-     cancelScope: vi.fn(),
++    cancel: vi.fn(),
++    cancelScope: vi.fn(),
 +    cancelSession: vi.fn(() => 0),
-     reconcileOrphans: vi.fn(),
-     getRecord: vi.fn(),
-   }),
-@@ -65,29 +97,994 @@ type MockRunExit = {
-   noOutputTimedOut: boolean;
- };
- 
--function createManagedRun(exit: MockRunExit, pid = 1234) {
--  return {
--    runId: "run-supervisor",
--    pid,
--    startedAtMs: Date.now(),
--    stdin: undefined,
--    wait: vi.fn().mockResolvedValue(exit),
--    cancel: vi.fn(),
--  };
--}
++    reconcileOrphans: vi.fn(),
++    getRecord: vi.fn(),
++  }),
++}));
++
++vi.mock("../infra/system-events.js", () => ({
++  enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
++}));
++
++vi.mock("../infra/heartbeat-wake.js", () => ({
++  requestHeartbeatNow: (...args: unknown[]) => requestHeartbeatNowMock(...args),
++}));
++
++vi.mock("./bootstrap-files.js", () => ({
++  makeBootstrapWarn: () => () => {},
++  resolveBootstrapContextForRun: hoisted.resolveBootstrapContextForRunMock,
++}));
++
++type MockRunExit = {
++  reason:
++    | "manual-cancel"
++    | "overall-timeout"
++    | "no-output-timeout"
++    | "spawn-error"
++    | "signal"
++    | "exit";
++  exitCode: number | null;
++  exitSignal: NodeJS.Signals | number | null;
++  durationMs: number;
++  stdout: string;
++  stderr: string;
++  timedOut: boolean;
++  noOutputTimedOut: boolean;
++};
++
 +function createManagedRun(exit: MockRunExit, pid = 1234) {
 +  return {
 +    runId: "run-supervisor",
@@ -1878,16 +1963,7 @@ index e77ac021fd..d4fa3d4e1c 100644
 +      ].join("\n"),
 +      "utf-8",
 +    );
- 
--describe("runCliAgent with process supervisor", () => {
--  beforeEach(() => {
--    supervisorSpawnMock.mockClear();
--    enqueueSystemEventMock.mockClear();
--    requestHeartbeatNowMock.mockClear();
--    hoisted.resolveBootstrapContextForRunMock.mockReset().mockResolvedValue({
--      bootstrapFiles: [],
--      contextFiles: [],
--    });
++
 +    const hookRunner = {
 +      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
 +      runBeforePromptBuild: vi.fn(async () => undefined),
@@ -1934,9 +2010,8 @@ index e77ac021fd..d4fa3d4e1c 100644
 +      },
 +      expect.any(Object),
 +    );
-   });
- 
--  it("runs CLI through supervisor and returns payload", async () => {
++  });
++
 +  it("emits llm_output hooks in CLI mode", async () => {
 +    const hookRunner = {
 +      hasHooks: vi.fn((hookName: string) => hookName === "llm_output"),
@@ -1946,38 +2021,32 @@ index e77ac021fd..d4fa3d4e1c 100644
 +    };
 +    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 +
-     supervisorSpawnMock.mockResolvedValueOnce(
-       createManagedRun({
-         reason: "exit",
-@@ -101,7 +1098,7 @@ describe("runCliAgent with process supervisor", () => {
-       }),
-     );
- 
--    const result = await runCliAgent({
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: "ok",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
 +    await runCliAgent({
-       sessionId: "s1",
-       sessionFile: "/tmp/session.jsonl",
-       workspaceDir: "/tmp",
-@@ -109,26 +1106,305 @@ describe("runCliAgent with process supervisor", () => {
-       provider: "codex-cli",
-       model: "gpt-5.2-codex",
-       timeoutMs: 1_000,
--      runId: "run-1",
--      cliSessionId: "thread-123",
++      sessionId: "s1",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      prompt: "hi",
++      provider: "codex-cli",
++      model: "gpt-5.2-codex",
++      timeoutMs: 1_000,
 +      runId: "run-cli-hook-llm-output",
 +      trigger: "user",
 +      messageChannel: "telegram",
-     });
- 
--    expect(result.payloads?.[0]?.text).toBe("ok");
--    expect(supervisorSpawnMock).toHaveBeenCalledTimes(1);
--    const input = supervisorSpawnMock.mock.calls[0]?.[0] as {
--      argv?: string[];
--      mode?: string;
--      timeoutMs?: number;
--      noOutputTimeoutMs?: number;
--      replaceExistingScope?: boolean;
--      scopeKey?: string;
++    });
++
 +    expect(hookRunner.runLlmOutput).toHaveBeenCalledTimes(1);
 +    expect(hookRunner.runLlmOutput).toHaveBeenCalledWith(
 +      expect.objectContaining({
@@ -2002,13 +2071,7 @@ index e77ac021fd..d4fa3d4e1c 100644
 +      runBeforePromptBuild: vi.fn(async () => undefined),
 +      runBeforeAgentStart: vi.fn(async () => undefined),
 +      runLlmOutput: vi.fn(async () => undefined),
-     };
--    expect(input.mode).toBe("child");
--    expect(input.argv?.[0]).toBe("codex");
--    expect(input.timeoutMs).toBe(1_000);
--    expect(input.noOutputTimeoutMs).toBeGreaterThanOrEqual(1_000);
--    expect(input.replaceExistingScope).toBe(true);
--    expect(input.scopeKey).toContain("thread-123");
++    };
 +    getGlobalHookRunnerMock.mockReturnValue(hookRunner as never);
 +
 +    supervisorSpawnMock.mockResolvedValueOnce(
@@ -2278,13 +2341,251 @@ index e77ac021fd..d4fa3d4e1c 100644
 +    expect(input.argv).toContain("--append-system-prompt");
 +    const systemPromptIndex = input.argv?.indexOf("--append-system-prompt") ?? -1;
 +    expect(input.argv?.[systemPromptIndex + 1]).toContain("compacted or summarized");
-   });
- 
-   it("prepends bootstrap warnings to the CLI prompt body", async () => {
-@@ -374,6 +1650,78 @@ describe("runCliAgent with process supervisor", () => {
-     const input = supervisorSpawnMock.mock.calls[0]?.[0] as { cwd?: string };
-     expect(input.cwd).toBe(path.resolve(fallbackWorkspace));
-   });
++  });
++
++  it("prepends bootstrap warnings to the CLI prompt body", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 50,
++        stdout: "ok",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++    hoisted.resolveBootstrapContextForRunMock.mockResolvedValueOnce({
++      bootstrapFiles: [
++        {
++          name: "AGENTS.md",
++          path: "/tmp/AGENTS.md",
++          content: "A".repeat(200),
++          missing: false,
++        },
++      ],
++      contextFiles: [{ path: "AGENTS.md", content: "A".repeat(20) }],
++    });
++
++    await runCliAgent({
++      sessionId: "s1",
++      sessionFile: "/tmp/session.jsonl",
++      workspaceDir: "/tmp",
++      config: {
++        agents: {
++          defaults: {
++            bootstrapMaxChars: 50,
++            bootstrapTotalMaxChars: 50,
++          },
++        },
++      } satisfies OpenClawConfig,
++      prompt: "hi",
++      provider: "codex-cli",
++      model: "gpt-5.2-codex",
++      timeoutMs: 1_000,
++      runId: "run-warning",
++      cliSessionId: "thread-123",
++    });
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as {
++      argv?: string[];
++      input?: string;
++    };
++    const promptCarrier = [input.input ?? "", ...(input.argv ?? [])].join("\n");
++
++    expect(promptCarrier).toContain("[Bootstrap truncation warning]");
++    expect(promptCarrier).toContain("- AGENTS.md: 200 raw -> 20 injected");
++    expect(promptCarrier).toContain("hi");
++  });
++
++  it("fails with timeout when no-output watchdog trips", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "no-output-timeout",
++        exitCode: null,
++        exitSignal: "SIGKILL",
++        durationMs: 200,
++        stdout: "",
++        stderr: "",
++        timedOut: true,
++        noOutputTimedOut: true,
++      }),
++    );
++
++    await expect(
++      runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-2",
++        cliSessionId: "thread-123",
++      }),
++    ).rejects.toThrow("produced no output");
++  });
++
++  it("enqueues a system event and heartbeat wake on no-output watchdog timeout for session runs", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "no-output-timeout",
++        exitCode: null,
++        exitSignal: "SIGKILL",
++        durationMs: 200,
++        stdout: "",
++        stderr: "",
++        timedOut: true,
++        noOutputTimedOut: true,
++      }),
++    );
++
++    await expect(
++      runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:main",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-2b",
++        cliSessionId: "thread-123",
++      }),
++    ).rejects.toThrow("produced no output");
++
++    expect(enqueueSystemEventMock).toHaveBeenCalledTimes(1);
++    const [notice, opts] = enqueueSystemEventMock.mock.calls[0] ?? [];
++    expect(String(notice)).toContain("produced no output");
++    expect(String(notice)).toContain("interactive input or an approval prompt");
++    expect(opts).toMatchObject({ sessionKey: "agent:main:main" });
++    expect(requestHeartbeatNowMock).toHaveBeenCalledWith({
++      reason: "cli:watchdog:stall",
++      sessionKey: "agent:main:main",
++    });
++  });
++
++  it("fails with timeout when overall timeout trips", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "overall-timeout",
++        exitCode: null,
++        exitSignal: "SIGKILL",
++        durationMs: 200,
++        stdout: "",
++        stderr: "",
++        timedOut: true,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await expect(
++      runCliAgent({
++        sessionId: "s1",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-3",
++        cliSessionId: "thread-123",
++      }),
++    ).rejects.toThrow("exceeded timeout");
++  });
++
++  it("rethrows the retry failure when session-expired recovery retry also fails", async () => {
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 1,
++        exitSignal: null,
++        durationMs: 150,
++        stdout: "",
++        stderr: "session expired",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 1,
++        exitSignal: null,
++        durationMs: 150,
++        stdout: "",
++        stderr: "rate limit exceeded",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    await expect(
++      runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:subagent:retry",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: "/tmp",
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-retry-failure",
++        cliSessionId: "thread-123",
++      }),
++    ).rejects.toThrow("rate limit exceeded");
++
++    expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("falls back to per-agent workspace when workspaceDir is missing", async () => {
++    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-"));
++    const fallbackWorkspace = path.join(tempDir, "workspace-main");
++    await fs.mkdir(fallbackWorkspace, { recursive: true });
++    const cfg = {
++      agents: {
++        defaults: {
++          workspace: fallbackWorkspace,
++        },
++      },
++    } satisfies OpenClawConfig;
++
++    supervisorSpawnMock.mockResolvedValueOnce(
++      createManagedRun({
++        reason: "exit",
++        exitCode: 0,
++        exitSignal: null,
++        durationMs: 25,
++        stdout: "ok",
++        stderr: "",
++        timedOut: false,
++        noOutputTimedOut: false,
++      }),
++    );
++
++    try {
++      await runCliAgent({
++        sessionId: "s1",
++        sessionKey: "agent:main:subagent:missing-workspace",
++        sessionFile: "/tmp/session.jsonl",
++        workspaceDir: undefined as unknown as string,
++        config: cfg,
++        prompt: "hi",
++        provider: "codex-cli",
++        model: "gpt-5.2-codex",
++        timeoutMs: 1_000,
++        runId: "run-4",
++      });
++    } finally {
++      await fs.rm(tempDir, { recursive: true, force: true });
++    }
++
++    const input = supervisorSpawnMock.mock.calls[0]?.[0] as { cwd?: string };
++    expect(input.cwd).toBe(path.resolve(fallbackWorkspace));
++  });
 +
 +  it("cancels running CLI process on abort signal", async () => {
 +    const managedRun = createManagedRun({
@@ -2357,1135 +2658,334 @@ index e77ac021fd..d4fa3d4e1c 100644
 +      }),
 +    ).rejects.toMatchObject({ name: "AbortError" });
 +  });
- });
- 
- describe("resolveCliNoOutputTimeoutMs", () => {
++});
++
++describe("resolveCliNoOutputTimeoutMs", () => {
++  it("uses backend-configured resume watchdog override", () => {
++    const timeoutMs = resolveCliNoOutputTimeoutMs({
++      backend: {
++        command: "codex",
++        reliability: {
++          watchdog: {
++            resume: {
++              noOutputTimeoutMs: 42_000,
++            },
++          },
++        },
++      },
++      timeoutMs: 120_000,
++      useResume: true,
++    });
++    expect(timeoutMs).toBe(42_000);
++  });
++});
 diff --git a/src/agents/cli-runner.ts b/src/agents/cli-runner.ts
-index 9056668e08..44b5e0299c 100644
+index d2eedf0640..dcaaddbc8b 100644
 --- a/src/agents/cli-runner.ts
 +++ b/src/agents/cli-runner.ts
-@@ -1,14 +1,24 @@
--import type { ImageContent } from "@mariozechner/pi-ai";
-+import crypto from "node:crypto";
-+import fs from "node:fs/promises";
-+import os from "node:os";
-+import path from "node:path";
-+import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
- import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
+@@ -1,7 +1,10 @@
+ import type { ImageContent } from "@mariozechner/pi-ai";
  import type { ThinkLevel } from "../auto-reply/thinking.js";
  import type { OpenClawConfig } from "../config/config.js";
-+import { appendCliTurnToSessionTranscript } from "../config/sessions.js";
-+import type { CliBackendConfig } from "../config/types.js";
-+import { MCP_PORT_OFFSET, ensureMcpConfigFile } from "../gateway/mcp-http.js";
- import { shouldLogVerbose } from "../globals.js";
- import { isTruthyEnvValue } from "../infra/env.js";
- import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
- import { enqueueSystemEvent } from "../infra/system-events.js";
- import { createSubsystemLogger } from "../logging/subsystem.js";
-+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
-+import type { PluginHookAgentContext } from "../plugins/types.js";
- import { getProcessSupervisor } from "../process/supervisor/index.js";
- import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
-+import { sliceUtf16Safe, resolveUserPath } from "../utils.js";
- import { resolveSessionAgentIds } from "./agent-scope.js";
- import {
-   analyzeBootstrapBudget,
-@@ -17,6 +27,11 @@ import {
-   buildBootstrapTruncationReportMeta,
-   prependBootstrapPromptWarning,
- } from "./bootstrap-budget.js";
+-import { executePreparedCliRun } from "./cli-runner/execute.js";
 +import {
-+  COMPACTION_SYSTEM_PROMPT,
-+  compactBootstrapFiles,
-+  resolveCompactionConfig,
-+} from "./bootstrap-compaction.js";
- import { makeBootstrapWarn, resolveBootstrapContextForRun } from "./bootstrap-files.js";
- import { resolveCliBackendConfig } from "./cli-backends.js";
- import { prepareCliBundleMcpConfig } from "./cli-runner/bundle-mcp.js";
-@@ -25,6 +40,7 @@ import {
-   buildCliSupervisorScopeKey,
-   buildCliArgs,
-   buildSystemPrompt,
-+  createStreamJsonProcessor,
-   enqueueCliRun,
-   normalizeCliModel,
-   parseCliJson,
-@@ -32,24 +48,463 @@ import {
-   resolveCliNoOutputTimeoutMs,
-   resolvePromptInput,
-   resolveSessionIdToSend,
-+  summarizeCliFailure,
-   resolveSystemPromptUsage,
-   writeCliImages,
- } from "./cli-runner/helpers.js";
-+import { hashCliSessionText } from "./cli-session.js";
-+import { resolveContextWindowInfo } from "./context-window-guard.js";
- import { resolveOpenClawDocsPath } from "./docs-path.js";
++  executeWithOverflowProtection,
++  executePreparedCliRun,
++} from "./cli-runner/execute.js";
+ import { prepareCliRunContext } from "./cli-runner/prepare.js";
+ import type { RunCliAgentParams } from "./cli-runner/types.js";
  import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
-+import { getApiKeyForModel, requireApiKey } from "./model-auth.js";
+@@ -11,49 +14,60 @@ import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
+ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPiRunResult> {
+   const context = await prepareCliRunContext(params);
+ 
+-  const buildCliRunResult = (resultParams: {
+-    output: Awaited<ReturnType<typeof executePreparedCliRun>>;
+-    effectiveCliSessionId?: string;
+-  }): EmbeddedPiRunResult => {
+-    const text = resultParams.output.text?.trim();
+-    const payloads = text ? [{ text }] : undefined;
+-
+-    return {
+-      payloads,
+-      meta: {
+-        durationMs: Date.now() - context.started,
+-        systemPromptReport: context.systemPromptReport,
+-        agentMeta: {
+-          sessionId: resultParams.effectiveCliSessionId ?? params.sessionId ?? "",
+-          provider: params.provider,
+-          model: context.modelId,
+-          usage: resultParams.output.usage,
+-          ...(resultParams.effectiveCliSessionId
+-            ? {
+-                cliSessionBinding: {
+-                  sessionId: resultParams.effectiveCliSessionId,
+-                  ...(params.authProfileId ? { authProfileId: params.authProfileId } : {}),
+-                  ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
+-                  ...(context.extraSystemPromptHash
+-                    ? { extraSystemPromptHash: context.extraSystemPromptHash }
+-                    : {}),
+-                  ...(context.preparedBackend.mcpConfigHash
+-                    ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
+-                    : {}),
+-                },
+-              }
+-            : {}),
+-        },
+-      },
+-    };
+-  };
+-
+   // Try with the provided CLI session ID first
+   try {
+     try {
+-      const output = await executePreparedCliRun(context, context.reusableCliSession.sessionId);
+-      const effectiveCliSessionId = output.sessionId ?? context.reusableCliSession.sessionId;
+-      return buildCliRunResult({ output, effectiveCliSessionId });
++      const result = await executeWithOverflowProtection(
++        context,
++        context.reusableCliSession.sessionId,
++      );
++      const effectiveCliSessionId =
++        result.cliSessionBinding?.sessionId ??
++        result.output.sessionId ??
++        context.reusableCliSession.sessionId;
++      const text = result.output.text?.trim();
++      const payloads = text ? [{ text }] : undefined;
++
++      return {
++        payloads,
++        meta: {
++          durationMs: Date.now() - context.started,
++          systemPromptReport: result.systemPromptReport,
++          agentMeta: {
++            sessionId: effectiveCliSessionId ?? params.sessionId ?? "",
++            provider: params.provider,
++            model: context.modelId,
++            usage: result.output.usage,
++            ...(result.compactionsThisRun > 0
++              ? { compactionCount: result.compactionsThisRun }
++              : {}),
++            ...(effectiveCliSessionId
++              ? {
++                  cliSessionBinding: {
++                    sessionId: effectiveCliSessionId,
++                    ...(params.authProfileId ? { authProfileId: params.authProfileId } : {}),
++                    ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
++                    ...(context.extraSystemPromptHash
++                      ? { extraSystemPromptHash: context.extraSystemPromptHash }
++                      : {}),
++                    ...(context.preparedBackend.mcpConfigHash
++                      ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
++                      : {}),
++                    ...(result.cliSessionBinding?.systemPromptFile
++                      ? {
++                          systemPromptFile: result.cliSessionBinding.systemPromptFile,
++                          systemPromptHash: result.cliSessionBinding.systemPromptHash,
++                          systemPromptCompactionCount:
++                            result.cliSessionBinding.systemPromptCompactionCount,
++                        }
++                      : {}),
++                  },
++                }
++              : {}),
++            ...(result.cliPromptLoad ? { cliPromptLoad: result.cliPromptLoad } : {}),
++          },
++        },
++      };
+     } catch (err) {
+       if (err instanceof FailoverError) {
+         // Check if this is a session expired error and we have a session to clear
+@@ -62,14 +76,53 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
+           context.reusableCliSession.sessionId &&
+           params.sessionKey
+         ) {
+-          // Clear the expired session ID from the session entry
+-          // This requires access to the session store, which we don't have here
+-          // We'll need to modify the caller to handle this case
++          // Retry without the session ID to create a new session
++          const result = await executeWithOverflowProtection(context, undefined);
++          const effectiveCliSessionId =
++            result.cliSessionBinding?.sessionId ?? result.output.sessionId;
++          const text = result.output.text?.trim();
++          const payloads = text ? [{ text }] : undefined;
+ 
+-          // For now, retry without the session ID to create a new session
+-          const output = await executePreparedCliRun(context, undefined);
+-          const effectiveCliSessionId = output.sessionId;
+-          return buildCliRunResult({ output, effectiveCliSessionId });
++          return {
++            payloads,
++            meta: {
++              durationMs: Date.now() - context.started,
++              systemPromptReport: result.systemPromptReport,
++              agentMeta: {
++                sessionId: effectiveCliSessionId ?? params.sessionId ?? "",
++                provider: params.provider,
++                model: context.modelId,
++                usage: result.output.usage,
++                ...(result.compactionsThisRun > 0
++                  ? { compactionCount: result.compactionsThisRun }
++                  : {}),
++                ...(effectiveCliSessionId
++                  ? {
++                      cliSessionBinding: {
++                        sessionId: effectiveCliSessionId,
++                        ...(params.authProfileId ? { authProfileId: params.authProfileId } : {}),
++                        ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
++                        ...(context.extraSystemPromptHash
++                          ? { extraSystemPromptHash: context.extraSystemPromptHash }
++                          : {}),
++                        ...(context.preparedBackend.mcpConfigHash
++                          ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
++                          : {}),
++                        ...(result.cliSessionBinding?.systemPromptFile
++                          ? {
++                              systemPromptFile: result.cliSessionBinding.systemPromptFile,
++                              systemPromptHash: result.cliSessionBinding.systemPromptHash,
++                              systemPromptCompactionCount:
++                                result.cliSessionBinding.systemPromptCompactionCount,
++                            }
++                          : {}),
++                      },
++                    }
++                  : {}),
++                ...(result.cliPromptLoad ? { cliPromptLoad: result.cliPromptLoad } : {}),
++              },
++            },
++          };
+         }
+         throw err;
+       }
+diff --git a/src/agents/cli-runner/execute.ts b/src/agents/cli-runner/execute.ts
+index 5dfaba5b0f..e80820d811 100644
+--- a/src/agents/cli-runner/execute.ts
++++ b/src/agents/cli-runner/execute.ts
+@@ -1,3 +1,4 @@
++import path from "node:path";
+ import { shouldLogVerbose } from "../../globals.js";
+ import { emitAgentEvent } from "../../infra/agent-events.js";
+ import { isTruthyEnvValue } from "../../infra/env.js";
+@@ -6,14 +7,26 @@ import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
+ import { enqueueSystemEvent as enqueueSystemEventImpl } from "../../infra/system-events.js";
+ import { getProcessSupervisor as getProcessSupervisorImpl } from "../../process/supervisor/index.js";
+ import { scopedHeartbeatWakeOptions } from "../../routing/session-key.js";
+-import { prependBootstrapPromptWarning } from "../bootstrap-budget.js";
 +import {
-+  isCliProvider,
-+  resolveDefaultModelForAgent,
-+  resolveNonCliModelRef,
-+} from "./model-selection.js";
- import {
++  analyzeBootstrapBudget,
++  buildBootstrapInjectionStats,
++  buildBootstrapPromptWarning,
++  prependBootstrapPromptWarning,
++} from "../bootstrap-budget.js";
++import { makeBootstrapWarn } from "../bootstrap-files.js";
+ import { createCliJsonlStreamingParser, parseCliOutput, type CliOutput } from "../cli-output.js";
+ import { FailoverError, resolveFailoverStatus } from "../failover-error.js";
+-import { classifyFailoverReason } from "../pi-embedded-helpers.js";
++import {
 +  buildBootstrapContextFiles,
-   classifyFailoverReason,
++  classifyFailoverReason,
 +  getBootstrapProfileConfig,
 +  isContextOverflowError,
-   isFailoverErrorMessage,
-   resolveBootstrapMaxChars,
-   resolveBootstrapPromptTruncationWarningMode,
-   resolveBootstrapTotalMaxChars,
-+  type BootstrapProfile,
- } from "./pi-embedded-helpers.js";
- import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
-+import { resolveModel } from "./pi-embedded-runner/model.js";
++} from "../pi-embedded-helpers.js";
+ import {
+   appendImagePathsToPrompt,
+   buildCliSupervisorScopeKey,
+   buildCliArgs,
++  buildSystemPrompt,
+   resolveCliRunQueueKey,
+   enqueueCliRun,
+   loadPromptRefImages,
+@@ -28,6 +41,15 @@ import {
+   CLI_BACKEND_LOG_OUTPUT_ENV,
+   LEGACY_CLAUDE_CLI_LOG_OUTPUT_ENV,
+ } from "./log.js";
 +import {
-+  applySkillEnvOverrides,
-+  applySkillEnvOverridesFromSnapshot,
-+  loadWorkspaceSkillEntries,
-+  resolveSkillsPromptForRun,
-+  type SkillSnapshot,
-+} from "./skills.js";
- import { buildSystemPromptReport } from "./system-prompt-report.js";
- import { redactRunIdentifier, resolveRunWorkspaceDir } from "./workspace-run.js";
++  resolveClaudeSystemPromptFilePath,
++  writeClaudeSystemPromptFile,
++  buildClaudeSystemPromptLoaderPrompt,
++  PromptFileReadRequiredError,
++  resolveReadToolFilePath,
++  estimatePromptTokens,
++  ESTIMATED_TOKENS_PER_IMAGE,
++} from "./prepare.js";
+ import type { PreparedCliRunContext } from "./types.js";
  
- const log = createSubsystemLogger("agent/claude-cli");
- 
-+type McpServers = Record<string, unknown>;
-+const MERGED_MCP_CONFIG_BASENAME_RE = /^mcp\.cli-merged\.[a-f0-9]{16}\.json$/;
-+const MERGED_MCP_CONFIG_MAX_FILES = 20;
-+const MERGED_MCP_CONFIG_MIN_AGE_MS = 60 * 60 * 1000;
-+const CLI_OUTPUT_LOG_HEAD_CHARS = 240;
-+const CLI_OUTPUT_LOG_TAIL_CHARS = 160;
-+const CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS = CLI_OUTPUT_LOG_HEAD_CHARS + CLI_OUTPUT_LOG_TAIL_CHARS;
+ const executeDeps = {
+@@ -312,3 +334,636 @@ export async function executePreparedCliRun(
+     }
+   }
+ }
++
++// ---------------------------------------------------------------------------
++// Session prompt file state (Layer 1)
++// ---------------------------------------------------------------------------
++
++export type CliSessionBindingResult = {
++  sessionId: string;
++  systemPromptFile?: string;
++  systemPromptHash?: string;
++  systemPromptCompactionCount?: number;
++};
++
++export type CliPromptLoadResult = {
++  sessionPromptFile?: string;
++  loaderMode: "normal" | "strict" | "disabled";
++  verifiedRead: boolean;
++  fallbackReason?:
++    | "write_failed"
++    | "verification_retry"
++    | "direct_injection_fallback"
++    | "direct_fallback_disabled";
++};
++
 +const ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK = false;
 +
-+function formatCliOutputForLog(channel: "stdout" | "stderr", text: string): string {
-+  if (!text) {
-+    return `cli ${channel}: <empty>`;
-+  }
-+  const totalChars = text.length;
-+  if (totalChars <= CLI_OUTPUT_LOG_PREVIEW_MAX_CHARS) {
-+    return `cli ${channel} (${totalChars} chars):\n${text}`;
-+  }
-+  const head = sliceUtf16Safe(text, 0, CLI_OUTPUT_LOG_HEAD_CHARS);
-+  const tailStart = Math.max(0, totalChars - CLI_OUTPUT_LOG_TAIL_CHARS);
-+  const tail = sliceUtf16Safe(text, tailStart);
-+  const truncatedChars = Math.max(0, totalChars - head.length - tail.length);
-+  return [
-+    `cli ${channel} (${totalChars} chars):`,
-+    head,
-+    `[truncated ${truncatedChars} chars]`,
-+    tail,
-+  ].join("\n");
-+}
-+
-+function isRecord(value: unknown): value is Record<string, unknown> {
-+  return typeof value === "object" && value !== null;
-+}
-+
-+function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
-+  const resolvedSessionFile = path.resolve(sessionFile);
-+  const sessionDir = path.dirname(resolvedSessionFile);
-+  const ext = path.extname(resolvedSessionFile);
-+  const baseName = path.basename(resolvedSessionFile, ext);
-+  return path.join(sessionDir, `${baseName}.claude-system-prompt.txt`);
-+}
-+
-+async function writeClaudeSystemPromptFile(params: {
-+  sessionFile: string;
-+  systemPrompt: string;
-+}): Promise<{ filePath: string; hash: string }> {
-+  const filePath = resolveClaudeSystemPromptFilePath(params.sessionFile);
-+  const normalizedPrompt = params.systemPrompt.endsWith("\n")
-+    ? params.systemPrompt
-+    : `${params.systemPrompt}\n`;
-+  const hash = hashCliSessionText(normalizedPrompt) ?? "";
-+  await fs.mkdir(path.dirname(filePath), { recursive: true });
-+  try {
-+    const existing = await fs.readFile(filePath, "utf-8");
-+    if (existing === normalizedPrompt) {
-+      return { filePath, hash };
-+    }
-+  } catch {
-+    // file may not exist yet
-+  }
-+  await fs.writeFile(filePath, normalizedPrompt, { mode: 0o600 });
-+  return { filePath, hash };
-+}
-+
-+function buildClaudeSystemPromptLoaderPrompt(params: {
-+  filePath: string;
-+  reason: "new-session" | "prompt-changed" | "compaction";
-+  strict?: boolean;
-+}): string {
-+  const baseLines = [
-+    `MANDATORY FIRST STEP: use the Read tool to read the full session prompt file at ${params.filePath} before you do anything else.`,
-+    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until you have read that file in this run.",
-+    "The file's contents are the authoritative OpenClaw system prompt for this session and override any remembered summaries or stale context.",
-+    "You must follow that file strictly for this turn and all subsequent turns in the session.",
-+  ];
-+  if (params.strict) {
-+    baseLines.unshift(
-+      "Your previous attempt did not verify a successful read of the session prompt file. You must read it in this run before you answer.",
-+    );
-+  }
-+  if (params.reason === "compaction") {
-+    baseLines.unshift(
-+      "Session context may have been compacted or summarized. You must re-read the session prompt file now before continuing.",
-+    );
-+  } else if (params.reason === "prompt-changed") {
-+    baseLines.unshift(
-+      "The session prompt file changed. You must re-read it completely before continuing.",
-+    );
-+  }
-+  return baseLines.join("\n");
-+}
-+
-+class PromptFileReadRequiredError extends Error {
-+  constructor(message: string) {
-+    super(message);
-+    this.name = "PromptFileReadRequiredError";
-+  }
-+}
-+
-+function resolveReadToolFilePath(input: unknown): string | undefined {
-+  if (!isRecord(input)) {
-+    return undefined;
-+  }
-+  const candidates = [input.file_path, input.filePath, input.path];
-+  for (const candidate of candidates) {
-+    if (typeof candidate === "string" && candidate.trim()) {
-+      return path.resolve(candidate.trim());
-+    }
-+  }
-+  return undefined;
-+}
-+
 +/**
-+ * Rough token estimate. Uses chars/1.5 for CJK-heavy content (>30% CJK chars),
-+ * chars/4 for English-heavy content. CJK characters typically tokenize at 1-3
-+ * tokens per character, so chars/4 severely underestimates for Chinese/Japanese
-+ * text — which is common in feishu/飞书 deployments.
++ * Wraps executePreparedCliRun with:
++ *  - Layer 1: Session prompt file writing + loader prompt + read verification
++ *  - Layer 2: Context overflow detection + /compact recovery + profile downgrade
++ *
++ * This is the function that cli-runner.ts should call instead of raw executePreparedCliRun.
 + */
-+function estimatePromptTokens(text: string): number {
-+  if (!text) {
-+    return 0;
-+  }
-+  // Count CJK Unified Ideographs, Hangul, Hiragana, Katakana, full-width forms
-+  const cjkCount =
-+    text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
-+      ?.length ?? 0;
-+  const cjkRatio = cjkCount / text.length;
-+  const charsPerToken = cjkRatio > 0.3 ? 1.5 : 4;
-+  return Math.ceil(text.length / charsPerToken);
-+}
-+
-+/**
-+ * Estimate image token cost for pre-flight context window guard.
-+ * Uses a rough average of ~1000 tokens per image (standard resolution).
-+ */
-+const ESTIMATED_TOKENS_PER_IMAGE = 1000;
-+
-+function resolveConfiguredPath(rawPath: string | undefined): string | undefined {
-+  const trimmed = rawPath?.trim();
-+  if (!trimmed) {
-+    return undefined;
-+  }
-+  return resolveUserPath(trimmed);
-+}
-+
-+async function readMcpServers(filePath: string): Promise<McpServers | null> {
-+  try {
-+    const raw = await fs.readFile(filePath, "utf-8");
-+    const parsed = JSON.parse(raw) as unknown;
-+    if (!isRecord(parsed)) {
-+      return {};
-+    }
-+    const serversRaw = parsed.mcpServers;
-+    if (!isRecord(serversRaw)) {
-+      return {};
-+    }
-+    return { ...serversRaw };
-+  } catch {
-+    return null;
-+  }
-+}
-+
-+async function writeMcpConfigIfChanged(filePath: string, content: string): Promise<void> {
-+  try {
-+    const existing = await fs.readFile(filePath, "utf-8");
-+    if (existing === content) {
-+      return;
-+    }
-+  } catch {
-+    // file may not exist yet
-+  }
-+  await fs.mkdir(path.dirname(filePath), { recursive: true });
-+  await fs.writeFile(filePath, content, { mode: 0o600 });
-+}
-+
-+async function cleanupMergedMcpConfigs(params: {
-+  dir: string;
-+  keepFilePath: string;
-+}): Promise<void> {
-+  const keepName = path.basename(params.keepFilePath);
-+  const now = Date.now();
-+  const entries = await fs.readdir(params.dir, { withFileTypes: true }).catch(() => []);
-+  const candidates: Array<{ name: string; filePath: string; mtimeMs: number }> = [];
-+  for (const entry of entries) {
-+    if (!entry.isFile() || !MERGED_MCP_CONFIG_BASENAME_RE.test(entry.name)) {
-+      continue;
-+    }
-+    const filePath = path.join(params.dir, entry.name);
-+    const stat = await fs.stat(filePath).catch(() => null);
-+    if (!stat) {
-+      continue;
-+    }
-+    candidates.push({
-+      name: entry.name,
-+      filePath,
-+      mtimeMs: stat.mtimeMs,
-+    });
-+  }
-+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-+
-+  const keepNames = new Set<string>([keepName]);
-+  for (const candidate of candidates) {
-+    if (keepNames.size >= MERGED_MCP_CONFIG_MAX_FILES) {
-+      break;
-+    }
-+    keepNames.add(candidate.name);
-+  }
-+
-+  for (const candidate of candidates) {
-+    if (keepNames.has(candidate.name)) {
-+      continue;
-+    }
-+    if (now - candidate.mtimeMs < MERGED_MCP_CONFIG_MIN_AGE_MS) {
-+      continue;
-+    }
-+    await fs.unlink(candidate.filePath).catch(() => undefined);
-+  }
-+}
-+
-+async function resolveClaudeMcpConfigForRun(params: {
-+  backend: CliBackendConfig;
-+  config?: OpenClawConfig;
-+}): Promise<{ mcpConfigPath?: string; useStrictMcp: boolean }> {
-+  const mcpCfg = params.backend.mcp;
-+  if (mcpCfg?.enabled === false) {
-+    return { mcpConfigPath: undefined, useStrictMcp: false };
-+  }
-+
-+  const useStrictMcp = mcpCfg?.strict !== false;
-+  const gatewayPort = params.config?.gateway?.port ?? 18789;
-+  const mcpPort = gatewayPort + MCP_PORT_OFFSET;
-+  const openclawDir = path.join(os.homedir(), ".openclaw");
-+  const defaultMcpConfigPath = ensureMcpConfigFile(openclawDir, mcpPort);
-+
-+  const configuredMcpPath = resolveConfiguredPath(mcpCfg?.configPath);
-+  const mergeMcpPath = resolveConfiguredPath(mcpCfg?.mergeConfigPath);
-+  const inlineServers = isRecord(mcpCfg?.servers) ? { ...mcpCfg.servers } : {};
-+  const hasInlineServers = Object.keys(inlineServers).length > 0;
-+  const needsMerge = Boolean(
-+    mergeMcpPath ||
-+    hasInlineServers ||
-+    (configuredMcpPath && configuredMcpPath !== defaultMcpConfigPath),
-+  );
-+  if (!needsMerge) {
-+    return {
-+      mcpConfigPath: configuredMcpPath ?? defaultMcpConfigPath,
-+      useStrictMcp,
-+    };
-+  }
-+
-+  const openclawServers = await readMcpServers(defaultMcpConfigPath);
-+  if (openclawServers === null) {
-+    log.warn(`MCP default config read failed, skipping merge: ${defaultMcpConfigPath}`);
-+    return {
-+      mcpConfigPath: defaultMcpConfigPath,
-+      useStrictMcp,
-+    };
-+  }
-+  const configuredServers = configuredMcpPath
-+    ? await readMcpServers(configuredMcpPath)
-+    : openclawServers;
-+  if (configuredMcpPath && configuredServers === null) {
-+    log.warn(`MCP primary config read failed: ${configuredMcpPath}`);
-+  }
-+  const mergeServers = mergeMcpPath ? await readMcpServers(mergeMcpPath) : {};
-+  if (mergeMcpPath && mergeServers === null) {
-+    log.warn(`MCP merge config read failed: ${mergeMcpPath}`);
-+  }
-+
-+  const mergedServers: McpServers = {
-+    ...(configuredServers ?? openclawServers),
-+    ...mergeServers,
-+    ...inlineServers,
-+  };
-+  const openclawServer = openclawServers.openclaw;
-+  if (isRecord(openclawServer)) {
-+    // Keep OpenClaw MCP server authoritative so tool routing cannot be shadowed.
-+    mergedServers.openclaw = openclawServer;
-+  }
-+
-+  const mergedContent = `${JSON.stringify({ mcpServers: mergedServers }, null, 2)}\n`;
-+  const mergedHash = crypto.createHash("sha256").update(mergedContent).digest("hex").slice(0, 16);
-+  const mergedPath = path.join(
-+    path.dirname(defaultMcpConfigPath),
-+    `mcp.cli-merged.${mergedHash}.json`,
-+  );
-+  await writeMcpConfigIfChanged(mergedPath, mergedContent);
-+  await cleanupMergedMcpConfigs({
-+    dir: path.dirname(defaultMcpConfigPath),
-+    keepFilePath: mergedPath,
-+  }).catch((err) => {
-+    log.debug(`MCP merged config cleanup skipped: ${String(err)}`);
-+  });
-+  return { mcpConfigPath: mergedPath, useStrictMcp };
-+}
-+
-+function createAbortError(signal?: AbortSignal): Error {
-+  const reason = signal && "reason" in signal ? (signal as { reason?: unknown }).reason : undefined;
-+  const err = reason ? new Error("aborted", { cause: reason }) : new Error("aborted");
-+  err.name = "AbortError";
-+  return err;
-+}
-+
-+async function readCliHookMessages(sessionFile: string): Promise<unknown[]> {
-+  const trimmed = sessionFile.trim();
-+  if (!trimmed) {
-+    return [];
-+  }
-+  try {
-+    const raw = await fs.readFile(path.resolve(trimmed), "utf-8");
-+    const lines = raw.split(/\r?\n/g);
-+    const messages: unknown[] = [];
-+    for (const line of lines) {
-+      const value = line.trim();
-+      if (!value) {
-+        continue;
-+      }
-+      try {
-+        const parsed = JSON.parse(value) as unknown;
-+        if (isRecord(parsed) && parsed.type === "message" && "message" in parsed) {
-+          messages.push(parsed.message);
-+        }
-+      } catch {
-+        // ignore malformed lines
-+      }
-+    }
-+    return messages;
-+  } catch {
-+    return [];
-+  }
-+}
-+
-+async function resolveCliPromptBuildHookResult(params: {
-+  hookRunner: ReturnType<typeof getGlobalHookRunner>;
-+  prompt: string;
-+  messages: unknown[];
-+  hookCtx: PluginHookAgentContext;
-+}): Promise<{ systemPrompt?: string; prependContext?: string } | undefined> {
-+  const hookRunner = params.hookRunner;
-+  if (!hookRunner) {
-+    return undefined;
-+  }
-+  const promptBuildResult = hookRunner.hasHooks("before_prompt_build")
-+    ? await hookRunner
-+        .runBeforePromptBuild(
-+          {
-+            prompt: params.prompt,
-+            messages: params.messages,
-+          },
-+          params.hookCtx,
-+        )
-+        .catch((hookErr: unknown) => {
-+          log.warn(`before_prompt_build hook failed: ${String(hookErr)}`);
-+          return undefined;
-+        })
-+    : undefined;
-+  const legacyResult = hookRunner.hasHooks("before_agent_start")
-+    ? await hookRunner
-+        .runBeforeAgentStart(
-+          {
-+            prompt: params.prompt,
-+            messages: params.messages,
-+          },
-+          params.hookCtx,
-+        )
-+        .catch((hookErr: unknown) => {
-+          log.warn(`before_agent_start hook (CLI path) failed: ${String(hookErr)}`);
-+          return undefined;
-+        })
-+    : undefined;
-+  return {
-+    systemPrompt: promptBuildResult?.systemPrompt ?? legacyResult?.systemPrompt,
-+    prependContext: [promptBuildResult?.prependContext, legacyResult?.prependContext]
-+      .filter((value): value is string => Boolean(value))
-+      .join("\n\n"),
-+  };
-+}
-+
-+function emitCliLlmOutputHook(params: {
-+  hookRunner: ReturnType<typeof getGlobalHookRunner>;
-+  hookCtx: PluginHookAgentContext;
-+  runId: string;
-+  sessionId: string;
-+  provider: string;
-+  model: string;
-+  output: {
-+    text: string;
-+    usage?: {
-+      input?: number;
-+      output?: number;
-+      cacheRead?: number;
-+      cacheWrite?: number;
-+      total?: number;
-+    };
-+  };
-+}) {
-+  const hookRunner = params.hookRunner;
-+  if (!hookRunner?.hasHooks("llm_output")) {
-+    return;
-+  }
-+  const text = params.output.text.trim();
-+  hookRunner
-+    .runLlmOutput(
-+      {
-+        runId: params.runId,
-+        sessionId: params.sessionId,
-+        provider: params.provider,
-+        model: params.model,
-+        assistantTexts: text ? [text] : [],
-+        lastAssistant: text ? { role: "assistant", content: text } : undefined,
-+        usage: params.output.usage,
-+      },
-+      params.hookCtx,
-+    )
-+    .catch((hookErr) => {
-+      log.warn(`llm_output hook failed (CLI path): ${String(hookErr)}`);
-+    });
-+}
-+
- export async function runCliAgent(params: {
-   sessionId: string;
-   sessionKey?: string;
-@@ -64,13 +519,28 @@ export async function runCliAgent(params: {
-   timeoutMs: number;
-   runId: string;
-   extraSystemPrompt?: string;
-+  skillsSnapshot?: SkillSnapshot;
-   streamParams?: import("./command/types.js").AgentStreamParams;
-   ownerNumbers?: string[];
-   cliSessionId?: string;
-+  cliSessionBinding?: import("../config/sessions.js").CliSessionBinding;
-+  sessionCompactionCount?: number;
-   bootstrapPromptWarningSignaturesSeen?: string[];
-   /** Backward-compat fallback when only the previous signature is available. */
-   bootstrapPromptWarningSignature?: string;
-   images?: ImageContent[];
-+  onAssistantTurn?: (text: string) => void;
-+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
-+  onToolUse?: (toolName: string) => void;
-+  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
-+  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
-+  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
-+  abortSignal?: AbortSignal;
-+  trigger?: PluginHookAgentContext["trigger"];
-+  messageChannel?: string;
-+  messageAccountId?: string;
-+  messageTo?: string;
-+  messageThreadId?: string | number;
- }): Promise<EmbeddedPiRunResult> {
-   const started = Date.now();
-   const workspaceResolution = resolveRunWorkspaceDir({
-@@ -106,23 +576,68 @@ export async function runCliAgent(params: {
-   const normalizedModel = normalizeCliModel(modelId, backend);
-   const modelDisplay = `${params.provider}/${modelId}`;
- 
--  const extraSystemPrompt = [
--    params.extraSystemPrompt?.trim(),
--    "Tools are disabled in this session. Do not call tools.",
--  ]
--    .filter(Boolean)
--    .join("\n");
-+  const isClaude = backendResolved.id === "claude-cli";
-+
-+  // MCP tool access only for Claude CLI; other backends get a "tools disabled" hint.
-+  let mcpConfigPath: string | undefined;
-+  let useStrictMcp = true;
-+  if (isClaude) {
-+    try {
-+      const mcpResolved = await resolveClaudeMcpConfigForRun({
-+        backend,
-+        config: params.config,
-+      });
-+      mcpConfigPath = mcpResolved.mcpConfigPath;
-+      useStrictMcp = mcpResolved.useStrictMcp;
-+    } catch (err) {
-+      log.warn(`mcp config setup failed: ${String(err)}`);
-+    }
-+  }
-+
-+  const extraSystemPrompt = isClaude
-+    ? params.extraSystemPrompt?.trim() || undefined
-+    : [params.extraSystemPrompt?.trim(), "Tools are disabled in this session. Do not call tools."]
-+        .filter(Boolean)
-+        .join("\n");
- 
-   const sessionLabel = params.sessionKey ?? params.sessionId;
-+
-+  // Resolve context window early — needed by Layer 3 (dynamic budget) and Layer 1 (pre-flight guard).
-+  // For CLI backends (claude-cli, codex-cli), resolve to the real provider/model first
-+  // so the context window lookup finds the actual model entry in config.
-+  // Use the raw modelId (pre-backend-alias) because normalizedModel may already be
-+  // aliased to a short name (e.g. "sonnet") that won't match the real model entry.
-+  // If the resolved model is still an unresolved placeholder (e.g. "default"),
-+  // fall back to the agent's configured default model for accurate lookup.
-+  let contextWindowRef = resolveNonCliModelRef(
-+    { provider: params.provider, model: modelId },
-+    params.config,
-+  );
-+  if (isCliProvider(contextWindowRef.provider, params.config)) {
-+    const agentDefault = resolveDefaultModelForAgent({
-+      cfg: params.config ?? {},
-+      agentId: params.agentId,
-+    });
-+    contextWindowRef = resolveNonCliModelRef(agentDefault, params.config);
-+  }
-+  const contextWindowInfo = resolveContextWindowInfo({
-+    cfg: params.config,
-+    provider: contextWindowRef.provider,
-+    modelId: contextWindowRef.model,
-+    defaultTokens: 200_000,
-+  });
-+  const contextWindowTokens = contextWindowInfo.tokens;
-+
-   const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun({
-     workspaceDir,
-     config: params.config,
-     sessionKey: params.sessionKey,
-     sessionId: params.sessionId,
-     warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
-+    contextWindowTokens,
-   });
-   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
--  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
-+  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
-   const bootstrapAnalysis = analyzeBootstrapBudget({
-     files: buildBootstrapInjectionStats({
-       bootstrapFiles,
-@@ -143,6 +658,40 @@ export async function runCliAgent(params: {
-     config: params.config,
-     agentId: params.agentId,
-   });
-+  const hookCtx: PluginHookAgentContext = {
-+    agentId: sessionAgentId,
-+    sessionKey: params.sessionKey,
-+    sessionId: params.sessionId,
-+    workspaceDir,
-+    messageProvider: params.messageChannel,
-+    trigger: params.trigger,
-+    channelId: params.messageChannel,
-+  };
-+  const hookRunner = getGlobalHookRunner();
-+  const hasPromptBuildHooks = Boolean(
-+    hookRunner?.hasHooks("before_prompt_build") || hookRunner?.hasHooks("before_agent_start"),
-+  );
-+  let promptForRun = params.prompt;
-+  const hookMessages = hasPromptBuildHooks ? await readCliHookMessages(params.sessionFile) : [];
-+  const promptBuildHookResult = hasPromptBuildHooks
-+    ? await resolveCliPromptBuildHookResult({
-+        hookRunner,
-+        prompt: params.prompt,
-+        messages: hookMessages,
-+        hookCtx,
-+      })
-+    : undefined;
-+  const prependContext = promptBuildHookResult?.prependContext;
-+  if (prependContext?.trim()) {
-+    promptForRun = `${prependContext}\n\n${params.prompt}`;
-+    log.debug(`hooks: prepended context to CLI prompt (${prependContext.length} chars)`);
-+  }
-+  const hookSystemPromptOverride = promptBuildHookResult?.systemPrompt?.trim() || undefined;
-+  if (hookSystemPromptOverride) {
-+    log.debug(
-+      `hooks: applied CLI systemPrompt override (${hookSystemPromptOverride.length} chars)`,
-+    );
-+  }
-   const heartbeatPrompt =
-     sessionAgentId === defaultAgentId
-       ? resolveHeartbeatPrompt(params.config?.agents?.defaults?.heartbeat?.prompt)
-@@ -153,11 +702,35 @@ export async function runCliAgent(params: {
-     cwd: process.cwd(),
-     moduleUrl: import.meta.url,
-   });
--  const systemPrompt = buildSystemPrompt({
-+  let skillsPrompt: string | undefined;
-+  let restoreSkillEnv: (() => void) | undefined;
-+  if (isClaude) {
-+    const shouldLoadSkillEntries = !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
-+    const skillEntries = shouldLoadSkillEntries
-+      ? loadWorkspaceSkillEntries(workspaceDir, { config: params.config })
-+      : undefined;
-+    restoreSkillEnv = params.skillsSnapshot
-+      ? applySkillEnvOverridesFromSnapshot({
-+          snapshot: params.skillsSnapshot,
-+          config: params.config,
-+        })
-+      : applySkillEnvOverrides({
-+          skills: skillEntries ?? [],
-+          config: params.config,
-+        });
-+    skillsPrompt = resolveSkillsPromptForRun({
-+      skillsSnapshot: params.skillsSnapshot,
-+      entries: shouldLoadSkillEntries ? skillEntries : undefined,
-+      config: params.config,
-+      workspaceDir,
-+    });
-+  }
-+  const builtSystemPrompt = buildSystemPrompt({
-     workspaceDir,
-     config: params.config,
-     defaultThinkLevel: params.thinkLevel,
-     extraSystemPrompt,
-+    skillsPrompt,
-     ownerNumbers: params.ownerNumbers,
-     heartbeatPrompt,
-     docsPath: docsPath ?? undefined,
-@@ -166,32 +739,379 @@ export async function runCliAgent(params: {
-     modelDisplay,
-     agentId: sessionAgentId,
-   });
--  const systemPromptReport = buildSystemPromptReport({
--    source: "run",
--    generatedAt: Date.now(),
--    sessionId: params.sessionId,
--    sessionKey: params.sessionKey,
--    provider: params.provider,
--    model: modelId,
--    workspaceDir,
--    bootstrapMaxChars,
--    bootstrapTotalMaxChars,
--    bootstrapTruncation: buildBootstrapTruncationReportMeta({
--      analysis: bootstrapAnalysis,
--      warningMode: bootstrapPromptWarningMode,
--      warning: bootstrapPromptWarning,
--    }),
--    sandbox: { mode: "off", sandboxed: false },
--    systemPrompt,
--    bootstrapFiles,
--    injectedFiles: contextFiles,
--    skillsPrompt: "",
--    tools: [],
--  });
-+  let systemPrompt = hookSystemPromptOverride ?? builtSystemPrompt;
-+  let activeProfile: BootstrapProfile = "normal";
-+  let activeContextFiles = contextFiles;
-+
-+  // Layer 1: Pre-flight context window guard
-+  // Image token estimate is used by both Layer 1 (pre-flight) and Layer 2 (retry).
-+  // Only charge multimodal token cost when the backend sends images via imageArg.
-+  // When imageArg is absent, images are appended as file paths to the prompt text,
-+  // which is already covered by estimatePromptTokens on the prompt string.
-+  const imageTokenEstimate = backend.imageArg
-+    ? (params.images?.length ?? 0) * ESTIMATED_TOKENS_PER_IMAGE
-+    : 0;
-+
-+  // Layer 1: Pre-flight context window guard
-+  // Estimate tokens for the TOTAL prompt (system + task + images), not just system prompt.
-+  if (!hookSystemPromptOverride) {
-+    const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
-+    let estimatedTokens =
-+      estimatePromptTokens(systemPrompt) + estimatePromptTokens(promptForRun) + imageTokenEstimate;
-+
-+    // Compaction observability state
-+    let compactionAttempted = false;
-+    let compactedFilesList: string[] = [];
-+    let compactionCharsBefore = 0;
-+    let compactionCharsAfter = 0;
-+    let compactionModelUsed = "";
-+    let compactionFallbackReason: string | undefined;
-+
-+    if (estimatedTokens > hardLimitTokens) {
-+      const warnForProfile = makeBootstrapWarn({
-+        sessionLabel,
-+        warn: (message) => log.warn(message),
-+      });
-+
-+      // Track last-built profile context files so compaction can compact them
-+      let lastProfileContextFiles = contextFiles;
-+
-+      // Profiles to try in order: reduced → compaction → minimal.
-+      // Compaction is a separate step (not a BootstrapProfile) that attempts to
-+      // shrink context files via LLM summarisation. It runs between "reduced" and
-+      // "minimal" so that if compaction succeeds we skip the more aggressive
-+      // minimal profile, and if it fails we fall through to minimal.
-+      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
-+      let compactionDone = false;
-+
-+      for (const profile of profilesToTry) {
-+        // --- Compaction step: run once, between "reduced" and "minimal" ---
-+        if (!compactionDone && profile === "minimal") {
-+          compactionDone = true;
-+          compactionAttempted = true;
-+          const compactionCfg = resolveCompactionConfig(params.config);
-+          // Resolve compaction model: config.model (may be "provider/model") or
-+          // inherit the agent's current model + provider.
-+          let compactionProvider: string;
-+          let compactionModelRef: string;
-+          if (compactionCfg.model?.includes("/")) {
-+            compactionProvider = compactionCfg.model.split("/")[0];
-+            compactionModelRef = compactionCfg.model.split("/").slice(1).join("/");
-+          } else if (compactionCfg.model) {
-+            compactionProvider = params.provider;
-+            compactionModelRef = compactionCfg.model;
-+          } else {
-+            compactionProvider = params.provider;
-+            compactionModelRef = modelId;
-+          }
-+
-+          // CLI backends (claude-cli, codex-cli) are wrappers around real LLM
-+          // providers — they don't exist in the model registry. Resolve to a real
-+          // provider/model. Use the current run's model (which may come from
-+          // --model override) first, falling back to agent default only if needed.
-+          if (isCliProvider(compactionProvider, params.config)) {
-+            const currentRunRef = resolveNonCliModelRef(
-+              { provider: compactionProvider, model: compactionModelRef },
-+              params.config,
-+            );
-+            if (!isCliProvider(currentRunRef.provider, params.config)) {
-+              compactionProvider = currentRunRef.provider;
-+              compactionModelRef = currentRunRef.model;
-+            } else {
-+              // Current model alias not resolvable — fall back to agent default
-+              const agentDefault = resolveDefaultModelForAgent({
-+                cfg: params.config ?? {},
-+                agentId: params.agentId,
-+              });
-+              const resolved = resolveNonCliModelRef(agentDefault, params.config);
-+              compactionProvider = resolved.provider;
-+              compactionModelRef = resolved.model;
-+            }
-+          }
-+
-+          compactionModelUsed = `${compactionProvider}/${compactionModelRef}`;
-+          try {
-+            // Resolve model via the unified model registry (provider-agnostic).
-+            const resolved = resolveModel(
-+              compactionProvider,
-+              compactionModelRef,
-+              undefined,
-+              params.config,
-+            );
-+            if (!resolved.model) {
-+              throw new Error(
-+                resolved.error ??
-+                  `Unknown compaction model: ${compactionProvider}/${compactionModelRef}`,
-+              );
-+            }
-+            const apiKey = requireApiKey(
-+              await getApiKeyForModel({ model: resolved.model, cfg: params.config }),
-+              compactionProvider,
-+            );
-+
-+            const isTextBlock = (b: { type: string }): b is { type: "text"; text: string } =>
-+              b.type === "text";
-+            // Per-file timeout is handled inside compactBootstrapFiles.
-+            // Pass the outer abort signal so user cancellation propagates.
-+            const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
-+              contextFiles: lastProfileContextFiles,
-+              config: compactionCfg,
-+              modelRef: compactionModelUsed,
-+              llmFn: async (userPrompt, signal) => {
-+                const res = await completeSimple(
-+                  resolved.model!,
-+                  {
-+                    systemPrompt: COMPACTION_SYSTEM_PROMPT,
-+                    messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
-+                  },
-+                  { apiKey, maxTokens: 4096, temperature: 0, signal },
-+                );
-+                const texts = res.content.filter(isTextBlock);
-+                if (texts.length === 0) {
-+                  throw new Error("No text content in compaction response");
-+                }
-+                return texts.map((b) => b.text).join("\n");
-+              },
-+              signal: params.abortSignal,
-+            });
-+
-+            compactedFilesList = results.filter((r) => r.success).map((r) => r.path);
-+            compactionCharsBefore = results.reduce((sum, r) => sum + r.charsBefore, 0);
-+            compactionCharsAfter = results.reduce((sum, r) => sum + r.charsAfter, 0);
-+
-+            if (compactedFilesList.length > 0) {
-+              // Compute warning lines using the active profile's budget (not normal)
-+              const compactedBudget =
-+                activeProfile === "normal"
-+                  ? { maxCharsPerFile: bootstrapMaxChars, totalMaxChars: bootstrapTotalMaxChars }
-+                  : getBootstrapProfileConfig(activeProfile);
-+              const compactedWarning = buildBootstrapPromptWarning({
-+                analysis: analyzeBootstrapBudget({
-+                  files: buildBootstrapInjectionStats({
-+                    bootstrapFiles,
-+                    injectedFiles: compactedContextFiles,
-+                  }),
-+                  bootstrapMaxChars: compactedBudget.maxCharsPerFile,
-+                  bootstrapTotalMaxChars: compactedBudget.totalMaxChars,
-+                }),
-+                mode: bootstrapPromptWarningMode,
-+                seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-+                previousSignature: params.bootstrapPromptWarningSignature,
-+              });
-+              const compactedSystemPrompt = prependBootstrapPromptWarning(
-+                buildSystemPrompt({
-+                  workspaceDir,
-+                  config: params.config,
-+                  defaultThinkLevel: params.thinkLevel,
-+                  extraSystemPrompt,
-+                  skillsPrompt,
-+                  ownerNumbers: params.ownerNumbers,
-+                  heartbeatPrompt,
-+                  docsPath: docsPath ?? undefined,
-+                  tools: [],
-+                  contextFiles: compactedContextFiles,
-+                  modelDisplay,
-+                  agentId: sessionAgentId,
-+                }),
-+                compactedWarning.lines,
-+              );
-+              const compactedTokens =
-+                estimatePromptTokens(compactedSystemPrompt) +
-+                estimatePromptTokens(promptForRun) +
-+                imageTokenEstimate;
-+              if (compactedTokens <= hardLimitTokens) {
-+                systemPrompt = compactedSystemPrompt;
-+                activeContextFiles = compactedContextFiles;
-+                estimatedTokens = compactedTokens;
-+                break;
-+              }
-+            }
-+          } catch (err) {
-+            compactionFallbackReason = err instanceof Error ? err.message : String(err);
-+            log.warn(
-+              `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${compactionFallbackReason}`,
-+            );
-+          }
-+          // Compaction didn't fit or failed — fall through to "minimal" profile
-+        }
-+
-+        const profileConfig = getBootstrapProfileConfig(profile);
-+        const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
-+          maxChars: profileConfig.maxCharsPerFile,
-+          totalMaxChars: profileConfig.totalMaxChars,
-+          warn: warnForProfile,
-+        });
-+        lastProfileContextFiles = profileContextFiles;
-+        // Compute warning lines for this profile's context (not the original)
-+        const profileWarning = buildBootstrapPromptWarning({
-+          analysis: analyzeBootstrapBudget({
-+            files: buildBootstrapInjectionStats({
-+              bootstrapFiles,
-+              injectedFiles: profileContextFiles,
-+            }),
-+            bootstrapMaxChars: profileConfig.maxCharsPerFile,
-+            bootstrapTotalMaxChars: profileConfig.totalMaxChars,
-+          }),
-+          mode: bootstrapPromptWarningMode,
-+          seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-+          previousSignature: params.bootstrapPromptWarningSignature,
-+        });
-+        const profileSystemPrompt = prependBootstrapPromptWarning(
-+          buildSystemPrompt({
-+            workspaceDir,
-+            config: params.config,
-+            defaultThinkLevel: params.thinkLevel,
-+            extraSystemPrompt,
-+            skillsPrompt,
-+            ownerNumbers: params.ownerNumbers,
-+            heartbeatPrompt,
-+            docsPath: docsPath ?? undefined,
-+            tools: [],
-+            contextFiles: profileContextFiles,
-+            modelDisplay,
-+            agentId: sessionAgentId,
-+          }),
-+          profileWarning.lines,
-+        );
-+        activeProfile = profile;
-+        systemPrompt = profileSystemPrompt;
-+        activeContextFiles = profileContextFiles;
-+        estimatedTokens =
-+          estimatePromptTokens(profileSystemPrompt) +
-+          estimatePromptTokens(promptForRun) +
-+          imageTokenEstimate;
-+        if (estimatedTokens <= hardLimitTokens) {
-+          break;
-+        }
-+      }
-+      if (estimatedTokens > hardLimitTokens) {
-+        log.error(
-+          `cli-runner: system prompt exceeds context limit after minimal profile (estimated=${estimatedTokens} tokens, limit=${hardLimitTokens}); proceeding anyway`,
-+        );
-+      }
-+    }
-+
-+    const logActiveBudget =
-+      activeProfile === "normal"
-+        ? { maxCharsPerFile: bootstrapMaxChars, totalMaxChars: bootstrapTotalMaxChars }
-+        : getBootstrapProfileConfig(activeProfile);
-+    const logActiveAnalysis =
-+      activeContextFiles !== contextFiles
-+        ? analyzeBootstrapBudget({
-+            files: buildBootstrapInjectionStats({
-+              bootstrapFiles,
-+              injectedFiles: activeContextFiles,
-+            }),
-+            bootstrapMaxChars: logActiveBudget.maxCharsPerFile,
-+            bootstrapTotalMaxChars: logActiveBudget.totalMaxChars,
-+          })
-+        : bootstrapAnalysis;
-+    log.info("cli-runner prompt stats", {
-+      estimated_tokens: estimatedTokens,
-+      context_window: contextWindowTokens,
-+      reserve: contextWindowTokens - hardLimitTokens,
-+      trim_profile: activeProfile,
-+      retry_count: 0,
-+      files_injected: activeContextFiles.length,
-+      files_truncated: logActiveAnalysis.truncatedFiles.length,
-+      files_skipped: bootstrapFiles.length - activeContextFiles.length,
-+      ...(isClaude
-+        ? {
-+            session_prompt_file: resolveClaudeSystemPromptFilePath(params.sessionFile),
-+          }
-+        : {}),
-+      compaction_attempted: compactionAttempted,
-+      ...(compactionAttempted && {
-+        compacted_files: compactedFilesList,
-+        chars_before: compactionCharsBefore,
-+        chars_after: compactionCharsAfter,
-+        compaction_model: compactionModelUsed,
-+        ...(compactionFallbackReason ? { fallback_reason: compactionFallbackReason } : {}),
-+      }),
-+    });
-+  }
-+
-+  // Rebuild analysis/report from the final active context files so metadata
-+  // reflects the actual profile used (not the initial "normal" profile).
-+  const buildReportForActiveContext = () => {
-+    // Use the active profile's budget limits so truncation analysis is accurate
-+    const activeBudget =
-+      activeProfile === "normal"
-+        ? { maxCharsPerFile: bootstrapMaxChars, totalMaxChars: bootstrapTotalMaxChars }
-+        : getBootstrapProfileConfig(activeProfile);
-+    const analysis =
-+      activeContextFiles !== contextFiles
-+        ? analyzeBootstrapBudget({
-+            files: buildBootstrapInjectionStats({
-+              bootstrapFiles,
-+              injectedFiles: activeContextFiles,
-+            }),
-+            bootstrapMaxChars: activeBudget.maxCharsPerFile,
-+            bootstrapTotalMaxChars: activeBudget.totalMaxChars,
-+          })
-+        : bootstrapAnalysis;
-+    const warning =
-+      activeContextFiles !== contextFiles
-+        ? buildBootstrapPromptWarning({
-+            analysis,
-+            mode: bootstrapPromptWarningMode,
-+            seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-+            previousSignature: params.bootstrapPromptWarningSignature,
-+          })
-+        : bootstrapPromptWarning;
-+    return buildSystemPromptReport({
-+      source: "run",
-+      generatedAt: Date.now(),
-+      sessionId: params.sessionId,
-+      sessionKey: params.sessionKey,
-+      provider: params.provider,
-+      model: modelId,
-+      workspaceDir,
-+      bootstrapMaxChars: activeBudget.maxCharsPerFile,
-+      bootstrapTotalMaxChars: activeBudget.totalMaxChars,
-+      bootstrapTruncation: buildBootstrapTruncationReportMeta({
-+        analysis,
-+        warningMode: bootstrapPromptWarningMode,
-+        warning,
-+      }),
-+      sandbox: { mode: "off", sandboxed: false },
-+      systemPrompt,
-+      bootstrapFiles,
-+      injectedFiles: activeContextFiles,
-+      skillsPrompt: "",
-+      tools: [],
-+    });
-+  };
-+  let systemPromptReport = buildReportForActiveContext();
++export async function executeWithOverflowProtection(
++  context: PreparedCliRunContext,
++  cliSessionIdToUse?: string,
++): Promise<{
++  output: CliOutput;
++  cliSessionBinding?: CliSessionBindingResult;
++  cliPromptLoad?: CliPromptLoadResult;
++  compactionsThisRun: number;
++  systemPromptReport: typeof context.systemPromptReport;
++}> {
++  const params = context.params;
++  let { systemPrompt, activeProfile, activeContextFiles, systemPromptReport } = context;
 +  let compactionsThisRun = 0;
-+  let latestCliSessionBinding:
-+    | {
-+        sessionId: string;
-+        systemPromptFile?: string;
-+        systemPromptHash?: string;
-+        systemPromptCompactionCount?: number;
-+      }
-+    | undefined;
-+  let latestCliPromptLoad:
-+    | {
-+        sessionPromptFile?: string;
-+        loaderMode: "normal" | "strict" | "disabled";
-+        verifiedRead: boolean;
-+        fallbackReason?:
-+          | "write_failed"
-+          | "verification_retry"
-+          | "direct_injection_fallback"
-+          | "direct_fallback_disabled";
-+      }
-+    | undefined;
- 
-   // Helper function to execute CLI with given session ID
-   const executeCliWithSession = async (
-     cliSessionIdToUse?: string,
-+    promptOverride?: string,
-+    isSystemCall?: boolean,
-+    forceReloadSystemPromptFile?: boolean,
-+    loaderPromptMode: "normal" | "strict" | "disabled" = "normal",
-   ): Promise<{
-     text: string;
-     sessionId?: string;
-@@ -203,6 +1123,11 @@ export async function runCliAgent(params: {
-       total?: number;
-     };
-   }> => {
-+    if (params.abortSignal?.aborted) {
-+      throw createAbortError(params.abortSignal);
-+    }
++  let latestCliSessionBinding: CliSessionBindingResult | undefined;
++  let latestCliPromptLoad: CliPromptLoadResult | undefined;
++
++  // Inner function: execute with a given session and loader mode, handling
++  // prompt file writing and read verification for Claude CLI.
++  const executeCliWithSession = async (
++    sessionId: string | undefined,
++    promptOverride: string | undefined,
++    isSystemCall: boolean,
++    forceReloadSystemPromptFile: boolean,
++    loaderPromptMode: "normal" | "strict" | "disabled",
++  ): Promise<CliOutput> => {
++    const backend = context.preparedBackend.backend;
 +    const currentCompactionCount =
 +      Math.max(0, params.sessionCompactionCount ?? 0) + compactionsThisRun;
-     const { sessionId: resolvedSessionId, isNew } = resolveSessionIdToSend({
-       backend,
-       cliSessionId: cliSessionIdToUse,
-@@ -210,18 +1135,106 @@ export async function runCliAgent(params: {
-     const useResume = Boolean(
-       cliSessionIdToUse && resolvedSessionId && backend.resumeArgs && backend.resumeArgs.length > 0,
-     );
--    const systemPromptArg = resolveSystemPromptUsage({
--      backend,
--      isNewSession: isNew,
--      systemPrompt,
--    });
++    const { sessionId: resolvedSessionId, isNew } = resolveSessionIdToSend({
++      backend,
++      cliSessionId: sessionId,
++    });
++    const useResume = Boolean(
++      sessionId && resolvedSessionId && backend.resumeArgs && backend.resumeArgs.length > 0,
++    );
++
 +    let systemPromptToSend: string | undefined = systemPrompt;
 +    let cliSystemPromptFile:
-+      | {
-+          filePath: string;
-+          hash: string;
-+        }
++      | { filePath: string; hash: string }
 +      | undefined;
 +    let loaderFallbackReason:
 +      | "write_failed"
@@ -3494,13 +2994,16 @@ index 9056668e08..44b5e0299c 100644
 +      | "direct_fallback_disabled"
 +      | undefined;
 +    let promptFileTrustedFromBinding = false;
++
 +    const matchingCliSessionBinding =
 +      params.cliSessionBinding &&
 +      params.cliSessionBinding.sessionId?.trim() &&
-+      params.cliSessionBinding.sessionId.trim() === cliSessionIdToUse?.trim()
++      params.cliSessionBinding.sessionId.trim() === sessionId?.trim()
 +        ? params.cliSessionBinding
 +        : undefined;
-+    if (isClaude && !isSystemCall) {
++
++    // Layer 1: Write session prompt file and build loader prompt (Claude CLI only)
++    if (context.isClaude && !isSystemCall) {
 +      try {
 +        cliSystemPromptFile = await writeClaudeSystemPromptFile({
 +          sessionFile: params.sessionFile,
@@ -3546,7 +3049,7 @@ index 9056668e08..44b5e0299c 100644
 +          matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile.hash,
 +        );
 +      } catch (error) {
-+        log.warn(
++        cliBackendLog.warn(
 +          `failed to write claude session prompt file (${resolveClaudeSystemPromptFilePath(params.sessionFile)}); falling back to direct prompt: ${String(error)}`,
 +        );
 +        systemPromptToSend = systemPrompt;
@@ -3554,8 +3057,10 @@ index 9056668e08..44b5e0299c 100644
 +        loaderFallbackReason = "write_failed";
 +      }
 +    }
++
++    // Resolve the system prompt arg based on loader mode
 +    const systemPromptArg =
-+      isClaude && !isSystemCall
++      context.isClaude && !isSystemCall
 +        ? systemPromptToSend?.trim() || null
 +        : resolveSystemPromptUsage({
 +            backend,
@@ -3563,7 +3068,7 @@ index 9056668e08..44b5e0299c 100644
 +            systemPrompt: systemPromptToSend,
 +          });
 +    const mustVerifyPromptFileRead = Boolean(
-+      isClaude &&
++      context.isClaude &&
 +      !isSystemCall &&
 +      cliSystemPromptFile &&
 +      systemPromptToSend &&
@@ -3571,288 +3076,211 @@ index 9056668e08..44b5e0299c 100644
 +    );
 +    let promptFileReadToolUseId: string | undefined;
 +    let promptFileReadVerified = false;
- 
-     let imagePaths: string[] | undefined;
-     let cleanupImages: (() => Promise<void>) | undefined;
--    let prompt = prependBootstrapPromptWarning(params.prompt, bootstrapPromptWarning.lines, {
--      preserveExactPrompt: heartbeatPrompt,
--    });
--    if (params.images && params.images.length > 0) {
++
++    // Build images and prompt
++    let imagePaths: string[] | undefined;
++    let cleanupImages: (() => Promise<void>) | undefined;
 +    let prompt =
 +      promptOverride ??
-+      prependBootstrapPromptWarning(promptForRun, bootstrapPromptWarning.lines, {
-+        preserveExactPrompt: heartbeatPrompt,
++      prependBootstrapPromptWarning(params.prompt, context.bootstrapPromptWarningLines, {
++        preserveExactPrompt: context.heartbeatPrompt,
 +      });
-+    if (!promptOverride && params.images && params.images.length > 0) {
-       const imagePayload = await writeCliImages(params.images);
-       imagePaths = imagePayload.paths;
-       cleanupImages = imagePayload.cleanup;
-@@ -249,6 +1262,13 @@ export async function runCliAgent(params: {
-       promptArg: argsPrompt,
-       useResume,
-     });
-+    // --mcp-config is a Claude Code specific flag.
-+    if (mcpConfigPath && backendResolved.id === "claude-cli") {
-+      if (useStrictMcp && !args.includes("--strict-mcp-config")) {
-+        args.push("--strict-mcp-config");
++    const resolvedImages =
++      !promptOverride && params.images && params.images.length > 0
++        ? params.images
++        : !promptOverride
++          ? await loadPromptRefImages({ prompt, workspaceDir: context.workspaceDir })
++          : [];
++    if (resolvedImages.length > 0) {
++      const imagePayload = await writeCliImages(resolvedImages);
++      imagePaths = imagePayload.paths;
++      cleanupImages = imagePayload.cleanup;
++      if (!backend.imageArg) {
++        prompt = appendImagePathsToPrompt(prompt, imagePaths);
 +      }
-+      args.push("--mcp-config", mcpConfigPath);
 +    }
- 
-     const serialize = backend.serialize ?? true;
-     const queueKey = serialize ? backendResolved.id : `${backendResolved.id}:${params.runId}`;
-@@ -256,8 +1276,18 @@ export async function runCliAgent(params: {
-     try {
-       const output = await enqueueCliRun(queueKey, async () => {
-         log.info(
--          `cli exec: provider=${params.provider} model=${normalizedModel} promptChars=${params.prompt.length}`,
-+          `cli exec: provider=${params.provider} model=${normalizedModel} promptChars=${promptForRun.length}`,
-         );
-+        if (cliSystemPromptFile && !isSystemCall) {
-+          log.info("cli session prompt file", {
-+            session_prompt_file: cliSystemPromptFile.filePath,
-+            session_prompt_hash: cliSystemPromptFile.hash,
-+            loader_mode: loaderPromptMode,
-+            requires_verified_read: mustVerifyPromptFileRead,
-+            force_reload: forceReloadSystemPromptFile === true,
-+            use_resume: useResume,
-+          });
-+        }
-         const logOutputText = isTruthyEnvValue(process.env.OPENCLAW_CLAUDE_CLI_LOG_OUTPUT);
-         if (logOutputText) {
-           const logArgs: string[] = [];
-@@ -300,6 +1330,15 @@ export async function runCliAgent(params: {
-           for (const key of backend.clearEnv ?? []) {
-             delete next[key];
-           }
-+          if (mcpConfigPath) {
-+            next.OPENCLAW_MCP_AGENT_ID = sessionAgentId ?? "";
-+            next.OPENCLAW_MCP_ACCOUNT_ID = params.messageAccountId ?? "";
-+            next.OPENCLAW_MCP_SESSION_KEY = params.sessionKey ?? "";
-+            next.OPENCLAW_MCP_MESSAGE_CHANNEL = params.messageChannel ?? "";
-+            next.OPENCLAW_MCP_TO = params.messageTo ?? "";
-+            next.OPENCLAW_MCP_THREAD_ID =
-+              params.messageThreadId != null ? String(params.messageThreadId) : "";
-+          }
-           return next;
-         })();
-         const noOutputTimeoutMs = resolveCliNoOutputTimeoutMs({
-@@ -314,6 +1353,68 @@ export async function runCliAgent(params: {
-           cliSessionId: useResume ? resolvedSessionId : undefined,
-         });
- 
-+        const outputMode = useResume ? (backend.resumeOutput ?? backend.output) : backend.output;
 +
-+        // Stream-json mode: process NDJSON lines as they arrive via onStdout
-+        const streamProcessor =
-+          outputMode === "stream-json"
-+            ? createStreamJsonProcessor(
++    const { argsPrompt, stdin } = resolvePromptInput({ backend, prompt });
++    const stdinPayload = stdin ?? "";
++    const baseArgs = useResume ? (backend.resumeArgs ?? backend.args ?? []) : (backend.args ?? []);
++    const resolvedArgs = useResume
++      ? baseArgs.map((entry) => entry.replaceAll("{sessionId}", resolvedSessionId ?? ""))
++      : baseArgs;
++    const args = buildCliArgs({
++      backend,
++      baseArgs: resolvedArgs,
++      modelId: context.normalizedModel,
++      sessionId: resolvedSessionId,
++      systemPrompt: systemPromptArg,
++      imagePaths,
++      promptArg: argsPrompt,
++      useResume,
++    });
++
++    const queueKey = resolveCliRunQueueKey({
++      backendId: context.backendResolved.id,
++      serialize: backend.serialize,
++      runId: params.runId,
++      workspaceDir: context.workspaceDir,
++      cliSessionId: useResume ? resolvedSessionId : undefined,
++    });
++
++    try {
++      const output = await enqueueCliRun(queueKey, async () => {
++        cliBackendLog.info(
++          `cli exec: provider=${params.provider} model=${context.normalizedModel} promptChars=${params.prompt.length}`,
++        );
++        const logOutputText =
++          isTruthyEnvValue(process.env[CLI_BACKEND_LOG_OUTPUT_ENV]) ||
++          isTruthyEnvValue(process.env[LEGACY_CLAUDE_CLI_LOG_OUTPUT_ENV]);
++        if (logOutputText) {
++          const logArgs = buildCliLogArgs({
++            args,
++            systemPromptArg: backend.systemPromptArg,
++            sessionArg: backend.sessionArg,
++            modelArg: backend.modelArg,
++            imageArg: backend.imageArg,
++            argsPrompt,
++          });
++          cliBackendLog.info(`cli argv: ${backend.command} ${logArgs.join(" ")}`);
++        }
++
++        const env = (() => {
++          const next = sanitizeHostExecEnv({
++            baseEnv: process.env,
++            blockPathOverrides: true,
++          });
++          for (const key of backend.clearEnv ?? []) {
++            delete next[key];
++          }
++          if (backend.env && Object.keys(backend.env).length > 0) {
++            Object.assign(
++              next,
++              sanitizeHostExecEnv({
++                baseEnv: {},
++                overrides: backend.env,
++                blockPathOverrides: true,
++              }),
++            );
++          }
++          Object.assign(next, context.preparedBackend.env);
++          return next;
++        })();
++        const noOutputTimeoutMs = resolveCliNoOutputTimeoutMs({
++          backend,
++          timeoutMs: params.timeoutMs,
++          useResume,
++        });
++        const streamingParser =
++          backend.output === "jsonl"
++            ? createCliJsonlStreamingParser({
 +                backend,
-+                isSystemCall
-+                  ? {} // suppress all stream callbacks for internal system calls (e.g. /compact)
-+                  : {
-+                      onSystemInit: params.onSystemInit,
-+                      onAssistantTurn: params.onAssistantTurn,
-+                      onToolUse: params.onToolUse,
-+                      onThinkingTurn: params.onThinkingTurn,
-+                      onToolUseEvent: (payload) => {
-+                        if (
-+                          mustVerifyPromptFileRead &&
-+                          payload.name === "Read" &&
-+                          cliSystemPromptFile &&
-+                          resolveReadToolFilePath(payload.input) === cliSystemPromptFile.filePath
-+                        ) {
-+                          promptFileReadToolUseId = payload.toolUseId;
-+                          if (!promptFileReadToolUseId) {
-+                            promptFileReadVerified = true;
-+                            log.info("cli session prompt read detected", {
-+                              session_prompt_file: cliSystemPromptFile.filePath,
-+                              loader_mode: loaderPromptMode,
-+                              verified_read: true,
-+                              verification_source: "tool_use_without_id",
-+                            });
-+                          } else {
-+                            log.info("cli session prompt read tool call matched", {
-+                              session_prompt_file: cliSystemPromptFile.filePath,
-+                              loader_mode: loaderPromptMode,
-+                              tool_use_id: promptFileReadToolUseId,
-+                            });
-+                          }
-+                        }
-+                        params.onToolUseEvent?.(payload);
-+                      },
-+                      onToolResult: (payload) => {
-+                        if (
-+                          mustVerifyPromptFileRead &&
-+                          !payload.isError &&
-+                          ((promptFileReadToolUseId &&
-+                            payload.toolUseId === promptFileReadToolUseId) ||
-+                            (!promptFileReadToolUseId && payload.toolUseId == null))
-+                        ) {
-+                          promptFileReadVerified = true;
-+                          log.info("cli session prompt read verified", {
-+                            session_prompt_file: cliSystemPromptFile?.filePath,
-+                            loader_mode: loaderPromptMode,
-+                            tool_use_id: payload.toolUseId ?? promptFileReadToolUseId,
-+                            verified_read: true,
-+                          });
-+                        }
-+                        params.onToolResult?.(payload);
-+                      },
-+                    },
-+              )
-+            : undefined;
++                providerId: context.backendResolved.id,
++                onAssistantDelta: ({ text, delta }) => {
++                  emitAgentEvent({
++                    runId: params.runId,
++                    stream: "assistant",
++                    data: { text, delta },
++                  });
++                },
++              })
++            : null;
++        const supervisor = executeDeps.getProcessSupervisor();
++        const scopeKey = buildCliSupervisorScopeKey({
++          backend,
++          backendId: context.backendResolved.id,
++          cliSessionId: useResume ? resolvedSessionId : undefined,
++        });
 +
-         const managedRun = await supervisor.spawn({
-           sessionId: params.sessionId,
-           backendId: backendResolved.id,
-@@ -326,29 +1427,77 @@ export async function runCliAgent(params: {
-           cwd: workspaceDir,
-           env,
-           input: stdinPayload,
-+          ...(streamProcessor ? { onStdout: streamProcessor.feed } : {}),
-         });
--        const result = await managedRun.wait();
-+        const onAbort = () => {
-+          managedRun.cancel("manual-cancel");
-+        };
-+        if (params.abortSignal) {
-+          if (params.abortSignal.aborted) {
-+            onAbort();
-+          } else {
-+            params.abortSignal.addEventListener("abort", onAbort, { once: true });
-+          }
++        const managedRun = await supervisor.spawn({
++          sessionId: params.sessionId,
++          backendId: context.backendResolved.id,
++          scopeKey,
++          replaceExistingScope: Boolean(useResume && scopeKey),
++          mode: "child",
++          argv: [backend.command, ...args],
++          timeoutMs: params.timeoutMs,
++          noOutputTimeoutMs,
++          cwd: context.workspaceDir,
++          env,
++          input: stdinPayload,
++          onStdout: streamingParser ? (chunk: string) => streamingParser.push(chunk) : undefined,
++        });
++        const result = await managedRun.wait();
++        streamingParser?.finish();
++
++        const stdout = result.stdout.trim();
++        const stderr = result.stderr.trim();
++        if (logOutputText) {
++          if (stdout) cliBackendLog.info(`cli stdout:\n${stdout}`);
++          if (stderr) cliBackendLog.info(`cli stderr:\n${stderr}`);
 +        }
-+        let result;
-+        try {
-+          result = await managedRun.wait();
-+        } finally {
-+          params.abortSignal?.removeEventListener("abort", onAbort);
++        if (shouldLogVerbose()) {
++          if (stdout) cliBackendLog.debug(`cli stdout:\n${stdout}`);
++          if (stderr) cliBackendLog.debug(`cli stderr:\n${stderr}`);
 +        }
-+        if (result.reason === "manual-cancel") {
-+          // Manual cancels can originate from this run's AbortSignal or from
-+          // external session control (/stop, scope replacement, etc.). Treat
-+          // both as terminal aborts so model fallback does not restart them.
-+          throw createAbortError(params.abortSignal);
-+        }
- 
-         const stdout = result.stdout.trim();
-         const stderr = result.stderr.trim();
-         if (logOutputText) {
-           if (stdout) {
--            log.info(`cli stdout:\n${stdout}`);
-+            log.info(formatCliOutputForLog("stdout", stdout));
-           }
-           if (stderr) {
--            log.info(`cli stderr:\n${stderr}`);
-+            log.info(formatCliOutputForLog("stderr", stderr));
-           }
-         }
-         if (shouldLogVerbose()) {
-           if (stdout) {
--            log.debug(`cli stdout:\n${stdout}`);
-+            log.debug(formatCliOutputForLog("stdout", stdout));
-           }
-           if (stderr) {
--            log.debug(`cli stderr:\n${stderr}`);
-+            log.debug(formatCliOutputForLog("stderr", stderr));
-           }
-         }
- 
-         if (result.exitCode !== 0 || result.reason !== "exit") {
-+          const parsedStreamOutput =
-+            !stderr && streamProcessor
-+              ? (() => {
-+                  try {
-+                    return streamProcessor.finish();
-+                  } catch {
-+                    return null;
-+                  }
-+                })()
-+              : null;
-+          const cliFailure = summarizeCliFailure({
-+            stdout,
-+            stderr,
-+            outputMode,
-+            useResume,
-+            cliSessionId: params.cliSessionId,
-+            parsedStreamOutput,
-+          });
-+          if (cliFailure.reason === "session_expired") {
-+            throw new FailoverError(cliFailure.message, {
-+              reason: cliFailure.reason,
++
++        if (result.exitCode !== 0 || result.reason !== "exit") {
++          if (result.reason === "no-output-timeout" || result.noOutputTimedOut) {
++            const timeoutReason = `CLI produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`;
++            cliBackendLog.warn(
++              `cli watchdog timeout: provider=${params.provider} model=${context.modelId} session=${resolvedSessionId ?? params.sessionId} noOutputTimeoutMs=${noOutputTimeoutMs} pid=${managedRun.pid ?? "unknown"}`,
++            );
++            if (params.sessionKey) {
++              const stallNotice = [
++                `CLI agent (${params.provider}) produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`,
++                "It may have been waiting for interactive input or an approval prompt.",
++                "For Claude Code, prefer --permission-mode bypassPermissions --print.",
++              ].join(" ");
++              executeDeps.enqueueSystemEvent(stallNotice, { sessionKey: params.sessionKey });
++              executeDeps.requestHeartbeatNow(
++                scopedHeartbeatWakeOptions(params.sessionKey, { reason: "cli:watchdog:stall" }),
++              );
++            }
++            throw new FailoverError(timeoutReason, {
++              reason: "timeout",
 +              provider: params.provider,
-+              model: modelId,
-+              status: resolveFailoverStatus(cliFailure.reason),
++              model: context.modelId,
++              status: resolveFailoverStatus("timeout"),
 +            });
 +          }
-           if (result.reason === "no-output-timeout" || result.noOutputTimedOut) {
-             const timeoutReason = `CLI produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`;
-             log.warn(
-@@ -381,7 +1530,7 @@ export async function runCliAgent(params: {
-               status: resolveFailoverStatus("timeout"),
-             });
-           }
--          const err = stderr || stdout || "CLI failed.";
-+          const err = cliFailure.message;
-           const reason = classifyFailoverReason(err) ?? "unknown";
-           const status = resolveFailoverStatus(reason);
-           throw new FailoverError(err, {
-@@ -392,18 +1541,100 @@ export async function runCliAgent(params: {
-           });
-         }
- 
--        const outputMode = useResume ? (backend.resumeOutput ?? backend.output) : backend.output;
--
--        if (outputMode === "text") {
--          return { text: stdout, sessionId: undefined };
--        }
--        if (outputMode === "jsonl") {
-+        let output: {
-+          text: string;
-+          sessionId?: string;
-+          usage?: {
-+            input?: number;
-+            output?: number;
-+            cacheRead?: number;
-+            cacheWrite?: number;
-+            total?: number;
-+          };
-+        };
-+        if (streamProcessor) {
-+          output = streamProcessor.finish();
-+        } else if (outputMode === "text") {
-+          output = { text: stdout, sessionId: undefined };
-+        } else if (outputMode === "jsonl") {
-           const parsed = parseCliJsonl(stdout, backend);
--          return parsed ?? { text: stdout };
-+          output = parsed ?? { text: stdout };
-+        } else {
-+          const parsed = parseCliJson(stdout, backend);
-+          output = parsed ?? { text: stdout };
-         }
--
--        const parsed = parseCliJson(stdout, backend);
--        return parsed ?? { text: stdout };
++          if (result.reason === "overall-timeout") {
++            const timeoutReason = `CLI exceeded timeout (${Math.round(params.timeoutMs / 1000)}s) and was terminated.`;
++            throw new FailoverError(timeoutReason, {
++              reason: "timeout",
++              provider: params.provider,
++              model: context.modelId,
++              status: resolveFailoverStatus("timeout"),
++            });
++          }
++          const err = stderr || stdout || "CLI failed.";
++          const reason = classifyFailoverReason(err, { provider: params.provider }) ?? "unknown";
++          const status = resolveFailoverStatus(reason);
++          throw new FailoverError(err, {
++            reason,
++            provider: params.provider,
++            model: context.modelId,
++            status,
++          });
++        }
++
++        const cliOutput = parseCliOutput({
++          raw: stdout,
++          backend,
++          providerId: context.backendResolved.id,
++          outputMode: useResume ? (backend.resumeOutput ?? backend.output) : backend.output,
++          fallbackSessionId: resolvedSessionId,
++        });
++
++        // Layer 1: Verify prompt file was read
 +        if (mustVerifyPromptFileRead && !promptFileReadVerified) {
 +          throw new PromptFileReadRequiredError(
 +            `Claude session did not verify a successful Read of ${cliSystemPromptFile?.filePath ?? "the session prompt file"}.`,
 +          );
 +        }
++
++        // Track session binding metadata
 +        if (!isSystemCall) {
-+          latestCliPromptLoad =
-+            isClaude && !isSystemCall
-+              ? {
-+                  ...(cliSystemPromptFile
-+                    ? { sessionPromptFile: cliSystemPromptFile.filePath }
-+                    : {}),
-+                  loaderMode: loaderPromptMode,
-+                  verifiedRead: mustVerifyPromptFileRead
-+                    ? promptFileReadVerified
-+                    : promptFileTrustedFromBinding,
-+                  ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
-+                }
-+              : undefined;
 +          const persistPromptFileMetadata =
 +            loaderPromptMode !== "disabled" &&
 +            Boolean(cliSystemPromptFile) &&
@@ -3862,9 +3290,9 @@ index 9056668e08..44b5e0299c 100644
 +                  cliSystemPromptFile?.filePath &&
 +                matchingCliSessionBinding?.systemPromptHash?.trim() === cliSystemPromptFile?.hash));
 +          latestCliSessionBinding =
-+            output.sessionId || resolvedSessionId
++            cliOutput.sessionId || resolvedSessionId
 +              ? {
-+                  sessionId: output.sessionId ?? resolvedSessionId ?? "",
++                  sessionId: cliOutput.sessionId ?? resolvedSessionId ?? "",
 +                  ...(persistPromptFileMetadata && cliSystemPromptFile
 +                    ? {
 +                        systemPromptFile: cliSystemPromptFile.filePath,
@@ -3877,43 +3305,33 @@ index 9056668e08..44b5e0299c 100644
 +                    : {}),
 +                }
 +              : undefined;
-+          try {
-+            const appendResult = await appendCliTurnToSessionTranscript({
-+              sessionFile: params.sessionFile,
-+              sessionId: params.sessionId,
-+              userText: params.prompt,
-+              assistantText: output.text,
-+              provider: params.provider,
-+              model: normalizedModel,
-+              usage: output.usage,
-+            });
-+            if (!appendResult.ok) {
-+              log.debug(`cli transcript append skipped: ${appendResult.reason}`);
-+            }
-+          } catch (err) {
-+            log.warn(`cli transcript append failed: ${String(err)}`);
-+          }
++          latestCliPromptLoad =
++            context.isClaude
++              ? {
++                  ...(cliSystemPromptFile
++                    ? { sessionPromptFile: cliSystemPromptFile.filePath }
++                    : {}),
++                  loaderMode: loaderPromptMode,
++                  verifiedRead: mustVerifyPromptFileRead
++                    ? promptFileReadVerified
++                    : promptFileTrustedFromBinding,
++                  ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
++                }
++              : undefined;
 +        }
-+        if (!isSystemCall) {
-+          emitCliLlmOutputHook({
-+            hookRunner,
-+            hookCtx,
-+            runId: params.runId,
-+            sessionId: output.sessionId ?? resolvedSessionId ?? params.sessionId,
-+            provider: params.provider,
-+            model: normalizedModel,
-+            output,
-+          });
-+        }
-+        return output;
-       });
- 
-       return output;
-@@ -414,10 +1645,107 @@ export async function runCliAgent(params: {
-     }
-   };
- 
-+  const executeCliWithLoaderFallback = async (paramsForRun: {
++
++        return cliOutput;
++      });
++      return output;
++    } finally {
++      if (cleanupImages) {
++        await cleanupImages();
++      }
++    }
++  };
++
++  // Layer 1 fallback chain: normal -> strict -> disabled
++  const executeCliWithLoaderFallback = async (runParams: {
 +    cliSessionId?: string;
 +    promptOverride?: string;
 +    isSystemCall?: boolean;
@@ -3921,17 +3339,17 @@ index 9056668e08..44b5e0299c 100644
 +  }) => {
 +    try {
 +      return await executeCliWithSession(
-+        paramsForRun.cliSessionId,
-+        paramsForRun.promptOverride,
-+        paramsForRun.isSystemCall,
-+        paramsForRun.forceReloadSystemPromptFile,
++        runParams.cliSessionId,
++        runParams.promptOverride,
++        runParams.isSystemCall ?? false,
++        runParams.forceReloadSystemPromptFile ?? false,
 +        "normal",
 +      );
 +    } catch (error) {
 +      if (!(error instanceof PromptFileReadRequiredError)) {
 +        throw error;
 +      }
-+      log.warn(
++      cliBackendLog.warn(
 +        `cli loader prompt verification failed; retrying with strict loader prompt (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
 +      );
 +      latestCliPromptLoad = {
@@ -3944,10 +3362,10 @@ index 9056668e08..44b5e0299c 100644
 +
 +    try {
 +      const output = await executeCliWithSession(
-+        paramsForRun.cliSessionId,
-+        paramsForRun.promptOverride,
-+        paramsForRun.isSystemCall,
-+        paramsForRun.forceReloadSystemPromptFile,
++        runParams.cliSessionId,
++        runParams.promptOverride,
++        runParams.isSystemCall ?? false,
++        runParams.forceReloadSystemPromptFile ?? false,
 +        "strict",
 +      );
 +      if (latestCliPromptLoad?.loaderMode === "strict") {
@@ -3968,7 +3386,7 @@ index 9056668e08..44b5e0299c 100644
 +          verifiedRead: false,
 +          fallbackReason: "direct_fallback_disabled",
 +        };
-+        log.warn(
++        cliBackendLog.warn(
 +          `cli loader prompt verification failed again; direct system prompt injection fallback is disabled (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
 +        );
 +        throw new FailoverError(
@@ -3976,13 +3394,13 @@ index 9056668e08..44b5e0299c 100644
 +          {
 +            reason: "unknown",
 +            provider: params.provider,
-+            model: modelId,
++            model: context.modelId,
 +            status: resolveFailoverStatus("unknown"),
 +          },
 +        );
 +      }
-+      log.warn(
-+        `cli loader prompt verification failed again; falling back to direct system prompt injection (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
++      cliBackendLog.warn(
++        `cli loader prompt verification failed again; falling back to direct system prompt injection: ${error.message}`,
 +      );
 +      latestCliPromptLoad = {
 +        sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
@@ -3991,10 +3409,10 @@ index 9056668e08..44b5e0299c 100644
 +        fallbackReason: "direct_injection_fallback",
 +      };
 +      const output = await executeCliWithSession(
-+        paramsForRun.cliSessionId,
-+        paramsForRun.promptOverride,
-+        paramsForRun.isSystemCall,
-+        paramsForRun.forceReloadSystemPromptFile,
++        runParams.cliSessionId,
++        runParams.promptOverride,
++        runParams.isSystemCall ?? false,
++        runParams.forceReloadSystemPromptFile ?? false,
 +        "disabled",
 +      );
 +      latestCliPromptLoad = {
@@ -4010,271 +3428,165 @@ index 9056668e08..44b5e0299c 100644
 +    }
 +  };
 +
-   // Try with the provided CLI session ID first
-   try {
-     try {
--      const output = await executeCliWithSession(params.cliSessionId);
-+      const output = await executeCliWithLoaderFallback({ cliSessionId: params.cliSessionId });
-       const text = output.text?.trim();
-       const payloads = text ? [{ text }] : undefined;
- 
-@@ -431,11 +1759,155 @@ export async function runCliAgent(params: {
-             provider: params.provider,
-             model: modelId,
-             usage: output.usage,
-+            ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
-+            ...(latestCliSessionBinding ? { cliSessionBinding: latestCliSessionBinding } : {}),
-+            ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
-           },
-         },
-       };
-     } catch (err) {
-       if (err instanceof FailoverError) {
-+        // Layer 2: Context overflow recovery — compact session history then retry with minimal profile
-+        if (isContextOverflowError(err.message)) {
-+          const preRetryEstimatedTokens =
-+            estimatePromptTokens(systemPrompt) +
-+            estimatePromptTokens(promptForRun) +
-+            imageTokenEstimate;
++  // Layer 2: Context overflow recovery
++  try {
++    const output = await executeCliWithLoaderFallback({ cliSessionId: cliSessionIdToUse });
++    return {
++      output,
++      cliSessionBinding: latestCliSessionBinding,
++      cliPromptLoad: latestCliPromptLoad,
++      compactionsThisRun,
++      systemPromptReport,
++    };
++  } catch (err) {
++    if (err instanceof FailoverError && isContextOverflowError(err.message)) {
++      const backend = context.preparedBackend.backend;
++      const imageTokenEstimate = backend.imageArg
++        ? (params.images?.length ?? 0) * ESTIMATED_TOKENS_PER_IMAGE
++        : 0;
 +
-+          // Step 2a: Send /compact to the existing session to shrink conversation history.
-+          // /compact supports non-interactive (-p) mode (supportsNonInteractive=true in claude-cli source).
-+          // Only meaningful for claude-cli backend with an existing session to resume.
-+          const sessionToCompact = params.cliSessionId;
-+          let compactSucceeded = false;
-+          if (sessionToCompact && isClaude) {
-+            try {
-+              log.warn("cli-runner: context overflow detected, sending /compact to session", {
-+                session: redactRunIdentifier(sessionToCompact),
-+                previous_profile: activeProfile,
-+                estimated_tokens: preRetryEstimatedTokens,
-+                context_window: contextWindowTokens,
-+              });
-+              await executeCliWithSession(sessionToCompact, "/compact", true /* isSystemCall */);
-+              compactSucceeded = true;
-+              compactionsThisRun += 1;
-+              log.warn("cli-runner: /compact succeeded, will retry with minimal profile");
-+            } catch (compactErr) {
-+              // If compact failed because the session expired, re-throw immediately so the
-+              // session_expired handler below can clear the stale session and retry correctly.
-+              if (compactErr instanceof FailoverError && compactErr.reason === "session_expired") {
-+                throw compactErr;
-+              }
-+              log.warn(
-+                `cli-runner: /compact failed (${compactErr instanceof Error ? compactErr.message : String(compactErr)}), proceeding with profile downgrade only`,
-+              );
-+            }
-+          } else {
-+            log.warn("cli-runner: context overflow detected, retrying with minimal profile", {
-+              provider: params.provider,
-+              previous_profile: activeProfile,
-+              estimated_tokens: preRetryEstimatedTokens,
-+              context_window: contextWindowTokens,
-+            });
++      // Step 2a: Send /compact to the existing session
++      const sessionToCompact = cliSessionIdToUse;
++      let compactSucceeded = false;
++      if (sessionToCompact && context.isClaude) {
++        try {
++          cliBackendLog.warn(
++            `cli-runner: context overflow detected, sending /compact to session`,
++          );
++          await executeCliWithSession(sessionToCompact, "/compact", true, false, "normal");
++          compactSucceeded = true;
++          compactionsThisRun += 1;
++          cliBackendLog.warn("cli-runner: /compact succeeded, will retry with minimal profile");
++        } catch (compactErr) {
++          if (compactErr instanceof FailoverError && compactErr.reason === "session_expired") {
++            throw compactErr;
 +          }
-+
-+          // Step 2b: Downgrade bootstrap profile to minimal to also shrink system prompt.
-+          if (activeProfile !== "minimal") {
-+            const minimalConfig = getBootstrapProfileConfig("minimal");
-+            const minimalContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
-+              maxChars: minimalConfig.maxCharsPerFile,
-+              totalMaxChars: minimalConfig.totalMaxChars,
-+              warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
-+            });
-+            const minimalWarning = buildBootstrapPromptWarning({
-+              analysis: analyzeBootstrapBudget({
-+                files: buildBootstrapInjectionStats({
-+                  bootstrapFiles,
-+                  injectedFiles: minimalContextFiles,
-+                }),
-+                bootstrapMaxChars: minimalConfig.maxCharsPerFile,
-+                bootstrapTotalMaxChars: minimalConfig.totalMaxChars,
-+              }),
-+              mode: bootstrapPromptWarningMode,
-+              seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-+              previousSignature: params.bootstrapPromptWarningSignature,
-+            });
-+            const minimalSystemPrompt = prependBootstrapPromptWarning(
-+              buildSystemPrompt({
-+                workspaceDir,
-+                config: params.config,
-+                defaultThinkLevel: params.thinkLevel,
-+                extraSystemPrompt,
-+                skillsPrompt,
-+                ownerNumbers: params.ownerNumbers,
-+                heartbeatPrompt,
-+                docsPath: docsPath ?? undefined,
-+                tools: [],
-+                contextFiles: minimalContextFiles,
-+                modelDisplay,
-+                agentId: sessionAgentId,
-+              }),
-+              minimalWarning.lines,
-+            );
-+            // Reassign the `let` bindings so executeCliWithSession sees the new prompt
-+            systemPrompt = minimalSystemPrompt;
-+            activeContextFiles = minimalContextFiles;
-+            activeProfile = "minimal";
-+            // Rebuild report to reflect the minimal profile used for retry
-+            systemPromptReport = buildReportForActiveContext();
-+          }
-+
-+          // Step 2c: Retry the original prompt with compacted session + minimal profile.
-+          // Session selection:
-+          // - If compact succeeded: resume the compacted session (history is shorter now).
-+          // - If compact failed or no session: use undefined to start a fresh session so the
-+          //   minimal system prompt is guaranteed to be injected (avoids systemPromptWhen:"first"
-+          //   skipping re-injection on resume when the profile was just downgraded to minimal).
-+          const sessionForRetry = compactSucceeded ? params.cliSessionId : undefined;
-+          try {
-+            const output = await executeCliWithLoaderFallback({
-+              cliSessionId: sessionForRetry,
-+              forceReloadSystemPromptFile: compactSucceeded,
-+            });
-+            const text = output.text?.trim();
-+            const payloads = text ? [{ text }] : undefined;
-+            return {
-+              payloads,
-+              meta: {
-+                durationMs: Date.now() - started,
-+                systemPromptReport,
-+                agentMeta: {
-+                  sessionId: output.sessionId ?? sessionForRetry ?? params.sessionId ?? "",
-+                  provider: params.provider,
-+                  model: modelId,
-+                  usage: output.usage,
-+                  ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
-+                  ...(latestCliSessionBinding
-+                    ? { cliSessionBinding: latestCliSessionBinding }
-+                    : {}),
-+                  ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
-+                },
-+              },
-+            };
-+          } catch (retryErr) {
-+            if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
-+              const estimatedTks =
-+                estimatePromptTokens(systemPrompt) +
-+                estimatePromptTokens(promptForRun) +
-+                imageTokenEstimate;
-+              throw new FailoverError(
-+                `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal, compact=${compactSucceeded}). Consider switching to the pi-embedded runtime or splitting the task.`,
-+                {
-+                  reason: "unknown",
-+                  provider: params.provider,
-+                  model: modelId,
-+                  status: resolveFailoverStatus("unknown"),
-+                },
-+              );
-+            }
-+            throw retryErr;
-+          }
++          cliBackendLog.warn(
++            `cli-runner: /compact failed (${compactErr instanceof Error ? compactErr.message : String(compactErr)}), proceeding with profile downgrade only`,
++          );
 +        }
++      }
 +
-         // Check if this is a session expired error and we have a session to clear
-         if (err.reason === "session_expired" && params.cliSessionId && params.sessionKey) {
-           log.warn(
-@@ -447,7 +1919,7 @@ export async function runCliAgent(params: {
-           // We'll need to modify the caller to handle this case
- 
-           // For now, retry without the session ID to create a new session
--          const output = await executeCliWithSession(undefined);
-+          const output = await executeCliWithLoaderFallback({ cliSessionId: undefined });
-           const text = output.text?.trim();
-           const payloads = text ? [{ text }] : undefined;
- 
-@@ -461,6 +1933,9 @@ export async function runCliAgent(params: {
-                 provider: params.provider,
-                 model: modelId,
-                 usage: output.usage,
-+                ...(compactionsThisRun > 0 ? { compactionCount: compactionsThisRun } : {}),
-+                ...(latestCliSessionBinding ? { cliSessionBinding: latestCliSessionBinding } : {}),
-+                ...(latestCliPromptLoad ? { cliPromptLoad: latestCliPromptLoad } : {}),
-               },
-             },
-           };
-@@ -482,6 +1957,13 @@ export async function runCliAgent(params: {
-     }
-   } finally {
-     await preparedBackend.cleanup?.();
-+    if (restoreSkillEnv) {
++      // Step 2b: Downgrade bootstrap profile to minimal
++      if (activeProfile !== "minimal") {
++        const sessionLabel = params.sessionKey ?? params.sessionId;
++        const minimalConfig = getBootstrapProfileConfig("minimal");
++        const minimalContextFiles = buildBootstrapContextFiles(context.bootstrapFiles, {
++          maxChars: minimalConfig.maxCharsPerFile,
++          totalMaxChars: minimalConfig.totalMaxChars,
++          warn: makeBootstrapWarn({
++            sessionLabel,
++            warn: (message) => cliBackendLog.warn(message),
++          }),
++        });
++        const minimalWarning = buildBootstrapPromptWarning({
++          analysis: analyzeBootstrapBudget({
++            files: buildBootstrapInjectionStats({
++              bootstrapFiles: context.bootstrapFiles,
++              injectedFiles: minimalContextFiles,
++            }),
++            bootstrapMaxChars: minimalConfig.maxCharsPerFile,
++            bootstrapTotalMaxChars: minimalConfig.totalMaxChars,
++          }),
++          mode: context.bootstrapPromptWarningMode,
++          seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
++          previousSignature: params.bootstrapPromptWarningSignature,
++        });
++        systemPrompt = prependBootstrapPromptWarning(
++          buildSystemPrompt({
++            workspaceDir: context.workspaceDir,
++            config: params.config,
++            defaultThinkLevel: params.thinkLevel,
++            extraSystemPrompt: context.extraSystemPrompt,
++            ownerNumbers: params.ownerNumbers,
++            heartbeatPrompt: context.heartbeatPrompt,
++            docsPath: context.docsPath,
++            tools: [],
++            contextFiles: minimalContextFiles,
++            modelDisplay: `${params.provider}/${context.modelId}`,
++            agentId: context.sessionAgentId,
++          }),
++          minimalWarning.lines,
++        );
++        activeContextFiles = minimalContextFiles;
++        activeProfile = "minimal";
++      }
++
++      // Step 2c: Retry
++      const sessionForRetry = compactSucceeded ? cliSessionIdToUse : undefined;
 +      try {
-+        restoreSkillEnv();
-+      } catch (error) {
-+        log.warn(`failed to restore skill env overrides: ${String(error)}`);
++        const output = await executeCliWithLoaderFallback({
++          cliSessionId: sessionForRetry,
++          forceReloadSystemPromptFile: compactSucceeded,
++        });
++        return {
++          output,
++          cliSessionBinding: latestCliSessionBinding,
++          cliPromptLoad: latestCliPromptLoad,
++          compactionsThisRun,
++          systemPromptReport,
++        };
++      } catch (retryErr) {
++        if (retryErr instanceof FailoverError && isContextOverflowError(retryErr.message)) {
++          const estimatedTks =
++            estimatePromptTokens(systemPrompt) +
++            estimatePromptTokens(params.prompt) +
++            imageTokenEstimate;
++          throw new FailoverError(
++            `Current task exceeds context window for this runtime (estimated=${estimatedTks} tokens, profile=minimal, compact=${compactSucceeded}). Consider switching to the pi-embedded runtime or splitting the task.`,
++            {
++              reason: "unknown",
++              provider: params.provider,
++              model: context.modelId,
++              status: resolveFailoverStatus("unknown"),
++            },
++          );
++        }
++        throw retryErr;
 +      }
 +    }
-   }
- }
- 
-@@ -499,9 +1981,22 @@ export async function runClaudeCliAgent(params: {
-   timeoutMs: number;
-   runId: string;
-   extraSystemPrompt?: string;
-+  skillsSnapshot?: SkillSnapshot;
-   ownerNumbers?: string[];
-   claudeSessionId?: string;
-   images?: ImageContent[];
-+  onAssistantTurn?: (text: string) => void;
-+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
-+  onToolUse?: (toolName: string) => void;
-+  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
-+  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
-+  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
-+  abortSignal?: AbortSignal;
-+  trigger?: PluginHookAgentContext["trigger"];
-+  messageChannel?: string;
-+  messageAccountId?: string;
-+  messageTo?: string;
-+  messageThreadId?: string | number;
- }): Promise<EmbeddedPiRunResult> {
-   return runCliAgent({
-     sessionId: params.sessionId,
-@@ -517,8 +2012,21 @@ export async function runClaudeCliAgent(params: {
-     timeoutMs: params.timeoutMs,
-     runId: params.runId,
-     extraSystemPrompt: params.extraSystemPrompt,
-+    skillsSnapshot: params.skillsSnapshot,
-     ownerNumbers: params.ownerNumbers,
-     cliSessionId: params.claudeSessionId,
-     images: params.images,
-+    onAssistantTurn: params.onAssistantTurn,
-+    onSystemInit: params.onSystemInit,
-+    onToolUse: params.onToolUse,
-+    onThinkingTurn: params.onThinkingTurn,
-+    onToolUseEvent: params.onToolUseEvent,
-+    onToolResult: params.onToolResult,
-+    abortSignal: params.abortSignal,
-+    trigger: params.trigger,
-+    messageChannel: params.messageChannel,
-+    messageAccountId: params.messageAccountId,
-+    messageTo: params.messageTo,
-+    messageThreadId: params.messageThreadId,
-   });
- }
++    throw err;
++  }
++}
 diff --git a/src/agents/cli-runner/helpers.ts b/src/agents/cli-runner/helpers.ts
-index 9828939611..07a0b17556 100644
+index f9a08c465b..2beecb4bd8 100644
 --- a/src/agents/cli-runner/helpers.ts
 +++ b/src/agents/cli-runner/helpers.ts
-@@ -8,6 +8,7 @@ import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+@@ -6,12 +6,15 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
+ import type { ImageContent } from "@mariozechner/pi-ai";
+ import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+ import { isClaudeCliProvider } from "../../../extensions/anthropic/api.js";
++import type { CliOutput } from "../cli-output.js";
++import { isRecord } from "../../utils.js";
  import type { ThinkLevel } from "../../auto-reply/thinking.js";
  import type { OpenClawConfig } from "../../config/config.js";
  import type { CliBackendConfig } from "../../config/types.js";
+ import { resolvePreferredOpenClawTmpDir } from "../../infra/tmp-openclaw-dir.js";
+ import { MAX_IMAGE_BYTES } from "../../media/constants.js";
+ import { extensionForMime } from "../../media/mime.js";
 +import { createSubsystemLogger } from "../../logging/subsystem.js";
  import { buildTtsSystemPromptHint } from "../../tts/tts.js";
- import { isRecord } from "../../utils.js";
  import { buildModelAliasLines } from "../model-alias-lines.js";
-@@ -19,6 +20,7 @@ import { buildSystemPromptParams } from "../system-prompt-params.js";
- import { buildAgentSystemPrompt } from "../system-prompt.js";
+ import { resolveDefaultModelForAgent } from "../model-selection.js";
+@@ -26,6 +29,15 @@ import { buildAgentSystemPrompt } from "../system-prompt.js";
+ import { sanitizeImageBlocks } from "../tool-images.js";
  export { buildCliSupervisorScopeKey, resolveCliNoOutputTimeoutMs } from "./reliability.js";
  
++type CliUsage = {
++  input?: number;
++  output?: number;
++  cacheRead?: number;
++  cacheWrite?: number;
++  total?: number;
++};
++
 +const log = createSubsystemLogger("agent/claude-cli/stream");
  const CLI_RUN_QUEUE = new KeyedAsyncQueue();
  export function enqueueCliRun<T>(key: string, task: () => Promise<T>): Promise<T> {
    return CLI_RUN_QUEUE.enqueue(key, task);
-@@ -38,11 +40,64 @@ export type CliOutput = {
-   usage?: CliUsage;
- };
+@@ -54,11 +66,64 @@ export function resolveCliRunQueueKey(params: {
+   return params.backendId;
+ }
  
 +export function summarizeCliFailure(params: {
 +  stdout: string;
@@ -4337,7 +3649,7 @@ index 9828939611..07a0b17556 100644
    ownerNumbers?: string[];
    heartbeatPrompt?: string;
    docsPath?: string;
-@@ -77,6 +132,7 @@ export function buildSystemPrompt(params: {
+@@ -93,6 +158,7 @@ export function buildSystemPrompt(params: {
      workspaceDir: params.workspaceDir,
      defaultThinkLevel: params.defaultThinkLevel,
      extraSystemPrompt: params.extraSystemPrompt,
@@ -4345,10 +3657,141 @@ index 9828939611..07a0b17556 100644
      ownerNumbers: params.ownerNumbers,
      ownerDisplay: ownerDisplay.ownerDisplay,
      ownerDisplaySecret: ownerDisplay.ownerDisplaySecret,
-@@ -244,6 +300,478 @@ export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput
-   return { text, sessionId, usage };
+@@ -129,6 +195,608 @@ export function normalizeCliModel(modelId: string, backend: CliBackendConfig): s
+   return trimmed;
  }
  
++function toUsage(raw: Record<string, unknown>): CliUsage | undefined {
++  const pick = (key: string) =>
++    typeof raw[key] === "number" && raw[key] > 0 ? raw[key] : undefined;
++  const input = pick("input_tokens") ?? pick("inputTokens");
++  const output = pick("output_tokens") ?? pick("outputTokens");
++  const cacheRead =
++    pick("cache_read_input_tokens") ?? pick("cached_input_tokens") ?? pick("cacheRead");
++  const cacheWrite = pick("cache_write_input_tokens") ?? pick("cacheWrite");
++  const total = pick("total_tokens") ?? pick("total");
++  if (!input && !output && !cacheRead && !cacheWrite && !total) {
++    return undefined;
++  }
++  return { input, output, cacheRead, cacheWrite, total };
++}
++
++function collectText(value: unknown): string {
++  if (!value) {
++    return "";
++  }
++  if (typeof value === "string") {
++    return value;
++  }
++  if (Array.isArray(value)) {
++    return value.map((entry) => collectText(entry)).join("");
++  }
++  if (!isRecord(value)) {
++    return "";
++  }
++  if (typeof value.text === "string") {
++    return value.text;
++  }
++  if (typeof value.content === "string") {
++    return value.content;
++  }
++  if (Array.isArray(value.content)) {
++    return value.content.map((entry) => collectText(entry)).join("");
++  }
++  if (isRecord(value.message)) {
++    return collectText(value.message);
++  }
++  return "";
++}
++
++function pickSessionId(
++  parsed: Record<string, unknown>,
++  backend: CliBackendConfig,
++): string | undefined {
++  const fields = backend.sessionIdFields ?? [
++    "session_id",
++    "sessionId",
++    "conversation_id",
++    "conversationId",
++  ];
++  for (const field of fields) {
++    const value = parsed[field];
++    if (typeof value === "string" && value.trim()) {
++      return value.trim();
++    }
++  }
++  return undefined;
++}
++
++export function parseCliJson(raw: string, backend: CliBackendConfig): CliOutput | null {
++  const trimmed = raw.trim();
++  if (!trimmed) {
++    return null;
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(trimmed);
++  } catch {
++    return null;
++  }
++  if (!isRecord(parsed)) {
++    return null;
++  }
++  const sessionId = pickSessionId(parsed, backend);
++  const usage = isRecord(parsed.usage) ? toUsage(parsed.usage) : undefined;
++  const text =
++    collectText(parsed.message) ||
++    collectText(parsed.content) ||
++    collectText(parsed.result) ||
++    collectText(parsed);
++  return { text: text.trim(), sessionId, usage };
++}
++
++export function parseCliJsonl(raw: string, backend: CliBackendConfig): CliOutput | null {
++  const lines = raw
++    .split(/\r?\n/g)
++    .map((line) => line.trim())
++    .filter(Boolean);
++  if (lines.length === 0) {
++    return null;
++  }
++  let sessionId: string | undefined;
++  let usage: CliUsage | undefined;
++  const texts: string[] = [];
++  for (const line of lines) {
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(line);
++    } catch {
++      continue;
++    }
++    if (!isRecord(parsed)) {
++      continue;
++    }
++    if (!sessionId) {
++      sessionId = pickSessionId(parsed, backend);
++    }
++    if (!sessionId && typeof parsed.thread_id === "string") {
++      sessionId = parsed.thread_id.trim();
++    }
++    if (isRecord(parsed.usage)) {
++      usage = toUsage(parsed.usage) ?? usage;
++    }
++    const item = isRecord(parsed.item) ? parsed.item : null;
++    if (item && typeof item.text === "string") {
++      const type = typeof item.type === "string" ? item.type.toLowerCase() : "";
++      if (!type || type.includes("message")) {
++        texts.push(item.text);
++      }
++    }
++  }
++  const text = texts.join("\n").trim();
++  if (!text) {
++    return null;
++  }
++  return { text, sessionId, usage };
++}
++
 +export type StreamJsonCallbacks = {
 +  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
 +  onAssistantTurn?: (text: string) => void;
@@ -4820,11 +4263,10 @@ index 9828939611..07a0b17556 100644
 +
 +  return { feed, finish };
 +}
-+
  export function resolveSystemPromptUsage(params: {
    backend: CliBackendConfig;
    isNewSession: boolean;
-@@ -253,7 +781,7 @@ export function resolveSystemPromptUsage(params: {
+@@ -138,7 +806,7 @@ export function resolveSystemPromptUsage(params: {
    if (!systemPrompt) {
      return null;
    }
@@ -4833,36 +4275,630 @@ index 9828939611..07a0b17556 100644
    if (when === "never") {
      return null;
    }
-@@ -354,10 +882,10 @@ export function buildCliArgs(params: {
-   useResume: boolean;
- }): string[] {
-   const args: string[] = [...params.baseArgs];
--  if (!params.useResume && params.backend.modelArg && params.modelId) {
-+  if (params.backend.modelArg && params.modelId) {
-     args.push(params.backend.modelArg, params.modelId);
-   }
--  if (!params.useResume && params.systemPrompt && params.backend.systemPromptArg) {
-+  if (params.systemPrompt && params.backend.systemPromptArg) {
-     args.push(params.backend.systemPromptArg, params.systemPrompt);
-   }
-   if (!params.useResume && params.sessionId) {
-diff --git a/src/agents/cli-session.test.ts b/src/agents/cli-session.test.ts
-new file mode 100644
-index 0000000000..c50efe36f7
---- /dev/null
-+++ b/src/agents/cli-session.test.ts
-@@ -0,0 +1,51 @@
-+import { describe, expect, it } from "vitest";
-+import type { SessionEntry } from "../config/sessions.js";
+diff --git a/src/agents/cli-runner/prepare.ts b/src/agents/cli-runner/prepare.ts
+index 04ca44e906..4f1fa66d90 100644
+--- a/src/agents/cli-runner/prepare.ts
++++ b/src/agents/cli-runner/prepare.ts
+@@ -1,3 +1,6 @@
++import fs from "node:fs/promises";
++import path from "node:path";
++import { type ImageContent, completeSimple } from "@mariozechner/pi-ai";
+ import { resolveHeartbeatPrompt } from "../../auto-reply/heartbeat.js";
+ import {
+   createMcpLoopbackServerConfig,
+@@ -9,7 +12,13 @@ import {
+   buildBootstrapPromptWarning,
+   buildBootstrapTruncationReportMeta,
+   analyzeBootstrapBudget,
++  prependBootstrapPromptWarning,
+ } from "../bootstrap-budget.js";
 +import {
-+  clearCliSession,
-+  getCliSessionBinding,
-+  getCliSessionId,
-+  setCliSessionBinding,
-+} from "./cli-session.js";
++  COMPACTION_SYSTEM_PROMPT,
++  compactBootstrapFiles,
++  resolveCompactionConfig,
++} from "../bootstrap-compaction.js";
+ import {
+   makeBootstrapWarn as makeBootstrapWarnImpl,
+   resolveBootstrapContextForRun as resolveBootstrapContextForRunImpl,
+@@ -17,12 +26,23 @@ import {
+ import { resolveCliAuthEpoch } from "../cli-auth-epoch.js";
+ import { resolveCliBackendConfig } from "../cli-backends.js";
+ import { hashCliSessionText, resolveCliSessionReuse } from "../cli-session.js";
++import { resolveContextWindowInfo } from "../context-window-guard.js";
+ import { resolveOpenClawDocsPath } from "../docs-path.js";
++import { getApiKeyForModel, requireApiKey } from "../model-auth.js";
++import {
++  isCliProvider,
++  resolveDefaultModelForAgent,
++  resolveNonCliModelRef,
++} from "../model-selection.js";
+ import {
++  buildBootstrapContextFiles,
++  getBootstrapProfileConfig,
+   resolveBootstrapMaxChars,
+   resolveBootstrapPromptTruncationWarningMode,
+   resolveBootstrapTotalMaxChars,
++  type BootstrapProfile,
+ } from "../pi-embedded-helpers.js";
++import { resolveModel } from "../pi-embedded-runner/model.js";
+ import { buildSystemPromptReport } from "../system-prompt-report.js";
+ import { redactRunIdentifier, resolveRunWorkspaceDir } from "../workspace-run.js";
+ import { prepareCliBundleMcpConfig } from "./bundle-mcp.js";
+@@ -41,6 +61,116 @@ export function setCliRunnerPrepareTestDeps(overrides: Partial<typeof prepareDep
+   Object.assign(prepareDeps, overrides);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Session prompt file management
++// ---------------------------------------------------------------------------
 +
-+describe("cli-session helpers", () => {
-+  it("stores and loads rich cli session bindings", () => {
++export function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
++  const resolvedSessionFile = path.resolve(sessionFile);
++  const sessionDir = path.dirname(resolvedSessionFile);
++  const ext = path.extname(resolvedSessionFile);
++  const baseName = path.basename(resolvedSessionFile, ext);
++  return path.join(sessionDir, `${baseName}.claude-system-prompt.txt`);
++}
++
++export async function writeClaudeSystemPromptFile(params: {
++  sessionFile: string;
++  systemPrompt: string;
++}): Promise<{ filePath: string; hash: string }> {
++  const filePath = resolveClaudeSystemPromptFilePath(params.sessionFile);
++  const normalizedPrompt = params.systemPrompt.endsWith("\n")
++    ? params.systemPrompt
++    : `${params.systemPrompt}\n`;
++  const hash = hashCliSessionText(normalizedPrompt) ?? "";
++  await fs.mkdir(path.dirname(filePath), { recursive: true });
++  try {
++    const existing = await fs.readFile(filePath, "utf-8");
++    if (existing === normalizedPrompt) {
++      return { filePath, hash };
++    }
++  } catch {
++    // file may not exist yet
++  }
++  await fs.writeFile(filePath, normalizedPrompt, { mode: 0o600 });
++  return { filePath, hash };
++}
++
++export function buildClaudeSystemPromptLoaderPrompt(params: {
++  filePath: string;
++  reason: "new-session" | "prompt-changed" | "compaction";
++  strict?: boolean;
++}): string {
++  const baseLines = [
++    `MANDATORY FIRST STEP: use the Read tool to read the full session prompt file at ${params.filePath} before you do anything else.`,
++    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until you have read that file in this run.",
++    "The file's contents are the authoritative OpenClaw system prompt for this session and override any remembered summaries or stale context.",
++    "You must follow that file strictly for this turn and all subsequent turns in the session.",
++  ];
++  if (params.strict) {
++    baseLines.unshift(
++      "Your previous attempt did not verify a successful read of the session prompt file. You must read it in this run before you answer.",
++    );
++  }
++  if (params.reason === "compaction") {
++    baseLines.unshift(
++      "Session context may have been compacted or summarized. You must re-read the session prompt file now before continuing.",
++    );
++  } else if (params.reason === "prompt-changed") {
++    baseLines.unshift(
++      "The session prompt file changed. You must re-read it completely before continuing.",
++    );
++  }
++  return baseLines.join("\n");
++}
++
++export class PromptFileReadRequiredError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "PromptFileReadRequiredError";
++  }
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null;
++}
++
++export function resolveReadToolFilePath(input: unknown): string | undefined {
++  if (!isRecord(input)) {
++    return undefined;
++  }
++  const candidates = [input.file_path, input.filePath, input.path];
++  for (const candidate of candidates) {
++    if (typeof candidate === "string" && candidate.trim()) {
++      return path.resolve(candidate.trim());
++    }
++  }
++  return undefined;
++}
++
++/**
++ * Rough token estimate. Uses chars/1.5 for CJK-heavy content (>30% CJK chars),
++ * chars/4 for English-heavy content. CJK characters typically tokenize at 1-3
++ * tokens per character, so chars/4 severely underestimates for Chinese/Japanese
++ * text -- which is common in feishu deployments.
++ */
++export function estimatePromptTokens(text: string): number {
++  if (!text) {
++    return 0;
++  }
++  const cjkCount =
++    text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
++      ?.length ?? 0;
++  const cjkRatio = cjkCount / text.length;
++  const charsPerToken = cjkRatio > 0.3 ? 1.5 : 4;
++  return Math.ceil(text.length / charsPerToken);
++}
++
++/**
++ * Estimate image token cost for pre-flight context window guard.
++ * Uses a rough average of ~1000 tokens per image (standard resolution).
++ */
++export const ESTIMATED_TOKENS_PER_IMAGE = 1000;
++
+ export async function prepareCliRunContext(
+   params: RunCliAgentParams,
+ ): Promise<PreparedCliRunContext> {
+@@ -66,6 +196,7 @@ export async function prepareCliRunContext(
+   if (!backendResolved) {
+     throw new Error(`Unknown CLI backend: ${params.provider}`);
+   }
++  const isClaude = backendResolved.id === "claude-cli";
+   const authEpoch = await resolveCliAuthEpoch({
+     provider: params.provider,
+     authProfileId: params.authProfileId,
+@@ -76,6 +207,26 @@ export async function prepareCliRunContext(
+   const normalizedModel = normalizeCliModel(modelId, backendResolved.config);
+   const modelDisplay = `${params.provider}/${modelId}`;
+ 
++  // Resolve context window early -- needed by Layer 3 (dynamic budget).
++  let contextWindowRef = resolveNonCliModelRef(
++    { provider: params.provider, model: modelId },
++    params.config,
++  );
++  if (isCliProvider(contextWindowRef.provider, params.config)) {
++    const agentDefault = resolveDefaultModelForAgent({
++      cfg: params.config ?? {},
++      agentId: params.agentId,
++    });
++    contextWindowRef = resolveNonCliModelRef(agentDefault, params.config);
++  }
++  const contextWindowInfo = resolveContextWindowInfo({
++    cfg: params.config,
++    provider: contextWindowRef.provider,
++    modelId: contextWindowRef.model,
++    defaultTokens: 200_000,
++  });
++  const contextWindowTokens = contextWindowInfo.tokens;
++
+   const sessionLabel = params.sessionKey ?? params.sessionId;
+   const { bootstrapFiles, contextFiles } = await prepareDeps.resolveBootstrapContextForRun({
+     workspaceDir,
+@@ -86,9 +237,10 @@ export async function prepareCliRunContext(
+       sessionLabel,
+       warn: (message) => cliBackendLog.warn(message),
+     }),
++    contextWindowTokens,
+   });
+   const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
+-  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
++  const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, contextWindowTokens);
+   const bootstrapAnalysis = analyzeBootstrapBudget({
+     files: buildBootstrapInjectionStats({
+       bootstrapFiles,
+@@ -154,7 +306,7 @@ export async function prepareCliRunContext(
+     cwd: process.cwd(),
+     moduleUrl: import.meta.url,
+   });
+-  const systemPrompt = buildSystemPrompt({
++  let systemPrompt = buildSystemPrompt({
+     workspaceDir,
+     config: params.config,
+     defaultThinkLevel: params.thinkLevel,
+@@ -167,28 +319,272 @@ export async function prepareCliRunContext(
+     modelDisplay,
+     agentId: sessionAgentId,
+   });
+-  const systemPromptReport = buildSystemPromptReport({
+-    source: "run",
+-    generatedAt: Date.now(),
+-    sessionId: params.sessionId,
+-    sessionKey: params.sessionKey,
+-    provider: params.provider,
+-    model: modelId,
+-    workspaceDir,
+-    bootstrapMaxChars,
+-    bootstrapTotalMaxChars,
+-    bootstrapTruncation: buildBootstrapTruncationReportMeta({
+-      analysis: bootstrapAnalysis,
+-      warningMode: bootstrapPromptWarningMode,
+-      warning: bootstrapPromptWarning,
+-    }),
+-    sandbox: { mode: "off", sandboxed: false },
+-    systemPrompt,
+-    bootstrapFiles,
+-    injectedFiles: contextFiles,
+-    skillsPrompt: "",
+-    tools: [],
+-  });
++
++  let activeProfile: BootstrapProfile = "normal";
++  let activeContextFiles = contextFiles;
++
++  // Layer 3: Pre-flight context window guard (dynamic budget).
++  // Only charge multimodal token cost when the backend sends images via imageArg.
++  const backend = backendResolved.config;
++  const imageTokenEstimate = backend.imageArg
++    ? (params.images?.length ?? 0) * ESTIMATED_TOKENS_PER_IMAGE
++    : 0;
++
++  if (true) {
++    const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
++    let estimatedTokens =
++      estimatePromptTokens(systemPrompt) +
++      estimatePromptTokens(params.prompt) +
++      imageTokenEstimate;
++
++    if (estimatedTokens > hardLimitTokens) {
++      const warnForProfile = prepareDeps.makeBootstrapWarn({
++        sessionLabel,
++        warn: (message) => cliBackendLog.warn(message),
++      });
++
++      let lastProfileContextFiles = contextFiles;
++      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
++      let compactionDone = false;
++
++      for (const profile of profilesToTry) {
++        // Compaction step: run once, between "reduced" and "minimal"
++        if (!compactionDone && profile === "minimal") {
++          compactionDone = true;
++          const compactionCfg = resolveCompactionConfig(params.config);
++          let compactionProvider: string;
++          let compactionModelRef: string;
++          if (compactionCfg.model?.includes("/")) {
++            compactionProvider = compactionCfg.model.split("/")[0];
++            compactionModelRef = compactionCfg.model.split("/").slice(1).join("/");
++          } else if (compactionCfg.model) {
++            compactionProvider = params.provider;
++            compactionModelRef = compactionCfg.model;
++          } else {
++            compactionProvider = params.provider;
++            compactionModelRef = modelId;
++          }
++
++          if (isCliProvider(compactionProvider, params.config)) {
++            const currentRunRef = resolveNonCliModelRef(
++              { provider: compactionProvider, model: compactionModelRef },
++              params.config,
++            );
++            if (!isCliProvider(currentRunRef.provider, params.config)) {
++              compactionProvider = currentRunRef.provider;
++              compactionModelRef = currentRunRef.model;
++            } else {
++              const agentDefault = resolveDefaultModelForAgent({
++                cfg: params.config ?? {},
++                agentId: params.agentId,
++              });
++              const resolved = resolveNonCliModelRef(agentDefault, params.config);
++              compactionProvider = resolved.provider;
++              compactionModelRef = resolved.model;
++            }
++          }
++
++          try {
++            const resolved = resolveModel(
++              compactionProvider,
++              compactionModelRef,
++              undefined,
++              params.config,
++            );
++            if (!resolved.model) {
++              throw new Error(
++                resolved.error ??
++                  `Unknown compaction model: ${compactionProvider}/${compactionModelRef}`,
++              );
++            }
++            const apiKey = requireApiKey(
++              await getApiKeyForModel({ model: resolved.model, cfg: params.config }),
++              compactionProvider,
++            );
++
++            const isTextBlock = (b: { type: string }): b is { type: "text"; text: string } =>
++              b.type === "text";
++            const { contextFiles: compactedContextFiles, results } = await compactBootstrapFiles({
++              contextFiles: lastProfileContextFiles,
++              config: compactionCfg,
++              modelRef: `${compactionProvider}/${compactionModelRef}`,
++              llmFn: async (userPrompt, signal) => {
++                const res = await completeSimple(
++                  resolved.model!,
++                  {
++                    systemPrompt: COMPACTION_SYSTEM_PROMPT,
++                    messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
++                  },
++                  { apiKey, maxTokens: 4096, temperature: 0, signal },
++                );
++                const texts = res.content.filter(isTextBlock);
++                if (texts.length === 0) {
++                  throw new Error("No text content in compaction response");
++                }
++                return texts.map((b) => b.text).join("\n");
++              },
++              signal: params.abortSignal,
++            });
++
++            const compactedFilesList = results.filter((r) => r.success).map((r) => r.path);
++            if (compactedFilesList.length > 0) {
++              const compactedBudget =
++                activeProfile === "normal"
++                  ? { maxCharsPerFile: bootstrapMaxChars, totalMaxChars: bootstrapTotalMaxChars }
++                  : getBootstrapProfileConfig(activeProfile);
++              const compactedWarning = buildBootstrapPromptWarning({
++                analysis: analyzeBootstrapBudget({
++                  files: buildBootstrapInjectionStats({
++                    bootstrapFiles,
++                    injectedFiles: compactedContextFiles,
++                  }),
++                  bootstrapMaxChars: compactedBudget.maxCharsPerFile,
++                  bootstrapTotalMaxChars: compactedBudget.totalMaxChars,
++                }),
++                mode: bootstrapPromptWarningMode,
++                seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
++                previousSignature: params.bootstrapPromptWarningSignature,
++              });
++              const compactedSystemPrompt = prependBootstrapPromptWarning(
++                buildSystemPrompt({
++                  workspaceDir,
++                  config: params.config,
++                  defaultThinkLevel: params.thinkLevel,
++                  extraSystemPrompt,
++                  ownerNumbers: params.ownerNumbers,
++                  heartbeatPrompt,
++                  docsPath: docsPath ?? undefined,
++                  tools: [],
++                  contextFiles: compactedContextFiles,
++                  modelDisplay,
++                  agentId: sessionAgentId,
++                }),
++                compactedWarning.lines,
++              );
++              const compactedTokens =
++                estimatePromptTokens(compactedSystemPrompt) +
++                estimatePromptTokens(params.prompt) +
++                imageTokenEstimate;
++              if (compactedTokens <= hardLimitTokens) {
++                systemPrompt = compactedSystemPrompt;
++                activeContextFiles = compactedContextFiles;
++                estimatedTokens = compactedTokens;
++                break;
++              }
++            }
++          } catch (err) {
++            cliBackendLog.warn(
++              `cli-runner: bootstrap compaction failed, falling back to minimal profile: ${err instanceof Error ? err.message : String(err)}`,
++            );
++          }
++        }
++
++        const profileConfig = getBootstrapProfileConfig(profile);
++        const profileContextFiles = buildBootstrapContextFiles(bootstrapFiles, {
++          maxChars: profileConfig.maxCharsPerFile,
++          totalMaxChars: profileConfig.totalMaxChars,
++          warn: warnForProfile,
++        });
++        lastProfileContextFiles = profileContextFiles;
++        const profileWarning = buildBootstrapPromptWarning({
++          analysis: analyzeBootstrapBudget({
++            files: buildBootstrapInjectionStats({
++              bootstrapFiles,
++              injectedFiles: profileContextFiles,
++            }),
++            bootstrapMaxChars: profileConfig.maxCharsPerFile,
++            bootstrapTotalMaxChars: profileConfig.totalMaxChars,
++          }),
++          mode: bootstrapPromptWarningMode,
++          seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
++          previousSignature: params.bootstrapPromptWarningSignature,
++        });
++        const profileSystemPrompt = prependBootstrapPromptWarning(
++          buildSystemPrompt({
++            workspaceDir,
++            config: params.config,
++            defaultThinkLevel: params.thinkLevel,
++            extraSystemPrompt,
++            ownerNumbers: params.ownerNumbers,
++            heartbeatPrompt,
++            docsPath: docsPath ?? undefined,
++            tools: [],
++            contextFiles: profileContextFiles,
++            modelDisplay,
++            agentId: sessionAgentId,
++          }),
++          profileWarning.lines,
++        );
++        activeProfile = profile;
++        systemPrompt = profileSystemPrompt;
++        activeContextFiles = profileContextFiles;
++        estimatedTokens =
++          estimatePromptTokens(profileSystemPrompt) +
++          estimatePromptTokens(params.prompt) +
++          imageTokenEstimate;
++        if (estimatedTokens <= hardLimitTokens) {
++          break;
++        }
++      }
++      if (estimatedTokens > hardLimitTokens) {
++        cliBackendLog.error(
++          `cli-runner: system prompt exceeds context limit after minimal profile (estimated=${estimatedTokens} tokens, limit=${hardLimitTokens}); proceeding anyway`,
++        );
++      }
++    }
++  }
++
++  // Build report from the final active context files so metadata reflects
++  // the actual profile used (not the initial "normal" profile).
++  const buildReportForActiveContext = () => {
++    const activeBudget =
++      activeProfile === "normal"
++        ? { maxCharsPerFile: bootstrapMaxChars, totalMaxChars: bootstrapTotalMaxChars }
++        : getBootstrapProfileConfig(activeProfile);
++    const analysis =
++      activeContextFiles !== contextFiles
++        ? analyzeBootstrapBudget({
++            files: buildBootstrapInjectionStats({
++              bootstrapFiles,
++              injectedFiles: activeContextFiles,
++            }),
++            bootstrapMaxChars: activeBudget.maxCharsPerFile,
++            bootstrapTotalMaxChars: activeBudget.totalMaxChars,
++          })
++        : bootstrapAnalysis;
++    const warning =
++      activeContextFiles !== contextFiles
++        ? buildBootstrapPromptWarning({
++            analysis,
++            mode: bootstrapPromptWarningMode,
++            seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
++            previousSignature: params.bootstrapPromptWarningSignature,
++          })
++        : bootstrapPromptWarning;
++    return buildSystemPromptReport({
++      source: "run",
++      generatedAt: Date.now(),
++      sessionId: params.sessionId,
++      sessionKey: params.sessionKey,
++      provider: params.provider,
++      model: modelId,
++      workspaceDir,
++      bootstrapMaxChars: activeBudget.maxCharsPerFile,
++      bootstrapTotalMaxChars: activeBudget.totalMaxChars,
++      bootstrapTruncation: buildBootstrapTruncationReportMeta({
++        analysis,
++        warningMode: bootstrapPromptWarningMode,
++        warning,
++      }),
++      sandbox: { mode: "off", sandboxed: false },
++      systemPrompt,
++      bootstrapFiles,
++      injectedFiles: activeContextFiles,
++      skillsPrompt: "",
++      tools: [],
++    });
++  };
++  const systemPromptReport = buildReportForActiveContext();
+ 
+   return {
+     params,
+@@ -205,5 +601,17 @@ export async function prepareCliRunContext(
+     heartbeatPrompt,
+     authEpoch,
+     extraSystemPromptHash,
++    contextWindowTokens,
++    activeProfile,
++    activeContextFiles,
++    bootstrapFiles,
++    bootstrapPromptWarningMode,
++    sessionAgentId,
++    defaultAgentId,
++    isClaude,
++    bootstrapMaxChars,
++    bootstrapTotalMaxChars,
++    docsPath: docsPath ?? undefined,
++    extraSystemPrompt,
+   };
+ }
+diff --git a/src/agents/cli-runner/types.ts b/src/agents/cli-runner/types.ts
+index 4194700529..c39d138fb4 100644
+--- a/src/agents/cli-runner/types.ts
++++ b/src/agents/cli-runner/types.ts
+@@ -6,6 +6,11 @@ import type { SessionSystemPromptReport } from "../../config/sessions/types.js";
+ import type { CliBackendConfig } from "../../config/types.js";
+ import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
+ import type { ResolvedCliBackend } from "../cli-backends.js";
++import type { BootstrapPromptWarningMode } from "../bootstrap-budget.js";
++import type { BootstrapProfile, EmbeddedContextFile } from "../pi-embedded-helpers.js";
++import type { EmbeddedRunTrigger } from "../pi-embedded-runner/run/params.js";
++import type { SkillSnapshot } from "../skills.js";
++import type { WorkspaceBootstrapFile } from "../workspace.js";
+ 
+ export type RunCliAgentParams = {
+   sessionId: string;
+@@ -32,6 +37,24 @@ export type RunCliAgentParams = {
+   imageOrder?: PromptImageOrderEntry[];
+   messageProvider?: string;
+   agentAccountId?: string;
++  /** Resolved message channel (e.g. "feishu") for context-aware streaming. */
++  messageChannel?: string;
++  /** Skills snapshot for the current workspace/agent context. */
++  skillsSnapshot?: SkillSnapshot;
++  /** Number of compactions that have already occurred on this session before this run. */
++  sessionCompactionCount?: number;
++  /** Abort signal to cancel the run early. */
++  abortSignal?: AbortSignal;
++  /** What triggered this agent run. */
++  trigger?: EmbeddedRunTrigger;
++  /** Called with each assistant text chunk as it streams in. */
++  onAssistantTurn?: (text: string) => void;
++  /** Called with each thinking/reasoning chunk as it streams in. */
++  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
++  /** Called when a tool-use block starts. */
++  onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
++  /** Called when a tool result arrives. */
++  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
+ };
+ 
+ export type CliPreparedBackend = {
+@@ -61,4 +84,30 @@ export type PreparedCliRunContext = {
+   heartbeatPrompt?: string;
+   authEpoch?: string;
+   extraSystemPromptHash?: string;
++  /** Context window size in tokens for the resolved model. */
++  contextWindowTokens: number;
++  /** The bootstrap profile actually used after pre-flight budget trimming. */
++  activeProfile: BootstrapProfile;
++  /** Context files actually injected after budget trimming (may differ from original). */
++  activeContextFiles: EmbeddedContextFile[];
++  /** Original bootstrap files before budget analysis (needed for runtime recovery). */
++  bootstrapFiles: WorkspaceBootstrapFile[];
++  /** Bootstrap prompt truncation warning mode. */
++  bootstrapPromptWarningMode: BootstrapPromptWarningMode;
++  /** Session agent ID resolved for the run. */
++  sessionAgentId?: string;
++  /** Default agent ID for the session. */
++  defaultAgentId?: string;
++  /** Whether this backend is claude-cli. */
++  isClaude: boolean;
++  /** Bootstrap budget limits (per-file). */
++  bootstrapMaxChars: number;
++  /** Bootstrap budget limits (total). */
++  bootstrapTotalMaxChars: number;
++  /** Skills prompt for the run (undefined if not applicable). */
++  skillsPrompt?: string;
++  /** Docs path resolved for the run workspace. */
++  docsPath?: string;
++  /** Extra system prompt used in the build. */
++  extraSystemPrompt?: string;
+ };
+diff --git a/src/agents/cli-session.test.ts b/src/agents/cli-session.test.ts
+index 718bb3faf5..3a472b8eab 100644
+--- a/src/agents/cli-session.test.ts
++++ b/src/agents/cli-session.test.ts
+@@ -4,6 +4,7 @@ import {
+   clearAllCliSessions,
+   clearCliSession,
+   getCliSessionBinding,
++  getCliSessionId,
+   hashCliSessionText,
+   resolveCliSessionReuse,
+   setCliSessionBinding,
+@@ -35,6 +36,30 @@ describe("cli-session helpers", () => {
+     });
+   });
+ 
++  it("stores and loads rich cli session bindings (systemPrompt fields)", () => {
 +    const entry: SessionEntry = {
 +      sessionId: "session-1",
 +      updatedAt: Date.now(),
@@ -4876,14 +4912,23 @@ index 0000000000..c50efe36f7
 +    });
 +
 +    expect(getCliSessionId(entry, "claude-cli")).toBe("claude-session-1");
-+    expect(getCliSessionBinding(entry, "claude-cli")).toEqual({
-+      sessionId: "claude-session-1",
-+      systemPromptFile: "/tmp/session.claude-system-prompt.txt",
-+      systemPromptHash: "hash-1",
-+      systemPromptCompactionCount: 2,
-+    });
++    expect(getCliSessionBinding(entry, "claude-cli")).toEqual(
++      expect.objectContaining({
++        sessionId: "claude-session-1",
++        systemPromptFile: "/tmp/session.claude-system-prompt.txt",
++        systemPromptHash: "hash-1",
++        systemPromptCompactionCount: 2,
++      }),
++    );
 +  });
 +
+   it("keeps legacy bindings reusable until richer metadata is persisted", () => {
+     const entry: SessionEntry = {
+       sessionId: "openclaw-session",
+@@ -48,6 +73,25 @@ describe("cli-session helpers", () => {
+     });
+   });
+ 
 +  it("falls back to legacy cliSessionIds and clears all related fields", () => {
 +    const entry: SessionEntry = {
 +      sessionId: "session-1",
@@ -4902,45 +4947,26 @@ index 0000000000..c50efe36f7
 +    expect(entry.cliSessionIds).toBeUndefined();
 +    expect(entry.claudeCliSessionId).toBeUndefined();
 +  });
-+});
++
+   it("invalidates legacy bindings when auth, prompt, or MCP state changes", () => {
+     const entry: SessionEntry = {
+       sessionId: "openclaw-session",
 diff --git a/src/agents/cli-session.ts b/src/agents/cli-session.ts
-index 1c9df998ce..42ff5e7a7b 100644
+index 09fdc701a4..edfe31242b 100644
 --- a/src/agents/cli-session.ts
 +++ b/src/agents/cli-session.ts
-@@ -1,33 +1,96 @@
--import type { SessionEntry } from "../config/sessions.js";
-+import crypto from "node:crypto";
-+import type { CliSessionBinding, SessionEntry } from "../config/sessions.js";
- import { normalizeProviderId } from "./model-selection.js";
+@@ -4,6 +4,7 @@ import { normalizeProviderId } from "./model-selection.js";
  
--export function getCliSessionId(
-+function trimOptional(value: string | undefined): string | undefined {
-+  const trimmed = value?.trim();
-+  return trimmed ? trimmed : undefined;
-+}
+ const CLAUDE_CLI_BACKEND_ID = "claude-cli";
+ 
 +
-+export function hashCliSessionText(value: string | undefined): string | undefined {
-+  const trimmed = trimOptional(value);
-+  if (!trimmed) {
-+    return undefined;
-+  }
-+  return crypto.createHash("sha256").update(trimmed).digest("hex");
-+}
-+
-+export function getCliSessionBinding(
-   entry: SessionEntry | undefined,
-   provider: string,
--): string | undefined {
-+): CliSessionBinding | undefined {
-   if (!entry) {
-     return undefined;
-   }
-   const normalized = normalizeProviderId(provider);
-+  const fromBindings = entry.cliSessionBindings?.[normalized];
-+  const bindingSessionId = trimOptional(fromBindings?.sessionId);
-+  if (bindingSessionId) {
-+    return {
-+      sessionId: bindingSessionId,
+ function trimOptional(value: string | undefined): string | undefined {
+   const trimmed = value?.trim();
+   return trimmed ? trimmed : undefined;
+@@ -34,6 +35,14 @@ export function getCliSessionBinding(
+       authEpoch: trimOptional(fromBindings?.authEpoch),
+       extraSystemPromptHash: trimOptional(fromBindings?.extraSystemPromptHash),
+       mcpConfigHash: trimOptional(fromBindings?.mcpConfigHash),
 +      systemPromptFile: trimOptional(fromBindings?.systemPromptFile),
 +      systemPromptHash: trimOptional(fromBindings?.systemPromptHash),
 +      systemPromptCompactionCount:
@@ -4949,49 +4975,13 @@ index 1c9df998ce..42ff5e7a7b 100644
 +        fromBindings.systemPromptCompactionCount >= 0
 +          ? fromBindings.systemPromptCompactionCount
 +          : undefined,
-+    };
-+  }
+     };
+   }
    const fromMap = entry.cliSessionIds?.[normalized];
-   if (fromMap?.trim()) {
--    return fromMap.trim();
-+    return { sessionId: fromMap.trim() };
-   }
-   if (normalized === "claude-cli") {
-     const legacy = entry.claudeCliSessionId?.trim();
-     if (legacy) {
--      return legacy;
-+      return { sessionId: legacy };
-     }
-   }
-   return undefined;
- }
- 
-+export function getCliSessionId(
-+  entry: SessionEntry | undefined,
-+  provider: string,
-+): string | undefined {
-+  return getCliSessionBinding(entry, provider)?.sessionId;
-+}
-+
- export function setCliSessionId(entry: SessionEntry, provider: string, sessionId: string): void {
-+  setCliSessionBinding(entry, provider, { sessionId });
-+}
-+
-+export function setCliSessionBinding(
-+  entry: SessionEntry,
-+  provider: string,
-+  binding: CliSessionBinding,
-+): void {
-   const normalized = normalizeProviderId(provider);
--  const trimmed = sessionId.trim();
-+  const trimmed = binding.sessionId.trim();
-   if (!trimmed) {
-     return;
-   }
-+  entry.cliSessionBindings = {
-+    ...entry.cliSessionBindings,
-+    [normalized]: {
-+      sessionId: trimmed,
+@@ -84,6 +93,19 @@ export function setCliSessionBinding(
+       ...(trimOptional(binding.mcpConfigHash)
+         ? { mcpConfigHash: trimOptional(binding.mcpConfigHash) }
+         : {}),
 +      ...(trimOptional(binding.systemPromptFile)
 +        ? { systemPromptFile: trimOptional(binding.systemPromptFile) }
 +        : {}),
@@ -5005,60 +4995,16 @@ index 1c9df998ce..42ff5e7a7b 100644
 +            systemPromptCompactionCount: Math.floor(binding.systemPromptCompactionCount),
 +          }
 +        : {}),
-+    },
-+  };
-   const existing = entry.cliSessionIds ?? {};
-   entry.cliSessionIds = { ...existing };
-   entry.cliSessionIds[normalized] = trimmed;
-@@ -35,3 +98,20 @@ export function setCliSessionId(entry: SessionEntry, provider: string, sessionId
-     entry.claudeCliSessionId = trimmed;
-   }
- }
-+
-+export function clearCliSession(entry: SessionEntry, provider: string): void {
-+  const normalized = normalizeProviderId(provider);
-+  if (entry.cliSessionBindings?.[normalized] !== undefined) {
-+    const next = { ...entry.cliSessionBindings };
-+    delete next[normalized];
-+    entry.cliSessionBindings = Object.keys(next).length > 0 ? next : undefined;
-+  }
-+  if (entry.cliSessionIds?.[normalized] !== undefined) {
-+    const next = { ...entry.cliSessionIds };
-+    delete next[normalized];
-+    entry.cliSessionIds = Object.keys(next).length > 0 ? next : undefined;
-+  }
-+  if (normalized === "claude-cli") {
-+    delete entry.claudeCliSessionId;
-+  }
-+}
+     },
+   };
+   entry.cliSessionIds = { ...entry.cliSessionIds, [normalized]: trimmed };
 diff --git a/src/agents/command/session-store.ts b/src/agents/command/session-store.ts
-index 0df9d66dc7..de7c14ecc6 100644
+index 23bae15ada..90098752a8 100644
 --- a/src/agents/command/session-store.ts
 +++ b/src/agents/command/session-store.ts
-@@ -6,7 +6,7 @@ import {
-   updateSessionStore,
- } from "../../config/sessions.js";
- import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
--import { setCliSessionId } from "../cli-session.js";
-+import { setCliSessionBinding, setCliSessionId } from "../cli-session.js";
- import { resolveContextTokensForModel } from "../context.js";
- import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
- import { isCliProvider } from "../model-selection.js";
-@@ -73,10 +73,16 @@ export async function updateSessionStoreAfterAgentRun(params: {
-     model: modelUsed,
-   });
-   if (isCliProvider(providerUsed, cfg)) {
--    const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
--    if (cliSessionId) {
--      setCliSessionId(next, providerUsed, cliSessionId);
-+    const cliSessionBinding = result.meta.agentMeta?.cliSessionBinding;
-+    if (cliSessionBinding?.sessionId?.trim()) {
-+      setCliSessionBinding(next, providerUsed, cliSessionBinding);
-+    } else {
-+      const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
-+      if (cliSessionId) {
-+        setCliSessionId(next, providerUsed, cliSessionId);
-+      }
+@@ -83,6 +83,7 @@ export async function updateSessionStoreAfterAgentRun(params: {
+         setCliSessionId(next, providerUsed, cliSessionId);
+       }
      }
 +    next.cliPromptLoad = result.meta.agentMeta?.cliPromptLoad;
    }
@@ -5280,25 +5226,49 @@ index 078acd904b..d3ecf514df 100644
    }
  
 diff --git a/src/config/sessions/sessions.test.ts b/src/config/sessions/sessions.test.ts
-index ff38953aae..34818a986a 100644
+index 7b6b85a38f..081dd842f4 100644
 --- a/src/config/sessions/sessions.test.ts
 +++ b/src/config/sessions/sessions.test.ts
-@@ -21,7 +21,10 @@ import {
-   validateSessionId,
- } from "./paths.js";
+@@ -16,6 +16,10 @@ import {
  import { evaluateSessionFreshness, resolveSessionResetPolicy } from "./reset.js";
--import { appendAssistantMessageToSessionTranscript } from "./transcript.js";
+ import { resolveAndPersistSessionFile } from "./session-file.js";
+ import { clearSessionStoreCacheForTest, loadSessionStore, updateSessionStore } from "./store.js";
 +import {
 +  appendAssistantMessageToSessionTranscript,
 +  appendCliTurnToSessionTranscript,
 +} from "./transcript.js";
- import type { SessionEntry } from "./types.js";
+ import { mergeSessionEntry, type SessionEntry } from "./types.js";
  
  function useTempSessionsFixture(prefix: string) {
-@@ -403,6 +406,14 @@ describe("appendAssistantMessageToSessionTranscript", () => {
-     const result = await appendAssistantMessageToSessionTranscript({
-       sessionKey,
-       text: "Hello from delivery mirror!",
+@@ -372,6 +376,248 @@ describe("session store lock (Promise chain mutex)", () => {
+   });
+ });
+ 
++describe("appendAssistantMessageToSessionTranscript", () => {
++  const fixture = useTempSessionsFixture("transcript-test-");
++  const sessionId = "test-session-id";
++  const sessionKey = "test-session";
++
++  function writeTranscriptStore() {
++    fs.writeFileSync(
++      fixture.storePath(),
++      JSON.stringify({
++        [sessionKey]: {
++          sessionId,
++          chatType: "direct",
++          channel: "discord",
++        },
++      }),
++      "utf-8",
++    );
++  }
++
++  it("creates transcript file and appends message for valid session", async () => {
++    writeTranscriptStore();
++
++    const result = await appendAssistantMessageToSessionTranscript({
++      sessionKey,
++      text: "Hello from delivery mirror!",
 +      messageMeta: {
 +        channel: "feishu",
 +        accountId: "default",
@@ -5307,13 +5277,29 @@ index ff38953aae..34818a986a 100644
 +        providerMessageId: "om_reply_1",
 +        providerMessageIds: ["om_reply_1"],
 +      },
-       storePath: fixture.storePath(),
-     });
- 
-@@ -426,6 +437,14 @@ describe("appendAssistantMessageToSessionTranscript", () => {
-       expect(messageLine.message.role).toBe("assistant");
-       expect(messageLine.message.content[0].type).toBe("text");
-       expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
++      storePath: fixture.storePath(),
++    });
++
++    expect(result.ok).toBe(true);
++    if (result.ok) {
++      expect(fs.existsSync(result.sessionFile)).toBe(true);
++      const sessionFileMode = fs.statSync(result.sessionFile).mode & 0o777;
++      if (process.platform !== "win32") {
++        expect(sessionFileMode).toBe(0o600);
++      }
++
++      const lines = fs.readFileSync(result.sessionFile, "utf-8").trim().split("\n");
++      expect(lines.length).toBe(2);
++
++      const header = JSON.parse(lines[0]);
++      expect(header.type).toBe("session");
++      expect(header.id).toBe(sessionId);
++
++      const messageLine = JSON.parse(lines[1]);
++      expect(messageLine.type).toBe("message");
++      expect(messageLine.message.role).toBe("assistant");
++      expect(messageLine.message.content[0].type).toBe("text");
++      expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
 +      expect(messageLine.message.openclawMessageMeta).toEqual({
 +        channel: "feishu",
 +        accountId: "default",
@@ -5322,14 +5308,116 @@ index ff38953aae..34818a986a 100644
 +        providerMessageId: "om_reply_1",
 +        providerMessageIds: ["om_reply_1"],
 +      });
-     }
-   });
- 
-@@ -536,7 +555,71 @@ describe("appendAssistantMessageToSessionTranscript", () => {
- 
-     expect(result.ok).toBe(true);
-     const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
--    expect(lines.length).toBe(3);
++    }
++  });
++
++  it("does not append a duplicate delivery mirror for the same idempotency key", async () => {
++    writeTranscriptStore();
++
++    await appendAssistantMessageToSessionTranscript({
++      sessionKey,
++      text: "Hello from delivery mirror!",
++      idempotencyKey: "mirror:test-source-message",
++      storePath: fixture.storePath(),
++    });
++    await appendAssistantMessageToSessionTranscript({
++      sessionKey,
++      text: "Hello from delivery mirror!",
++      idempotencyKey: "mirror:test-source-message",
++      storePath: fixture.storePath(),
++    });
++
++    const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
++    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
++    expect(lines.length).toBe(2);
++
++    const messageLine = JSON.parse(lines[1]);
++    expect(messageLine.message.idempotencyKey).toBe("mirror:test-source-message");
++    expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
++  });
++
++  it("finds session entry using normalized (lowercased) key", async () => {
++    const sessionId = "test-session-normalized";
++    // Store key is lowercase (as written by updateSessionStore/normalizeStoreSessionKey)
++    const storeKey = "agent:main:bluebubbles:direct:+15551234567";
++    const store = {
++      [storeKey]: {
++        sessionId,
++        chatType: "direct",
++        channel: "bluebubbles",
++      },
++    };
++    fs.writeFileSync(fixture.storePath(), JSON.stringify(store), "utf-8");
++
++    // Pass a mixed-case key — append should still find the entry via normalization
++    const result = await appendAssistantMessageToSessionTranscript({
++      sessionKey: "agent:main:BlueBubbles:direct:+15551234567",
++      text: "Hello normalized!",
++      storePath: fixture.storePath(),
++    });
++
++    expect(result.ok).toBe(true);
++  });
++
++  it("finds Slack session entry using normalized (lowercased) key", async () => {
++    const sessionId = "test-slack-session";
++    // Slack session keys include channel type and target ID; store key is lowercase
++    const storeKey = "agent:main:slack:direct:u12345abc";
++    const store = {
++      [storeKey]: {
++        sessionId,
++        chatType: "direct",
++        channel: "slack",
++      },
++    };
++    fs.writeFileSync(fixture.storePath(), JSON.stringify(store), "utf-8");
++
++    // Pass a mixed-case key (as resolveSlackSession might produce) — normalization should match
++    const result = await appendAssistantMessageToSessionTranscript({
++      sessionKey: "agent:main:slack:direct:U12345ABC",
++      text: "Hello Slack user!",
++      storePath: fixture.storePath(),
++    });
++
++    expect(result.ok).toBe(true);
++  });
++
++  it("ignores malformed transcript lines when checking mirror idempotency", async () => {
++    writeTranscriptStore();
++
++    const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
++    fs.writeFileSync(
++      sessionFile,
++      [
++        JSON.stringify({
++          type: "session",
++          version: 1,
++          id: sessionId,
++          timestamp: new Date().toISOString(),
++          cwd: process.cwd(),
++        }),
++        "{not-json",
++        JSON.stringify({
++          type: "message",
++          message: {
++            role: "assistant",
++            idempotencyKey: "mirror:test-source-message",
++            content: [{ type: "text", text: "Hello from delivery mirror!" }],
++          },
++        }),
++      ].join("\n") + "\n",
++      "utf-8",
++    );
++
++    const result = await appendAssistantMessageToSessionTranscript({
++      sessionKey,
++      text: "Hello from delivery mirror!",
++      idempotencyKey: "mirror:test-source-message",
++      storePath: fixture.storePath(),
++    });
++
++    expect(result.ok).toBe(true);
++    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
 +    expect(lines.length).toBe(4);
 +  });
 +});
@@ -5395,14 +5483,17 @@ index ff38953aae..34818a986a 100644
 +    const assistantLine = messages[1];
 +    expect(assistantLine.message.role).toBe("assistant");
 +    expect(assistantLine.message.usage.totalTokens).toBe(0);
-   });
- });
++  });
++});
++
+ describe("resolveAndPersistSessionFile", () => {
+   const fixture = useTempSessionsFixture("session-file-test-");
  
 diff --git a/src/process/supervisor/supervisor.test.ts b/src/process/supervisor/supervisor.test.ts
-index dec725e150..f5860717c3 100644
+index 2f72685b3d..488081b740 100644
 --- a/src/process/supervisor/supervisor.test.ts
 +++ b/src/process/supervisor/supervisor.test.ts
-@@ -76,6 +76,29 @@ describe("process supervisor", () => {
+@@ -205,6 +205,29 @@ describe("process supervisor", () => {
      expect(secondExit.stdout).toBe("new");
    });
  
@@ -5430,13 +5521,13 @@ index dec725e150..f5860717c3 100644
 +  });
 +
    it("applies overall timeout even for near-immediate timer firing", async () => {
-     const supervisor = createProcessSupervisor();
-     const run = await spawnChild(supervisor, {
+     vi.useFakeTimers();
+     const adapter = createStubChildAdapter({
 diff --git a/src/process/supervisor/supervisor.ts b/src/process/supervisor/supervisor.ts
-index 3c6834003f..978bf46ab6 100644
+index 6339781d22..1ff4c884a3 100644
 --- a/src/process/supervisor/supervisor.ts
 +++ b/src/process/supervisor/supervisor.ts
-@@ -17,6 +17,7 @@ const log = createSubsystemLogger("process/supervisor");
+@@ -14,6 +14,7 @@ import type {
  
  type ActiveRun = {
    run: ManagedRun;
@@ -5444,7 +5535,7 @@ index 3c6834003f..978bf46ab6 100644
    scopeKey?: string;
  };
  
-@@ -58,6 +59,25 @@ export function createProcessSupervisor(): ProcessSupervisor {
+@@ -55,6 +56,25 @@ export function createProcessSupervisor(): ProcessSupervisor {
      }
    };
  
@@ -5470,7 +5561,7 @@ index 3c6834003f..978bf46ab6 100644
    const spawn = async (input: SpawnInput): Promise<ManagedRun> => {
      const runId = input.runId?.trim() || crypto.randomUUID();
      if (input.replaceExistingScope && input.scopeKey?.trim()) {
-@@ -255,6 +275,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
+@@ -252,6 +272,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
  
        active.set(runId, {
          run: managedRun,
@@ -5478,7 +5569,7 @@ index 3c6834003f..978bf46ab6 100644
          scopeKey: input.scopeKey?.trim() || undefined,
        });
        return managedRun;
-@@ -273,6 +294,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
+@@ -271,6 +292,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
      spawn,
      cancel,
      cancelScope,

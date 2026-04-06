@@ -24,8 +24,11 @@
 | `extensions/feishu/src/outbound.ts` | `sendText` 返回值增加 `meta.contentType`/`meta.finalContent`；`sendMedia` 返回值增加 `meta.contentType`/`meta.rawContent`；import 改用 `shouldUseFeishuMarkdownCard` |
 | `extensions/feishu/src/media.ts` | `sendImageFeishu`/`sendFileFeishu` 修复 reply 路由条件（`replyToMessageId && replyInThread`）；返回值增加 `rawContent` 字段 |
 | `extensions/feishu/src/media-types.ts` | **新文件**：`resolveMediaContentType()` — 根据扩展名解析媒体类型 |
-| `extensions/feishu/index.ts` | 导出 `createFeishuReplyDispatcher` 和 `getBotOpenId`；`registerFull()` 将 dispatcher 注册到 `runtime.channel.reply` |
+| `extensions/feishu/index.ts` | 导出 `createFeishuReplyDispatcher`、`getBotOpenId` 和 `monitorFeishuProvider`；`registerFull()` 将 dispatcher 注册到 `runtime.channel.reply` |
 | `extensions/feishu/src/exports.test.ts` | **新文件**：验证导出和 runtime 注册 |
+| `extensions/feishu/src/channel.test.ts` | hook 集成、取消行为、renderMode 路由测试 |
+| `extensions/feishu/src/outbound.test.ts` | meta 断言、卡片 mention 规范化（`normalizeMentionTagsForCard`）测试 |
+| `extensions/feishu/src/media.test.ts` | reply 路由修复、`replyInThread` 行为测试 |
 
 ---
 
@@ -59,16 +62,12 @@ async handleAction("send", params):
         })
 
     elif mediaUrl:
-        # 先发文本（如果有）
-        if lifecycleResult.content.trim():
-            textResult = await feishuOutbound.sendText(lifecycleResult.content)
-            emitFeishuActionMessageSent({
-                to, content: lifecycleResult.content, result: textResult
-            })
-
-        # 再发媒体
-        mediaResult = await feishuOutbound.sendMedia(mediaUrl)
-        emitFeishuActionMessageSent({ to, content: "", result: mediaResult })
+        # 媒体和文本作为一条消息发送
+        mediaResult = await feishuOutbound.sendMedia({
+            mediaUrl,
+            text: lifecycleResult.content   # 文本作为媒体消息的附带内容
+        })
+        emitFeishuActionMessageSent({ to, content: lifecycleResult.content, result: mediaResult })
         return mediaResult
 
     else:
@@ -327,7 +326,7 @@ message.create(receive_id, content)
 |------|------|
 | 443-475 | `emitFeishuActionMessageSent()` — 发射 message_sent hook 事件 |
 | 477-514 | `applyFeishuActionMessageSending()` — 运行 message_sending hook 管线 |
-| 751-757 | `send` action 参数解析新增 `media`/`filePath`/`media_url`/`image` |
+| 752-757 | `send` action 参数解析新增 `media`/`filePath`/`media_url`/`image` |
 | 766-767 | 错误信息更新为 `requires text/message, card, or media` |
 | 771-790 | `applyFeishuActionMessageSending()` 调用和取消检查 |
 | 800-829 | media 路径：发媒体并发射 hook |
@@ -345,7 +344,7 @@ message.create(receive_id, content)
 | 121-133 | `attachFeishuMediaMetadata()` — 附加媒体元数据 |
 | 157-167 | 本地图片自动转发：附加 media 元数据 |
 | 186-187 | card 模式检测使用 `shouldUseFeishuMarkdownCard()` |
-| 197-213 | card 发送后附加 `meta.contentType="interactive"` 和 `meta.finalContent` |
+| 197-213 | card 发送后附加 `meta.contentType="interactive"` 和 `meta.finalContent`（经 `normalizeMentionTagsForCard` 处理） |
 | 215-229 | 文本发送后附加 `meta.contentType="post"` 和 `meta.finalContent` |
 | 268-276 | media 发送后通过 `attachFeishuMediaMetadata()` 附加元数据 |
 

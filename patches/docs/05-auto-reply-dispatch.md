@@ -21,7 +21,9 @@
 | 文件 | 关键修改 |
 |------|---------|
 | `src/auto-reply/types.ts` | `ReplyPayload` 新增 `toolCallId?: string`；`onToolStart` 回调新增 `toolCallId` 参数 |
-| `src/auto-reply/reply/agent-runner-execution.ts` | CLI 流式路径集成（streaming chain、reasoning、tool events）；toolCallId 传递；AbortError 静默处理；silent token 缓冲 |
+| `src/auto-reply/reply/agent-runner-execution.ts` | CLI 流式路径集成（streaming chain、reasoning、tool events）；toolCallId 传递；AbortError 静默处理；silent token 缓冲；`AgentRunLoopResult { kind: "aborted" }` 返回值；`resolveFailoverReasonFromError` 集成 |
+| `src/auto-reply/reply/agent-runner-memory.ts` | `runEmbeddedPiAgent` → `runModelAwareAgent` 替换（memory flush 路径） |
+| `src/auto-reply/reply/agent-runner.ts` | 处理 `kind:"aborted"` 返回值；传递 `cliSessionBinding` 和 `cliPromptLoad` 参数 |
 | `src/auto-reply/reply/dispatch-from-config.ts` | 最终回复去重逻辑；飞书 mention 标签归一化 |
 | `src/auto-reply/reply/followup-runner.ts` | 替换 `runEmbeddedPiAgent` 为 `runModelAwareAgent`；传递 `cliSessionBinding` 和 `cliPromptLoad` |
 | `src/auto-reply/reply/message-received-hooks.ts` | 新文件，实现 `emitMessageReceivedHooks` — 插件 + 内部钩子双轨触发 |
@@ -29,9 +31,12 @@
 | `src/auto-reply/reply/streaming-directives.ts` | `pendingSilent` 缓冲机制；`couldBeSilentTokenStart` 集成 |
 | `src/auto-reply/tokens.ts` | 新增 `couldBeSilentTokenStart()` — 宽松前缀匹配（不要求下划线） |
 | `src/auto-reply/status.ts` | 新增 `formatCliPromptLoadLine()` — `/status` 显示 CLI prompt 加载状态 |
-| `src/auto-reply/reply/get-reply.ts` | 自动轮换（auto-rotation）时触发 reset hooks |
+| `src/auto-reply/reply/get-reply.ts` | 自动轮换（auto-rotation）时通过 `shouldEmitAutoRotationResetHooks` 判断是否触发 session reset hooks；新增 auto-rotation reset hooks 逻辑 |
 | `src/auto-reply/reply/session.ts` | `previousSessionEntry` 在新会话创建时始终保留 |
 | `src/auto-reply/reply/abort.ts` | force-stop 集成 `processSupervisor.cancelSession` |
+| `src/commands/commands-core.ts` | `command` 参数改为可选；新增 `commandSource`、`senderId`、`routeHookMessages` 参数 |
+| `src/commands/commands-session-abort.ts` | `abortEmbeddedPiRun` 替换为 `abortSessionExecutions` |
+| `src/templating/templating.ts` | `MsgContext` 新增 `ChannelData` 字段 |
 | `src/auto-reply/heartbeat.ts` | heartbeat prompt 补充 "do NOT use the message tool" 指令 |
 
 ### 测试文件
@@ -44,6 +49,8 @@
 | `src/auto-reply/reply/reply-utils.test.ts` | silent token 缓冲、split streaming 测试 |
 | `src/auto-reply/tokens.test.ts` | `couldBeSilentTokenStart` 全覆盖 |
 | `src/auto-reply/status.cli-prompt-load.test.ts` | CLI prompt load 状态渲染测试 |
+| `src/commands/commands-core.test.ts` | 可选 command 参数及新参数覆盖 |
+| `src/commands/commands-session-abort.test.ts` | `abortSessionExecutions` 替换验证 |
 
 ## 伪代码 (Pseudocode)
 
@@ -211,6 +218,49 @@ silentPrefixBuf = ""
     返回 nextPatch
 ```
 
+### Auto-Rotation Reset Hooks
+
+```
+// get-reply.ts
+函数 getReply(params):
+    ...
+    // 自动轮换场景: 当 session 因 auto-rotation 触发新会话时，
+    // 需要通知插件系统执行 reset hooks（例如清理上下文、重置状态）
+    如果 shouldEmitAutoRotationResetHooks(rotationResult, previousSession):
+        await emitSessionResetHooks({
+            sessionKey,
+            reason: "auto-rotation",
+            previousSessionEntry,
+        })
+    ...
+```
+
+### AgentRunLoopResult { kind: "aborted" } 处理
+
+```
+// agent-runner-execution.ts
+函数 runAgentExecutionLoop(params):
+    ...
+    try:
+        result = await runModelLoop(...)
+    catch err:
+        如果 err.name === "AbortError":
+            返回 { kind: "aborted" }
+        failoverReason = resolveFailoverReasonFromError(err)
+        如果 failoverReason:
+            返回 { kind: "failover", reason: failoverReason }
+        throw err
+    ...
+
+// agent-runner.ts
+函数 runReplyAgent(params):
+    result = await runAgentExecutionLoop(...)
+    如果 result.kind === "aborted":
+        // 静默处理，不发送回复
+        返回
+    ...
+```
+
 ## 数据流程图 (Data Flow Diagram)
 
 ### toolCallId 端到端数据流
@@ -361,7 +411,7 @@ Chunk 2: "T really"
 | 位置 | 行号 | 说明 |
 |------|------|------|
 | `onToolStart` 回调 | 66 | `toolCallId?: string` — 新增参数 |
-| `ReplyPayload.toolCallId` | 95 | `toolCallId?: string` — payload 中的 tool call ID |
+| `ReplyPayload.toolCallId` | 148 | `toolCallId?: string` — payload 中的 tool call ID |
 
 ### CLI 流式集成 — `src/auto-reply/reply/agent-runner-execution.ts`
 
@@ -371,7 +421,7 @@ Chunk 2: "T really"
 | silent 缓冲声明 | 603 | `let silentPrefixBuf = ""` |
 | silent 缓冲判断 | 613 | `if (couldBeSilentTokenStart(combinedText, SILENT_REPLY_TOKEN))` |
 | onToolStart 传递 toolCallId | 929 | `onToolStart({ name, phase, toolCallId })` |
-| Embedded tool event 中传递 toolCallId | 1011 | `toolCallId` 赋值 |
+| Embedded tool event 中传递 toolCallId | 925-926 | `toolCallId` 赋值 |
 | AbortError 静默检测 | 1232 | `err.name === "AbortError"` |
 | AbortError 返回 | 1331 | `return { kind: "aborted" }` |
 
@@ -414,7 +464,7 @@ Chunk 2: "T really"
 | `applyCliSessionStateToSessionPatch` | 19 | 替代原 `applyCliSessionIdToSessionPatch` |
 | `cliPromptLoad` 写入 | 31-32 | `nextPatch.cliPromptLoad = params.cliPromptLoad` |
 | 富绑定写入 | 40 | `setCliSessionBinding(nextEntry, cliProvider, params.cliSessionBinding)` |
-| `persistSessionUsageUpdate` | 82 | 含 `cliSessionBinding` 和 `cliPromptLoad` 参数 |
+| `persistSessionUsageUpdate` | 98 | 含 `cliSessionBinding` 和 `cliPromptLoad` 参数 |
 
 ### Status 输出 — `src/auto-reply/status.ts`
 

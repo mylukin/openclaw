@@ -1,42 +1,31 @@
-From 3092895bdacf82e017047ddd4d36f19e2a75a78e Mon Sep 17 00:00:00 2001
+From 0f66aae65735faeb42998fd9d45d3db4823eba82 Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:03:49 +0800
-Subject: [PATCH 06/10] feat(feishu): normalize mentions, enrich quoted
+Date: Mon, 6 Apr 2026 01:43:13 +0800
+Subject: [PATCH 06/12] feat(feishu): normalize mentions, enrich quoted
  messages, handle recall events, and harden monitor
 
-- Normalize mention tags for card/text rendering and persist mention content
-- Enrich quoted-message placeholders with actual content
-- Handle message recall events with delivery error recovery
-- Allow control commands in open direct chats
-- Restore DM stop handling
-- Harden sender lookup and bot mention detection
-- Add cardHeader/cardNote config flags
-- Show single tool status line instead of accumulating log
-- Improve typing reaction handling with fallback
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
  extensions/feishu/src/bot-content.ts          |  16 +-
- extensions/feishu/src/bot-sender-name.ts      |  37 +
+ extensions/feishu/src/bot-sender-name.ts      |  39 +-
+ extensions/feishu/src/bot.broadcast.test.ts   |   4 +
  .../feishu/src/bot.checkBotMentioned.test.ts  |  15 +
  .../feishu/src/bot.stripBotMention.test.ts    |  17 +
- extensions/feishu/src/bot.test.ts             | 543 +++++++++++-
- extensions/feishu/src/bot.ts                  | 285 ++++++-
+ extensions/feishu/src/bot.test.ts             | 550 +++++++++++-
+ extensions/feishu/src/bot.ts                  | 305 ++++++-
  extensions/feishu/src/config-schema.test.ts   |  31 +
  extensions/feishu/src/config-schema.ts        |  16 +
- extensions/feishu/src/drive.ts                |  15 +-
  extensions/feishu/src/mention.test.ts         |  28 +
  extensions/feishu/src/mention.ts              |  43 +
- extensions/feishu/src/monitor.account.ts      | 123 ++-
+ extensions/feishu/src/monitor.account.ts      | 122 ++-
  extensions/feishu/src/monitor.events.test.ts  | 246 ++++++
- extensions/feishu/src/monitor.ts              | 787 +++++++++++++++++-
+ extensions/feishu/src/monitor.ts              | 786 +++++++++++++++++-
  extensions/feishu/src/monitor.utils.ts        |  90 ++
  extensions/feishu/src/quoted-message.test.ts  | 459 ++++++++++
  extensions/feishu/src/quoted-message.ts       | 410 +++++++++
  extensions/feishu/src/types.ts                |   2 +
  .../src/typing.reaction-id-fallback.test.ts   | 180 ++++
  extensions/feishu/src/typing.ts               | 101 ++-
- 20 files changed, 3358 insertions(+), 86 deletions(-)
+ 20 files changed, 3373 insertions(+), 87 deletions(-)
  create mode 100644 extensions/feishu/src/mention.test.ts
  create mode 100644 extensions/feishu/src/monitor.events.test.ts
  create mode 100644 extensions/feishu/src/monitor.utils.ts
@@ -45,10 +34,10 @@ Co-Authored-By: Claude <noreply@anthropic.com>
  create mode 100644 extensions/feishu/src/typing.reaction-id-fallback.test.ts
 
 diff --git a/extensions/feishu/src/bot-content.ts b/extensions/feishu/src/bot-content.ts
-index d8dcc1c0aa..73ab285b69 100644
+index 22212ca67a..eb6df373f2 100644
 --- a/extensions/feishu/src/bot-content.ts
 +++ b/extensions/feishu/src/bot-content.ts
-@@ -271,8 +271,13 @@ export function normalizeMentions(
+@@ -255,8 +255,13 @@ export function normalizeMentions(
    }
    const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
    const escapeName = (value: string) => value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -64,7 +53,7 @@ index d8dcc1c0aa..73ab285b69 100644
      const mentionId = mention.id.open_id;
      const replacement =
        botStripId && mentionId === botStripId
-@@ -280,9 +285,12 @@ export function normalizeMentions(
+@@ -264,9 +269,12 @@ export function normalizeMentions(
          : mentionId
            ? `<at user_id="${mentionId}">${escapeName(mention.name)}</at>`
            : `@${mention.name}`;
@@ -80,10 +69,10 @@ index d8dcc1c0aa..73ab285b69 100644
  
  export function normalizeFeishuCommandProbeBody(text: string): string {
 diff --git a/extensions/feishu/src/bot-sender-name.ts b/extensions/feishu/src/bot-sender-name.ts
-index 57b5aad3c9..e23190c96d 100644
+index f45b5ca0f5..67246c9cf2 100644
 --- a/extensions/feishu/src/bot-sender-name.ts
 +++ b/extensions/feishu/src/bot-sender-name.ts
-@@ -17,7 +17,9 @@ const FEISHU_SCOPE_CORRECTIONS: Record<string, string> = {
+@@ -25,7 +25,9 @@ const FEISHU_SCOPE_CORRECTIONS: Record<string, string> = {
    "contact:contact.base:readonly": "contact:user.base:readonly",
  };
  const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
@@ -93,7 +82,7 @@ index 57b5aad3c9..e23190c96d 100644
  
  function correctFeishuScopeInUrl(url: string): string {
    let corrected = url;
-@@ -66,6 +68,30 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
+@@ -74,6 +76,30 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
    return "user_id";
  }
  
@@ -124,7 +113,7 @@ index 57b5aad3c9..e23190c96d 100644
  export async function resolveFeishuSenderName(params: {
    account: ResolvedFeishuAccount;
    senderId: string;
-@@ -86,6 +112,11 @@ export async function resolveFeishuSenderName(params: {
+@@ -94,6 +120,11 @@ export async function resolveFeishuSenderName(params: {
    if (cached && cached.expireAt > now) {
      return { name: cached.name };
    }
@@ -136,10 +125,12 @@ index 57b5aad3c9..e23190c96d 100644
  
    try {
      const client = createFeishuClient(account);
-@@ -101,11 +132,17 @@ export async function resolveFeishuSenderName(params: {
-       res?.data?.user?.en_name;
+@@ -105,12 +136,18 @@ export async function resolveFeishuSenderName(params: {
+     const user = res.data?.user;
+     const name = user?.name ?? user?.nickname ?? user?.en_name;
  
-     if (name && typeof name === "string") {
+-    if (name) {
++    if (name && typeof name === "string") {
 +      senderLookupBackoff.delete(lookupKey);
        senderNameCache.set(normalizedSenderId, { name, expireAt: now + SENDER_NAME_TTL_MS });
        return { name };
@@ -154,8 +145,23 @@ index 57b5aad3c9..e23190c96d 100644
      const permErr = extractPermissionError(err);
      if (permErr) {
        if (shouldSuppressPermissionErrorNotice(permErr)) {
+diff --git a/extensions/feishu/src/bot.broadcast.test.ts b/extensions/feishu/src/bot.broadcast.test.ts
+index 1340fe8a83..a16697506e 100644
+--- a/extensions/feishu/src/bot.broadcast.test.ts
++++ b/extensions/feishu/src/bot.broadcast.test.ts
+@@ -110,6 +110,10 @@ describe("broadcast dispatch", () => {
+         upsertPairingRequest: vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false }),
+         buildPairingReply: vi.fn(() => "Pairing response"),
+       },
++      session: {
++        resolveStorePath: vi.fn(() => "/tmp/sessions.json"),
++        readSessionUpdatedAt: vi.fn(() => undefined),
++      },
+     },
+     media: {
+       detectMime: vi.fn(async () => "application/octet-stream"),
 diff --git a/extensions/feishu/src/bot.checkBotMentioned.test.ts b/extensions/feishu/src/bot.checkBotMentioned.test.ts
-index a7ea679227..146176df00 100644
+index 8aa80b31f3..4f66e090fe 100644
 --- a/extensions/feishu/src/bot.checkBotMentioned.test.ts
 +++ b/extensions/feishu/src/bot.checkBotMentioned.test.ts
 @@ -128,6 +128,21 @@ describe("parseFeishuMessageEvent – mentionedBot", () => {
@@ -181,10 +187,10 @@ index a7ea679227..146176df00 100644
      const BOT_OPEN_ID = "ou_bot_123";
      const event = makePostEvent({
 diff --git a/extensions/feishu/src/bot.stripBotMention.test.ts b/extensions/feishu/src/bot.stripBotMention.test.ts
-index 1c23c8fced..5c3fe7e1a9 100644
+index 902effa0f5..183ffe0928 100644
 --- a/extensions/feishu/src/bot.stripBotMention.test.ts
 +++ b/extensions/feishu/src/bot.stripBotMention.test.ts
-@@ -111,6 +111,23 @@ describe("normalizeMentions (via parseFeishuMessageEvent)", () => {
+@@ -107,6 +107,23 @@ describe("normalizeMentions (via parseFeishuMessageEvent)", () => {
      );
    });
  
@@ -207,32 +213,40 @@ index 1c23c8fced..5c3fe7e1a9 100644
 +
    it("treats $ in display name as literal (no replacement-pattern interpolation)", () => {
      const ctx = parseFeishuMessageEvent(
-       makeEvent("@_user_1 hi", [
+       makeEvent("@_user_1 hi", [{ key: "@_user_1", name: "$& the user", id: { open_id: "ou_x" } }]),
 diff --git a/extensions/feishu/src/bot.test.ts b/extensions/feishu/src/bot.test.ts
-index c12c6993ee..2dcd9dd8bb 100644
+index 5afbe843c3..c52bba5748 100644
 --- a/extensions/feishu/src/bot.test.ts
 +++ b/extensions/feishu/src/bot.test.ts
-@@ -1,7 +1,16 @@
+@@ -1,8 +1,17 @@
 +import fs from "node:fs";
 +import os from "node:os";
 +import path from "node:path";
 +import { SessionManager } from "@mariozechner/pi-coding-agent";
+ import type * as ConversationRuntime from "openclaw/plugin-sdk/conversation-runtime";
+ import type { ResolvedAgentRoute } from "openclaw/plugin-sdk/routing";
  import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { createRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
+ import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
++import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
 +import {
 +  registerLiveSessionTranscript,
 +  resetLiveSessionTranscriptRegistryForTests,
 +} from "../../../src/agents/pi-embedded-runner/live-session-registry.js";
- import { createPluginRuntimeMock } from "../../../test/helpers/extensions/plugin-runtime-mock.js";
- import { createRuntimeEnv } from "../../../test/helpers/extensions/runtime-env.js";
- import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
-+import { resetFeishuSenderNameCacheForTests } from "./bot-sender-name.js";
  import type { FeishuMessageEvent } from "./bot.js";
  import {
    buildBroadcastSessionKey,
-@@ -100,6 +109,27 @@ vi.mock("../../../src/infra/outbound/session-binding-service.js", () => ({
-   }),
- }));
+@@ -312,6 +321,34 @@ vi.mock("openclaw/plugin-sdk/conversation-runtime", async () => {
+   };
+ });
  
++vi.mock("../../../src/infra/outbound/session-binding-service.js", () => ({
++  getSessionBindingService: () => ({
++    resolveByConversation: mockResolveBoundConversation,
++    touch: mockTouchBinding,
++  }),
++}));
++
 +function createSessionTranscriptFixture() {
 +  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-feishu-bot-test-"));
 +  const storePath = path.join(dir, "sessions.json");
@@ -257,7 +271,7 @@ index c12c6993ee..2dcd9dd8bb 100644
  async function dispatchMessage(params: { cfg: ClawdbotConfig; event: FeishuMessageEvent }) {
    const runtime = createRuntimeEnv();
    await handleFeishuMessage({
-@@ -464,11 +494,16 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -519,11 +556,16 @@ describe("handleFeishuMessage command authorization", () => {
  
    beforeEach(() => {
      vi.clearAllMocks();
@@ -273,9 +287,9 @@ index c12c6993ee..2dcd9dd8bb 100644
 +      (store?: string) => store ?? "/tmp/feishu-sessions.json",
 +    );
      mockResolveConfiguredBindingRoute.mockReset().mockImplementation(
-       ({ route }) =>
-         ({
-@@ -605,7 +640,10 @@ describe("handleFeishuMessage command authorization", () => {
+       ({
+         route,
+@@ -641,7 +683,10 @@ describe("handleFeishuMessage command authorization", () => {
  
      expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
        useAccessGroups: true,
@@ -287,7 +301,7 @@ index c12c6993ee..2dcd9dd8bb 100644
      });
      expect(mockFinalizeInboundContext).toHaveBeenCalledTimes(1);
      expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
-@@ -617,6 +655,53 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -653,6 +698,53 @@ describe("handleFeishuMessage command authorization", () => {
      );
    });
  
@@ -341,7 +355,7 @@ index c12c6993ee..2dcd9dd8bb 100644
    it("reads pairing allow store for non-command DMs when dmPolicy is pairing", async () => {
      mockShouldComputeCommandAuthorized.mockReturnValue(false);
      mockReadAllowFromStore.mockResolvedValue(["ou-attacker"]);
-@@ -733,6 +818,296 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -769,6 +861,296 @@ describe("handleFeishuMessage command authorization", () => {
      );
    });
  
@@ -635,10 +649,10 @@ index c12c6993ee..2dcd9dd8bb 100644
 +    expect(dispatcherParams?.onFinalTextDelivered).toBeUndefined();
 +  });
 +
-   it("replies pairing challenge to DM chat_id instead of user:sender id", async () => {
-     const cfg: ClawdbotConfig = {
-       channels: {
-@@ -859,7 +1234,10 @@ describe("handleFeishuMessage command authorization", () => {
+   it("uses message create_time as Timestamp instead of Date.now()", async () => {
+     mockShouldComputeCommandAuthorized.mockReturnValue(false);
+ 
+@@ -973,7 +1355,10 @@ describe("handleFeishuMessage command authorization", () => {
  
      expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
        useAccessGroups: true,
@@ -650,7 +664,7 @@ index c12c6993ee..2dcd9dd8bb 100644
      });
      expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
        expect.objectContaining({
-@@ -943,7 +1321,10 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -1057,7 +1442,10 @@ describe("handleFeishuMessage command authorization", () => {
  
      expect(mockResolveCommandAuthorizedFromAuthorizers).toHaveBeenCalledWith({
        useAccessGroups: true,
@@ -662,7 +676,7 @@ index c12c6993ee..2dcd9dd8bb 100644
      });
      expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
        expect.objectContaining({
-@@ -1585,6 +1966,110 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -1899,6 +2287,110 @@ describe("handleFeishuMessage command authorization", () => {
      );
    });
  
@@ -773,7 +787,7 @@ index c12c6993ee..2dcd9dd8bb 100644
    it("routes group sessions by sender when groupSessionScope=group_sender", async () => {
      mockShouldComputeCommandAuthorized.mockReturnValue(false);
  
-@@ -1980,7 +2465,7 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -2294,7 +2786,7 @@ describe("handleFeishuMessage command authorization", () => {
      expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
        expect.objectContaining({
          replyToMessageId: "om_quote_reply",
@@ -782,7 +796,7 @@ index c12c6993ee..2dcd9dd8bb 100644
        }),
      );
    });
-@@ -2061,7 +2546,7 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -2375,7 +2867,7 @@ describe("handleFeishuMessage command authorization", () => {
      );
    });
  
@@ -791,7 +805,7 @@ index c12c6993ee..2dcd9dd8bb 100644
      mockShouldComputeCommandAuthorized.mockReturnValue(false);
  
      const cfg: ClawdbotConfig = {
-@@ -2094,8 +2579,50 @@ describe("handleFeishuMessage command authorization", () => {
+@@ -2408,8 +2900,50 @@ describe("handleFeishuMessage command authorization", () => {
  
      expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
        expect.objectContaining({
@@ -845,26 +859,26 @@ index c12c6993ee..2dcd9dd8bb 100644
      );
    });
 diff --git a/extensions/feishu/src/bot.ts b/extensions/feishu/src/bot.ts
-index 63b898a23f..7a91ddfd96 100644
+index c6419339b0..0ee74228ea 100644
 --- a/extensions/feishu/src/bot.ts
 +++ b/extensions/feishu/src/bot.ts
-@@ -7,6 +7,7 @@ import { deriveLastRoutePolicy } from "openclaw/plugin-sdk/routing";
- import { resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/routing";
- import type { ClawdbotConfig, RuntimeEnv } from "../runtime-api.js";
+@@ -5,6 +5,7 @@ import {
+ } from "openclaw/plugin-sdk/conversation-runtime";
+ import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-runtime";
+ import { resolveAgentOutboundIdentity } from "openclaw/plugin-sdk/outbound-runtime";
++import { appendAssistantMessageToSessionTranscript } from "openclaw/plugin-sdk/feishu";
  import {
-+  appendAssistantMessageToSessionTranscript,
-   buildAgentMediaPayload,
    buildPendingHistoryContextFromMap,
    clearHistoryEntriesIfEnabled,
-@@ -42,6 +43,7 @@ import {
-   resolveFeishuAllowlistMatch,
+@@ -50,6 +51,7 @@ import {
    isFeishuGroupAllowed,
  } from "./policy.js";
+ import { resolveFeishuReasoningPreviewEnabled } from "./reasoning-preview.js";
 +import { resolveQuotedFeishuMessageContent } from "./quoted-message.js";
  import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
  import { getFeishuRuntime } from "./runtime.js";
  import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
-@@ -54,6 +56,7 @@ export { toMessageResourceType } from "./bot-content.js";
+@@ -62,6 +64,7 @@ export { toMessageResourceType } from "./bot-content.js";
  // Key: appId or "default", Value: timestamp of last notification
  const permissionErrorNotifiedAt = new Map<string, number>();
  const PERMISSION_ERROR_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
@@ -872,8 +886,8 @@ index 63b898a23f..7a91ddfd96 100644
  export type FeishuMessageEvent = {
    sender: {
      sender_id: {
-@@ -218,11 +221,84 @@ export function buildFeishuAgentBody(params: {
-   return messageBody;
+@@ -296,11 +299,84 @@ function filterFetchedGroupContextMessages<
+   }).items;
  }
  
 +function collectProviderMessageIds(params: {
@@ -957,7 +971,7 @@ index 63b898a23f..7a91ddfd96 100644
    runtime?: RuntimeEnv;
    chatHistories?: Map<string, HistoryEntry[]>;
    accountId?: string;
-@@ -334,6 +410,7 @@ export async function handleFeishuMessage(params: {
+@@ -412,6 +488,7 @@ export async function handleFeishuMessage(params: {
      0,
      feishuCfg?.historyLimit ?? cfg.messages?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT,
    );
@@ -965,16 +979,16 @@ index 63b898a23f..7a91ddfd96 100644
    const groupConfig = isGroup
      ? resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: ctx.chatId })
      : undefined;
-@@ -358,6 +435,7 @@ export async function handleFeishuMessage(params: {
-     : null;
+@@ -449,6 +526,7 @@ export async function handleFeishuMessage(params: {
+     : Date.now();
  
    let requireMention = false; // DMs never require mention; groups may override below
 +  let boundSessionKey: string | undefined;
    if (isGroup) {
      if (groupConfig?.enabled === false) {
        log(`feishu[${account.accountId}]: group ${ctx.chatId} is disabled`);
-@@ -418,7 +496,25 @@ export async function handleFeishuMessage(params: {
-       groupConfig,
+@@ -507,7 +585,25 @@ export async function handleFeishuMessage(params: {
+       groupPolicy,
      }));
  
 -    if (requireMention && !ctx.mentionedBot) {
@@ -1000,7 +1014,7 @@ index 63b898a23f..7a91ddfd96 100644
        log(`feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot`);
        // Record to pending history for non-broadcast groups only. For broadcast groups,
        // the mentioned handler's broadcast dispatch writes the turn directly into all
-@@ -502,6 +598,11 @@ export async function handleFeishuMessage(params: {
+@@ -591,6 +687,11 @@ export async function handleFeishuMessage(params: {
      const commandAllowFrom = isGroup
        ? (groupConfig?.allowFrom ?? configAllowFrom)
        : effectiveDmAllowFrom;
@@ -1012,7 +1026,7 @@ index 63b898a23f..7a91ddfd96 100644
      const senderAllowedForCommands = resolveFeishuAllowlistMatch({
        allowFrom: commandAllowFrom,
        senderId: ctx.senderOpenId,
-@@ -513,6 +614,7 @@ export async function handleFeishuMessage(params: {
+@@ -602,6 +703,7 @@ export async function handleFeishuMessage(params: {
            useAccessGroups,
            authorizers: [
              { configured: commandAllowFrom.length > 0, allowed: senderAllowedForCommands },
@@ -1020,7 +1034,7 @@ index 63b898a23f..7a91ddfd96 100644
            ],
          })
        : undefined;
-@@ -523,7 +625,6 @@ export async function handleFeishuMessage(params: {
+@@ -612,7 +714,6 @@ export async function handleFeishuMessage(params: {
      const feishuTo = isGroup ? `chat:${ctx.chatId}` : `user:${ctx.senderOpenId}`;
      const peerId = isGroup ? (groupSession?.peerId ?? ctx.chatId) : ctx.senderOpenId;
      const parentPeer = isGroup ? (groupSession?.parentPeer ?? null) : null;
@@ -1028,7 +1042,7 @@ index 63b898a23f..7a91ddfd96 100644
      const feishuAcpConversationSupported =
        !isGroup ||
        groupSession?.groupSessionScope === "group_topic" ||
-@@ -639,7 +740,11 @@ export async function handleFeishuMessage(params: {
+@@ -728,7 +829,11 @@ export async function handleFeishuMessage(params: {
            to: `chat:${ctx.chatId}`,
            text: `⚠️ Failed to initialize the configured ACP session for this Feishu conversation: ${ensured.error}`,
            replyToMessageId: replyTargetMessageId,
@@ -1041,7 +1055,7 @@ index 63b898a23f..7a91ddfd96 100644
            accountId: account.accountId,
          }).catch((err) => {
            log(`feishu[${account.accountId}]: failed to send ACP init error reply: ${String(err)}`);
-@@ -671,20 +776,37 @@ export async function handleFeishuMessage(params: {
+@@ -765,30 +870,47 @@ export async function handleFeishuMessage(params: {
      });
      const mediaPayload = buildAgentMediaPayload(mediaList);
  
@@ -1058,7 +1072,17 @@ index 63b898a23f..7a91ddfd96 100644
 -          messageId: ctx.parentId,
 -          accountId: account.accountId,
 -        });
--        if (quotedMessageInfo) {
+-        if (
+-          quotedMessageInfo &&
+-          shouldIncludeFetchedGroupContextMessage({
+-            isGroup,
+-            allowFrom: effectiveGroupSenderAllowFrom,
+-            mode: contextVisibilityMode,
+-            kind: "quote",
+-            senderId: quotedMessageInfo.senderId,
+-            senderType: quotedMessageInfo.senderType,
+-          })
+-        ) {
 -          quotedContent = quotedMessageInfo.content;
 +        if (isGroup) {
 +          quotedMessageInfo = await getMessageFeishu({
@@ -1066,7 +1090,17 @@ index 63b898a23f..7a91ddfd96 100644
 +            messageId: ctx.parentId,
 +            accountId: account.accountId,
 +          });
-+          if (quotedMessageInfo) {
++          if (
++            quotedMessageInfo &&
++            shouldIncludeFetchedGroupContextMessage({
++              isGroup,
++              allowFrom: effectiveGroupSenderAllowFrom,
++              mode: contextVisibilityMode,
++              kind: "quote",
++              senderId: quotedMessageInfo.senderId,
++              senderType: quotedMessageInfo.senderType,
++            })
++          ) {
 +            quotedContent = quotedMessageInfo.content;
 +          }
 +        } else {
@@ -1086,9 +1120,9 @@ index 63b898a23f..7a91ddfd96 100644
 -            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent?.slice(0, 100)}`,
 +            `feishu[${account.accountId}]: fetched quoted message: ${quotedContent.slice(0, 100)}`,
            );
-         }
-       } catch (err) {
-@@ -923,6 +1045,30 @@ export async function handleFeishuMessage(params: {
+         } else if (quotedMessageInfo) {
+           log(
+@@ -1055,6 +1177,30 @@ export async function handleFeishuMessage(params: {
          OriginatingChannel: "feishu" as const,
          OriginatingTo: feishuTo,
          GroupSystemPrompt: isGroup ? groupConfig?.systemPrompt?.trim() || undefined : undefined,
@@ -1119,7 +1153,7 @@ index 63b898a23f..7a91ddfd96 100644
          ...mediaPayload,
        });
      };
-@@ -946,11 +1092,19 @@ export async function handleFeishuMessage(params: {
+@@ -1074,11 +1220,19 @@ export async function handleFeishuMessage(params: {
      const configReplyInThread =
        isGroup &&
        (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled";
@@ -1142,7 +1176,7 @@ index 63b898a23f..7a91ddfd96 100644
        // Cross-account dedup: in multi-account setups, Feishu delivers the same
        // event to every bot account in the group. Only one account should handle
        // broadcast dispatch to avoid duplicate agent sessions and race conditions.
-@@ -993,6 +1147,15 @@ export async function handleFeishuMessage(params: {
+@@ -1125,6 +1279,15 @@ export async function handleFeishuMessage(params: {
          );
  
          if (agentId === activeAgentId) {
@@ -1158,8 +1192,8 @@ index 63b898a23f..7a91ddfd96 100644
            // Active agent: real Feishu dispatcher (responds on Feishu)
            const identity = resolveAgentOutboundIdentity(cfg, agentId);
            const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
-@@ -1002,13 +1165,17 @@ export async function handleFeishuMessage(params: {
-             chatId: ctx.chatId,
+@@ -1135,13 +1298,17 @@ export async function handleFeishuMessage(params: {
+             allowReasoningPreview,
              replyToMessageId: replyTargetMessageId,
              skipReplyToInMessages: !isGroup,
 -            replyInThread,
@@ -1179,7 +1213,7 @@ index 63b898a23f..7a91ddfd96 100644
            });
  
            log(
-@@ -1086,14 +1253,78 @@ export async function handleFeishuMessage(params: {
+@@ -1220,14 +1387,78 @@ export async function handleFeishuMessage(params: {
        log(
          `feishu[${account.accountId}]: broadcast dispatch complete for ${broadcastAgents.length} agents`,
        );
@@ -1258,11 +1292,11 @@ index 63b898a23f..7a91ddfd96 100644
 +          });
  
        const identity = resolveAgentOutboundIdentity(cfg, route.agentId);
-       const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
-@@ -1101,18 +1332,24 @@ export async function handleFeishuMessage(params: {
-         agentId: route.agentId,
+       const allowReasoningPreview = resolveFeishuReasoningPreviewEnabled({
+@@ -1242,18 +1473,24 @@ export async function handleFeishuMessage(params: {
          runtime: runtime as RuntimeEnv,
          chatId: ctx.chatId,
+         allowReasoningPreview,
 -        replyToMessageId: replyTargetMessageId,
 +        replyToMessageId: boundSessionKey
 +          ? (ctx.rootId ?? replyTargetMessageId)
@@ -1290,10 +1324,10 @@ index 63b898a23f..7a91ddfd96 100644
          dispatcher,
          onSettled: () => {
 diff --git a/extensions/feishu/src/config-schema.test.ts b/extensions/feishu/src/config-schema.test.ts
-index 60855a324e..69f5e795fa 100644
+index e937af2f39..2794dbcc07 100644
 --- a/extensions/feishu/src/config-schema.test.ts
 +++ b/extensions/feishu/src/config-schema.test.ts
-@@ -196,6 +196,37 @@ describe("FeishuConfigSchema replyInThread", () => {
+@@ -199,6 +199,37 @@ describe("FeishuConfigSchema replyInThread", () => {
    });
  });
  
@@ -1332,7 +1366,7 @@ index 60855a324e..69f5e795fa 100644
    it("defaults top-level typingIndicator and resolveSenderNames to true", () => {
      const result = FeishuConfigSchema.parse({});
 diff --git a/extensions/feishu/src/config-schema.ts b/extensions/feishu/src/config-schema.ts
-index db1714f173..acee4e852b 100644
+index 1efd59e12a..ea6c990f29 100644
 --- a/extensions/feishu/src/config-schema.ts
 +++ b/extensions/feishu/src/config-schema.ts
 @@ -20,6 +20,7 @@ const FeishuDomainSchema = z.union([
@@ -1408,32 +1442,6 @@ index db1714f173..acee4e852b 100644
      webhookPath: z.string().optional().default("/feishu/events"),
      ...FeishuSharedConfigShape,
      dmPolicy: DmPolicySchema.optional().default("pairing"),
-diff --git a/extensions/feishu/src/drive.ts b/extensions/feishu/src/drive.ts
-index 495b6aaaef..a52b6301c5 100644
---- a/extensions/feishu/src/drive.ts
-+++ b/extensions/feishu/src/drive.ts
-@@ -12,14 +12,13 @@ import {
- // ============ Actions ============
- 
- async function getRootFolderToken(client: Lark.Client): Promise<string> {
--  // Use generic HTTP client to call the root folder meta API
--  // as it's not directly exposed in the SDK
--  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- accessing internal SDK property
--  const domain = (client as any).domain ?? "https://open.feishu.cn";
--  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- accessing internal SDK property
--  const res = (await (client as any).httpInstance.get(
--    `${domain}/open-apis/drive/explorer/v2/root_folder/meta`,
--  )) as { code: number; msg?: string; data?: { token?: string } };
-+  // Use SDK generic request for endpoints not exposed as typed methods.
-+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK generic request method
-+  const res = (await (client as any).request({
-+    method: "GET",
-+    url: "/open-apis/drive/explorer/v2/root_folder/meta",
-+    data: {},
-+  })) as { code: number; msg?: string; data?: { token?: string } };
-   if (res.code !== 0) {
-     throw new Error(res.msg ?? "Failed to get root folder");
-   }
 diff --git a/extensions/feishu/src/mention.test.ts b/extensions/feishu/src/mention.test.ts
 new file mode 100644
 index 0000000000..e5fcbb2cc8
@@ -1523,7 +1531,7 @@ index 9c0fd96e35..82c8a9c3d6 100644
   * Extract mention targets from message event (excluding the bot itself)
   */
 diff --git a/extensions/feishu/src/monitor.account.ts b/extensions/feishu/src/monitor.account.ts
-index ff3a0ba9dc..37369bdfd5 100644
+index 5dc6c622a8..d0db587687 100644
 --- a/extensions/feishu/src/monitor.account.ts
 +++ b/extensions/feishu/src/monitor.account.ts
 @@ -1,6 +1,11 @@
@@ -1539,7 +1547,7 @@ index ff3a0ba9dc..37369bdfd5 100644
  import { resolveFeishuAccount } from "./accounts.js";
  import { raceWithTimeoutAndAbort } from "./async.js";
  import {
-@@ -23,6 +28,7 @@ import { isMentionForwardRequest } from "./mention.js";
+@@ -26,6 +31,7 @@ import { parseFeishuDriveCommentNoticeEventPayload } from "./monitor.comment.js"
  import { fetchBotIdentityForMonitor } from "./monitor.startup.js";
  import { botNames, botOpenIds } from "./monitor.state.js";
  import { monitorWebhook, monitorWebSocket } from "./monitor.transport.js";
@@ -1547,7 +1555,7 @@ index ff3a0ba9dc..37369bdfd5 100644
  import { getFeishuRuntime } from "./runtime.js";
  import { getMessageFeishu } from "./send.js";
  import { createFeishuThreadBindingManager } from "./thread-bindings.js";
-@@ -435,10 +441,30 @@ function registerEventHandlers(
+@@ -578,6 +584,18 @@ function registerEventHandlers(
      "im.message.message_read_v1": async () => {
        // Ignore read receipts
      },
@@ -1565,7 +1573,10 @@ index ff3a0ba9dc..37369bdfd5 100644
 +    },
      "im.chat.member.bot.added_v1": async (data) => {
        try {
-         const event = data as unknown as FeishuBotAddedEvent;
+         const event = parseFeishuBotAddedEventPayload(data);
+@@ -585,6 +603,14 @@ function registerEventHandlers(
+           return;
+         }
          log(`feishu[${accountId}]: bot added to chat ${event.chat_id}`);
 +        if (!event.chat_id) return;
 +        const hookRunner = getGlobalHookRunner();
@@ -1578,21 +1589,23 @@ index ff3a0ba9dc..37369bdfd5 100644
        } catch (err) {
          error(`feishu[${accountId}]: error handling bot added event: ${String(err)}`);
        }
-@@ -447,10 +473,105 @@ function registerEventHandlers(
-       try {
-         const event = data as unknown as { chat_id: string };
-         log(`feishu[${accountId}]: bot removed from chat ${event.chat_id}`);
-+        if (!event.chat_id) return;
+@@ -596,6 +622,13 @@ function registerEventHandlers(
+           return;
+         }
+         log(`feishu[${accountId}]: bot removed from chat ${chatId}`);
 +        const hookRunner = getGlobalHookRunner();
 +        if (hookRunner?.hasHooks("chat_member_bot_deleted")) {
 +          void hookRunner.runChatMemberBotDeleted(
-+            { chatId: event.chat_id },
++            { chatId },
 +            { channelId: "feishu", accountId },
 +          );
 +        }
        } catch (err) {
          error(`feishu[${accountId}]: error handling bot removed event: ${String(err)}`);
        }
+@@ -654,6 +687,93 @@ function registerEventHandlers(
+         },
+       });
      },
 +    "im.chat.member.user.added_v1": async (data) => {
 +      try {
@@ -1937,33 +1950,34 @@ index 0000000000..19518ee5c2
 +  });
 +});
 diff --git a/extensions/feishu/src/monitor.ts b/extensions/feishu/src/monitor.ts
-index 67be9c259f..6527c1a672 100644
+index 3613a1c55c..fbc5aefb0c 100644
 --- a/extensions/feishu/src/monitor.ts
 +++ b/extensions/feishu/src/monitor.ts
-@@ -1,17 +1,21 @@
--import type { ClawdbotConfig, RuntimeEnv } from "../runtime-api.js";
--import { listEnabledFeishuAccounts, resolveFeishuAccount } from "./accounts.js";
+@@ -1,17 +1,24 @@
 +import * as http from "http";
 +import * as Lark from "@larksuiteoapi/node-sdk";
+ import type { ClawdbotConfig, RuntimeEnv } from "../runtime-api.js";
+-import { listEnabledFeishuAccounts, resolveFeishuRuntimeAccount } from "./accounts.js";
  import {
 -  monitorSingleAccount,
 -  resolveReactionSyntheticEvent,
 -  type FeishuReactionCreatedEvent,
 -} from "./monitor.account.js";
 -import { fetchBotIdentityForMonitor } from "./monitor.startup.js";
--import {
++  getGlobalHookRunner,
++  installRequestBodyLimitGuard,
++  type HistoryEntry,
++} from "openclaw/plugin-sdk/feishu";
+ import {
 -  clearFeishuWebhookRateLimitStateForTest,
 -  getFeishuWebhookRateLimitStateSizeForTest,
 -  isWebhookRateLimitedForTest,
 -  stopFeishuMonitorState,
 -} from "./monitor.state.js";
-+  type ClawdbotConfig,
-+  type RuntimeEnv,
-+  type HistoryEntry,
-+  getGlobalHookRunner,
-+  installRequestBodyLimitGuard,
-+} from "../runtime-api.js";
-+import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
++  listEnabledFeishuAccounts,
++  resolveFeishuAccount,
++  resolveFeishuRuntimeAccount,
++} from "./accounts.js";
 +import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
 +import { handleFeishuCardAction, type FeishuCardActionEvent } from "./card-action.js";
 +import { createFeishuWSClient, createEventDispatcher } from "./client.js";
@@ -1975,7 +1989,7 @@ index 67be9c259f..6527c1a672 100644
  
  export type MonitorFeishuOpts = {
    config?: ClawdbotConfig;
-@@ -20,14 +24,700 @@ export type MonitorFeishuOpts = {
+@@ -20,14 +27,700 @@ export type MonitorFeishuOpts = {
    accountId?: string;
  };
  
@@ -2004,9 +2018,8 @@ index 67be9c259f..6527c1a672 100644
 +  operator_type?: string;
 +  user_id?: { open_id?: string };
 +  action_time?: string;
- };
--export type { FeishuReactionCreatedEvent };
- 
++};
++
 +type ResolveReactionSyntheticEventParams = {
 +  cfg: ClawdbotConfig;
 +  accountId: string;
@@ -2469,8 +2482,9 @@ index 67be9c259f..6527c1a672 100644
 +  runtime?: RuntimeEnv;
 +  abortSignal?: AbortSignal;
 +  botOpenIdSource?: { kind: "prefetched"; botOpenId?: string } | { kind: "fetch" };
-+};
-+
+ };
+-export type { FeishuReactionCreatedEvent };
+ 
 +/**
 + * Monitor a single Feishu account.
 + */
@@ -2682,15 +2696,15 @@ index 67be9c259f..6527c1a672 100644
  export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promise<void> {
    const cfg = opts.config;
    if (!cfg) {
-@@ -36,6 +726,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+@@ -36,6 +729,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
  
    const log = opts.runtime?.log ?? console.log;
  
 +  // If accountId is specified, only monitor that account
    if (opts.accountId) {
-     const account = resolveFeishuAccount({ cfg, accountId: opts.accountId });
-     if (!account.enabled || !account.configured) {
-@@ -49,6 +740,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+     const account = resolveFeishuRuntimeAccount(
+       { cfg, accountId: opts.accountId },
+@@ -52,6 +746,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
      });
    }
  
@@ -2698,7 +2712,7 @@ index 67be9c259f..6527c1a672 100644
    const accounts = listEnabledFeishuAccounts(cfg);
    if (accounts.length === 0) {
      throw new Error("No enabled Feishu accounts configured");
-@@ -58,38 +750,57 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
+@@ -61,38 +756,57 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
      `feishu: starting ${accounts.length} account(s): ${accounts.map((a) => a.accountId).join(", ")}`,
    );
  
@@ -3959,12 +3973,12 @@ index 0000000000..d92ed3fec4
 +  });
 +});
 diff --git a/extensions/feishu/src/typing.ts b/extensions/feishu/src/typing.ts
-index d3f25297a7..b5c7d371d7 100644
+index c9da414c2e..ae1395a3b2 100644
 --- a/extensions/feishu/src/typing.ts
 +++ b/extensions/feishu/src/typing.ts
-@@ -40,6 +40,60 @@ export type TypingIndicatorState = {
-   reactionId: string | null;
- };
+@@ -44,6 +44,60 @@ type FeishuMessageReactionCreateResponse = Awaited<
+   ReturnType<ReturnType<typeof createFeishuClient>["im"]["messageReaction"]["create"]>
+ >;
  
 +type FeishuReactionListItem = {
 +  reaction_id?: string;
@@ -4023,7 +4037,7 @@ index d3f25297a7..b5c7d371d7 100644
  /**
   * Check whether an error represents a rate-limit or quota-exceeded condition
   * from the Feishu API that should stop the typing keepalive loop.
-@@ -104,9 +158,10 @@ export async function addTypingIndicator(params: {
+@@ -108,9 +162,10 @@ export async function addTypingIndicator(params: {
    cfg: ClawdbotConfig;
    messageId: string;
    accountId?: string;
@@ -4032,16 +4046,16 @@ index d3f25297a7..b5c7d371d7 100644
  }): Promise<TypingIndicatorState> {
 -  const { cfg, messageId, accountId, runtime } = params;
 +  const { cfg, messageId, accountId, botOpenId, runtime } = params;
-   const account = resolveFeishuAccount({ cfg, accountId });
+   const account = resolveFeishuRuntimeAccount({ cfg, accountId });
    if (!account.configured) {
      return { messageId, reactionId: null };
-@@ -135,8 +190,48 @@ export async function addTypingIndicator(params: {
+@@ -139,8 +194,48 @@ export async function addTypingIndicator(params: {
      }
  
-     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
--    const reactionId = (response as any)?.data?.reaction_id ?? null;
+     const typedResponse: FeishuMessageReactionCreateResponse = response;
+-    const reactionId = typedResponse.data?.reaction_id ?? null;
 -    return { messageId, reactionId };
-+    const directReactionId = asNonEmptyString((response as any)?.data?.reaction_id);
++    const directReactionId = asNonEmptyString(typedResponse.data?.reaction_id);
 +    if (directReactionId) {
 +      return { messageId, reactionId: directReactionId };
 +    }

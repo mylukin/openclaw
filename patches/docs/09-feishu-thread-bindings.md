@@ -345,6 +345,7 @@ globalThis.__openclawFeishuThreadBindingManagers:
 | 125-132 | `resolveStateDirFromEnv()` 路径解析（支持测试/生产环境） |
 | 134-136 | `resolveThreadBindingsPath()` -> `~/.openclaw/feishu/thread-bindings.json` |
 | 142-144 | `shouldDefaultPersist()` 非测试环境默认持久化 |
+| 146-149 | `shouldPersistAnyAccount()` 检查是否有任何账号启用了持久化 |
 | 153-179 | `saveBindingsToDisk()` 原子写入（先 tmp 再 rename） |
 | 157-164 | 写盘节流逻辑（minIntervalMs 检查） |
 | 181-206 | `ensureBindingsLoaded()` 启动时从磁盘恢复 |
@@ -357,6 +358,10 @@ globalThis.__openclawFeishuThreadBindingManagers:
 |------|------|
 | 36-40 | `resolveAgentIdFromSessionKey()` 从 session key 提取 agentId |
 | 42-48 | `normalizeTargetKind()` 推断 subagent/acp 类型 |
+| 50-52 | `toSessionBindingTargetKind()` 内部 targetKind -> SDK BindingTargetKind 映射 |
+| 54-56 | `toFeishuTargetKind()` SDK BindingTargetKind -> 内部 targetKind 映射 |
+| 65-67 | `resolveIdleTimeoutMs()` 计算有效的空闲超时值 |
+| 69-71 | `resolveMaxAgeMs()` 计算有效的最大存活时间值 |
 | 58-63 | `normalizeDurationMs()` 安全的时长转换 |
 | 73-80 | `resolveInactivityExpiresAt()` 计算 idle 过期时间 |
 | 82-89 | `resolveMaxAgeExpiresAt()` 计算 max-age 过期时间 |

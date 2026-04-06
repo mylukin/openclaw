@@ -30,13 +30,31 @@
 | `src/agents/model-aware-runner.ts` | **新文件 (113行)**：`runModelAwareAgent()` 统一入口，自动路由到嵌入式或 CLI 运行器，映射流回调 |
 | `src/agents/bootstrap-compaction.ts` | **新文件 (315行)**：LLM 驱动的 bootstrap 文件压缩，含内容哈希缓存、head/tail 截断、超时控制 |
 | `src/agents/pi-embedded-runner/run/image-pre-analysis.ts` | **新文件 (191行)**：图像预分析管道，用 imageModel 分析图像并将文本结果传给主模型 |
-| `src/agents/pi-embedded-helpers/errors.ts` | 新增 `looksLikeCliStreamTranscript()` 过滤器；识别 em-dash 格式溢出；`classifyFailoverReason` 新增 `"internal server error"` 匹配 |
+| `src/agents/pi-embedded-helpers/errors.ts` | 新增 `looksLikeCliStreamTranscript()` 过滤器；识别 em-dash 格式溢出；`"internal server error"` 已存在于 `TRANSIENT_API_ERROR_RE` 正则中（非本 patch 新增） |
 | `src/agents/pi-embedded-helpers/failover-matches.ts` | 新增 OpenAI 通用 500 重试模式 `"you can retry your request"` |
 | `src/agents/pi-embedded-helpers/bootstrap.ts` | 新增 `BootstrapProfile` 三级配置（normal/reduced/minimal）；`resolveBootstrapBudgetForModel()` 根据上下文窗口动态计算 bootstrap 预算 |
 | `src/agents/model-selection.ts` | 新增 `resolveNonCliModelRef()` 将 CLI 提供商映射到真实 API 提供商 |
 | `src/agents/pi-embedded-runner/run/attempt.ts` | 图像处理逻辑重构为预分析优先路径 + 回退路径 |
 | `src/agents/pi-embedded-runner/live-session-registry.ts` | **新文件 (81行)**：活跃会话注册表，允许通过 sessionKey/sessionId 读取运行中会话的条目 |
 | `src/agents/bootstrap-files.ts` | `resolveBootstrapContextForRun` 新增 `contextWindowTokens` 参数 |
+| `src/agents/pi-tools.read.ts` | `createHostReadOperations`、`createHostReadTool` — 宿主读取工具工厂 |
+| `src/agents/pi-tools.ts` | `allowReadOutsideWorkspace` 逻辑 — 控制文件系统读取边界 |
+| `src/agents/tool-fs-policy.ts` | `ToolFsPolicy.allowReadOutsideWorkspace` 字段 — 文件系统策略扩展 |
+| `src/agents/skills/workspace.ts` | `allowSymlinksOutsideRoot` 选项 — 允许符号链接指向工作区外 |
+| `src/agents/system-prompt.ts` | message tool prompt 重写: `target` 替换 `to`，新增 `action=read` |
+| `src/agents/pi-embedded-runner/types.ts` | `EmbeddedPiAgentMeta.cliPromptLoad` 字段 — CLI prompt 加载元数据 |
+| `src/agents/tools/session-status-tool.ts` | 输出中包含 `cliPromptLoad` 信息 |
+| `src/agents/pi-embedded-helpers/bootstrap-budget.ts` | 重新导出 `BootstrapProfile`、`BootstrapProfileConfig` |
+| `src/agents/pi-embedded-helpers.ts` | barrel 重新导出 — 汇总导出 bootstrap 相关类型 |
+| `src/agents/cron/isolated-agent/run.ts` | **新文件 (445行)**：完整的 cron 隔离 agent 运行实现 |
+| `src/agents/model-aware-runner.test.ts` | 模型感知运行器测试 |
+| `src/agents/bootstrap-compaction.test.ts` | bootstrap 压缩测试 |
+| `src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts` | 图像预分析测试 |
+| `src/agents/pi-embedded-helpers/errors.test.ts` | 错误分类增强测试 |
+| `src/agents/pi-embedded-helpers/failover-matches.test.ts` | 故障转移匹配测试 |
+| `src/agents/pi-embedded-helpers/bootstrap.test.ts` | bootstrap profile 测试 |
+| `src/agents/pi-embedded-runner/live-session-registry.test.ts` | 活跃会话注册表测试 |
+| `src/agents/model-selection.test.ts` | 模型选择测试 |
 
 ---
 
@@ -147,8 +165,10 @@ function compactBootstrapFiles({ contextFiles, config, llmFn, modelRef }):
 
 ```
 function shouldUseImagePreAnalysis({ config }):
-    // 检查配置中是否定义了 imageModel
-    return config?.agents?.defaults?.imageModel != null
+    // 通过 coerceImageModelConfig() 解析 imageModel 配置
+    // 不是简单的 null 检查，而是完整的配置解析与校验
+    imageModelConfig = coerceImageModelConfig(config?.agents?.defaults?.imageModel)
+    return imageModelConfig != null
 
 function analyzeImagesWithImageModel({ images, config, agentDir, userPrompt }):
     // 逐张分析, 累积结果
@@ -220,9 +240,8 @@ function isContextOverflowError(errorMessage):
 function classifyFailoverReason(raw):
     // ... 现有分类 ...
     
-    // 新增: 裸文本 "internal server error"
-    if raw.toLowerCase().includes("internal server error"):
-        return "timeout"
+    // 注意: "internal server error" 已预先存在于 TRANSIENT_API_ERROR_RE 正则中
+    // 本 patch 未新增此匹配，仅确认其在 classifyFailoverReason 路径中被触发
 
 // failover-matches.ts ERROR_PATTERNS.server:
     // 新增: OpenAI 通用 500 重试提示
@@ -365,11 +384,11 @@ prompt(      mainModelSupportsImages?
 | `src/agents/pi-embedded-runner/run/image-pre-analysis.ts` | 31 | `shouldUseImagePreAnalysis()` - 检查 imageModel 配置 |
 | `src/agents/pi-embedded-runner/run/image-pre-analysis.ts` | 44-191 | `analyzeImagesWithImageModel()` - 逐张分析 + 文本格式化 |
 | `src/agents/pi-embedded-runner/run/image-pre-analysis.ts` | 99 | 调用 `runWithImageModelFallback()` |
-| `src/agents/pi-embedded-helpers/errors.ts` | 218-230 | `looksLikeCliStreamTranscript()` - CLI 流式转录检测 |
+| `src/agents/pi-embedded-helpers/errors.ts` | 218-232 | `looksLikeCliStreamTranscript()` - CLI 流式转录检测 |
 | `src/agents/pi-embedded-helpers/errors.ts` | 252 | `isContextOverflowError` 排除 CLI 转录 |
 | `src/agents/pi-embedded-helpers/errors.ts` | 274-275 | 新增 em-dash `"context overflow —"` 和 `"context overflow --"` 模式 |
 | `src/agents/pi-embedded-helpers/errors.ts` | 322 | `isLikelyContextOverflowError` 排除 CLI 转录 |
-| `src/agents/pi-embedded-helpers/errors.ts` | 1167 | `classifyFailoverReason` 的 `"internal server error"` 匹配 (在 `TRANSIENT_API_ERROR_RE` 正则中) |
+| `src/agents/pi-embedded-helpers/errors.ts` | 1167 | `classifyFailoverReason` 的 `"internal server error"` 匹配 (已预先存在于 `TRANSIENT_API_ERROR_RE` 正则中，非本 patch 新增) |
 | `src/agents/pi-embedded-helpers/failover-matches.ts` | 112-113 | 新增 OpenAI `"you can retry your request"` 模式 |
 | `src/agents/pi-embedded-helpers/bootstrap.ts` | 107-118 | `resolveBootstrapTotalMaxChars` 新增 `contextWindowTokens` 参数 |
 | `src/agents/pi-embedded-helpers/bootstrap.ts` | 124-142 | `BootstrapProfile` 类型 + `getBootstrapProfileConfig()` |
@@ -377,3 +396,10 @@ prompt(      mainModelSupportsImages?
 | `src/agents/pi-embedded-helpers/bootstrap.ts` | 149-162 | `resolveBootstrapBudgetForModel()` - 动态预算: reserve=max(30%,30K), chars=clamp(avail*4, 20K, 150K) |
 | `src/agents/model-selection.ts` | 439 | `resolveNonCliModelRef()` - CLI 到 API 提供商映射 |
 | `src/agents/pi-embedded-runner/live-session-registry.ts` | 1-81 | 活跃会话注册表: 按 sessionKey/sessionId 注册/读取/注销 |
+
+---
+
+## Commit 12 修复说明
+
+- `src/agents/cron/isolated-agent/run.ts`：移除死代码（未使用的变量和不可达分支）
+- `src/agents/pi-embedded-runner/run/prepare.ts`：移除 `if(true)` 包装，简化条件逻辑
