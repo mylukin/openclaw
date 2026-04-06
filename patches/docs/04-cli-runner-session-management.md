@@ -45,9 +45,8 @@ CLI runner（`claude-cli` 后端）运行时面临几个关键问题：
 | `src/agents/cli-runner.test.ts` | 1430+ 行新增，覆盖三层保护、prompt loader、会话恢复等 |
 | `src/agents/cli-session.test.ts` | 51 行新增，覆盖富绑定存取和 legacy 兼容 |
 | `src/process/supervisor/supervisor.test.ts` | 新增 `cancelSession` 测试 |
-| `src/agents/cli-runner/execute.test.ts` | 溢出保护 Layer 1+2 测试 |
-| `src/agents/cli-runner/prepare.test.ts` | session prompt 文件函数、token 估算测试 |
 | `src/agents/cli-backends.test.ts` | model alias、permission 规范化测试 |
+| `src/agents/cli-runner.helpers.stream-json.test.ts` / `src/agents/cli-runner.test.ts` / `src/agents/cli-session.test.ts` / `src/process/supervisor/supervisor.test.ts` | 当前保留并覆盖 CLI runner 主路径、stream-json、session binding、cancelSession 等行为 |
 
 ## 伪代码 (Pseudocode)
 

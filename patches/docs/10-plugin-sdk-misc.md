@@ -16,7 +16,7 @@ Patch 09 引入了飞书线程绑定管理器，该管理器依赖多个 core �
 | `src/plugin-sdk/index.ts` | 新增大量运行时导出和类型导出 |
 | `src/plugin-sdk/feishu.ts` | 新增飞书专用导出（hook runner、session、sanitize 等） |
 | `src/plugins/contracts/plugin-sdk-index.test.ts` | 更新运行时导出快照 |
-| `src/plugin-sdk/channel-import-guardrails.test.ts` | 新增飞书文件到例外列表 |
+| `src/plugin-sdk/channel-import-guardrails.test.ts` | 新增飞书文件到例外列表；当前还包含 BlueBubbles test-support 的显式例外，反映仓库现状 |
 | `test/helpers/plugins/plugin-runtime-mock.ts` | 新增 `agents` 和 `hooks` Mock |
 | `.gitignore` | 新增 `skills/skillstore-plugin-publisher/` |
 
@@ -310,8 +310,9 @@ mergeDeep(base, overrides)               [plugin-runtime-mock.ts:23-36]
 | 行号 | 内容 |
 |------|------|
 | 167-174 | `LOCAL_EXTENSION_API_BARREL_EXCEPTIONS` 数组 |
-| 172 | `"extensions/feishu/src/quoted-message.ts"` (新增例外) |
-| 173 | `"extensions/feishu/src/thread-bindings.manager.ts"` (新增例外) |
+| 172 | `"extensions/feishu/src/quoted-message.ts"` (飞书例外) |
+| 173 | `"extensions/feishu/src/thread-bindings.manager.ts"` (飞书例外) |
+| 174 | `"extensions/bluebubbles/src/test-support/monitor-test-support.ts"` (当前 guardrail 也显式忽略的测试支撑文件) |
 
 ### `src/plugins/contracts/plugin-sdk-index.test.ts`
 

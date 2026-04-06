@@ -40,7 +40,7 @@
 | `extensions/feishu/src/config-schema.test.ts` | 31 行新增，配置 schema 验证测试 |
 | `extensions/feishu/src/monitor.events.test.ts` | **新文件**：246 行，飞书事件监控测试 |
 | `extensions/feishu/src/typing.reaction-id-fallback.test.ts` | **新文件**：180 行，typing reaction ID fallback 测试 |
-| `extensions/feishu/src/runtime-api.ts` | 移除重复的 `monitorFeishuProvider` 导出；新增 `getGlobalHookRunner` 再导出 |
+| `extensions/feishu/runtime-api.ts` / `extensions/feishu/src/bot-runtime-api.ts` | 当前通过顶层 runtime barrel 与 bot-local runtime barrel 暴露 `getGlobalHookRunner`、session transcript 等能力，避免直接自导入 `plugin-sdk/feishu` |
 
 ---
 
@@ -274,11 +274,18 @@ CommandAuthorized = true --> /stop 命令被执行
 | 320 | `createDirectReplyMirrorHandler()` — 将 bot 回复写入 session transcript |
 | 491 | `dispatchMode = feishuCfg?.dispatchMode ?? "auto"` |
 | 585-606 | requireMention / bound thread session 检测（`getSessionBindingService().resolveByConversation`） |
-| 606 | `dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot` 门控 |
-| 693-706 | `openDirectCommandsAllowed` 逻辑和双 authorizer 数组 |
-| 900 | DM 引用消息走 `resolveQuotedFeishuMessageContent()` |
+| 610 | `dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot` 门控 |
+| 697-710 | `openDirectCommandsAllowed` 逻辑和双 authorizer 数组 |
+| 904 | DM 引用消息走 `resolveQuotedFeishuMessageContent()` |
 | — | `handleFeishuMessage` 新增 `botOpenIdsByAccount` 参数，用于多账号场景下的 bot open ID 查找 |
 | — | ChannelData 块：`messageId`、`chatType`、`accountId`、`mentions`、`media` 等字段经 `finalizeInboundContext` 传递至下游 |
+
+### `extensions/feishu/runtime-api.ts` / `extensions/feishu/src/bot-runtime-api.ts`
+
+| 行号 | 内容 |
+|------|------|
+| `extensions/feishu/runtime-api.ts:31-45` | 通过本地 runtime barrel 暴露 `getGlobalHookRunner`、`appendAssistantMessageToSessionTranscript`、request body guard 等能力 |
+| `extensions/feishu/src/bot-runtime-api.ts:1-9` | bot 本地 runtime barrel 汇总 transcript / context visibility / routing 等导出 |
 
 ### `extensions/feishu/src/bot-content.ts`
 
@@ -323,7 +330,7 @@ CommandAuthorized = true --> /stop 命令被执行
 |------|------|
 | 69 | `pickTypingReactionIdForCleanup()` — typing reaction 清理 fallback（调用点 226） |
 
-### `extensions/feishu/src/runtime-api.ts`
+### `extensions/feishu/runtime-api.ts`
 
 | 行号 | 内容 |
 |------|------|

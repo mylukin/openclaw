@@ -26,7 +26,7 @@
 | `src/auto-reply/reply/agent-runner.ts` | 处理 `kind:"aborted"` 返回值；传递 `cliSessionBinding` 和 `cliPromptLoad` 参数 |
 | `src/auto-reply/reply/dispatch-from-config.ts` | 最终回复去重逻辑；飞书 mention 标签归一化 |
 | `src/auto-reply/reply/followup-runner.ts` | 替换 `runEmbeddedPiAgent` 为 `runModelAwareAgent`；传递 `cliSessionBinding` 和 `cliPromptLoad` |
-| `src/auto-reply/reply/message-received-hooks.ts` | 新文件，实现 `emitMessageReceivedHooks` — 插件 + 内部钩子双轨触发 |
+| `src/auto-reply/reply/dispatch-from-config.ts` | 当前把 `message_received` 的插件 hook 与内部 hook 双轨触发内联在 dispatch 管道里，而不是单独拆到 `message-received-hooks.ts` |
 | `src/auto-reply/reply/session-usage.ts` | `applyCliSessionStateToSessionPatch` 替代原 `applyCliSessionIdToSessionPatch`，支持富绑定和 prompt load 状态 |
 | `src/auto-reply/reply/streaming-directives.ts` | `pendingSilent` 缓冲机制；`couldBeSilentTokenStart` 集成 |
 | `src/auto-reply/tokens.ts` | 新增 `couldBeSilentTokenStart()` — 宽松前缀匹配（不要求下划线） |
@@ -34,9 +34,9 @@
 | `src/auto-reply/reply/get-reply.ts` | 自动轮换（auto-rotation）时通过 `shouldEmitAutoRotationResetHooks` 判断是否触发 session reset hooks；新增 auto-rotation reset hooks 逻辑 |
 | `src/auto-reply/reply/session.ts` | `previousSessionEntry` 在新会话创建时始终保留 |
 | `src/auto-reply/reply/abort.ts` | force-stop 集成 `processSupervisor.cancelSession` |
-| `src/commands/commands-core.ts` | `command` 参数改为可选；新增 `commandSource`、`senderId`、`routeHookMessages` 参数 |
-| `src/commands/commands-session-abort.ts` | `abortEmbeddedPiRun` 替换为 `abortSessionExecutions` |
-| `src/templating/templating.ts` | `MsgContext` 新增 `ChannelData` 字段 |
+| `src/auto-reply/reply/commands-core.ts` | `command` 参数改为可选；新增 `commandSource`、`senderId`、`routeHookMessages` 参数 |
+| `src/auto-reply/reply/commands-session-abort.ts` | `abortEmbeddedPiRun` 替换为 `abortSessionExecutions` |
+| `src/auto-reply/templating.ts` | `MsgContext` 新增 `ChannelData` 字段 |
 | `src/auto-reply/heartbeat.ts` | heartbeat prompt 补充 "do NOT use the message tool" 指令 |
 
 ### 测试文件
@@ -49,8 +49,7 @@
 | `src/auto-reply/reply/reply-utils.test.ts` | silent token 缓冲、split streaming 测试 |
 | `src/auto-reply/tokens.test.ts` | `couldBeSilentTokenStart` 全覆盖 |
 | `src/auto-reply/status.cli-prompt-load.test.ts` | CLI prompt load 状态渲染测试 |
-| `src/commands/commands-core.test.ts` | 可选 command 参数及新参数覆盖 |
-| `src/commands/commands-session-abort.test.ts` | `abortSessionExecutions` 替换验证 |
+| `src/auto-reply/reply/commands-core.test.ts` | 可选 command 参数及新参数覆盖 |
 
 ## 伪代码 (Pseudocode)
 
@@ -433,15 +432,12 @@ Chunk 2: "T really"
 | `normalizeMentionsForDedup` | 898 | 两种飞书 mention 格式统一为 `<at:$1>` |
 | 去重判断 | 912 | `if (deliveredFinalTexts.has(normalizedText)) continue` |
 
-### Message-Received Hooks — `src/auto-reply/reply/message-received-hooks.ts`
+### Message-Received Hooks — `src/auto-reply/reply/dispatch-from-config.ts`
 
 | 位置 | 行号 | 说明 |
 |------|------|------|
-| 内容解析 | 6 | `resolveInboundContent()` — BodyForCommands → RawBody → Body 优先级 |
-| 钩子入口 | 19 | `emitMessageReceivedHooks({ ctx })` |
-| 内容提取 | 26 | `resolveInboundContent(ctx)` 调用 |
-| 插件 hook 触发 | 33 | `hookRunner.runMessageReceived()` — fire-and-forget |
-| 内部 hook 触发 | 68-69 | `triggerInternalHook(createInternalHookEvent("message", "received", ...))` |
+| 插件 hook 触发 | 477-484 | `hookRunner.runMessageReceived()` — fire-and-forget |
+| 内部 hook 触发 | 487-496 | `triggerInternalHook(createInternalHookEvent("message", "received", ...))` |
 
 ### Silent Token 缓冲 — `src/auto-reply/tokens.ts`
 

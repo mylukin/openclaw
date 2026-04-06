@@ -49,15 +49,15 @@ outbound 消息分发管道需要同时处理两类频道级信息：
 | `src/config/types.gateway.ts` | `GatewayNodesConfig` 增加 `overrides` 映射类型 |
 | `src/config/types.skills.ts` | 技能类型扩展支持 hook 级别模型覆盖 |
 | `src/config/types.tools.ts` | 工具类型增加可选元数据字段 |
-| `src/config/zod-schema.*.ts` | Zod schema 同步更新：override 结构、hook model 字段等 |
+| `src/config/zod-schema.core.ts` / `src/config/zod-schema.hooks.ts` / `src/config/zod-schema.agent-defaults.ts` | Zod schema 同步更新：override 结构、hook model 字段、agent defaults 扩展等 |
 | `src/plugins/loader.ts` | 嵌入式插件列表新增条目；加载顺序调整 |
 | `src/plugins/manifest-registry.ts` | 注册表构建时保留 hook 元数据（`model`、`timeout` 等） |
 | `src/plugins/runtime/index.ts` | 运行时导出新增 agents 和 hooks 公共表面 |
-| `src/plugins/runtime-model-aware.runtime.ts` | 新增运行时模型感知辅助：`resolveModelRefFromString`、`buildModelAliasIndex` |
+| `src/plugins/runtime/runtime-model-aware.runtime.ts` | 运行时模型感知辅助：`resolveModelRefFromString`、`buildModelAliasIndex` 通过 runtime 公共表面暴露 |
 | `src/infra/outbound/outbound-send-service.ts` | 新增 `isCancelledPluginActionPayload` 判定；cancelled payload 跳过发送 |
 | `src/infra/outbound/conversation-id.ts` | 会话 ID 生成增加 `chat:` 前缀支持 |
-| `src/infra/session-memory/transcript.ts` | delivery-mirror 过滤逻辑：跳过非当前会话的 mirror 条目 |
-| `src/infra/session-memory/HOOK.md` | 新增 session-memory hook 内部文档 |
+| `src/hooks/bundled/session-memory/transcript.ts` | delivery-mirror 过滤逻辑：跳过非当前会话的 mirror 条目（当前实现路径） |
+| `src/hooks/bundled/session-memory/HOOK.md` | session-memory hook 内部文档（当前实现路径） |
 | `src/plugins/types.ts` | 新增 `chat_member_user_added` 等 chat member hook 类型；handler map 扩展；元数据字段增加 |
 | `src/plugins/schema-validator.ts` | Ajv 导入从默认导入重构为命名导入（ESM 兼容） |
 | `src/hooks/llm-slug-generator.test.ts` | hook 级模型覆盖、CLI 后端回退、超时配置的单元测试 |
@@ -66,7 +66,7 @@ outbound 消息分发管道需要同时处理两类频道级信息：
 | `src/infra/outbound/conversation-id.test.ts` | `chat:` 前缀会话 ID 解析的单元测试 |
 | `src/infra/outbound/deliver.test.ts` | `buildMirrorMessageMeta`、`buildDeliveryResultMetadata` 的单元测试 |
 | `src/infra/outbound/outbound-send-service.test.ts` | `isCancelledPluginActionPayload` 判定的单元测试 |
-| `src/infra/session-memory/handler.test.ts` | delivery-mirror 过滤、转录追加逻辑的单元测试 |
+| `src/hooks/bundled/session-memory/handler.test.ts` | delivery-mirror 过滤、转录追加逻辑的单元测试（当前实现路径） |
 
 ---
 
@@ -256,3 +256,5 @@ initializeGlobalHookRunner(registry_B)
 | `src/config/sessions/transcript.ts` | 168-216 | `appendCliTurnToSessionTranscript()` 函数定义 |
 | `src/config/sessions/transcript.ts` | 277-310 | `appendAssistantMessageToSessionTranscript()` 的 leafId 保护 |
 | `src/channels/plugins/registry.ts` | 24 | 频道插件缓存结构增加 `sourceSignature` |
+| `src/hooks/bundled/session-memory/transcript.ts` | 当前实现路径 | delivery-mirror transcript 过滤逻辑 |
+| `src/hooks/bundled/session-memory/HOOK.md` | 当前实现路径 | session-memory hook 内部文档 |

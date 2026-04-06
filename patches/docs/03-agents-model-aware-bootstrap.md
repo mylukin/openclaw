@@ -44,16 +44,16 @@
 | `src/agents/system-prompt.ts` | message tool prompt 重写: `target` 替换 `to`，新增 `action=read` |
 | `src/agents/pi-embedded-runner/types.ts` | `EmbeddedPiAgentMeta.cliPromptLoad` 字段 — CLI prompt 加载元数据 |
 | `src/agents/tools/session-status-tool.ts` | 输出中包含 `cliPromptLoad` 信息 |
-| `src/agents/pi-embedded-helpers/bootstrap-budget.ts` | 重新导出 `BootstrapProfile`、`BootstrapProfileConfig` |
+| `src/agents/bootstrap-budget.ts` | 重新导出 `BootstrapProfile`、`BootstrapProfileConfig`（当前文件名） |
 | `src/agents/pi-embedded-helpers.ts` | barrel 重新导出 — 汇总导出 bootstrap 相关类型 |
-| `src/agents/cron/isolated-agent/run.ts` | **新文件 (445行)**：完整的 cron 隔离 agent 运行实现 |
+| `src/cron/isolated-agent/run.ts` | cron 隔离 agent 运行入口（后续已从 `src/agents/` 拆分到 `src/cron/isolated-agent/`） |
 | `src/agents/model-aware-runner.test.ts` | 模型感知运行器测试 |
 | `src/agents/bootstrap-compaction.test.ts` | bootstrap 压缩测试 |
 | `src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts` | 图像预分析测试 |
-| `src/agents/pi-embedded-helpers/errors.test.ts` | 错误分类增强测试 |
-| `src/agents/pi-embedded-helpers/failover-matches.test.ts` | 故障转移匹配测试 |
-| `src/agents/pi-embedded-helpers/bootstrap.test.ts` | bootstrap profile 测试 |
-| `src/agents/pi-embedded-runner/live-session-registry.test.ts` | 活跃会话注册表测试 |
+| `src/agents/model-aware-runner.test.ts` / `src/agents/bootstrap-compaction.test.ts` | 模型感知路由与 bootstrap compaction 核心测试 |
+| `src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts` / `src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts` | 图像预分析测试 |
+| `src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts` | bootstrap profile 测试 |
+| `src/agents/model-selection.test.ts` | `resolveNonCliModelRef()` 与 alias 路由测试 |
 | `src/agents/model-selection.test.ts` | 模型选择测试 |
 
 ---
@@ -399,7 +399,7 @@ prompt(      mainModelSupportsImages?
 
 ---
 
-## Commit 12 修复说明
+## 当前实现说明
 
-- `src/agents/cron/isolated-agent/run.ts`：移除死代码（未使用的变量和不可达分支）
-- `src/agents/pi-embedded-runner/run/prepare.ts`：移除 `if(true)` 包装，简化条件逻辑
+- 后续重构已把 cron 隔离 agent 相关实现拆到 `src/cron/isolated-agent/` 目录；需求本身未变，只是文件位置更新。
+- `resolveNonCliModelRef()`、bootstrap compaction 和 image pre-analysis 的收口逻辑已在当前分支通过定向回归验证。
