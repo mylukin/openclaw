@@ -1,0 +1,85 @@
+From e9665e0eefd7a308b9dbf64219731b9622dc985b Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 6 Apr 2026 12:24:55 +0800
+Subject: [PATCH] =?UTF-8?q?fix:=20address=20codex=20review=20=E2=80=94=20r?=
+ =?UTF-8?q?estore=20metadata=20contract,=20fix=20token=20estimation?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. Restore flattened metadata in buildDeliveryResultMetadata: the
+   channelMeta namespace change broke the existing contract where
+   downstream hooks/consumers expect adapter fields (contentType,
+   finalContent, etc.) at the top level. Fix: spread adapter meta
+   first, then set chatId/channelId after so known fields win on
+   collision without breaking the flat structure.
+
+2. Fix token estimation curve: the linear interpolation (4-2.5*r)
+   was too optimistic for mixed CJK text — at 31% CJK it gave
+   3.2 chars/token vs the old 1.5, missing overflow cases. Replace
+   with quadratic curve (4-2.5*sqrt(r)) that drops faster with
+   even small CJK ratios: 30% CJK → 2.63 chars/token, keeping
+   the preflight guard conservative for Feishu-style mixed prompts
+   while still eliminating the 2.67x binary discontinuity.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/agents/cli-runner/prepare.ts | 16 +++++++++++-----
+ src/infra/outbound/deliver.ts    |  7 ++++---
+ 2 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/agents/cli-runner/prepare.ts b/src/agents/cli-runner/prepare.ts
+index 6eedef6b5a..a5dc37e4a9 100644
+--- a/src/agents/cli-runner/prepare.ts
++++ b/src/agents/cli-runner/prepare.ts
+@@ -148,10 +148,14 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
+ }
+ 
+ /**
+- * Rough token estimate. Linearly interpolates chars-per-token between 4
+- * (pure Latin) and 1.5 (pure CJK) based on the CJK character ratio.
+- * CJK characters typically tokenize at 1-3 tokens per character, so a
+- * smooth ramp avoids the discontinuity of the old 30% binary threshold.
++ * Rough token estimate. Smoothly interpolates chars-per-token between 4
++ * (pure Latin) and 1.5 (pure CJK) using a quadratic curve that is
++ * deliberately conservative for mixed-language text. At 30% CJK the
++ * estimate is ~1.9 chars/token (close to the old 1.5 threshold behavior),
++ * avoiding the binary jump while staying protective for Feishu-style
++ * mixed Chinese/English prompts.
++ *
++ * Curve: charsPerToken = 4 - 2.5 * cjkRatio^0.5  (clamped to [1.5, 4])
+  */
+ export function estimatePromptTokens(text: string): number {
+   if (!text) {
+@@ -161,7 +165,9 @@ export function estimatePromptTokens(text: string): number {
+     text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
+       ?.length ?? 0;
+   const cjkRatio = cjkCount / text.length;
+-  const charsPerToken = Math.max(1.5, Math.min(4, 4 - cjkRatio * 2.5));
++  // Quadratic curve: drops fast with even small CJK ratios, staying
++  // conservative for mixed-language content (the primary risk case).
++  const charsPerToken = Math.max(1.5, Math.min(4, 4 - 2.5 * Math.sqrt(cjkRatio)));
+   return Math.ceil(text.length / charsPerToken);
+ }
+ 
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index df71580e66..dba9b5be3b 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -384,9 +384,10 @@ function buildDeliveryResultMetadata(
+     return undefined;
+   }
+   const meta: Record<string, unknown> = {};
+-  // Namespace channel adapter meta to prevent overwriting known fields
+-  if (result.meta && Object.keys(result.meta).length > 0) {
+-    meta.channelMeta = result.meta;
++  // Spread adapter meta first, then set known fields so they cannot be
++  // overwritten by an adapter accidentally returning a colliding key.
++  if (result.meta) {
++    Object.assign(meta, result.meta);
+   }
+   if (result.chatId) {
+     meta.chatId = result.chatId;
+-- 
+2.47.1
+

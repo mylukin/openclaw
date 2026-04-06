@@ -1,0 +1,610 @@
+From efca1edcb0309c2a1284de4f5cd980732bcd5e2d Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 6 Apr 2026 19:55:52 +0800
+Subject: [PATCH 02/10] feat(gateway): harden node override policy, add MCP
+ HTTP bridge, and session archive improvements
+
+---
+ src/gateway/chat-sanitize.test.ts          |  32 ++++
+ src/gateway/chat-sanitize.ts               |   5 +-
+ src/gateway/gateway-misc.test.ts           | 154 ++++++++++++++++++
+ src/gateway/node-command-policy.ts         |  63 ++++++--
+ src/gateway/node-connect-reconcile.ts      |   2 +
+ src/gateway/server-methods/chat.ts         |  17 +-
+ src/gateway/server-methods/nodes.ts        |   2 +
+ src/gateway/session-archive.fs.ts          | 174 ++++++++++++++++++++-
+ src/gateway/session-archive.runtime.ts     |   4 +-
+ src/gateway/session-transcript-files.fs.ts |   3 +-
+ 10 files changed, 421 insertions(+), 35 deletions(-)
+
+diff --git a/src/gateway/chat-sanitize.test.ts b/src/gateway/chat-sanitize.test.ts
+index d287160db1..6d2ba7a2d9 100644
+--- a/src/gateway/chat-sanitize.test.ts
++++ b/src/gateway/chat-sanitize.test.ts
+@@ -22,6 +22,22 @@ describe("stripEnvelopeFromMessage", () => {
+     expect(result.content?.[0]?.text).toBe("hi");
+   });
+ 
++  test("removes inbound metadata from input_text content arrays", () => {
++    const input = {
++      role: "user",
++      content: [
++        {
++          type: "input_text",
++          text: 'Conversation info (untrusted metadata):\n```json\n{"message_id":"123"}\n```\n\nHello there',
++        },
++      ],
++    };
++    const result = stripEnvelopeFromMessage(input) as {
++      content?: Array<{ type: string; text?: string }>;
++    };
++    expect(result.content?.[0]?.text).toBe("Hello there");
++  });
++
+   test("does not strip inline message_id text that is part of a line", () => {
+     const input = {
+       role: "user",
+@@ -50,6 +66,22 @@ describe("stripEnvelopeFromMessage", () => {
+     expect(result.content).toBe("Assistant body");
+   });
+ 
++  test("defensively strips inbound metadata blocks from output_text content arrays", () => {
++    const input = {
++      role: "assistant",
++      content: [
++        {
++          type: "output_text",
++          text: 'Conversation info (untrusted metadata):\n```json\n{"message_id":"123"}\n```\n\nAssistant body',
++        },
++      ],
++    };
++    const result = stripEnvelopeFromMessage(input) as {
++      content?: Array<{ type: string; text?: string }>;
++    };
++    expect(result.content?.[0]?.text).toBe("Assistant body");
++  });
++
+   test("removes inbound un-bracketed conversation info blocks from user messages", () => {
+     const input = {
+       role: "user",
+diff --git a/src/gateway/chat-sanitize.ts b/src/gateway/chat-sanitize.ts
+index 79fe822071..cee21551c1 100644
+--- a/src/gateway/chat-sanitize.ts
++++ b/src/gateway/chat-sanitize.ts
+@@ -44,7 +44,10 @@ function stripEnvelopeFromContentWithRole(
+       return item;
+     }
+     const entry = item as Record<string, unknown>;
+-    if (entry.type !== "text" || typeof entry.text !== "string") {
++    if (
++      (entry.type !== "text" && entry.type !== "input_text" && entry.type !== "output_text") ||
++      typeof entry.text !== "string"
++    ) {
+       return item;
+     }
+     const inboundStripped = stripInboundMetadata(entry.text);
+diff --git a/src/gateway/gateway-misc.test.ts b/src/gateway/gateway-misc.test.ts
+index 954aa65c62..cf317f6e0f 100644
+--- a/src/gateway/gateway-misc.test.ts
++++ b/src/gateway/gateway-misc.test.ts
+@@ -423,6 +423,160 @@ describe("resolveNodeCommandAllowlist", () => {
+     expect(allow.has("system.which")).toBe(false);
+     expect(allow.has("device.info")).toBe(true);
+   });
++
++  it("per-node denyCommands merges with global deny", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "lukin-dev": {
++                denyCommands: ["browser.proxy"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-123", displayName: "lukin-dev" },
++    );
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("per-node allowCommands merges with global allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            allowCommands: ["camera.snap"],
++            overrides: {
++              "my-node": {
++                allowCommands: ["screen.record"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "ios", deviceFamily: "iPhone", nodeId: "n1", displayName: "my-node" },
++    );
++    expect(allow.has("camera.snap")).toBe(true);
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("nodeId match takes priority over displayName", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-display": { denyCommands: ["system.run"] },
++              "node-abc": { denyCommands: ["system.notify"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-abc", displayName: "my-display" },
++    );
++    // nodeId override wins: system.notify denied, system.run allowed
++    expect(allow.has("system.notify")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("matches by nodeId prefix", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("falls back to global config when no override matches", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            denyCommands: ["camera.snap"],
++            overrides: {
++              "other-node": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "my-node", displayName: "my-node" },
++    );
++    // Global deny applies, per-node deny for "other-node" does not
++    expect(allow.has("camera.snap")).toBe(false);
++    expect(allow.has("browser.proxy")).toBe(true);
++  });
++
++  it("per-node allow and deny coexist; deny wins over allow", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "my-node": {
++                allowCommands: ["camera.snap", "screen.record"],
++                denyCommands: ["camera.snap"],
++              },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "n1", displayName: "my-node" },
++    );
++    // camera.snap added by allow but removed by deny
++    expect(allow.has("camera.snap")).toBe(false);
++    // screen.record only in allow, not denied
++    expect(allow.has("screen.record")).toBe(true);
++  });
++
++  it("ignores empty-string override key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "": { denyCommands: ["system.run"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "any-node", displayName: "" },
++    );
++    // Empty key should not match — system.run stays allowed
++    expect(allow.has("system.run")).toBe(true);
++  });
++
++  it("prefix match picks longest matching key", () => {
++    const allow = resolveNodeCommandAllowlist(
++      {
++        gateway: {
++          nodes: {
++            overrides: {
++              "node-": { denyCommands: ["system.run", "browser.proxy"] },
++              "node-lukin-": { denyCommands: ["browser.proxy"] },
++            },
++          },
++        },
++      },
++      { platform: "linux", deviceFamily: "", nodeId: "node-lukin-20", displayName: "" },
++    );
++    // "node-lukin-" is the longest prefix → only browser.proxy denied
++    expect(allow.has("browser.proxy")).toBe(false);
++    expect(allow.has("system.run")).toBe(true);
++  });
+ });
+ 
+ describe("normalizeVoiceWakeTriggers", () => {
+diff --git a/src/gateway/node-command-policy.ts b/src/gateway/node-command-policy.ts
+index b760f6a84f..b608bc87a7 100644
+--- a/src/gateway/node-command-policy.ts
++++ b/src/gateway/node-command-policy.ts
+@@ -1,4 +1,5 @@
+ import type { OpenClawConfig } from "../config/config.js";
++import type { GatewayNodeOverrideConfig } from "../config/types.gateway.js";
+ import {
+   NODE_BROWSER_PROXY_COMMAND,
+   NODE_SYSTEM_NOTIFY_COMMAND,
+@@ -175,18 +176,29 @@ function normalizePlatformId(platform?: string, deviceFamily?: string): Platform
+ 
+ export function resolveNodeCommandAllowlist(
+   cfg: OpenClawConfig,
+-  node?: Pick<NodeSession, "platform" | "deviceFamily">,
++  node?: Pick<NodeSession, "platform" | "deviceFamily"> &
++    Partial<Pick<NodeSession, "nodeId" | "displayName">>,
+ ): Set<string> {
+   const platformId = normalizePlatformId(node?.platform, node?.deviceFamily);
+   const base = PLATFORM_DEFAULTS[platformId] ?? PLATFORM_DEFAULTS.unknown;
+-  const extra = cfg.gateway?.nodes?.allowCommands ?? [];
+-  const deny = new Set(cfg.gateway?.nodes?.denyCommands ?? []);
+-  const allow = new Set([...base, ...extra].map((cmd) => cmd.trim()).filter(Boolean));
+-  for (const blocked of deny) {
+-    const trimmed = blocked.trim();
+-    if (trimmed) {
+-      allow.delete(trimmed);
+-    }
++
++  // Global config
++  const extraGlobal = cfg.gateway?.nodes?.allowCommands ?? [];
++  const denyGlobal = cfg.gateway?.nodes?.denyCommands ?? [];
++
++  // Per-node override lookup
++  const override = resolveNodeOverride(cfg, node);
++  const extraNode = override?.allowCommands ?? [];
++  const denyNode = override?.denyCommands ?? [];
++
++  // Merge: base + global allow + per-node allow
++  const allow = new Set(
++    [...base, ...extraGlobal, ...extraNode].map((cmd) => cmd.trim()).filter(Boolean),
++  );
++
++  // Remove: global deny + per-node deny
++  for (const cmd of [...denyGlobal, ...denyNode].map((c) => c.trim()).filter(Boolean)) {
++    allow.delete(cmd);
+   }
+   return allow;
+ }
+@@ -217,6 +229,39 @@ export function normalizeDeclaredNodeCommands(params: {
+   );
+ }
+ 
++function resolveNodeOverride(
++  cfg: OpenClawConfig,
++  node?: Partial<Pick<NodeSession, "nodeId" | "displayName">>,
++): GatewayNodeOverrideConfig | undefined {
++  const overrides = cfg.gateway?.nodes?.overrides;
++  if (!overrides || !node) {
++    return undefined;
++  }
++  // 1. nodeId exact match
++  if (node.nodeId && overrides[node.nodeId]) {
++    return overrides[node.nodeId];
++  }
++  // 2. displayName exact match
++  if (node.displayName && overrides[node.displayName]) {
++    return overrides[node.displayName];
++  }
++  // 3. nodeId prefix match (longest prefix wins; skip empty keys)
++  if (node.nodeId) {
++    let bestKey: string | undefined;
++    for (const key of Object.keys(overrides)) {
++      if (key && node.nodeId.startsWith(key)) {
++        if (!bestKey || key.length > bestKey.length) {
++          bestKey = key;
++        }
++      }
++    }
++    if (bestKey) {
++      return overrides[bestKey];
++    }
++  }
++  return undefined;
++}
++
+ export function isNodeCommandAllowed(params: {
+   command: string;
+   declaredCommands?: string[];
+diff --git a/src/gateway/node-connect-reconcile.ts b/src/gateway/node-connect-reconcile.ts
+index a3ca9caf38..d17a6b8644 100644
+--- a/src/gateway/node-connect-reconcile.ts
++++ b/src/gateway/node-connect-reconcile.ts
+@@ -52,6 +52,8 @@ export async function reconcileNodePairingOnConnect(params: {
+   const allowlist = resolveNodeCommandAllowlist(params.cfg, {
+     platform: params.connectParams.client.platform,
+     deviceFamily: params.connectParams.client.deviceFamily,
++    nodeId,
++    displayName: params.connectParams.client.displayName,
+   });
+   const declared = normalizeDeclaredNodeCommands({
+     declaredCommands: Array.isArray(params.connectParams.commands)
+diff --git a/src/gateway/server-methods/chat.ts b/src/gateway/server-methods/chat.ts
+index b76ebbfe98..66bd9a3009 100644
+--- a/src/gateway/server-methods/chat.ts
++++ b/src/gateway/server-methods/chat.ts
+@@ -11,6 +11,7 @@ import type { MsgContext } from "../../auto-reply/templating.js";
+ import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+ import type { ReplyPayload } from "../../auto-reply/types.js";
+ import { resolveSessionFilePath } from "../../config/sessions.js";
++import { transcriptFindIdempotencyKey } from "../../config/sessions/transcript.js";
+ import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
+ import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
+ import { type SavedMedia, saveMediaBuffer } from "../../media/store.js";
+@@ -815,21 +816,7 @@ function ensureTranscriptFile(params: { transcriptPath: string; sessionId: strin
+ }
+ 
+ function transcriptHasIdempotencyKey(transcriptPath: string, idempotencyKey: string): boolean {
+-  try {
+-    const lines = fs.readFileSync(transcriptPath, "utf-8").split(/\r?\n/);
+-    for (const line of lines) {
+-      if (!line.trim()) {
+-        continue;
+-      }
+-      const parsed = JSON.parse(line) as { message?: { idempotencyKey?: unknown } };
+-      if (parsed?.message?.idempotencyKey === idempotencyKey) {
+-        return true;
+-      }
+-    }
+-    return false;
+-  } catch {
+-    return false;
+-  }
++  return transcriptFindIdempotencyKey(transcriptPath, idempotencyKey) !== undefined;
+ }
+ 
+ function appendAssistantTranscriptMessage(params: {
+diff --git a/src/gateway/server-methods/nodes.ts b/src/gateway/server-methods/nodes.ts
+index 77446ecbd5..8a140a6de5 100644
+--- a/src/gateway/server-methods/nodes.ts
++++ b/src/gateway/server-methods/nodes.ts
+@@ -222,6 +222,8 @@ function resolveAllowedPendingNodeActions(params: {
+   const allowlist = resolveNodeCommandAllowlist(loadConfig(), {
+     platform: connect?.client?.platform,
+     deviceFamily: connect?.client?.deviceFamily,
++    nodeId: params.nodeId,
++    displayName: connect?.client?.displayName,
+   });
+   const allowed = pending.filter((entry) => {
+     const result = isNodeCommandAllowed({
+diff --git a/src/gateway/session-archive.fs.ts b/src/gateway/session-archive.fs.ts
+index 5c878b9bda..80f50e075c 100644
+--- a/src/gateway/session-archive.fs.ts
++++ b/src/gateway/session-archive.fs.ts
+@@ -1,7 +1,167 @@
+-export {
+-  archiveFileOnDisk,
+-  archiveSessionTranscriptsDetailed,
+-  archiveSessionTranscripts,
+-  cleanupArchivedSessionTranscripts,
+-  resolveStableSessionEndTranscript,
+-} from "./session-transcript-files.fs.js";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  formatSessionArchiveTimestamp,
++  parseSessionArchiveTimestamp,
++  resolveSessionPromptFileNameFromTranscriptFileName,
++  type SessionArchiveReason,
++} from "../config/sessions/artifacts.js";
++import {
++  resolveSessionFilePath,
++  resolveSessionTranscriptPath,
++  resolveSessionTranscriptPathInDir,
++} from "../config/sessions/paths.js";
++import { resolveRequiredHomeDir } from "../infra/home-dir.js";
++
++export type ArchiveFileReason = SessionArchiveReason;
++
++function canonicalizePathForComparison(filePath: string): string {
++  const resolved = path.resolve(filePath);
++  try {
++    return fs.realpathSync(resolved);
++  } catch {
++    return resolved;
++  }
++}
++
++function resolveSessionTranscriptCandidates(
++  sessionId: string,
++  storePath: string | undefined,
++  sessionFile?: string,
++  agentId?: string,
++): string[] {
++  const candidates: string[] = [];
++  const pushCandidate = (resolve: () => string): void => {
++    try {
++      candidates.push(resolve());
++    } catch {
++      // Ignore invalid paths/IDs and keep scanning other safe candidates.
++    }
++  };
++
++  if (storePath) {
++    const sessionsDir = path.dirname(storePath);
++    if (sessionFile) {
++      pushCandidate(() =>
++        resolveSessionFilePath(sessionId, { sessionFile }, { sessionsDir, agentId }),
++      );
++    }
++    pushCandidate(() => resolveSessionTranscriptPathInDir(sessionId, sessionsDir));
++  } else if (sessionFile) {
++    if (agentId) {
++      pushCandidate(() => resolveSessionFilePath(sessionId, { sessionFile }, { agentId }));
++    } else {
++      const trimmed = sessionFile.trim();
++      if (trimmed) {
++        candidates.push(path.resolve(trimmed));
++      }
++    }
++  }
++
++  if (agentId) {
++    pushCandidate(() => resolveSessionTranscriptPath(sessionId, agentId));
++  }
++
++  const home = resolveRequiredHomeDir(process.env, os.homedir);
++  const legacyDir = path.join(home, ".openclaw", "sessions");
++  pushCandidate(() => resolveSessionTranscriptPathInDir(sessionId, legacyDir));
++
++  return Array.from(new Set(candidates));
++}
++
++export function archiveFileOnDisk(filePath: string, reason: ArchiveFileReason): string {
++  const ts = formatSessionArchiveTimestamp();
++  const archived = `${filePath}.${reason}.${ts}`;
++  fs.renameSync(filePath, archived);
++  return archived;
++}
++
++export function archiveSessionTranscripts(opts: {
++  sessionId: string;
++  storePath: string | undefined;
++  sessionFile?: string;
++  agentId?: string;
++  reason: "reset" | "deleted";
++  restrictToStoreDir?: boolean;
++}): string[] {
++  const archived: string[] = [];
++  const restrictToStoreDir = opts.restrictToStoreDir ?? true;
++  const storeDir =
++    restrictToStoreDir && opts.storePath
++      ? canonicalizePathForComparison(path.dirname(opts.storePath))
++      : null;
++  for (const candidate of resolveSessionTranscriptCandidates(
++    opts.sessionId,
++    opts.storePath,
++    opts.sessionFile,
++    opts.agentId,
++  )) {
++    const candidatePath = canonicalizePathForComparison(candidate);
++    if (storeDir) {
++      const relative = path.relative(storeDir, candidatePath);
++      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
++        continue;
++      }
++    }
++    if (!fs.existsSync(candidatePath)) {
++      continue;
++    }
++    try {
++      archived.push(archiveFileOnDisk(candidatePath, opts.reason));
++      const promptFileName = resolveSessionPromptFileNameFromTranscriptFileName(
++        path.basename(candidatePath),
++      );
++      if (!promptFileName) {
++        continue;
++      }
++      const promptPath = path.join(path.dirname(candidatePath), promptFileName);
++      if (!fs.existsSync(promptPath)) {
++        continue;
++      }
++      archived.push(archiveFileOnDisk(promptPath, opts.reason));
++    } catch {
++      // Best-effort.
++    }
++  }
++  return archived;
++}
++
++export async function cleanupArchivedSessionTranscripts(opts: {
++  directories: string[];
++  olderThanMs: number;
++  reason?: ArchiveFileReason;
++  nowMs?: number;
++}): Promise<{ removed: number; scanned: number }> {
++  if (!Number.isFinite(opts.olderThanMs) || opts.olderThanMs < 0) {
++    return { removed: 0, scanned: 0 };
++  }
++  const now = opts.nowMs ?? Date.now();
++  const reason: ArchiveFileReason = opts.reason ?? "deleted";
++  const directories = Array.from(new Set(opts.directories.map((dir) => path.resolve(dir))));
++  let removed = 0;
++  let scanned = 0;
++
++  for (const dir of directories) {
++    const entries = await fs.promises.readdir(dir).catch(() => []);
++    for (const entry of entries) {
++      const timestamp = parseSessionArchiveTimestamp(entry, reason);
++      if (timestamp == null) {
++        continue;
++      }
++      scanned += 1;
++      if (now - timestamp <= opts.olderThanMs) {
++        continue;
++      }
++      const fullPath = path.join(dir, entry);
++      const stat = await fs.promises.stat(fullPath).catch(() => null);
++      if (!stat?.isFile()) {
++        continue;
++      }
++      await fs.promises.rm(fullPath).catch(() => undefined);
++      removed += 1;
++    }
++  }
++
++  return { removed, scanned };
++}
+diff --git a/src/gateway/session-archive.runtime.ts b/src/gateway/session-archive.runtime.ts
+index feb7059bb6..c5112100ba 100644
+--- a/src/gateway/session-archive.runtime.ts
++++ b/src/gateway/session-archive.runtime.ts
+@@ -1,6 +1,6 @@
+ export {
+-  archiveSessionTranscriptsDetailed,
+   archiveSessionTranscripts,
++  archiveSessionTranscriptsDetailed,
+   cleanupArchivedSessionTranscripts,
+   resolveStableSessionEndTranscript,
+-} from "./session-archive.fs.js";
++} from "./session-transcript-files.fs.js";
+diff --git a/src/gateway/session-transcript-files.fs.ts b/src/gateway/session-transcript-files.fs.ts
+index 3fd0cf1137..6b880c37a6 100644
+--- a/src/gateway/session-transcript-files.fs.ts
++++ b/src/gateway/session-transcript-files.fs.ts
+@@ -158,8 +158,9 @@ export function archiveSessionTranscriptsDetailed(opts: {
+   restrictToStoreDir?: boolean;
+ }): ArchivedSessionTranscript[] {
+   const archived: ArchivedSessionTranscript[] = [];
++  const restrictToStoreDir = opts.restrictToStoreDir ?? true;
+   const storeDir =
+-    opts.restrictToStoreDir && opts.storePath
++    restrictToStoreDir && opts.storePath
+       ? canonicalizePathForComparison(path.dirname(opts.storePath))
+       : null;
+   for (const candidate of resolveSessionTranscriptCandidates(
+-- 
+2.47.1
+
