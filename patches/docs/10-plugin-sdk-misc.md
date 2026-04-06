@@ -47,7 +47,7 @@ export { registerLogTransport }
 
 // 诊断事件（从仅导出 onDiagnosticEvent 扩展为完整 API）
 export { emitDiagnosticEvent, isDiagnosticsEnabled, onDiagnosticEvent }
-export type { DiagnosticEventPayload, DiagnosticHeartbeatEvent, ... 全部14个诊断事件类型 }
+export type { DiagnosticEventPayload, DiagnosticHeartbeatEvent, ... 全部13个诊断事件类型 }
 
 // 媒体工具
 export { detectMime, extensionForMime, getFileExtension }
@@ -217,6 +217,12 @@ channel-import-guardrails.test.ts
     |     检查 forbiddenPatterns 是否匹配
     |         --> 匹配则测试失败
     |
+    |     注：守卫测试还使用以下结构化常量控制扫描范围：
+    |     - GUARDED_CHANNEL_EXTENSIONS: 受守卫约束的 channel 扩展列表
+    |     - ALLOWED_EXTENSION_PUBLIC_SURFACES: 允许的公共 API 表面文件
+    |     - SAME_CHANNEL_SDK_GUARDS: 同名 channel SDK 导入禁止规则
+    |     - SETUP_BARREL_GUARDS: setup barrel 导入守卫规则
+    |
     +---> index.test.ts "keeps the root runtime surface intentionally small":
               |
               v
@@ -224,7 +230,9 @@ channel-import-guardrails.test.ts
               |
               v
           断言排序后的导出列表 === 快照
-              （快照新增了 SessionBindingError, clamp, detectMime,
+              （快照中 buildFalImageGenerationProvider、buildGoogleImageGenerationProvider、
+               buildOpenAIImageGenerationProvider 为已有导出，非本次新增。
+               快照新增了 SessionBindingError, clamp, detectMime,
                emitDiagnosticEvent, escapeRegExp, extensionForMime,
                extractOriginalFilename, getFileExtension,
                getSessionBindingService, isDiagnosticsEnabled,
@@ -277,7 +285,7 @@ mergeDeep(base, overrides)               [plugin-runtime-mock.ts:23-36]
 | 113 | `export { registerLogTransport }` (新增) |
 | 114 | LogTransport 类型导出 (新增) |
 | 115-119 | 诊断事件运行时导出 (改为 3 个函数，原来只有 `onDiagnosticEvent`) |
-| 120-135 | 诊断事件全部类型导出 (新增 14 个类型) |
+| 120-135 | 诊断事件全部类型导出 (新增 13 个类型) |
 | 136 | `export { detectMime, extensionForMime, getFileExtension }` (新增) |
 | 137 | `export { extractOriginalFilename }` (新增) |
 | 138 | `export { listSkillCommandsForAgents }` (新增) |

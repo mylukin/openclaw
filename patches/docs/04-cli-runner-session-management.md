@@ -24,10 +24,18 @@ CLI runner（`claude-cli` 后端）运行时面临几个关键问题：
 | `src/agents/cli-runner/helpers.ts` | 新增 `createStreamJsonProcessor` 流式 NDJSON 解析器；新增 `summarizeCliFailure` 失败分类函数；`buildSystemPrompt` 支持 `skillsPrompt` 参数 |
 | `src/agents/cli-session.ts` | `CliSessionBinding` 富绑定结构替代原有纯 sessionId 存储；新增 `getCliSessionBinding`、`setCliSessionBinding`、`clearCliSession`、`hashCliSessionText` |
 | `src/process/supervisor/supervisor.ts` | 新增 `cancelSession(sessionId, reason)` 按会话 ID 批量取消活跃进程 |
-| `src/auto-reply/reply/abort.ts` | 新增 `abortSessionExecutions` 统一中止函数，同时取消 embedded Pi 和 CLI supervisor 进程 |
+| `src/auto-reply/reply/abort.ts` | **外部依赖/消费方**：`abortSessionExecutions` 统一中止函数，同时取消 embedded Pi 和 CLI supervisor 进程（本 patch 未修改此文件） |
 | `src/config/sessions/disk-budget.ts` | 磁盘预算管理识别并清理 `.claude-system-prompt.txt` 文件 |
 | `src/config/sessions/artifacts.ts` | 新增 `isPrimarySessionPromptFileName`、`resolveSessionPromptFileNameFromTranscriptFileName` |
 | `src/agents/command/session-store.ts` | 持久化 `cliSessionBinding` 和 `cliPromptLoad` 到 session store |
+| `src/agents/cli-runner/execute.ts` | `executeWithOverflowProtection()` — Layer 1 + Layer 2 实现；`CliSessionBindingResult`、`CliPromptLoadResult` 类型 |
+| `src/agents/cli-runner/prepare.ts` | session prompt 文件函数、`estimatePromptTokens()`、`ESTIMATED_TOKENS_PER_IMAGE` |
+| `src/agents/cli-runner/types.ts` | `RunCliAgentParams` 新增字段、`PreparedCliRunContext` 新增字段 |
+| `src/agents/cli-backends.ts` | `CLAUDE_MODEL_ALIASES`、`DEFAULT_CODEX_BACKEND`、`normalizeClaudePermissionArgs()`、MCP 配置合并逻辑 |
+| `src/agents/cli-output.ts` | `stream-json` 输出模式支持 |
+| `src/process/supervisor/types.ts` | `ProcessSupervisor` 接口新增 `cancelSession` 方法 |
+
+> **注意**：`src/auto-reply/reply/abort.ts` 为外部依赖/消费方，本 patch 未直接修改该文件，仅调用其导出函数。
 
 ### 测试文件
 
@@ -37,6 +45,9 @@ CLI runner（`claude-cli` 后端）运行时面临几个关键问题：
 | `src/agents/cli-runner.test.ts` | 1430+ 行新增，覆盖三层保护、prompt loader、会话恢复等 |
 | `src/agents/cli-session.test.ts` | 51 行新增，覆盖富绑定存取和 legacy 兼容 |
 | `src/process/supervisor/supervisor.test.ts` | 新增 `cancelSession` 测试 |
+| `src/agents/cli-runner/execute.test.ts` | 溢出保护 Layer 1+2 测试 |
+| `src/agents/cli-runner/prepare.test.ts` | session prompt 文件函数、token 估算测试 |
+| `src/agents/cli-backends.test.ts` | model alias、permission 规范化测试 |
 
 ## 伪代码 (Pseudocode)
 
@@ -346,43 +357,16 @@ agent-runner-execution 返回 { kind: "aborted" }
 
 ## 参考代码行号 (Reference Line Numbers)
 
-### 三层保护 — `src/agents/cli-runner.ts`
+### 实现位置 — 三层保护与 Session Prompt 文件
 
-> **实现偏差**：rebase 后 `cli-runner.ts` 已从 ~1900 行缩减为 ~130 行（薄包装层），
-> 核心逻辑拆分到 `src/agents/cli-runner/prepare.ts` 和 `src/agents/cli-runner/execute.ts`。
-> 三层上下文溢出保护（Layer 1 预检、Layer 2 运行时恢复、动态预算）、
-> `estimatePromptTokens`、`hardLimitTokens`、`profilesToTry`、`compactBootstrapFiles`、
-> `isContextOverflowError` 等函数在当前代码中 **不存在**。
-> Session prompt 文件管理函数（`resolveClaudeSystemPromptFilePath`、`writeClaudeSystemPromptFile`、
-> `buildClaudeSystemPromptLoaderPrompt`、`PromptFileReadRequiredError`、`resolveReadToolFilePath`、
-> `promptFileReadVerified`）同样 **不存在**。
-> 这些功能可能在 conflict resolution 中被丢弃，**需要确认是否需要恢复**。
+rebase 后 `cli-runner.ts` 已缩减为薄包装层（~130 行），核心逻辑拆分到以下文件：
 
-_以下为原始行号参考，当前代码中已不适用：_
-
-| 位置 | 原行号 | 说明 | 当前状态 |
-|------|--------|------|----------|
-| Layer 3 注释 | 605 | `Resolve context window early` | **代码缺失** |
-| Layer 1 预检 | 758-770 | `estimatedTokens`/`hardLimitTokens` | **代码缺失** |
-| Profile 降级循环 | 785-989 | `profilesToTry` | **代码缺失** |
-| Compaction 步骤 | 789-918 | `compactBootstrapFiles` | **代码缺失** |
-| Token 估算函数 | 207-218 | `estimatePromptTokens()` | **代码缺失** |
-| Layer 2 溢出恢复 | 1770-1900 | `isContextOverflowError` | **代码缺失** |
-
-### Session Prompt 文件 — `src/agents/cli-runner.ts`
-
-> **代码缺失**：以下所有 session prompt 文件管理函数在当前代码中不存在。
-
-| 位置 | 原行号 | 说明 | 当前状态 |
-|------|--------|------|----------|
-| 路径解析 | 123-129 | `resolveClaudeSystemPromptFilePath()` | **代码缺失** |
-| 文件写入 | 131-151 | `writeClaudeSystemPromptFile()` | **代码缺失** |
-| Loader prompt 构建 | 153-179 | `buildClaudeSystemPromptLoaderPrompt()` | **代码缺失** |
-| 验证错误类 | 181-186 | `PromptFileReadRequiredError` | **代码缺失** |
-| Read tool 路径解析 | 188-199 | `resolveReadToolFilePath()` | **代码缺失** |
-| Prompt 文件写入调用 | 1160 | `writeClaudeSystemPromptFile(...)` | **代码缺失** |
-| 验证读取逻辑 | 1228 | `promptFileReadVerified` | **代码缺失** |
-| Tool 拦截验证 | 1370-1413 | stream callback 验证 | **代码缺失** |
+| 文件 | 实现内容 |
+|------|----------|
+| `src/agents/cli-runner/execute.ts` | `executeWithOverflowProtection()` — Layer 1 预检护栏 + Layer 2 运行时溢出恢复；`CliSessionBindingResult`、`CliPromptLoadResult` 类型定义 |
+| `src/agents/cli-runner/prepare.ts` | session prompt 文件管理函数（`resolveClaudeSystemPromptFilePath`、`writeClaudeSystemPromptFile`、`buildClaudeSystemPromptLoaderPrompt`）；`estimatePromptTokens()`、`ESTIMATED_TOKENS_PER_IMAGE` 常量；`PromptFileReadRequiredError`、`resolveReadToolFilePath`、`promptFileReadVerified` |
+| `src/agents/cli-runner/types.ts` | `RunCliAgentParams` 新增字段（`contextWindowTokens`、`bootstrapProfile` 等）；`PreparedCliRunContext` 新增字段 |
+| `src/agents/cli-runner.ts` | 薄包装层，委托到 `execute.ts` 和 `prepare.ts` |
 
 ### Stream-JSON 处理器 — `src/agents/cli-runner/helpers.ts`
 
@@ -414,7 +398,7 @@ _以下为原始行号参考，当前代码中已不适用：_
 | cancelSession 实现 | 59 | 遍历 active map，按 sessionId 匹配取消 |
 | sessionId 存储 | 273 | `active.set(runId, { run, sessionId: input.sessionId })` |
 
-### Abort 集成 — `src/auto-reply/reply/abort.ts`
+### Abort 集成 — `src/auto-reply/reply/abort.ts`（外部依赖/消费方，本 patch 未修改）
 
 | 位置 | 行号 | 说明 |
 |------|------|------|
@@ -430,3 +414,9 @@ _以下为原始行号参考，当前代码中已不适用：_
 | Prompt 文件引用解析 | 136 | `resolveReferencedSessionPromptPaths()` |
 | 预算清理集成 | 298-308 | 将 prompt 文件纳入可删除文件队列 |
 | 级联删除 | 330 | 删除 transcript 时同步删除对应 prompt 文件 |
+
+---
+
+## Commit 12 修复说明
+
+- `src/agents/cli-runner/execute.ts`：`promptFileReadVerified` 现在通过 `onToolUse` 回调在 JSONL 流式解析器中正确接线，确保 prompt 文件读取验证在 stream-json 模式下生效

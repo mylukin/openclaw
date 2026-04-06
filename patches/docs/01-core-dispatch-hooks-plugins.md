@@ -35,13 +35,38 @@ outbound 消息分发管道需要同时处理两类频道级信息：
 | `src/hooks/message-hook-mappers.ts` | `CanonicalInboundMessageHookContext` 新增 `channelData` 字段；`CanonicalSentMessageHookContext` 新增 `metadata` 字段 |
 | `src/plugins/hooks.ts` | `runMessageSending` 合并结果时新增 `metadata` 合并逻辑；新增 `chat_member_user_added` 等 hook |
 | `src/plugins/hook-runner-global.ts` | `initializeGlobalHookRunner` 检测新注册表是否缺少旧注册表的 hook，缺失时合并保留 |
-| `src/infra/outbound/channel-resolution.ts` | 移除 `resolveDirectFromActiveRegistry`；当已有频道插件加载时跳过引导，避免重载 |
+| `src/infra/outbound/channel-resolution.ts` | 移除 `resolveDirectFromActiveRegistry` 及其调用点，简化回退链 |
 | `src/infra/outbound/channel-selection.ts` | 回退频道解析从 `resolveAvailableKnownChannel` 改为 `resolveKnownChannel` |
 | `src/hooks/llm-slug-generator.ts` | 引入 `buildModelAliasIndex` + `resolveModelRefFromString`；支持 hook 级 model 覆盖；CLI 后端自动回退到默认嵌入式提供商 |
 | `src/config/sessions/types.ts` | 新增 `CliSessionBinding`、`CliPromptLoadStatus` 类型 |
 | `src/config/sessions/transcript.ts` | 新增 `appendCliTurnToSessionTranscript`；`appendAssistantMessageToSessionTranscript` 增加 `messageMeta` 参数 + leafId 保护 |
 | `src/plugins/runtime/types-core.ts` | 新增运行时类型定义（`PluginHookChatMemberBotEvent`、`PluginHookChatMemberUserEvent`） |
 | `src/channels/plugins/registry.ts` | 频道插件缓存增加 `sourceSignature` 防止虚假缓存命中 |
+| `src/config/schema.base.generated.ts` | 新增 `gateway.nodes.overrides` 配置模式；hook entries 增加 `model` 字段 |
+| `src/config/schema.help.ts` | 新增 override 级别的 help 文案（`allowCommands`、`denyCommands`） |
+| `src/config/schema.labels.ts` | 新增 override 配置项的 label 映射 |
+| `src/config/types.agent-defaults.ts` | Agent 默认配置类型新增 `sessionMemory` 字段 |
+| `src/config/types.gateway.ts` | `GatewayNodesConfig` 增加 `overrides` 映射类型 |
+| `src/config/types.skills.ts` | 技能类型扩展支持 hook 级别模型覆盖 |
+| `src/config/types.tools.ts` | 工具类型增加可选元数据字段 |
+| `src/config/zod-schema.*.ts` | Zod schema 同步更新：override 结构、hook model 字段等 |
+| `src/plugins/loader.ts` | 嵌入式插件列表新增条目；加载顺序调整 |
+| `src/plugins/manifest-registry.ts` | 注册表构建时保留 hook 元数据（`model`、`timeout` 等） |
+| `src/plugins/runtime/index.ts` | 运行时导出新增 agents 和 hooks 公共表面 |
+| `src/plugins/runtime-model-aware.runtime.ts` | 新增运行时模型感知辅助：`resolveModelRefFromString`、`buildModelAliasIndex` |
+| `src/infra/outbound/outbound-send-service.ts` | 新增 `isCancelledPluginActionPayload` 判定；cancelled payload 跳过发送 |
+| `src/infra/outbound/conversation-id.ts` | 会话 ID 生成增加 `chat:` 前缀支持 |
+| `src/infra/session-memory/transcript.ts` | delivery-mirror 过滤逻辑：跳过非当前会话的 mirror 条目 |
+| `src/infra/session-memory/HOOK.md` | 新增 session-memory hook 内部文档 |
+| `src/plugins/types.ts` | 新增 `chat_member_user_added` 等 chat member hook 类型；handler map 扩展；元数据字段增加 |
+| `src/plugins/schema-validator.ts` | Ajv 导入从默认导入重构为命名导入（ESM 兼容） |
+| `src/hooks/llm-slug-generator.test.ts` | hook 级模型覆盖、CLI 后端回退、超时配置的单元测试 |
+| `src/plugins/hook-runner-global.test.ts` | hook runner 合并保护逻辑的单元测试 |
+| `src/hooks/message-hook-mappers.test.ts` | `channelData` / `metadata` 字段映射的单元测试 |
+| `src/infra/outbound/conversation-id.test.ts` | `chat:` 前缀会话 ID 解析的单元测试 |
+| `src/infra/outbound/deliver.test.ts` | `buildMirrorMessageMeta`、`buildDeliveryResultMetadata` 的单元测试 |
+| `src/infra/outbound/outbound-send-service.test.ts` | `isCancelledPluginActionPayload` 判定的单元测试 |
+| `src/infra/session-memory/handler.test.ts` | delivery-mirror 过滤、转录追加逻辑的单元测试 |
 
 ---
 
@@ -225,9 +250,9 @@ initializeGlobalHookRunner(registry_B)
 | `src/hooks/llm-slug-generator.ts` | 78-117 | hook 级模型覆盖 + CLI 回退逻辑 |
 | `src/hooks/message-hook-mappers.ts` | 45 | `CanonicalInboundMessageHookContext` 新增 `channelData` |
 | `src/hooks/message-hook-mappers.ts` | 59 | `CanonicalSentMessageHookContext` 新增 `metadata` |
-| `src/infra/outbound/channel-resolution.ts` | 44-48 | 已有频道插件时跳过引导（early return） |
+| `src/infra/outbound/channel-resolution.ts` | 44-52 | 回退链简化（移除 `resolveDirectFromActiveRegistry` 调用点） |
 | `src/infra/outbound/channel-selection.ts` | 161 | 回退改为 `resolveKnownChannel` |
-| `src/config/sessions/types.ts` | 68-83 | `CliSessionBinding` 和 `CliPromptLoadStatus` 类型定义 |
+| `src/config/sessions/types.ts` | 68-88 | `CliSessionBinding` 和 `CliPromptLoadStatus` 类型定义 |
 | `src/config/sessions/transcript.ts` | 168-216 | `appendCliTurnToSessionTranscript()` 函数定义 |
 | `src/config/sessions/transcript.ts` | 277-310 | `appendAssistantMessageToSessionTranscript()` 的 leafId 保护 |
 | `src/channels/plugins/registry.ts` | 24 | 频道插件缓存结构增加 `sourceSignature` |

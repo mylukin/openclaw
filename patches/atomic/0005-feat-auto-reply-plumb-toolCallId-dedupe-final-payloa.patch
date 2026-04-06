@@ -1,38 +1,29 @@
-From bd939087daeba1b9d42afe03dd89f4566dfb678c Mon Sep 17 00:00:00 2001
+From b926ef603320aa0074c41d4556b7d9a04398fecc Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:02:56 +0800
-Subject: [PATCH 05/10] feat(auto-reply): plumb toolCallId, dedupe final
+Date: Mon, 6 Apr 2026 01:42:56 +0800
+Subject: [PATCH 05/12] feat(auto-reply): plumb toolCallId, dedupe final
  payloads, and harden session dispatch
 
-- Plumb toolCallId through onToolStart and ReplyPayload
-- Dedupe equivalent final payloads in dispatch-from-config
-- Use runModelAwareAgent in memory flush and followup runner
-- Expose replyToId in message_sending hook metadata
-- Harden abort handling and session hooks context
-- Add message-received hooks pipeline
-- Improve streaming directives and session usage tracking
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
  src/auto-reply/heartbeat.ts                   |   2 +-
  src/auto-reply/reply/abort.test.ts            |  43 +++
  src/auto-reply/reply/abort.ts                 |  45 ++-
- .../reply/agent-runner-execution.ts           | 230 ++++++++++++++-
- src/auto-reply/reply/agent-runner-memory.ts   |   4 +-
+ .../reply/agent-runner-execution.ts           | 120 +++++++-
+ src/auto-reply/reply/agent-runner-memory.ts   |   5 +-
  .../agent-runner.misc.runreplyagent.test.ts   | 263 +++++++++++++++++-
  .../agent-runner.runreplyagent.e2e.test.ts    |  13 +
- src/auto-reply/reply/agent-runner.ts          |   6 +
+ src/auto-reply/reply/agent-runner.ts          |   7 +-
  src/auto-reply/reply/commands-core.ts         |  22 +-
  .../reply/commands-session-abort.ts           |   4 +-
  .../reply/dispatch-from-config.test.ts        |  56 ++++
- src/auto-reply/reply/dispatch-from-config.ts  |  19 +-
- src/auto-reply/reply/followup-runner.ts       |  17 +-
+ src/auto-reply/reply/dispatch-from-config.ts  |  53 +++-
+ src/auto-reply/reply/followup-runner.ts       |  15 +-
  .../get-reply.reset-hooks-fallback.test.ts    |  77 +++++
- src/auto-reply/reply/get-reply.ts             |  32 ++-
+ src/auto-reply/reply/get-reply.ts             |  66 +++--
  .../reply/message-received-hooks.ts           |  94 +++++++
  src/auto-reply/reply/reply-utils.test.ts      |  45 +++
  .../reply/session-hooks-context.test.ts       |  30 ++
- src/auto-reply/reply/session-usage.ts         |  39 ++-
+ src/auto-reply/reply/session-usage.ts         |  36 ++-
  src/auto-reply/reply/session.test.ts          |  49 ++++
  src/auto-reply/reply/session.ts               |   6 +-
  src/auto-reply/reply/streaming-directives.ts  |  31 ++-
@@ -42,16 +33,16 @@ Co-Authored-By: Claude <noreply@anthropic.com>
  src/auto-reply/templating.ts                  |   2 +
  src/auto-reply/tokens.test.ts                 |  48 +++-
  src/auto-reply/tokens.ts                      |  29 +-
- src/auto-reply/types.ts                       |   7 +-
- 29 files changed, 1234 insertions(+), 51 deletions(-)
+ src/auto-reply/types.ts                       |   3 +-
+ 29 files changed, 1154 insertions(+), 82 deletions(-)
  create mode 100644 src/auto-reply/reply/message-received-hooks.ts
  create mode 100644 src/auto-reply/status.cli-prompt-load.test.ts
 
 diff --git a/src/auto-reply/heartbeat.ts b/src/auto-reply/heartbeat.ts
-index 4141d180f6..56a56eb70d 100644
+index e2ffa71b6c..86a9271e6e 100644
 --- a/src/auto-reply/heartbeat.ts
 +++ b/src/auto-reply/heartbeat.ts
-@@ -4,7 +4,7 @@ import { HEARTBEAT_TOKEN } from "./tokens.js";
+@@ -11,7 +11,7 @@ export type HeartbeatTask = {
  // Default heartbeat prompt (used when config.agents.defaults.heartbeat.prompt is unset).
  // Keep it tight and avoid encouraging the model to invent/rehash "open loops" from prior chat context.
  export const HEARTBEAT_PROMPT =
@@ -61,10 +52,10 @@ index 4141d180f6..56a56eb70d 100644
  export const DEFAULT_HEARTBEAT_ACK_MAX_CHARS = 300;
  
 diff --git a/src/auto-reply/reply/abort.test.ts b/src/auto-reply/reply/abort.test.ts
-index 55450e4356..83b641fc75 100644
+index a5a3a57521..4a6b61a2c4 100644
 --- a/src/auto-reply/reply/abort.test.ts
 +++ b/src/auto-reply/reply/abort.test.ts
-@@ -59,6 +59,10 @@ const acpManagerMocks = vi.hoisted(() => ({
+@@ -65,6 +65,10 @@ const acpManagerMocks = vi.hoisted(() => ({
    cancelSession: vi.fn(async () => {}),
  }));
  
@@ -75,10 +66,10 @@ index 55450e4356..83b641fc75 100644
  vi.mock("../../acp/control-plane/manager.js", () => ({
    getAcpSessionManager: () => ({
      resolveSession: acpManagerMocks.resolveSession,
-@@ -172,6 +176,10 @@ describe("abort detection", () => {
-           cancelSession: acpManagerMocks.cancelSession,
-         }) as never) as never,
+@@ -180,6 +184,10 @@ describe("abort detection", () => {
        abortEmbeddedPiRun: () => true,
+       getLatestSubagentRunByChildSessionKey:
+         subagentRegistryMocks.getLatestSubagentRunByChildSessionKey,
 +      getProcessSupervisor: (() =>
 +        ({
 +          cancelSession: processSupervisorMocks.cancelSession,
@@ -86,15 +77,15 @@ index 55450e4356..83b641fc75 100644
        listSubagentRunsForController: subagentRegistryMocks.listSubagentRunsForRequester,
        markSubagentRunTerminated: subagentRegistryMocks.markSubagentRunTerminated,
      });
-@@ -189,6 +197,7 @@ describe("abort detection", () => {
-     commandQueueMocks.clearCommandLane.mockClear().mockReturnValue(1);
+@@ -198,6 +206,7 @@ describe("abort detection", () => {
      acpManagerMocks.resolveSession.mockReset().mockReturnValue({ kind: "none" });
      acpManagerMocks.cancelSession.mockReset().mockResolvedValue(undefined);
+     subagentRegistryMocks.getLatestSubagentRunByChildSessionKey.mockReset().mockReturnValue(null);
 +    processSupervisorMocks.cancelSession.mockReset().mockReturnValue(0);
    });
  
    it("triggerBodyNormalized extracts /stop from RawBody for abort detection", async () => {
-@@ -428,6 +437,40 @@ describe("abort detection", () => {
+@@ -437,6 +446,40 @@ describe("abort detection", () => {
      expectSessionLaneCleared(sessionKey);
    });
  
@@ -136,10 +127,10 @@ index 55450e4356..83b641fc75 100644
      const sessionKey = "agent:codex:acp:test-1";
      const sessionId = "session-123";
 diff --git a/src/auto-reply/reply/abort.ts b/src/auto-reply/reply/abort.ts
-index 3d51db17dd..0ed17bec2e 100644
+index 2f46a387b7..779ec04422 100644
 --- a/src/auto-reply/reply/abort.ts
 +++ b/src/auto-reply/reply/abort.ts
-@@ -18,6 +18,7 @@ import {
+@@ -20,6 +20,7 @@ import {
    updateSessionStore,
  } from "../../config/sessions.js";
  import { logVerbose } from "../../globals.js";
@@ -147,27 +138,27 @@ index 3d51db17dd..0ed17bec2e 100644
  import { parseAgentSessionKey } from "../../routing/session-key.js";
  import { resolveCommandAuthorization } from "../command-auth.js";
  import type { FinalizedMsgContext, MsgContext } from "../templating.js";
-@@ -50,6 +51,7 @@ export {
- const defaultAbortDeps = {
+@@ -53,6 +54,7 @@ const defaultAbortDeps = {
    getAcpSessionManager,
    abortEmbeddedPiRun,
+   getLatestSubagentRunByChildSessionKey,
 +  getProcessSupervisor,
    listSubagentRunsForController,
    markSubagentRunTerminated,
  };
-@@ -63,6 +65,8 @@ export const __testing = {
-     abortDeps.getAcpSessionManager =
-       deps?.getAcpSessionManager ?? defaultAbortDeps.getAcpSessionManager;
-     abortDeps.abortEmbeddedPiRun = deps?.abortEmbeddedPiRun ?? defaultAbortDeps.abortEmbeddedPiRun;
+@@ -69,6 +71,8 @@ export const __testing = {
+     abortDeps.getLatestSubagentRunByChildSessionKey =
+       deps?.getLatestSubagentRunByChildSessionKey ??
+       defaultAbortDeps.getLatestSubagentRunByChildSessionKey;
 +    abortDeps.getProcessSupervisor =
 +      deps?.getProcessSupervisor ?? defaultAbortDeps.getProcessSupervisor;
      abortDeps.listSubagentRunsForController =
        deps?.listSubagentRunsForController ?? defaultAbortDeps.listSubagentRunsForController;
      abortDeps.markSubagentRunTerminated =
-@@ -71,11 +75,39 @@ export const __testing = {
-   resetDepsForTests(): void {
-     abortDeps.getAcpSessionManager = defaultAbortDeps.getAcpSessionManager;
+@@ -79,11 +83,39 @@ export const __testing = {
      abortDeps.abortEmbeddedPiRun = defaultAbortDeps.abortEmbeddedPiRun;
+     abortDeps.getLatestSubagentRunByChildSessionKey =
+       defaultAbortDeps.getLatestSubagentRunByChildSessionKey;
 +    abortDeps.getProcessSupervisor = defaultAbortDeps.getProcessSupervisor;
      abortDeps.listSubagentRunsForController = defaultAbortDeps.listSubagentRunsForController;
      abortDeps.markSubagentRunTerminated = defaultAbortDeps.markSubagentRunTerminated;
@@ -204,7 +195,7 @@ index 3d51db17dd..0ed17bec2e 100644
  export function formatAbortReplyText(stoppedSubagents?: number): string {
    if (typeof stoppedSubagents !== "number" || stoppedSubagents <= 0) {
      return "⚙️ Agent was aborted.";
-@@ -163,7 +195,7 @@ export function stopSubagentsForRequester(params: {
+@@ -188,7 +220,7 @@ export function stopSubagentsForRequester(params: {
        }
        const entry = store[childKey];
        const sessionId = entry?.sessionId;
@@ -213,7 +204,7 @@ index 3d51db17dd..0ed17bec2e 100644
        const markedTerminated =
          abortDeps.markSubagentRunTerminated({
            runId: run.runId,
-@@ -171,7 +203,13 @@ export function stopSubagentsForRequester(params: {
+@@ -196,7 +228,13 @@ export function stopSubagentsForRequester(params: {
            reason: "killed",
          }) > 0;
  
@@ -228,7 +219,7 @@ index 3d51db17dd..0ed17bec2e 100644
          stopped += 1;
        }
      }
-@@ -246,7 +284,8 @@ export async function tryFastAbortFromMessage(params: {
+@@ -271,7 +309,8 @@ export async function tryFastAbortFromMessage(params: {
        }
      }
      const sessionId = entry?.sessionId;
@@ -239,20 +230,18 @@ index 3d51db17dd..0ed17bec2e 100644
      if (cleared.followupCleared > 0 || cleared.laneCleared > 0) {
        logVerbose(
 diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
-index f164559a79..f07213db20 100644
+index 36bfe2f042..f486b9e4c0 100644
 --- a/src/auto-reply/reply/agent-runner-execution.ts
 +++ b/src/auto-reply/reply/agent-runner-execution.ts
-@@ -3,7 +3,8 @@ import fs from "node:fs";
- import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
+@@ -7,6 +7,7 @@ import {
  import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
  import { runCliAgent } from "../../agents/cli-runner.js";
--import { getCliSessionId } from "../../agents/cli-session.js";
-+import { getCliSessionBinding } from "../../agents/cli-session.js";
+ import { getCliSessionBinding } from "../../agents/cli-session.js";
 +import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
- import { runWithModelFallback } from "../../agents/model-fallback.js";
+ import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
+ import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
  import { isCliProvider } from "../../agents/model-selection.js";
- import {
-@@ -34,6 +35,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
+@@ -42,6 +43,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
  import type { TemplateContext } from "../templating.js";
  import type { VerboseLevel } from "../thinking.js";
  import {
@@ -260,23 +249,23 @@ index f164559a79..f07213db20 100644
    HEARTBEAT_TOKEN,
    isSilentReplyPrefixText,
    isSilentReplyText,
-@@ -48,6 +50,7 @@ import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
+@@ -57,6 +59,7 @@ import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
  import type { FollowupRun } from "./queue.js";
  import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
  import { createReplyMediaPathNormalizer } from "./reply-media-paths.runtime.js";
 +import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
  import type { TypingSignaler } from "./typing-mode.js";
  
- export type RuntimeFallbackAttempt = {
-@@ -72,6 +75,7 @@ export type AgentRunLoopResult =
+ // Maximum number of LiveSessionModelSwitchError retries before surfacing a
+@@ -91,6 +94,7 @@ export type AgentRunLoopResult =
        /** Payload keys sent directly (not via pipeline) during tool flush. */
        directlySentBlockKeys?: Set<string>;
      }
 +  | { kind: "aborted" }
    | { kind: "final"; payload: ReplyPayload };
  
- export async function runAgentTurnWithFallback(params: {
-@@ -187,11 +191,24 @@ export async function runAgentTurnWithFallback(params: {
+ type FallbackSelectionState = Pick<
+@@ -593,11 +597,24 @@ export async function runAgentTurnWithFallback(params: {
          }
          return { text: sanitized, skip: false };
        };
@@ -303,15 +292,10 @@ index f164559a79..f07213db20 100644
          if (skip || !text) {
            return undefined;
          }
-@@ -240,9 +257,61 @@ export async function runAgentTurnWithFallback(params: {
-                 startedAt,
-               },
-             });
--            const cliSessionId = getCliSessionId(params.getActiveSessionEntry(), provider);
-+            const cliSessionBinding = getCliSessionBinding(
-+              params.getActiveSessionEntry(),
-+              provider,
-+            );
+@@ -665,8 +682,57 @@ export async function runAgentTurnWithFallback(params: {
+               provider === params.followupRun.run.provider
+                 ? params.followupRun.run.authProfileId
+                 : undefined;
 +            const cliSessionId = cliSessionBinding?.sessionId;
              return (async () => {
                let lifecycleTerminalEmitted = false;
@@ -366,157 +350,45 @@ index f164559a79..f07213db20 100644
                try {
                  const result = await runCliAgent({
                    sessionId: params.followupRun.run.sessionId,
-@@ -258,22 +327,137 @@ export async function runAgentTurnWithFallback(params: {
-                   timeoutMs: params.followupRun.run.timeoutMs,
+@@ -683,7 +749,7 @@ export async function runAgentTurnWithFallback(params: {
                    runId,
                    extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
-+                  skillsSnapshot: params.followupRun.run.skillsSnapshot,
                    ownerNumbers: params.followupRun.run.ownerNumbers,
-                   cliSessionId,
-+                  cliSessionBinding,
-+                  sessionCompactionCount: params.getActiveSessionEntry()?.compactionCount,
+-                  cliSessionId: cliSessionBinding?.sessionId,
++                  cliSessionId,
+                   cliSessionBinding,
+                   authProfileId,
                    bootstrapPromptWarningSignaturesSeen,
-                   bootstrapPromptWarningSignature:
-                     bootstrapPromptWarningSignaturesSeen[
-                       bootstrapPromptWarningSignaturesSeen.length - 1
-                     ],
-                   images: params.opts?.images,
-+                  abortSignal: params.opts?.abortSignal,
-+                  trigger: params.isHeartbeat ? "heartbeat" : "user",
-+                  messageChannel: params.followupRun.run.messageProvider,
-+                  messageAccountId:
-+                    (params.sessionCtx as { AccountId?: string }).AccountId ?? undefined,
-+                  messageTo: params.sessionCtx.OriginatingTo ?? params.sessionCtx.To ?? undefined,
-+                  messageThreadId: params.sessionCtx.MessageThreadId ?? undefined,
-+                  onSystemInit: ({ subtype }) => {
-+                    if (subtype === "init") {
-+                      queueAssistantMessageStart();
-+                    }
-+                  },
-+                  onAssistantTurn: (text) => {
-+                    queueAssistantMessageStart();
-+                    queueReasoningEndIfNeeded();
-+                    emitAgentEvent({
-+                      runId,
-+                      stream: "assistant",
-+                      data: { text },
-+                    });
-+                    // Mirror the embedded path's onPartialReply flow:
-+                    // 1. handlePartialForTyping awaits signalTextDelta (starts
-+                    //    streaming card on first call via typing → onReplyStart)
-+                    // 2. then onPartialReply queues the card content update
-+                    // Chained (not fire-and-forget) so signalTextDelta completes
-+                    // before onPartialReply, and markRunComplete waits for all.
-+                    queueStreamingStep(async () => {
-+                      const parsedChunk = streamingDirectiveAccumulator.consume(text, {
-+                        silentToken: SILENT_REPLY_TOKEN,
-+                      });
-+                      const normalizedText = await handlePartialForTyping({
-+                        text: parsedChunk?.text,
-+                        mediaUrl: parsedChunk?.mediaUrl,
-+                        mediaUrls: parsedChunk?.mediaUrls,
-+                        audioAsVoice: parsedChunk?.audioAsVoice,
-+                      });
-+                      if (normalizedText !== undefined && params.opts?.onPartialReply) {
-+                        await params.opts.onPartialReply({ text: normalizedText });
-+                      }
-+                    });
-+                  },
-+                  onThinkingTurn: ({ text, delta }) => {
-+                    if (!text.trim()) {
-+                      return;
-+                    }
-+                    queueAssistantMessageStart();
-+                    cliReasoningOpen = true;
-+                    emitAgentEvent({
-+                      runId,
-+                      stream: "thinking",
-+                      data: {
-+                        text,
-+                        ...(delta ? { delta } : {}),
-+                      },
-+                    });
-+                    queueStreamingStep(async () => {
-+                      await params.typingSignals.signalReasoningDelta();
-+                      const rendered = formatReasoningPayload(text);
-+                      if (!rendered) {
-+                        return;
-+                      }
-+                      await params.opts?.onReasoningStream?.({
-+                        text: rendered,
-+                        isReasoning: true,
-+                      });
-+                    });
-+                  },
-+                  onToolUseEvent: (payload) => {
-+                    queueAssistantMessageStart();
-+                    queueReasoningEndIfNeeded();
-+                    emitAgentEvent({
-+                      runId,
-+                      stream: "tool",
-+                      data: {
-+                        phase: "start",
-+                        name: payload.name,
-+                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
-+                        ...(payload.input !== undefined ? { input: payload.input } : {}),
-+                      },
-+                    });
-+                    queueStreamingStep(async () => {
-+                      await params.typingSignals.signalToolStart();
-+                      await params.opts?.onToolStart?.({
-+                        name: payload.name,
-+                        phase: "start",
-+                        ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
-+                      });
-+                    });
-+                  },
-+                  onToolResult: (payload) => {
-+                    queueReasoningEndIfNeeded();
-+                    const preview =
-+                      typeof payload.text === "string" && payload.text.trim()
-+                        ? payload.text.trim().slice(0, 1_200)
-+                        : undefined;
-+                    emitAgentEvent({
-+                      runId,
-+                      stream: "tool",
-+                      data: {
-+                        phase: "result",
-+                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
-+                        ...(preview ? { partialResult: preview, result: preview } : {}),
-+                        ...(payload.isError ? { isError: true } : {}),
-+                      },
-+                    });
-+                  },
-                 });
+@@ -699,10 +765,16 @@ export async function runAgentTurnWithFallback(params: {
                  bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
                    result.meta?.systemPromptReport,
                  );
 +                queueReasoningEndIfNeeded();
- 
--                // CLI backends don't emit streaming assistant events, so we need to
--                // emit one with the final text so server-chat can populate its buffer
--                // and send the response to TUI/WebSocket clients.
++
 +                // Drain all pending streaming card updates before returning.
 +                // This must happen before the caller's markRunComplete() so the
 +                // typing controller's startGuard doesn't block startStreaming().
 +                await streamingChain;
-+
+ 
+-                // CLI backends don't emit streaming assistant events, so we need to
+-                // emit one with the final text so server-chat can populate its buffer
+-                // and send the response to TUI/WebSocket clients.
 +                // Emit the final/authoritative assistant text so server-chat can
 +                // populate its buffer. For stream-json backends this supplements
 +                // the intermediate onAssistantTurn events with the definitive result.
                  const cliText = result.payloads?.[0]?.text?.trim();
                  if (cliText) {
                    emitAgentEvent({
-@@ -296,6 +480,8 @@ export async function runAgentTurnWithFallback(params: {
+@@ -725,6 +797,8 @@ export async function runAgentTurnWithFallback(params: {
  
                  return result;
                } catch (err) {
 +                queueReasoningEndIfNeeded();
 +                await streamingChain;
-                 emitAgentEvent({
-                   runId,
-                   stream: "lifecycle",
-@@ -406,9 +592,11 @@ export async function runAgentTurnWithFallback(params: {
+                 if (rollbackFallbackCandidateSelection) {
+                   try {
+                     await rollbackFallbackCandidateSelection();
+@@ -848,9 +922,11 @@ export async function runAgentTurnWithFallback(params: {
                    if (evt.stream === "tool") {
                      const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
                      const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
@@ -528,10 +400,10 @@ index f164559a79..f07213db20 100644
 +                      await params.opts?.onToolStart?.({ name, phase, toolCallId });
                      }
                    }
-                   // Track auto-compaction and notify higher layers.
-@@ -557,8 +745,12 @@ export async function runAgentTurnWithFallback(params: {
-       break;
-     } catch (err) {
+                   if (evt.stream === "item") {
+@@ -1151,8 +1227,12 @@ export async function runAgentTurnWithFallback(params: {
+         continue;
+       }
        const message = err instanceof Error ? err.message : String(err);
 -      const isBilling = isBillingErrorMessage(message);
 -      const isContextOverflow = !isBilling && isLikelyContextOverflowError(message);
@@ -544,7 +416,7 @@ index f164559a79..f07213db20 100644
        const isCompactionFailure = !isBilling && isCompactionFailureError(message);
        const isSessionCorruption = /function call turn comes immediately after/i.test(message);
        const isRoleOrderingError = /incorrect role information|roles must alternate/i.test(message);
-@@ -649,6 +841,14 @@ export async function runAgentTurnWithFallback(params: {
+@@ -1243,6 +1323,14 @@ export async function runAgentTurnWithFallback(params: {
          continue;
        }
  
@@ -557,41 +429,46 @@ index f164559a79..f07213db20 100644
 +      }
 +
        defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
-       const safeMessage = isTransientHttp
-         ? sanitizeUserFacingText(message, { errorContext: true })
-@@ -658,9 +858,13 @@ export async function runAgentTurnWithFallback(params: {
-         ? BILLING_ERROR_USER_MESSAGE
-         : isContextOverflow
-           ? "⚠️ Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."
--          : isRoleOrderingError
--            ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
--            : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
-+          : failoverReason === "session_expired"
-+            ? "⚠️ Agent session expired before reply. Please try again."
-+            : failoverReason === "format"
-+              ? "⚠️ Agent returned malformed output before reply. Please try again."
-+              : isRoleOrderingError
-+                ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
-+                : `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`;
+       // Only classify as rate-limit when we have concrete evidence from the
+       // underlying error. FallbackSummaryError messages embed per-attempt
+@@ -1261,11 +1349,15 @@ export async function runAgentTurnWithFallback(params: {
+           ? buildRateLimitCooldownMessage(err)
+           : isContextOverflow
+             ? "⚠️ Context overflow — prompt too large for this model. Try a shorter message or a larger-context model."
+-            : isRoleOrderingError
+-              ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
+-              : shouldSurfaceToControlUi
+-                ? `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`
+-                : buildExternalRunFailureText(message);
++            : failoverReason === "session_expired"
++              ? "⚠️ Agent session expired before reply. Please try again."
++              : failoverReason === "format"
++                ? "⚠️ Agent returned malformed output before reply. Please try again."
++                : isRoleOrderingError
++                  ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
++                  : shouldSurfaceToControlUi
++                    ? `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`
++                    : buildExternalRunFailureText(message);
  
        return {
          kind: "final",
 diff --git a/src/auto-reply/reply/agent-runner-memory.ts b/src/auto-reply/reply/agent-runner-memory.ts
-index d3a1df8e06..2752956b40 100644
+index f401d07f68..a07bd049a9 100644
 --- a/src/auto-reply/reply/agent-runner-memory.ts
 +++ b/src/auto-reply/reply/agent-runner-memory.ts
-@@ -3,9 +3,9 @@ import fs from "node:fs";
+@@ -3,9 +3,10 @@ import fs from "node:fs";
  import type { AgentMessage } from "@mariozechner/pi-agent-core";
  import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
  import { estimateMessagesTokens } from "../../agents/compaction.js";
 +import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
  import { runWithModelFallback } from "../../agents/model-fallback.js";
  import { isCliProvider } from "../../agents/model-selection.js";
--import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+-import { compactEmbeddedPiSession, runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
++import { compactEmbeddedPiSession } from "../../agents/pi-embedded.js";
  import { resolveSandboxConfigForAgent, resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
  import {
    derivePromptTokens,
-@@ -491,7 +491,7 @@ export async function runMemoryFlushIfNeeded(params: {
+@@ -692,7 +693,7 @@ export async function runMemoryFlushIfNeeded(params: {
            runId: flushRunId,
            allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
          });
@@ -601,7 +478,7 @@ index d3a1df8e06..2752956b40 100644
            ...senderContext,
            ...runBaseParams,
 diff --git a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
-index 534b2d65a4..37a895d366 100644
+index e9f8c9368f..e190a1648a 100644
 --- a/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
 +++ b/src/auto-reply/reply/agent-runner.misc.runreplyagent.test.ts
 @@ -3,6 +3,7 @@ import fs from "node:fs/promises";
@@ -612,7 +489,7 @@ index 534b2d65a4..37a895d366 100644
  import type { SessionEntry } from "../../config/sessions.js";
  import { loadSessionStore, saveSessionStore } from "../../config/sessions.js";
  import { onAgentEvent } from "../../infra/agent-events.js";
-@@ -1036,7 +1037,19 @@ describe("runReplyAgent block streaming", () => {
+@@ -1170,7 +1171,19 @@ describe("runReplyAgent block streaming", () => {
  });
  
  describe("runReplyAgent claude-cli routing", () => {
@@ -633,7 +510,7 @@ index 534b2d65a4..37a895d366 100644
      const typing = createMockTypingController();
      const sessionCtx = {
        Provider: "webchat",
-@@ -1089,7 +1102,8 @@ describe("runReplyAgent claude-cli routing", () => {
+@@ -1223,7 +1236,8 @@ describe("runReplyAgent claude-cli routing", () => {
        blockStreamingEnabled: false,
        resolvedBlockStreamingBreak: "message_end",
        shouldInjectGroupIntro: false,
@@ -643,7 +520,7 @@ index 534b2d65a4..37a895d366 100644
      });
    }
  
-@@ -1128,6 +1142,179 @@ describe("runReplyAgent claude-cli routing", () => {
+@@ -1262,6 +1276,179 @@ describe("runReplyAgent claude-cli routing", () => {
      expect(lifecyclePhases).toEqual(["start", "end"]);
      expect(result).toMatchObject({ text: "ok" });
    });
@@ -823,7 +700,7 @@ index 534b2d65a4..37a895d366 100644
  });
  
  describe("runReplyAgent messaging tool suppression", () => {
-@@ -1945,4 +2132,76 @@ describe("runReplyAgent billing error classification", () => {
+@@ -2087,6 +2274,78 @@ describe("runReplyAgent billing error classification", () => {
      expect(payload?.text).toContain("billing error");
      expect(payload?.text).not.toContain("Context overflow");
    });
@@ -900,11 +777,13 @@ index 534b2d65a4..37a895d366 100644
 +    expect(payload?.text).not.toContain("Context overflow");
 +  });
  });
+ 
+ describe("runReplyAgent mid-turn rate-limit fallback", () => {
 diff --git a/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts b/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
-index 8f27f1b3ff..1955189256 100644
+index 1328d49925..65141752b4 100644
 --- a/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
 +++ b/src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts
-@@ -1539,6 +1539,19 @@ describe("runReplyAgent typing (heartbeat)", () => {
+@@ -1640,6 +1640,19 @@ describe("runReplyAgent typing (heartbeat)", () => {
      });
    });
  
@@ -925,10 +804,10 @@ index 8f27f1b3ff..1955189256 100644
      await withTempStateDir(async (stateDir) => {
        const saveSpy = vi
 diff --git a/src/auto-reply/reply/agent-runner.ts b/src/auto-reply/reply/agent-runner.ts
-index 659045a313..bd6af3fa43 100644
+index 4eb4237a98..5fc42eed29 100644
 --- a/src/auto-reply/reply/agent-runner.ts
 +++ b/src/auto-reply/reply/agent-runner.ts
-@@ -390,6 +390,10 @@ export async function runReplyAgent(params: {
+@@ -429,6 +429,10 @@ export async function runReplyAgent(params: {
        return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
      }
  
@@ -939,20 +818,21 @@ index 659045a313..bd6af3fa43 100644
      const {
        runId,
        runResult,
-@@ -495,6 +499,8 @@ export async function runReplyAgent(params: {
+@@ -537,7 +541,8 @@ export async function runReplyAgent(params: {
        contextTokensUsed,
        systemPromptReport: runResult.meta?.systemPromptReport,
        cliSessionId,
-+      cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding,
+-      cliSessionBinding,
++      cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding ?? cliSessionBinding,
 +      cliPromptLoad: runResult.meta?.agentMeta?.cliPromptLoad,
+       usageIsContextSnapshot: isCliProvider(providerUsed, cfg),
      });
  
-     // Drain any late tool/block deliveries before deciding there's "nothing to send".
 diff --git a/src/auto-reply/reply/commands-core.ts b/src/auto-reply/reply/commands-core.ts
-index cc27f28d5f..688689062c 100644
+index 5b99105ff4..17a49bd24f 100644
 --- a/src/auto-reply/reply/commands-core.ts
 +++ b/src/auto-reply/reply/commands-core.ts
-@@ -35,33 +35,39 @@ export async function emitResetCommandHooks(params: {
+@@ -116,33 +116,39 @@ export async function emitResetCommandHooks(params: {
    action: ResetCommandAction;
    ctx: HandleCommandsParams["ctx"];
    cfg: HandleCommandsParams["cfg"];
@@ -1027,10 +907,10 @@ index 2991ede75c..f791d11aab 100644
  
    const persisted = await persistAbortTargetEntry({
 diff --git a/src/auto-reply/reply/dispatch-from-config.test.ts b/src/auto-reply/reply/dispatch-from-config.test.ts
-index d00956672b..5696d2a5b4 100644
+index 857947ff89..cd2ccacb97 100644
 --- a/src/auto-reply/reply/dispatch-from-config.test.ts
 +++ b/src/auto-reply/reply/dispatch-from-config.test.ts
-@@ -2018,6 +2018,12 @@ describe("dispatchReplyFromConfig", () => {
+@@ -2415,6 +2415,12 @@ describe("dispatchReplyFromConfig", () => {
        AccountId: "acc-1",
        GroupSpace: "guild-123",
        GroupChannel: "alerts",
@@ -1043,7 +923,7 @@ index d00956672b..5696d2a5b4 100644
      });
  
      const replyResolver = async () => ({ text: "hi" }) satisfies ReplyPayload;
-@@ -2032,6 +2038,12 @@ describe("dispatchReplyFromConfig", () => {
+@@ -2429,6 +2435,12 @@ describe("dispatchReplyFromConfig", () => {
            originatingChannel: "Telegram",
            originatingTo: "telegram:999",
            messageId: "sid-full",
@@ -1056,7 +936,7 @@ index d00956672b..5696d2a5b4 100644
            senderId: "user-1",
            senderName: "Alice",
            senderUsername: "alice",
-@@ -2196,6 +2208,50 @@ describe("dispatchReplyFromConfig", () => {
+@@ -2593,6 +2605,50 @@ describe("dispatchReplyFromConfig", () => {
      );
    });
  
@@ -1108,10 +988,10 @@ index d00956672b..5696d2a5b4 100644
      setNoAbort();
      hookMocks.runner.hasHooks.mockImplementation(
 diff --git a/src/auto-reply/reply/dispatch-from-config.ts b/src/auto-reply/reply/dispatch-from-config.ts
-index 5b18b417a3..dd7c04af2f 100644
+index 9fa92ba0f3..136dd3dd27 100644
 --- a/src/auto-reply/reply/dispatch-from-config.ts
 +++ b/src/auto-reply/reply/dispatch-from-config.ts
-@@ -672,15 +672,29 @@ export async function dispatchReplyFromConfig(params: {
+@@ -891,18 +891,63 @@ export async function dispatchReplyFromConfig(params: {
      }
  
      const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
@@ -1131,6 +1011,9 @@ index 5b18b417a3..dd7c04af2f 100644
        if (reply.isReasoning === true) {
          continue;
        }
+-      const finalReply = await sendFinalPayload(reply);
+-      queuedFinal = finalReply.queuedFinal || queuedFinal;
+-      routedFinalCount += finalReply.routedFinalCount;
 +      // Dedup equivalent final replies (e.g. same text with different mention tag formats).
 +      if (reply.text) {
 +        const normalizedText = normalizeMentionsForDedup(reply.text);
@@ -1139,35 +1022,59 @@ index 5b18b417a3..dd7c04af2f 100644
 +        }
 +        deliveredFinalTexts.add(normalizedText);
 +      }
-       const ttsReply = await maybeApplyTtsToPayload({
-         payload: reply,
-         cfg,
-@@ -712,7 +726,8 @@ export async function dispatchReplyFromConfig(params: {
-           routedFinalCount += 1;
-         }
-       } else {
--        queuedFinal = dispatcher.sendFinalReply(ttsReply) || queuedFinal;
++      const ttsReply = await maybeApplyTtsToPayload({
++        payload: reply,
++        cfg,
++        channel: ttsChannel,
++        kind: "final",
++        inboundAudio,
++        ttsAuto: sessionTtsAuto,
++      });
++      if (shouldRouteToOriginating && originatingChannel && originatingTo) {
++        // Route final reply to originating channel.
++        const result = await routeReplyRuntime.routeReply({
++          payload: ttsReply,
++          channel: originatingChannel,
++          to: originatingTo,
++          sessionKey: ctx.SessionKey,
++          accountId: ctx.AccountId,
++          threadId: routeThreadId,
++          cfg,
++          isGroup,
++          groupId,
++        });
++        if (!result.ok) {
++          logVerbose(
++            `dispatch-from-config: route-reply (final) failed: ${result.error ?? "unknown error"}`,
++          );
++        }
++        queuedFinal = result.ok || queuedFinal;
++        if (result.ok) {
++          routedFinalCount += 1;
++        }
++      } else {
 +        const didQueue = dispatcher.sendFinalReply(ttsReply);
 +        queuedFinal = didQueue || queuedFinal;
-       }
++      }
      }
  
+     const ttsMode = resolveConfiguredTtsMode(cfg);
 diff --git a/src/auto-reply/reply/followup-runner.ts b/src/auto-reply/reply/followup-runner.ts
-index f5bd3db9af..4be0982e07 100644
+index 6b195a4807..69808f7701 100644
 --- a/src/auto-reply/reply/followup-runner.ts
 +++ b/src/auto-reply/reply/followup-runner.ts
-@@ -7,8 +7,9 @@ import { resolveRunModelFallbacksOverride } from "../../agents/agent-scope.js";
+@@ -7,9 +7,9 @@ import { resolveRunModelFallbacksOverride } from "../../agents/agent-scope.js";
  import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
  import { lookupContextTokens } from "../../agents/context.js";
  import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 +import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
  import { runWithModelFallback } from "../../agents/model-fallback.js";
+ import { isCliProvider } from "../../agents/model-selection.js";
 -import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
-+import { isCliProvider } from "../../agents/model-selection.js";
  import type { SessionEntry } from "../../config/sessions.js";
  import type { TypingMode } from "../../config/types.js";
  import { logVerbose } from "../../globals.js";
-@@ -149,7 +150,7 @@ export function createFollowupRunner(params: {
+@@ -151,7 +151,7 @@ export function createFollowupRunner(params: {
          });
        }
        let autoCompactionCount = 0;
@@ -1175,8 +1082,8 @@ index f5bd3db9af..4be0982e07 100644
 +      let runResult: Awaited<ReturnType<typeof runModelAwareAgent>>;
        let fallbackProvider = queued.run.provider;
        let fallbackModel = queued.run.model;
-       const activeSessionEntry =
-@@ -173,7 +174,7 @@ export function createFollowupRunner(params: {
+       let activeSessionEntry =
+@@ -187,7 +187,7 @@ export function createFollowupRunner(params: {
              const authProfile = resolveRunAuthProfile(queued.run, provider);
              let attemptCompactionCount = 0;
              try {
@@ -1185,7 +1092,7 @@ index f5bd3db9af..4be0982e07 100644
                  allowGatewaySubagentBinding: true,
                  sessionId: queued.run.sessionId,
                  sessionKey: queued.run.sessionKey,
-@@ -261,6 +262,11 @@ export function createFollowupRunner(params: {
+@@ -275,6 +275,11 @@ export function createFollowupRunner(params: {
        const usage = runResult.meta?.agentMeta?.usage;
        const promptTokens = runResult.meta?.agentMeta?.promptTokens;
        const modelUsed = runResult.meta?.agentMeta?.model ?? fallbackModel ?? defaultModel;
@@ -1197,7 +1104,7 @@ index f5bd3db9af..4be0982e07 100644
        const contextTokensUsed =
          agentCfgContextTokens ??
          lookupContextTokens(modelUsed) ??
-@@ -276,9 +282,12 @@ export function createFollowupRunner(params: {
+@@ -290,10 +295,12 @@ export function createFollowupRunner(params: {
            lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
            promptTokens,
            modelUsed,
@@ -1206,16 +1113,16 @@ index f5bd3db9af..4be0982e07 100644
            contextTokensUsed,
            systemPromptReport: runResult.meta?.systemPromptReport,
 +          cliSessionId,
-+          cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding,
+           cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding,
 +          cliPromptLoad: runResult.meta?.agentMeta?.cliPromptLoad,
-           logLabel: "followup",
-         });
-       }
+           usageIsContextSnapshot: isCliProvider(
+             fallbackProvider ?? queued.run.provider,
+             queued.run.config,
 diff --git a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
-index 41f60b6568..ebdc8dc2df 100644
+index 214a0edc53..fe07c766cf 100644
 --- a/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
 +++ b/src/auto-reply/reply/get-reply.reset-hooks-fallback.test.ts
-@@ -49,6 +49,22 @@ function buildNativeResetContext(): MsgContext {
+@@ -48,6 +48,22 @@ function buildNativeResetContext(): MsgContext {
    };
  }
  
@@ -1305,7 +1212,7 @@ index 41f60b6568..ebdc8dc2df 100644
 +  });
  });
 diff --git a/src/auto-reply/reply/get-reply.ts b/src/auto-reply/reply/get-reply.ts
-index a722e4bb22..6fcd484692 100644
+index d1e16007b4..18e3330012 100644
 --- a/src/auto-reply/reply/get-reply.ts
 +++ b/src/auto-reply/reply/get-reply.ts
 @@ -4,7 +4,7 @@ import {
@@ -1317,10 +1224,42 @@ index a722e4bb22..6fcd484692 100644
  import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
  import { DEFAULT_AGENT_WORKSPACE_DIR, ensureAgentWorkspace } from "../../agents/workspace.js";
  import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
-@@ -218,6 +218,36 @@ export async function getReplyFromConfig(
+@@ -23,22 +23,15 @@ import { runPreparedReply } from "./get-reply-run.js";
+ import { finalizeInboundContext } from "./inbound-context.js";
+ import { emitPreAgentMessageHooks } from "./message-preprocess-hooks.js";
+ import { initSessionState } from "./session.js";
++import { applyResetModelOverride } from "./session-reset-model.runtime.js";
+ import { createTypingController } from "./typing.js";
+ 
+ type ResetCommandAction = "new" | "reset";
+ 
+-let sessionResetModelRuntimePromise: Promise<
+-  typeof import("./session-reset-model.runtime.js")
+-> | null = null;
+ let stageSandboxMediaRuntimePromise: Promise<
+   typeof import("./stage-sandbox-media.runtime.js")
+ > | null = null;
+ 
+-function loadSessionResetModelRuntime() {
+-  sessionResetModelRuntimePromise ??= import("./session-reset-model.runtime.js");
+-  return sessionResetModelRuntimePromise;
+-}
+-
+ function loadStageSandboxMediaRuntime() {
+   stageSandboxMediaRuntimePromise ??= import("./stage-sandbox-media.runtime.js");
+   return stageSandboxMediaRuntimePromise;
+@@ -251,25 +244,52 @@ export async function getReplyFromConfig(
      bodyStripped,
    } = sessionState;
  
+-  if (resetTriggered && bodyStripped?.trim()) {
+-    const { applyResetModelOverride } = await loadSessionResetModelRuntime();
+-    await applyResetModelOverride({
+-      cfg,
+-      agentId,
+-      resetTriggered,
+-      bodyStripped,
+-      sessionCtx,
 +  const previousProviderCandidate =
 +    previousSessionEntry?.modelProvider ?? previousSessionEntry?.providerOverride ?? "";
 +  const previousHasCliSessionMarker = Boolean(
@@ -1339,21 +1278,43 @@ index a722e4bb22..6fcd484692 100644
 +    const { emitResetCommandHooks } = await import("./commands-core.runtime.js");
 +    await emitResetCommandHooks({
 +      action: "reset",
-+      ctx: finalized,
+       ctx: finalized,
+-      sessionEntry,
+-      sessionStore,
 +      cfg,
-+      sessionKey,
+       sessionKey,
+-      storePath,
+-      defaultProvider,
+-      defaultModel,
+-      aliasIndex,
 +      sessionEntry,
 +      previousSessionEntry,
 +      workspaceDir,
 +      routeHookMessages: false,
 +      commandSource: "auto-rotation",
 +      senderId: finalized.SenderId,
-+    });
-+  }
+     });
+   }
+ 
++  await applyResetModelOverride({
++    cfg,
++    agentId,
++    resetTriggered,
++    bodyStripped,
++    sessionCtx,
++    ctx: finalized,
++    sessionEntry,
++    sessionStore,
++    sessionKey,
++    storePath,
++    defaultProvider,
++    defaultModel,
++    aliasIndex,
++  });
 +
-   await applyResetModelOverride({
+   const channelModelOverride = resolveChannelModelOverride({
      cfg,
-     agentId,
+     channel:
 diff --git a/src/auto-reply/reply/message-received-hooks.ts b/src/auto-reply/reply/message-received-hooks.ts
 new file mode 100644
 index 0000000000..a427c9a1fb
@@ -1455,10 +1416,10 @@ index 0000000000..a427c9a1fb
 +  }
 +}
 diff --git a/src/auto-reply/reply/reply-utils.test.ts b/src/auto-reply/reply/reply-utils.test.ts
-index 2055ce5458..424e72e9a2 100644
+index 2f7d990626..e36cf33d3d 100644
 --- a/src/auto-reply/reply/reply-utils.test.ts
 +++ b/src/auto-reply/reply/reply-utils.test.ts
-@@ -852,6 +852,51 @@ describe("createStreamingDirectiveAccumulator", () => {
+@@ -952,6 +952,51 @@ describe("createStreamingDirectiveAccumulator", () => {
      expect(afterReset?.replyToTag).toBe(false);
      expect(afterReset?.replyToId).toBeUndefined();
    });
@@ -1511,12 +1472,12 @@ index 2055ce5458..424e72e9a2 100644
  
  describe("extractShortModelName", () => {
 diff --git a/src/auto-reply/reply/session-hooks-context.test.ts b/src/auto-reply/reply/session-hooks-context.test.ts
-index ee8137d3dd..ec4f8b9a6b 100644
+index c7fe1ce5dc..805bc34deb 100644
 --- a/src/auto-reply/reply/session-hooks-context.test.ts
 +++ b/src/auto-reply/reply/session-hooks-context.test.ts
-@@ -98,4 +98,34 @@ describe("session hook context wiring", () => {
-     const [startEvent] = hookRunnerMocks.runSessionStart.mock.calls[0] ?? [];
-     expect(startEvent).toMatchObject({ resumedFrom: "old-session" });
+@@ -287,4 +287,34 @@ describe("session hook context wiring", () => {
+       vi.useRealTimers();
+     }
    });
 +
 +  it("fires session_end/session_start when session rolls automatically by reset policy", async () => {
@@ -1550,15 +1511,9 @@ index ee8137d3dd..ec4f8b9a6b 100644
 +  });
  });
 diff --git a/src/auto-reply/reply/session-usage.ts b/src/auto-reply/reply/session-usage.ts
-index d3594fcdf4..5d1bab1dd4 100644
+index ddd768b7eb..196aa04516 100644
 --- a/src/auto-reply/reply/session-usage.ts
 +++ b/src/auto-reply/reply/session-usage.ts
-@@ -1,4 +1,4 @@
--import { setCliSessionId } from "../../agents/cli-session.js";
-+import { setCliSessionBinding, setCliSessionId } from "../../agents/cli-session.js";
- import {
-   deriveSessionTotalTokens,
-   hasNonzeroUsage,
 @@ -7,6 +7,8 @@ import {
  import type { OpenClawConfig } from "../../config/config.js";
  import { loadConfig } from "../../config/config.js";
@@ -1568,7 +1523,7 @@ index d3594fcdf4..5d1bab1dd4 100644
    type SessionSystemPromptReport,
    type SessionEntry,
    updateSessionStoreEntry,
-@@ -14,25 +16,46 @@ import {
+@@ -14,37 +16,46 @@ import {
  import { logVerbose } from "../../globals.js";
  import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
  
@@ -1577,6 +1532,7 @@ index d3594fcdf4..5d1bab1dd4 100644
    params: {
      providerUsed?: string;
      cliSessionId?: string;
+-    cliSessionBinding?: import("../../config/sessions.js").CliSessionBinding;
 +    cliSessionBinding?: CliSessionBinding;
 +    cliPromptLoad?: CliPromptLoadStatus;
    },
@@ -1584,7 +1540,7 @@ index d3594fcdf4..5d1bab1dd4 100644
    patch: Partial<SessionEntry>,
  ): Partial<SessionEntry> {
    const cliProvider = params.providerUsed ?? entry.modelProvider;
--  if (params.cliSessionId && cliProvider) {
+-  if (params.cliSessionBinding && cliProvider) {
 +  const nextPatch = { ...patch };
 +  if (params.cliPromptLoad) {
 +    nextPatch.cliPromptLoad = params.cliPromptLoad;
@@ -1594,15 +1550,18 @@ index d3594fcdf4..5d1bab1dd4 100644
 +  }
 +
 +  if (params.cliSessionBinding?.sessionId?.trim()) {
-+    const nextEntry = { ...entry, ...patch };
-+    setCliSessionBinding(nextEntry, cliProvider, params.cliSessionBinding);
-+    return {
+     const nextEntry = { ...entry, ...patch };
+     setCliSessionBinding(nextEntry, cliProvider, params.cliSessionBinding);
+     return {
+-      ...patch,
+-      cliSessionIds: nextEntry.cliSessionIds,
 +      ...nextPatch,
-+      cliSessionBindings: nextEntry.cliSessionBindings,
+       cliSessionBindings: nextEntry.cliSessionBindings,
 +      cliSessionIds: nextEntry.cliSessionIds,
-+      claudeCliSessionId: nextEntry.claudeCliSessionId,
-+    };
-+  }
+       claudeCliSessionId: nextEntry.claudeCliSessionId,
+     };
+   }
+-  if (params.cliSessionId && cliProvider) {
 +
 +  if (params.cliSessionId) {
      const nextEntry = { ...entry, ...patch };
@@ -1611,6 +1570,7 @@ index d3594fcdf4..5d1bab1dd4 100644
 -      ...patch,
 +      ...nextPatch,
        cliSessionIds: nextEntry.cliSessionIds,
+-      cliSessionBindings: nextEntry.cliSessionBindings,
        claudeCliSessionId: nextEntry.claudeCliSessionId,
      };
    }
@@ -1619,16 +1579,17 @@ index d3594fcdf4..5d1bab1dd4 100644
  }
  
  function resolveNonNegativeNumber(value: number | undefined): number | undefined {
-@@ -74,6 +97,8 @@ export async function persistSessionUsageUpdate(params: {
-   promptTokens?: number;
+@@ -87,7 +98,8 @@ export async function persistSessionUsageUpdate(params: {
+   usageIsContextSnapshot?: boolean;
    systemPromptReport?: SessionSystemPromptReport;
    cliSessionId?: string;
+-  cliSessionBinding?: import("../../config/sessions.js").CliSessionBinding;
 +  cliSessionBinding?: CliSessionBinding;
 +  cliPromptLoad?: CliPromptLoadStatus;
    logLabel?: string;
  }): Promise<void> {
    const { storePath, sessionKey } = params;
-@@ -141,7 +166,7 @@ export async function persistSessionUsageUpdate(params: {
+@@ -158,7 +170,7 @@ export async function persistSessionUsageUpdate(params: {
            // context utilization is stale/unknown.
            patch.totalTokens = totalTokens;
            patch.totalTokensFresh = typeof totalTokens === "number";
@@ -1637,7 +1598,7 @@ index d3594fcdf4..5d1bab1dd4 100644
          },
        });
      } catch (err) {
-@@ -163,7 +188,7 @@ export async function persistSessionUsageUpdate(params: {
+@@ -180,7 +192,7 @@ export async function persistSessionUsageUpdate(params: {
              systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
              updatedAt: Date.now(),
            };
@@ -1647,10 +1608,10 @@ index d3594fcdf4..5d1bab1dd4 100644
        });
      } catch (err) {
 diff --git a/src/auto-reply/reply/session.test.ts b/src/auto-reply/reply/session.test.ts
-index cd8f4184ad..a0ab97f07b 100644
+index 26de9b9651..494f892dae 100644
 --- a/src/auto-reply/reply/session.test.ts
 +++ b/src/auto-reply/reply/session.test.ts
-@@ -887,6 +887,7 @@ describe("initSessionState reset policy", () => {
+@@ -1126,6 +1126,7 @@ describe("initSessionState reset policy", () => {
  
      expect(result.isNewSession).toBe(true);
      expect(result.sessionId).not.toBe(existingSessionId);
@@ -1658,7 +1619,7 @@ index cd8f4184ad..a0ab97f07b 100644
      expect(clearBootstrapSnapshotOnSessionRolloverSpy).toHaveBeenCalledWith({
        sessionKey,
        previousSessionId: existingSessionId,
-@@ -1799,6 +1800,54 @@ describe("persistSessionUsageUpdate", () => {
+@@ -2276,6 +2277,54 @@ describe("persistSessionUsageUpdate", () => {
      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
      expect(stored[sessionKey].estimatedCostUsd).toBe(0);
    });
@@ -1714,10 +1675,10 @@ index cd8f4184ad..a0ab97f07b 100644
  
  describe("initSessionState stale threadId fallback", () => {
 diff --git a/src/auto-reply/reply/session.ts b/src/auto-reply/reply/session.ts
-index 70ee1cc60c..0f9f28836f 100644
+index a3771f70d2..83f97f4d60 100644
 --- a/src/auto-reply/reply/session.ts
 +++ b/src/auto-reply/reply/session.ts
-@@ -319,6 +319,7 @@ export async function initSessionState(params: {
+@@ -418,6 +418,7 @@ export async function initSessionState(params: {
      sessionStore[retiredLegacyMainDelivery.key] = retiredLegacyMainDelivery.entry;
    }
    const entry = sessionStore[sessionKey];
@@ -1725,17 +1686,17 @@ index 70ee1cc60c..0f9f28836f 100644
    const now = Date.now();
    const isThread = resolveThreadFlag({
      sessionKey,
-@@ -348,7 +349,7 @@ export async function initSessionState(params: {
+@@ -456,7 +457,7 @@ export async function initSessionState(params: {
    // archived afterward.  We need to do this for both explicit resets (/new, /reset)
    // and for scheduled/daily resets where the session has become stale (!freshEntry).
    // Without this, daily-reset transcripts are left as orphaned files on disk (#35481).
 -  const previousSessionEntry = (resetTriggered || !freshEntry) && entry ? { ...entry } : undefined;
 +  previousSessionEntry = (resetTriggered || !freshEntry) && entry ? { ...entry } : undefined;
-   clearBootstrapSnapshotOnSessionRollover({
-     sessionKey,
-     previousSessionId: previousSessionEntry?.sessionId,
-@@ -389,6 +390,9 @@ export async function initSessionState(params: {
-       persistedLabel = entry.label;
+   const previousSessionEndReason = resetTriggered
+     ? resolveExplicitSessionEndReason(matchedResetTriggerLower)
+     : resolveStaleSessionEndReason({
+@@ -515,6 +516,9 @@ export async function initSessionState(params: {
+       persistedDisplayName = entry.displayName;
      }
    }
 +  if (isNewSession && entry?.sessionId) {
@@ -1847,7 +1808,7 @@ index 0000000000..5f5107d5f7
 +  });
 +});
 diff --git a/src/auto-reply/status.test.ts b/src/auto-reply/status.test.ts
-index adf354dc1d..7a31080790 100644
+index a810e133a6..514b249a5a 100644
 --- a/src/auto-reply/status.test.ts
 +++ b/src/auto-reply/status.test.ts
 @@ -93,6 +93,30 @@ describe("buildStatusMessage", () => {
@@ -1882,10 +1843,10 @@ index adf354dc1d..7a31080790 100644
      const text = buildStatusMessage({
        agent: {
 diff --git a/src/auto-reply/status.ts b/src/auto-reply/status.ts
-index 5bf56da4a8..e96438aba5 100644
+index 13af0b9434..346b8513b8 100644
 --- a/src/auto-reply/status.ts
 +++ b/src/auto-reply/status.ts
-@@ -17,6 +17,7 @@ import {
+@@ -23,6 +23,7 @@ import {
    resolveMainSessionKey,
    resolveSessionFilePath,
    resolveSessionFilePathOptions,
@@ -1893,8 +1854,8 @@ index 5bf56da4a8..e96438aba5 100644
    type SessionEntry,
    type SessionScope,
  } from "../config/sessions.js";
-@@ -411,6 +412,21 @@ const formatVoiceModeLine = (
-   return `🔊 Voice: ${autoMode} · provider=${provider} · limit=${maxLength} · summary=${summarize}`;
+@@ -436,6 +437,21 @@ const formatVoiceModeLine = (
+   return `🔊 Voice: ${snapshot.autoMode} · provider=${snapshot.provider} · limit=${snapshot.maxLength} · summary=${snapshot.summarize ? "on" : "off"}`;
  };
  
 +const formatCliPromptLoadLine = (status?: CliPromptLoadStatus): string | null => {
@@ -1915,7 +1876,7 @@ index 5bf56da4a8..e96438aba5 100644
  export function buildStatusMessage(args: StatusArgs): string {
    const now = args.now ?? Date.now();
    const entry = args.sessionEntry;
-@@ -781,6 +797,7 @@ export function buildStatusMessage(args: StatusArgs): string {
+@@ -827,6 +843,7 @@ export function buildStatusMessage(args: StatusArgs): string {
      usagePair && costLine ? `${usagePair} · ${costLine}` : (usagePair ?? costLine);
    const mediaLine = formatMediaUnderstandingLine(args.mediaDecisions);
    const voiceLine = formatVoiceModeLine(args.config, args.sessionEntry);
@@ -1923,7 +1884,7 @@ index 5bf56da4a8..e96438aba5 100644
  
    return [
      versionLine,
-@@ -791,6 +808,7 @@ export function buildStatusMessage(args: StatusArgs): string {
+@@ -837,6 +854,7 @@ export function buildStatusMessage(args: StatusArgs): string {
      cacheLine,
      `📚 ${contextLine}`,
      mediaLine,
@@ -1932,10 +1893,10 @@ index 5bf56da4a8..e96438aba5 100644
      `🧵 ${sessionLine}`,
      args.subagentsLine,
 diff --git a/src/auto-reply/templating.ts b/src/auto-reply/templating.ts
-index 601fa6891b..02e9499a6b 100644
+index dfacdf40d6..af725f2d6b 100644
 --- a/src/auto-reply/templating.ts
 +++ b/src/auto-reply/templating.ts
-@@ -164,6 +164,8 @@ export type MsgContext = {
+@@ -176,6 +176,8 @@ export type MsgContext = {
     * The chat/channel/user ID where the reply should be sent.
     */
    OriginatingTo?: string;
@@ -1945,7 +1906,7 @@ index 601fa6891b..02e9499a6b 100644
     * True when the current turn intentionally requested external delivery to
     * OriginatingChannel/OriginatingTo, rather than inheriting stale session route metadata.
 diff --git a/src/auto-reply/tokens.test.ts b/src/auto-reply/tokens.test.ts
-index f610fa3546..b38aa9a899 100644
+index 9c4b3611f1..d0507e063b 100644
 --- a/src/auto-reply/tokens.test.ts
 +++ b/src/auto-reply/tokens.test.ts
 @@ -1,5 +1,10 @@
@@ -1960,7 +1921,7 @@ index f610fa3546..b38aa9a899 100644
  
  describe("isSilentReplyText", () => {
    it("returns true for exact token", () => {
-@@ -102,3 +107,44 @@ describe("isSilentReplyPrefixText", () => {
+@@ -107,3 +112,44 @@ describe("isSilentReplyPrefixText", () => {
      expect(isSilentReplyPrefixText("NO-")).toBe(false);
    });
  });
@@ -2006,7 +1967,7 @@ index f610fa3546..b38aa9a899 100644
 +  });
 +});
 diff --git a/src/auto-reply/tokens.ts b/src/auto-reply/tokens.ts
-index f5445ad553..f7239a2aef 100644
+index d028d00916..c3a9eeb952 100644
 --- a/src/auto-reply/tokens.ts
 +++ b/src/auto-reply/tokens.ts
 @@ -3,6 +3,7 @@ import { escapeRegExp } from "../utils.js";
@@ -2017,7 +1978,7 @@ index f5445ad553..f7239a2aef 100644
  const silentExactRegexByToken = new Map<string, RegExp>();
  const silentTrailingRegexByToken = new Map<string, RegExp>();
  
-@@ -49,6 +50,32 @@ export function stripSilentToken(text: string, token: string = SILENT_REPLY_TOKE
+@@ -86,6 +87,32 @@ export function stripSilentToken(text: string, token: string = SILENT_REPLY_TOKE
    return text.replace(getSilentTrailingRegex(token), "").trim();
  }
  
@@ -2050,7 +2011,7 @@ index f5445ad553..f7239a2aef 100644
  export function isSilentReplyPrefixText(
    text: string | undefined,
    token: string = SILENT_REPLY_TOKEN,
-@@ -72,7 +99,7 @@ export function isSilentReplyPrefixText(
+@@ -109,7 +136,7 @@ export function isSilentReplyPrefixText(
    if (normalized.length < 2) {
      return false;
    }
@@ -2060,23 +2021,19 @@ index f5445ad553..f7239a2aef 100644
    }
    const tokenUpper = token.toUpperCase();
 diff --git a/src/auto-reply/types.ts b/src/auto-reply/types.ts
-index 638dda42d8..d3fd42778d 100644
+index 5b9de460de..1cc95a3000 100644
 --- a/src/auto-reply/types.ts
 +++ b/src/auto-reply/types.ts
-@@ -54,7 +54,11 @@ export type GetReplyOptions = {
+@@ -63,7 +63,7 @@ export type GetReplyOptions = {
    onBlockReply?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
    onToolResult?: (payload: ReplyPayload) => Promise<void> | void;
    /** Called when a tool phase starts/updates, before summary payloads are emitted. */
 -  onToolStart?: (payload: { name?: string; phase?: string }) => Promise<void> | void;
-+  onToolStart?: (payload: {
-+    name?: string;
-+    phase?: string;
-+    toolCallId?: string;
-+  }) => Promise<void> | void;
-   /** Called when context auto-compaction starts (allows UX feedback during the pause). */
-   onCompactionStart?: () => Promise<void> | void;
-   /** Called when context auto-compaction completes. */
-@@ -75,6 +79,7 @@ export type GetReplyOptions = {
++  onToolStart?: (payload: { name?: string; phase?: string; toolCallId?: string }) => Promise<void> | void;
+   /** Called when a concrete work item starts, updates, or completes. */
+   onItemEvent?: (payload: {
+     itemId?: string;
+@@ -145,6 +145,7 @@ export type GetReplyOptions = {
  
  export type ReplyPayload = {
    text?: string;

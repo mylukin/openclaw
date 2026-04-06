@@ -1,49 +1,40 @@
-From 56dc306a298405b2a0e9e15e52513434eb1a0205 Mon Sep 17 00:00:00 2001
+From d0bc9840c47fa1d4e34b8d40ba1750c2d526afa9 Mon Sep 17 00:00:00 2001
 From: Lukin <mylukin@gmail.com>
-Date: Sun, 5 Apr 2026 19:01:09 +0800
-Subject: [PATCH 03/10] feat(agents): add model-aware runner, bootstrap
+Date: Mon, 6 Apr 2026 01:42:56 +0800
+Subject: [PATCH 03/12] feat(agents): add model-aware runner, bootstrap
  compaction, image pre-analysis, and failover hardening
 
-- Add runModelAwareAgent for memory flush and followup runner
-- Harden bootstrap compaction and context window budgeting
-- Add image pre-analysis for non-vision models with graceful fallback
-- Recognize claude-cli em-dash context overflow format
-- Detect OpenAI generic 500 retry error as transient failure
-- Classify bare "Internal server error" as failover-eligible timeout
-- Add live session registry for embedded runner
-
-Co-Authored-By: Claude <noreply@anthropic.com>
 ---
- src/agents/agent-command.ts                   |  41 +-
+ .../src/memory/manager.async-search.test.ts   |  36 +-
+ src/agents/agent-command.ts                   |   1 -
  src/agents/bootstrap-budget.ts                |   2 +
  src/agents/bootstrap-compaction.test.ts       | 601 ++++++++++++++++++
  src/agents/bootstrap-compaction.ts            | 315 +++++++++
  src/agents/bootstrap-files.ts                 |   4 +-
  src/agents/model-aware-runner.test.ts         | 147 +++++
- src/agents/model-aware-runner.ts              | 113 ++++
+ src/agents/model-aware-runner.ts              | 112 ++++
  src/agents/model-selection.test.ts            |  66 ++
  src/agents/model-selection.ts                 |  36 ++
  ...mbedded-helpers.bootstrap-profiles.test.ts | 106 +++
  ...dded-helpers.isbillingerrormessage.test.ts |  17 +
  src/agents/pi-embedded-helpers.ts             |   4 +
  src/agents/pi-embedded-helpers/bootstrap.ts   |  51 +-
- src/agents/pi-embedded-helpers/errors.ts      |  35 +
+ src/agents/pi-embedded-helpers/errors.ts      |  29 +
  .../pi-embedded-helpers/failover-matches.ts   |   2 +
  .../live-session-registry.ts                  |  81 +++
  src/agents/pi-embedded-runner/run/attempt.ts  |  71 ++-
  .../run/image-pre-analysis.behavior.test.ts   | 110 ++++
  .../run/image-pre-analysis.test.ts            | 133 ++++
  .../run/image-pre-analysis.ts                 | 191 ++++++
- src/agents/pi-embedded-runner/types.ts        |  12 +-
+ src/agents/pi-embedded-runner/types.ts        |   7 +-
  src/agents/pi-tools.read.ts                   |  31 +
  src/agents/pi-tools.ts                        |  27 +-
  src/agents/skills/workspace.ts                |  16 +
  src/agents/system-prompt.ts                   |   4 +-
  src/agents/tool-fs-policy.ts                  |  10 +-
  src/agents/tools/session-status-tool.ts       |   1 +
- src/cron/isolated-agent/run.ts                |  36 +-
- src/memory/manager.async-search.test.ts       |  37 +-
- 29 files changed, 2250 insertions(+), 50 deletions(-)
+ src/cron/isolated-agent/run.ts                | 445 ++++++++++++-
+ 29 files changed, 2613 insertions(+), 43 deletions(-)
  create mode 100644 src/agents/bootstrap-compaction.test.ts
  create mode 100644 src/agents/bootstrap-compaction.ts
  create mode 100644 src/agents/model-aware-runner.test.ts
@@ -54,93 +45,84 @@ Co-Authored-By: Claude <noreply@anthropic.com>
  create mode 100644 src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts
  create mode 100644 src/agents/pi-embedded-runner/run/image-pre-analysis.ts
 
+diff --git a/extensions/memory-core/src/memory/manager.async-search.test.ts b/extensions/memory-core/src/memory/manager.async-search.test.ts
+index 3b32aa1661..53eb6ca7e3 100644
+--- a/extensions/memory-core/src/memory/manager.async-search.test.ts
++++ b/extensions/memory-core/src/memory/manager.async-search.test.ts
+@@ -3,21 +3,17 @@ import os from "node:os";
+ import path from "node:path";
+ import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import type { MemoryIndexManager } from "./index.js";
+ import { closeAllMemorySearchManagers } from "./index.js";
++import "./test-runtime-mocks.js";
+ import { createOpenAIEmbeddingProviderMock } from "./test-embeddings-mock.js";
+-import { createMemoryManagerOrThrow } from "./test-manager.js";
++
++type MemoryIndexManager = import("./index.js").MemoryIndexManager;
++type MemoryIndexModule = typeof import("./index.js");
+ 
+ const embedBatch = vi.fn(async (_input: string[]): Promise<number[][]> => []);
+ const embedQuery = vi.fn(async (_input: string): Promise<number[]> => [0.2, 0.2, 0.2]);
+-
+-vi.mock("./embeddings.js", () => ({
+-  createEmbeddingProvider: async (_options: unknown) =>
+-    createOpenAIEmbeddingProviderMock({
+-      embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
+-      embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
+-    }),
+-}));
++let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
++let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
+ 
+ describe("memory search async sync", () => {
+   let workspaceDir: string;
+@@ -43,6 +39,15 @@ describe("memory search async sync", () => {
+     }) as OpenClawConfig;
+ 
+   beforeEach(async () => {
++    vi.resetModules();
++    vi.doMock("./embeddings.js", () => ({
++      createEmbeddingProvider: async (_options: unknown) =>
++        createOpenAIEmbeddingProviderMock({
++          embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
++          embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
++        }),
++    }));
++    ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
+     await closeAllMemorySearchManagers();
+     embedBatch.mockClear();
+     embedBatch.mockImplementation(async (input: string[]) => input.map(() => [0.2, 0.2, 0.2]));
+@@ -62,6 +67,17 @@ describe("memory search async sync", () => {
+     await fs.rm(workspaceDir, { recursive: true, force: true });
+   });
+ 
++  async function createMemoryManagerOrThrow(
++    cfg: OpenClawConfig,
++    agentId = "main",
++  ): Promise<MemoryIndexManager> {
++    const result = await getMemorySearchManager({ cfg, agentId });
++    if (!result.manager) {
++      throw new Error("manager missing");
++    }
++    return result.manager as unknown as MemoryIndexManager;
++  }
++
+   it("does not await sync when searching", async () => {
+     const cfg = buildConfig();
+     manager = await createMemoryManagerOrThrow(cfg);
 diff --git a/src/agents/agent-command.ts b/src/agents/agent-command.ts
-index 5db40b13a2..6827a3f458 100644
+index 1e112834f0..27293ef05e 100644
 --- a/src/agents/agent-command.ts
 +++ b/src/agents/agent-command.ts
-@@ -65,7 +65,12 @@ import { ensureAuthProfileStore } from "./auth-profiles.js";
- import { clearSessionAuthProfileOverride } from "./auth-profiles/session-override.js";
- import { resolveBootstrapWarningSignaturesSeen } from "./bootstrap-budget.js";
- import { runCliAgent } from "./cli-runner.js";
--import { getCliSessionId, setCliSessionId } from "./cli-session.js";
-+import {
-+  clearCliSession,
-+  getCliSessionBinding,
-+  setCliSessionBinding,
-+  setCliSessionId,
-+} from "./cli-session.js";
- import { deliverAgentCommandResult } from "./command/delivery.js";
- import { resolveAgentRunContext } from "./command/run-context.js";
- import { updateSessionStoreAfterAgentRun } from "./command/session-store.js";
-@@ -82,7 +87,6 @@ import {
-   isCliProvider,
-   modelKey,
-   normalizeModelRef,
--  normalizeProviderId,
-   parseModelRef,
-   resolveConfiguredModelRef,
-   resolveDefaultModelForAgent,
-@@ -387,7 +391,8 @@ function runAgentAttempt(params: {
-   const bootstrapPromptWarningSignature =
-     bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
-   if (isCliProvider(params.providerOverride, params.cfg)) {
--    const cliSessionId = getCliSessionId(params.sessionEntry, params.providerOverride);
-+    const cliSessionBinding = getCliSessionBinding(params.sessionEntry, params.providerOverride);
-+    const cliSessionId = cliSessionBinding?.sessionId;
-     const runCliWithSession = (nextCliSessionId: string | undefined) =>
-       runCliAgent({
-         sessionId: params.sessionId,
-@@ -404,6 +409,11 @@ function runAgentAttempt(params: {
-         runId: params.runId,
-         extraSystemPrompt: params.opts.extraSystemPrompt,
-         cliSessionId: nextCliSessionId,
-+        cliSessionBinding:
-+          nextCliSessionId && cliSessionBinding?.sessionId === nextCliSessionId
-+            ? cliSessionBinding
-+            : undefined,
-+        sessionCompactionCount: params.sessionEntry?.compactionCount,
-         bootstrapPromptWarningSignaturesSeen,
-         bootstrapPromptWarningSignature,
-         images: params.isFallbackRetry ? undefined : params.opts.images,
-@@ -427,15 +437,7 @@ function runAgentAttempt(params: {
-         const entry = params.sessionStore[params.sessionKey];
-         if (entry) {
-           const updatedEntry = { ...entry };
--          if (params.providerOverride === "claude-cli") {
--            delete updatedEntry.claudeCliSessionId;
--          }
--          if (updatedEntry.cliSessionIds) {
--            const normalizedProvider = normalizeProviderId(params.providerOverride);
--            const newCliSessionIds = { ...updatedEntry.cliSessionIds };
--            delete newCliSessionIds[normalizedProvider];
--            updatedEntry.cliSessionIds = newCliSessionIds;
--          }
-+          clearCliSession(updatedEntry, params.providerOverride);
-           updatedEntry.updatedAt = Date.now();
- 
-           await persistSessionEntry({
-@@ -461,11 +463,16 @@ function runAgentAttempt(params: {
-             const entry = params.sessionStore[params.sessionKey];
-             if (entry) {
-               const updatedEntry = { ...entry };
--              setCliSessionId(
--                updatedEntry,
--                params.providerOverride,
--                result.meta.agentMeta.sessionId,
--              );
-+              const nextBinding = result.meta.agentMeta?.cliSessionBinding;
-+              if (nextBinding?.sessionId?.trim()) {
-+                setCliSessionBinding(updatedEntry, params.providerOverride, nextBinding);
-+              } else {
-+                setCliSessionId(
-+                  updatedEntry,
-+                  params.providerOverride,
-+                  result.meta.agentMeta.sessionId,
-+                );
-+              }
-               updatedEntry.updatedAt = Date.now();
- 
-               await persistSessionEntry({
+@@ -153,7 +153,6 @@ function normalizeExplicitOverrideInput(raw: string, kind: "provider" | "model")
+   }
+   return trimmed;
+ }
+-
+ async function prepareAgentCommandExecution(
+   opts: AgentCommandOpts & { senderIsOwner: boolean },
+   runtime: RuntimeEnv,
 diff --git a/src/agents/bootstrap-budget.ts b/src/agents/bootstrap-budget.ts
 index 060541925b..4e00861c1f 100644
 --- a/src/agents/bootstrap-budget.ts
@@ -1259,10 +1241,10 @@ index 0000000000..22ee9544a4
 +});
 diff --git a/src/agents/model-aware-runner.ts b/src/agents/model-aware-runner.ts
 new file mode 100644
-index 0000000000..b109b5afd0
+index 0000000000..2276f516d5
 --- /dev/null
 +++ b/src/agents/model-aware-runner.ts
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,112 @@
 +import { runCliAgent } from "./cli-runner.js";
 +import { DEFAULT_PROVIDER } from "./defaults.js";
 +import { isCliProvider } from "./model-selection.js";
@@ -1361,7 +1343,6 @@ index 0000000000..b109b5afd0
 +      if (payload.text || payload.isError) {
 +        void params.onToolResult?.({
 +          text: payload.text,
-+          ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
 +        });
 +      }
 +      emitAgentEvent(params.onAgentEvent, {
@@ -1377,18 +1358,18 @@ index 0000000000..b109b5afd0
 +  });
 +}
 diff --git a/src/agents/model-selection.test.ts b/src/agents/model-selection.test.ts
-index 05085bc1d1..eda99e49fd 100644
+index df3813d339..bc2650bb7d 100644
 --- a/src/agents/model-selection.test.ts
 +++ b/src/agents/model-selection.test.ts
-@@ -12,6 +12,7 @@ import {
-   modelKey,
+@@ -14,6 +14,7 @@ import {
    resolveAllowedModelRef,
    resolveConfiguredModelRef,
+   resolveSubagentConfiguredModelSelection,
 +  resolveNonCliModelRef,
    resolveThinkingDefault,
    resolveModelRefFromString,
  } from "./model-selection.js";
-@@ -808,6 +809,71 @@ describe("model-selection", () => {
+@@ -1002,6 +1003,71 @@ describe("model-selection", () => {
    });
  });
  
@@ -1461,10 +1442,10 @@ index 05085bc1d1..eda99e49fd 100644
    it("returns trimmed string for string input", () => {
      expect(normalizeModelSelection("ollama/llama3.2:3b")).toBe("ollama/llama3.2:3b");
 diff --git a/src/agents/model-selection.ts b/src/agents/model-selection.ts
-index 95969c71c0..c110419514 100644
+index dd42d24847..f34f854780 100644
 --- a/src/agents/model-selection.ts
 +++ b/src/agents/model-selection.ts
-@@ -337,6 +337,42 @@ export function resolveConfiguredModelRef(params: {
+@@ -427,6 +427,42 @@ export function resolveConfiguredModelRef(params: {
    return { provider: params.defaultProvider, model: params.defaultModel };
  }
  
@@ -1620,10 +1601,10 @@ index 0000000000..6fbfa213d2
 +  });
 +});
 diff --git a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
-index 8c0a0b1994..4cecc71e60 100644
+index becaca64da..149e764124 100644
 --- a/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
 +++ b/src/agents/pi-embedded-helpers.isbillingerrormessage.test.ts
-@@ -484,6 +484,17 @@ describe("isLikelyContextOverflowError", () => {
+@@ -489,6 +489,17 @@ describe("isLikelyContextOverflowError", () => {
        expect(isLikelyContextOverflowError(sample)).toBe(false);
      }
    });
@@ -1641,9 +1622,9 @@ index 8c0a0b1994..4cecc71e60 100644
  });
  
  describe("extractObservedOverflowTokenCount", () => {
-@@ -860,4 +871,10 @@ describe("classifyFailoverReason", () => {
+@@ -1064,4 +1075,10 @@ describe("classifyFailoverReason", () => {
        ),
-     ).toBe("timeout");
+     ).toBe("auth_permanent");
    });
 +
 +  it("classifies bare 'Internal server error' text as timeout", () => {
@@ -1741,10 +1722,10 @@ index e6e0792f4b..219b9ea56c 100644
    cfg?: OpenClawConfig,
  ): "off" | "once" | "always" {
 diff --git a/src/agents/pi-embedded-helpers/errors.ts b/src/agents/pi-embedded-helpers/errors.ts
-index 9f68bcac44..e3d965eaa9 100644
+index eb202045c1..af37e07d03 100644
 --- a/src/agents/pi-embedded-helpers/errors.ts
 +++ b/src/agents/pi-embedded-helpers/errors.ts
-@@ -134,6 +134,22 @@ function hasRateLimitTpmHint(raw: string): boolean {
+@@ -215,6 +215,22 @@ function hasRateLimitTpmHint(raw: string): boolean {
    return /\btpm\b/i.test(lower) || lower.includes("tokens per minute");
  }
  
@@ -1767,7 +1748,7 @@ index 9f68bcac44..e3d965eaa9 100644
  export function isContextOverflowError(errorMessage?: string): boolean {
    if (!errorMessage) {
      return false;
-@@ -149,6 +165,13 @@ export function isContextOverflowError(errorMessage?: string): boolean {
+@@ -230,6 +246,13 @@ export function isContextOverflowError(errorMessage?: string): boolean {
      return false;
    }
  
@@ -1781,8 +1762,8 @@ index 9f68bcac44..e3d965eaa9 100644
    const hasRequestSizeExceeds = lower.includes("request size exceeds");
    const hasContextWindow =
      lower.includes("context window") ||
-@@ -165,6 +188,8 @@ export function isContextOverflowError(errorMessage?: string): boolean {
-     lower.includes("model token limit") ||
+@@ -248,6 +271,8 @@ export function isContextOverflowError(errorMessage?: string): boolean {
+     (lower.includes("input exceeds") && lower.includes("maximum number of tokens")) ||
      (hasRequestSizeExceeds && hasContextWindow) ||
      lower.includes("context overflow:") ||
 +    lower.includes("context overflow \u2014") || // claude-cli uses em-dash: "Context overflow — prompt too large"
@@ -1790,7 +1771,7 @@ index 9f68bcac44..e3d965eaa9 100644
      lower.includes("exceed context limit") ||
      lower.includes("exceeds the model's maximum context") ||
      (lower.includes("max_tokens") && lower.includes("exceed") && lower.includes("context")) ||
-@@ -209,6 +234,10 @@ export function isLikelyContextOverflowError(errorMessage?: string): boolean {
+@@ -294,6 +319,10 @@ export function isLikelyContextOverflowError(errorMessage?: string): boolean {
      return false;
    }
  
@@ -1801,27 +1782,14 @@ index 9f68bcac44..e3d965eaa9 100644
    if (CONTEXT_WINDOW_TOO_SMALL_RE.test(errorMessage)) {
      return false;
    }
-@@ -893,6 +922,12 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
-   if (isJsonApiInternalServerError(raw)) {
-     return "timeout";
-   }
-+  // Catch bare "internal server error" text that isn't wrapped in a JSON
-+  // payload (e.g. "HTTP 400: Internal server error" from OpenAI proxies).
-+  // This is always a server-side fault and should trigger failover.
-+  if (raw.toLowerCase().includes("internal server error")) {
-+    return "timeout";
-+  }
-   if (isCloudCodeAssistFormatError(raw)) {
-     return "format";
-   }
 diff --git a/src/agents/pi-embedded-helpers/failover-matches.ts b/src/agents/pi-embedded-helpers/failover-matches.ts
-index 9f6e83e946..46c5da0347 100644
+index c4685986d0..f504fa9e37 100644
 --- a/src/agents/pi-embedded-helpers/failover-matches.ts
 +++ b/src/agents/pi-embedded-helpers/failover-matches.ts
-@@ -50,6 +50,8 @@ const ERROR_PATTERNS = {
-     /\bstop reason:\s*(?:abort|error|malformed_response|network_error)\b/i,
-     /\breason:\s*(?:abort|error|malformed_response|network_error)\b/i,
-     /\bunhandled stop reason:\s*(?:abort|error|malformed_response|network_error)\b/i,
+@@ -109,6 +109,8 @@ const ERROR_PATTERNS = {
+     // falls through to reason=unknown (#58315).
+     /\boperation was aborted\b/i,
+     /\bstream (?:was )?(?:closed|aborted)\b/i,
 +    // OpenAI generic 500: "An error occurred while processing your request. You can retry your request..."
 +    /you can retry your request/i,
    ],
@@ -1915,28 +1883,28 @@ index 0000000000..f74bd0c93b
 +  LIVE_SESSION_BY_ID.clear();
 +}
 diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
-index a228618b10..47e1707e69 100644
+index 114802e8f8..fa6b44cfa1 100644
 --- a/src/agents/pi-embedded-runner/run/attempt.ts
 +++ b/src/agents/pi-embedded-runner/run/attempt.ts
-@@ -115,6 +115,7 @@ import {
-   sanitizeToolsForGoogle,
- } from "../google.js";
+@@ -101,6 +101,7 @@ import { buildEmbeddedExtensionFactories } from "../extensions.js";
+ import { applyExtraParamsToAgent, resolveAgentTransportOverride } from "../extra-params.js";
+ import { prepareGooglePromptCacheStreamFn } from "../google-prompt-cache.js";
  import { getDmHistoryLimitFromSessionKey, limitHistoryTurns } from "../history.js";
 +import { registerLiveSessionTranscript } from "../live-session-registry.js";
  import { log } from "../logger.js";
  import { buildEmbeddedMessageActionDiscoveryInput } from "../message-action-discovery-input.js";
- import { buildModelAliasLines } from "../model.js";
-@@ -157,7 +158,8 @@ import {
+ import {
+@@ -188,7 +189,8 @@ import {
    shouldFlagCompactionTimeout,
  } from "./compaction-timeout.js";
  import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 -import { detectAndLoadPromptImages } from "./images.js";
 +import { shouldUseImagePreAnalysis, analyzeImagesWithImageModel } from "./image-pre-analysis.js";
 +import { detectAndLoadPromptImages, modelSupportsImages } from "./images.js";
+ import { buildAttemptReplayMetadata } from "./incomplete-turn.js";
+ import { resolveLlmIdleTimeoutMs, streamWithIdleTimeout } from "./llm-idle-timeout.js";
  import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
- 
- type PromptBuildHookRunner = {
-@@ -2045,6 +2047,7 @@ export async function runEmbeddedAttempt(
+@@ -729,6 +731,7 @@ export async function runEmbeddedAttempt(
      let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
      let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
      let removeToolResultContextGuard: (() => void) | undefined;
@@ -1944,7 +1912,7 @@ index a228618b10..47e1707e69 100644
      try {
        await repairSessionFileIfNeeded({
          sessionFile: params.sessionFile,
-@@ -2192,6 +2195,11 @@ export async function runEmbeddedAttempt(
+@@ -880,6 +883,11 @@ export async function runEmbeddedAttempt(
        queueYieldInterruptForSession = () => {
          queueSessionsYieldInterruptMessage(activeSession);
        };
@@ -1956,7 +1924,7 @@ index a228618b10..47e1707e69 100644
        removeToolResultContextGuard = installToolResultContextGuard({
          agent: activeSession.agent,
          contextWindowTokens: Math.max(
-@@ -2875,7 +2883,65 @@ export async function runEmbeddedAttempt(
+@@ -1686,7 +1694,65 @@ export async function runEmbeddedAttempt(
            // Only pass images option if there are actually images to pass
            // This avoids potential issues with models that don't expect the images parameter
            if (imageResult.images.length > 0) {
@@ -2023,7 +1991,7 @@ index a228618b10..47e1707e69 100644
            } else {
              await abortable(activeSession.prompt(effectivePrompt));
            }
-@@ -3114,6 +3180,7 @@ export async function runEmbeddedAttempt(
+@@ -1927,6 +1993,7 @@ export async function runEmbeddedAttempt(
              `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
            );
          }
@@ -2484,36 +2452,32 @@ index 0000000000..282e1c95a4
 +  };
 +}
 diff --git a/src/agents/pi-embedded-runner/types.ts b/src/agents/pi-embedded-runner/types.ts
-index 722abbf2a9..7bf4cf27a9 100644
+index 61b3a7af93..acbeeda811 100644
 --- a/src/agents/pi-embedded-runner/types.ts
 +++ b/src/agents/pi-embedded-runner/types.ts
-@@ -1,10 +1,20 @@
--import type { SessionSystemPromptReport } from "../../config/sessions/types.js";
+@@ -1,4 +1,8 @@
+-import type { CliSessionBinding, SessionSystemPromptReport } from "../../config/sessions/types.js";
 +import type {
 +  CliPromptLoadStatus,
++  CliSessionBinding,
 +  SessionSystemPromptReport,
 +} from "../../config/sessions/types.js";
  import type { MessagingToolSend } from "../pi-embedded-messaging.js";
  
  export type EmbeddedPiAgentMeta = {
-   sessionId: string;
+@@ -6,6 +10,7 @@ export type EmbeddedPiAgentMeta = {
    provider: string;
    model: string;
-+  cliSessionBinding?: {
-+    sessionId: string;
-+    systemPromptFile?: string;
-+    systemPromptHash?: string;
-+    systemPromptCompactionCount?: number;
-+  };
+   cliSessionBinding?: CliSessionBinding;
 +  cliPromptLoad?: CliPromptLoadStatus;
    compactionCount?: number;
    promptTokens?: number;
    usage?: {
 diff --git a/src/agents/pi-tools.read.ts b/src/agents/pi-tools.read.ts
-index 91951fe2c1..dd2ed80f66 100644
+index c78a865f52..2b9dc44701 100644
 --- a/src/agents/pi-tools.read.ts
 +++ b/src/agents/pi-tools.read.ts
-@@ -675,6 +675,37 @@ function createSandboxReadOperations(params: SandboxToolParams) {
+@@ -683,6 +683,37 @@ function createSandboxReadOperations(params: SandboxToolParams) {
    } as const;
  }
  
@@ -2552,7 +2516,7 @@ index 91951fe2c1..dd2ed80f66 100644
    return {
      mkdir: async (dir: string) => {
 diff --git a/src/agents/pi-tools.ts b/src/agents/pi-tools.ts
-index 3f7b8f5546..b2570e142f 100644
+index e423abad9e..82996252d8 100644
 --- a/src/agents/pi-tools.ts
 +++ b/src/agents/pi-tools.ts
 @@ -4,6 +4,7 @@ import type { ModelCompatConfig } from "../config/types.models.js";
@@ -2563,7 +2527,7 @@ index 3f7b8f5546..b2570e142f 100644
  import { getPluginToolMeta } from "../plugins/tools.js";
  import { isSubagentSessionKey } from "../routing/session-key.js";
  import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
-@@ -30,6 +31,7 @@ import {
+@@ -32,6 +33,7 @@ import {
  } from "./pi-tools.policy.js";
  import {
    assertRequiredParams,
@@ -2571,7 +2535,7 @@ index 3f7b8f5546..b2570e142f 100644
    createHostWorkspaceEditTool,
    createHostWorkspaceWriteTool,
    createOpenClawReadTool,
-@@ -59,6 +61,8 @@ import {
+@@ -61,6 +63,8 @@ import {
  } from "./tool-policy.js";
  import { resolveWorkspaceRoot } from "./workspace-dir.js";
  
@@ -2580,7 +2544,7 @@ index 3f7b8f5546..b2570e142f 100644
  function isOpenAIProvider(provider?: string) {
    const normalized = provider?.trim().toLowerCase();
    return normalized === "openai" || normalized === "openai-codex";
-@@ -345,12 +349,15 @@ export function createOpenClawCodingTools(options?: {
+@@ -395,12 +399,15 @@ export function createOpenClawCodingTools(options?: {
    const fsConfig = resolveToolFsConfig({ cfg: options?.config, agentId });
    const fsPolicy = createToolFsPolicy({
      workspaceOnly: isMemoryFlushRun || fsConfig.workspaceOnly,
@@ -2596,7 +2560,7 @@ index 3f7b8f5546..b2570e142f 100644
    const applyPatchConfig = execConfig.applyPatch;
    // Secure by default: apply_patch is workspace-contained unless explicitly disabled.
    // (tools.fs.workspaceOnly is a separate umbrella flag for read/write/edit/apply_patch.)
-@@ -372,6 +379,7 @@ export function createOpenClawCodingTools(options?: {
+@@ -422,6 +429,7 @@ export function createOpenClawCodingTools(options?: {
    const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
      if (tool.name === readTool.name) {
        if (sandboxRoot) {
@@ -2604,7 +2568,7 @@ index 3f7b8f5546..b2570e142f 100644
          const sandboxed = createSandboxedReadTool({
            root: sandboxRoot,
            bridge: sandboxFsBridge!,
-@@ -386,11 +394,24 @@ export function createOpenClawCodingTools(options?: {
+@@ -436,11 +444,24 @@ export function createOpenClawCodingTools(options?: {
              : sandboxed,
          ];
        }
@@ -2633,10 +2597,10 @@ index 3f7b8f5546..b2570e142f 100644
      }
      if (tool.name === "bash" || tool.name === execToolName) {
 diff --git a/src/agents/skills/workspace.ts b/src/agents/skills/workspace.ts
-index b53cbf5cd3..10137d4219 100644
+index 2b51a6d80b..0ba2875f2e 100644
 --- a/src/agents/skills/workspace.ts
 +++ b/src/agents/skills/workspace.ts
-@@ -204,6 +204,8 @@ function resolveContainedSkillPath(params: {
+@@ -159,6 +159,8 @@ function resolveContainedSkillPath(params: {
    rootDir: string;
    rootRealPath: string;
    candidatePath: string;
@@ -2645,7 +2609,7 @@ index b53cbf5cd3..10137d4219 100644
  }): string | null {
    const candidateRealPath = tryRealpath(params.candidatePath);
    if (!candidateRealPath) {
-@@ -212,6 +214,10 @@ function resolveContainedSkillPath(params: {
+@@ -167,6 +169,10 @@ function resolveContainedSkillPath(params: {
    if (isPathInside(params.rootRealPath, candidateRealPath)) {
      return candidateRealPath;
    }
@@ -2656,7 +2620,7 @@ index b53cbf5cd3..10137d4219 100644
    warnEscapedSkillPath({
      source: params.source,
      rootDir: params.rootDir,
-@@ -226,6 +232,7 @@ function filterLoadedSkillsInsideRoot(params: {
+@@ -181,6 +187,7 @@ function filterLoadedSkillsInsideRoot(params: {
    source: string;
    rootDir: string;
    rootRealPath: string;
@@ -2664,7 +2628,7 @@ index b53cbf5cd3..10137d4219 100644
  }): Skill[] {
    return params.skills.filter((skill) => {
      const baseDirRealPath = resolveContainedSkillPath({
-@@ -233,6 +240,7 @@ function filterLoadedSkillsInsideRoot(params: {
+@@ -188,6 +195,7 @@ function filterLoadedSkillsInsideRoot(params: {
        rootDir: params.rootDir,
        rootRealPath: params.rootRealPath,
        candidatePath: skill.baseDir,
@@ -2672,7 +2636,7 @@ index b53cbf5cd3..10137d4219 100644
      });
      if (!baseDirRealPath) {
        return false;
-@@ -242,6 +250,7 @@ function filterLoadedSkillsInsideRoot(params: {
+@@ -197,6 +205,7 @@ function filterLoadedSkillsInsideRoot(params: {
        rootDir: params.rootDir,
        rootRealPath: params.rootRealPath,
        candidatePath: skill.filePath,
@@ -2680,7 +2644,7 @@ index b53cbf5cd3..10137d4219 100644
      });
      return Boolean(skillFileRealPath);
    });
-@@ -299,6 +308,7 @@ function loadSkillEntries(
+@@ -254,6 +263,7 @@ function loadSkillEntries(
    },
  ): SkillEntry[] {
    const limits = resolveSkillsLimits(opts?.config);
@@ -2688,7 +2652,7 @@ index b53cbf5cd3..10137d4219 100644
  
    const loadSkills = (params: { dir: string; source: string }): Skill[] => {
      const rootDir = path.resolve(params.dir);
-@@ -312,6 +322,7 @@ function loadSkillEntries(
+@@ -267,6 +277,7 @@ function loadSkillEntries(
        rootDir,
        rootRealPath,
        candidatePath: baseDir,
@@ -2696,7 +2660,7 @@ index b53cbf5cd3..10137d4219 100644
      });
      if (!baseDirRealPath) {
        return [];
-@@ -325,6 +336,7 @@ function loadSkillEntries(
+@@ -280,6 +291,7 @@ function loadSkillEntries(
          rootDir,
          rootRealPath: baseDirRealPath,
          candidatePath: rootSkillMd,
@@ -2704,7 +2668,7 @@ index b53cbf5cd3..10137d4219 100644
        });
        if (!rootSkillRealPath) {
          return [];
-@@ -350,6 +362,7 @@ function loadSkillEntries(
+@@ -309,6 +321,7 @@ function loadSkillEntries(
          source: params.source,
          rootDir,
          rootRealPath: baseDirRealPath,
@@ -2712,7 +2676,7 @@ index b53cbf5cd3..10137d4219 100644
        });
      }
  
-@@ -386,6 +399,7 @@ function loadSkillEntries(
+@@ -345,6 +358,7 @@ function loadSkillEntries(
          rootDir,
          rootRealPath: baseDirRealPath,
          candidatePath: skillDir,
@@ -2720,7 +2684,7 @@ index b53cbf5cd3..10137d4219 100644
        });
        if (!skillDirRealPath) {
          continue;
-@@ -399,6 +413,7 @@ function loadSkillEntries(
+@@ -358,6 +372,7 @@ function loadSkillEntries(
          rootDir,
          rootRealPath: baseDirRealPath,
          candidatePath: skillMd,
@@ -2728,7 +2692,7 @@ index b53cbf5cd3..10137d4219 100644
        });
        if (!skillMdRealPath) {
          continue;
-@@ -425,6 +440,7 @@ function loadSkillEntries(
+@@ -388,6 +403,7 @@ function loadSkillEntries(
            source: params.source,
            rootDir,
            rootRealPath: baseDirRealPath,
@@ -2737,10 +2701,10 @@ index b53cbf5cd3..10137d4219 100644
        );
  
 diff --git a/src/agents/system-prompt.ts b/src/agents/system-prompt.ts
-index 09074c2880..bc9e99ab47 100644
+index 3b322170b7..62163d202a 100644
 --- a/src/agents/system-prompt.ts
 +++ b/src/agents/system-prompt.ts
-@@ -127,7 +127,9 @@ function buildMessagingSection(params: {
+@@ -209,7 +209,9 @@ function buildMessagingSection(params: {
            "",
            "### message tool",
            "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
@@ -2752,10 +2716,10 @@ index 09074c2880..bc9e99ab47 100644
            `- If you use \`message\` (\`action=send\`) to deliver your user-visible reply, respond with ONLY: ${SILENT_REPLY_TOKEN} (avoid duplicate replies).`,
            params.inlineButtonsEnabled
 diff --git a/src/agents/tool-fs-policy.ts b/src/agents/tool-fs-policy.ts
-index 59d04c56e6..1e0bc1e3ed 100644
+index cdaba44fc1..fa6fad45a0 100644
 --- a/src/agents/tool-fs-policy.ts
 +++ b/src/agents/tool-fs-policy.ts
-@@ -3,16 +3,22 @@ import { resolveAgentConfig } from "./agent-scope.js";
+@@ -6,16 +6,22 @@ import { mergeAlsoAllowPolicy, resolveToolProfilePolicy } from "./tool-policy.js
  
  export type ToolFsPolicy = {
    workspaceOnly: boolean;
@@ -2779,7 +2743,7 @@ index 59d04c56e6..1e0bc1e3ed 100644
  } {
    const cfg = params.cfg;
    const globalFs = cfg?.tools?.fs;
-@@ -20,6 +26,8 @@ export function resolveToolFsConfig(params: { cfg?: OpenClawConfig; agentId?: st
+@@ -23,6 +29,8 @@ export function resolveToolFsConfig(params: { cfg?: OpenClawConfig; agentId?: st
      cfg && params.agentId ? resolveAgentConfig(cfg, params.agentId)?.tools?.fs : undefined;
    return {
      workspaceOnly: agentFs?.workspaceOnly ?? globalFs?.workspaceOnly,
@@ -2789,38 +2753,162 @@ index 59d04c56e6..1e0bc1e3ed 100644
  }
  
 diff --git a/src/agents/tools/session-status-tool.ts b/src/agents/tools/session-status-tool.ts
-index ab1880579d..1af99c1588 100644
+index 959892530c..f2a7556868 100644
 --- a/src/agents/tools/session-status-tool.ts
 +++ b/src/agents/tools/session-status-tool.ts
-@@ -518,6 +518,7 @@ export function createSessionStatusTool(opts?: {
+@@ -512,6 +512,7 @@ export function createSessionStatusTool(opts?: {
            sessionKey: resolved.key,
            changedModel,
-           statusText,
+           statusText: fullStatusText,
 +          cliPromptLoad: resolved.entry.cliPromptLoad,
          },
        };
      },
 diff --git a/src/cron/isolated-agent/run.ts b/src/cron/isolated-agent/run.ts
-index 367a7da5f1..fb3aa92e4e 100644
+index 285d6360f0..1a0e3c6904 100644
 --- a/src/cron/isolated-agent/run.ts
 +++ b/src/cron/isolated-agent/run.ts
-@@ -8,7 +8,11 @@ import {
- import { resolveSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
- import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
- import { runCliAgent } from "../../agents/cli-runner.js";
--import { getCliSessionId, setCliSessionId } from "../../agents/cli-session.js";
+@@ -1,5 +1,41 @@
++import {
++  resolveAgentConfig,
++  resolveAgentDir,
++  resolveAgentModelFallbacksOverride,
++  resolveAgentWorkspaceDir,
++  resolveDefaultAgentId,
++} from "../../agents/agent-scope.js";
++import { resolveSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
++import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
++import { runCliAgent } from "../../agents/cli-runner.js";
 +import {
 +  getCliSessionBinding,
 +  setCliSessionBinding,
 +  setCliSessionId,
 +} from "../../agents/cli-session.js";
- import { lookupContextTokens } from "../../agents/context.js";
- import { resolveCronStyleNow } from "../../agents/current-time.js";
- import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
-@@ -463,15 +467,16 @@ export async function runCronIsolatedAgentTurn(params: {
-           }
-           const bootstrapPromptWarningSignature =
-             bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
++import { lookupContextTokens } from "../../agents/context.js";
++import { resolveCronStyleNow } from "../../agents/current-time.js";
++import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
++import { resolveFastModeState } from "../../agents/fast-mode.js";
++import { resolveNestedAgentLane } from "../../agents/lanes.js";
++import { loadModelCatalog } from "../../agents/model-catalog.js";
++import { runWithModelFallback } from "../../agents/model-fallback.js";
++import { isCliProvider, resolveThinkingDefault } from "../../agents/model-selection.js";
++import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+ import type { SkillSnapshot } from "../../agents/skills.js";
+-import type { ThinkLevel } from "../../auto-reply/thinking.js";
++import {
++  countActiveDescendantRuns,
++  listDescendantRunsForRequester,
++} from "../../agents/subagent-registry.js";
++import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
++import { deriveSessionTotalTokens, hasNonzeroUsage } from "../../agents/usage.js";
++import { ensureAgentWorkspace } from "../../agents/workspace.js";
++import {
++  normalizeThinkLevel,
++  normalizeVerboseLevel,
++  supportsXHighThinking,
++  type ThinkLevel,
++} from "../../auto-reply/thinking.js";
+ import type { CliDeps } from "../../cli/outbound-send-deps.js";
+ import type { OpenClawConfig } from "../../config/config.js";
+ import type { AgentDefaultsConfig } from "../../config/types.agent-defaults.js";
+@@ -27,33 +63,15 @@ import {
+   type MutableCronSession,
+   type PersistCronSessionEntry,
+ } from "./run-session-state.js";
++import { setSessionRuntimeModel } from "../../config/sessions.js";
++import { logWarn } from "../../logger.js";
+ import {
+-  DEFAULT_CONTEXT_TOKENS,
+   buildSafeExternalPrompt,
+-  deriveSessionTotalTokens,
+   detectSuspiciousPatterns,
+-  ensureAgentWorkspace,
+-  hasNonzeroUsage,
+-  isCliProvider,
+   isExternalHookSession,
+-  loadModelCatalog,
+-  logWarn,
+-  lookupContextTokens,
+   mapHookExternalContentSource,
+-  normalizeAgentId,
+-  normalizeThinkLevel,
+-  resolveAgentConfig,
+-  resolveAgentDir,
+-  resolveAgentTimeoutMs,
+-  resolveAgentWorkspaceDir,
+-  resolveCronStyleNow,
+-  resolveDefaultAgentId,
+   resolveHookExternalContentSource,
+-  resolveSessionAuthProfileOverride,
+-  resolveThinkingDefault,
+-  setSessionRuntimeModel,
+-  supportsXHighThinking,
+-} from "./run.runtime.js";
++} from "../../security/external-content.js";
+ import { resolveCronAgentSessionKey } from "./session-key.js";
+ import { resolveCronSession } from "./session.js";
+ import { resolveCronSkillsSnapshot } from "./skills-snapshot.js";
+@@ -722,4 +740,387 @@ export async function runCronIsolatedAgentTurn(params: {
+   } catch (err) {
+     return prepared.context.withRunSession({ status: "error", error: String(err) });
+   }
++
++
++  // Resolve auth profile for the session, mirroring the inbound auto-reply path
++  // (get-reply-run.ts). Without this, isolated cron sessions fall back to env-var
++  // auth which may not match the configured auth-profiles, causing 401 errors.
++  const authProfileId = await resolveSessionAuthProfileOverride({
++    cfg: cfgWithAgentDefaults,
++    provider,
++    agentDir,
++    sessionEntry: cronSession.sessionEntry,
++    sessionStore: cronSession.store,
++    sessionKey: agentSessionKey,
++    storePath: cronSession.storePath,
++    isNewSession: cronSession.isNewSession,
++  });
++  const authProfileIdSource = cronSession.sessionEntry.authProfileOverrideSource;
++
++  let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>> | undefined;
++  let fallbackProvider = provider;
++  let fallbackModel = model;
++  const runStartedAt = Date.now();
++  let runEndedAt = runStartedAt;
++  try {
++    const sessionFile = resolveSessionTranscriptPath(cronSession.sessionEntry.sessionId, agentId);
++    const resolvedVerboseLevel =
++      normalizeVerboseLevel(cronSession.sessionEntry.verboseLevel) ??
++      normalizeVerboseLevel(agentCfg?.verboseDefault) ??
++      "off";
++    registerAgentRunContext(cronSession.sessionEntry.sessionId, {
++      sessionKey: agentSessionKey,
++      verboseLevel: resolvedVerboseLevel,
++    });
++    const messageChannel = resolvedDelivery.channel;
++    // Per-job payload.fallbacks takes priority over agent-level fallbacks.
++    const payloadFallbacks =
++      params.job.payload.kind === "agentTurn" && Array.isArray(params.job.payload.fallbacks)
++        ? params.job.payload.fallbacks
++        : undefined;
++    let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
++      cronSession.sessionEntry.systemPromptReport,
++    );
++
++    const runPrompt = async (promptText: string) => {
++      const fallbackResult = await runWithModelFallback({
++        cfg: cfgWithAgentDefaults,
++        provider,
++        model,
++        runId: cronSession.sessionEntry.sessionId,
++        agentDir,
++        fallbacksOverride:
++          payloadFallbacks ?? resolveAgentModelFallbacksOverride(params.cfg, agentId),
++        run: async (providerOverride, modelOverride, runOptions) => {
++          if (abortSignal?.aborted) {
++            throw new Error(abortReason());
++          }
++          const bootstrapPromptWarningSignature =
++            bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1];
 +          // Fresh isolated cron sessions must not reuse a stored CLI session ID.
 +          // Passing an existing ID activates the resume watchdog profile
 +          // (noOutputTimeoutRatio 0.3, maxMs 180 s) instead of the fresh profile
@@ -2830,34 +2918,169 @@ index 367a7da5f1..fb3aa92e4e 100644
 +            ? undefined
 +            : getCliSessionBinding(cronSession.sessionEntry, providerOverride);
 +          const cliSessionId = cliSessionBinding?.sessionId;
-           if (isCliProvider(providerOverride, cfgWithAgentDefaults)) {
--            // Fresh isolated cron sessions must not reuse a stored CLI session ID.
--            // Passing an existing ID activates the resume watchdog profile
--            // (noOutputTimeoutRatio 0.3, maxMs 180 s) instead of the fresh profile
--            // (ratio 0.8, maxMs 600 s), causing jobs to time out at roughly 1/3 of
--            // the configured timeoutSeconds. See: https://github.com/openclaw/openclaw/issues/29774
--            const cliSessionId = cronSession.isNewSession
--              ? undefined
--              : getCliSessionId(cronSession.sessionEntry, providerOverride);
-             const result = await runCliAgent({
-               sessionId: cronSession.sessionEntry.sessionId,
-               sessionKey: agentSessionKey,
-@@ -486,6 +491,8 @@ export async function runCronIsolatedAgentTurn(params: {
-               timeoutMs,
-               runId: cronSession.sessionEntry.sessionId,
-               cliSessionId,
++          if (isCliProvider(providerOverride, cfgWithAgentDefaults)) {
++            const result = await runCliAgent({
++              sessionId: cronSession.sessionEntry.sessionId,
++              sessionKey: agentSessionKey,
++              agentId,
++              sessionFile,
++              workspaceDir,
++              config: cfgWithAgentDefaults,
++              prompt: promptText,
++              provider: providerOverride,
++              model: modelOverride,
++              thinkLevel,
++              timeoutMs,
++              runId: cronSession.sessionEntry.sessionId,
++              cliSessionId,
 +              cliSessionBinding,
 +              sessionCompactionCount: cronSession.sessionEntry.compactionCount,
-               bootstrapPromptWarningSignaturesSeen,
-               bootstrapPromptWarningSignature,
-             });
-@@ -632,9 +639,14 @@ export async function runCronIsolatedAgentTurn(params: {
-     });
-     cronSession.sessionEntry.contextTokens = contextTokens;
-     if (isCliProvider(providerUsed, cfgWithAgentDefaults)) {
--      const cliSessionId = finalRunResult.meta?.agentMeta?.sessionId?.trim();
--      if (cliSessionId) {
--        setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
++              bootstrapPromptWarningSignaturesSeen,
++              bootstrapPromptWarningSignature,
++            });
++            bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
++              result.meta?.systemPromptReport,
++            );
++            return result;
++          }
++          const result = await runEmbeddedPiAgent({
++            sessionId: cronSession.sessionEntry.sessionId,
++            sessionKey: agentSessionKey,
++            agentId,
++            trigger: "cron",
++            // Cron runs execute inside the gateway process and need the same
++            // explicit subagent late-binding as other gateway-owned runners.
++            allowGatewaySubagentBinding: true,
++            // Cron jobs are trusted local automation, so isolated runs should
++            // inherit owner-only tooling like local `openclaw agent` runs.
++            senderIsOwner: true,
++            messageChannel,
++            agentAccountId: resolvedDelivery.accountId,
++            sessionFile,
++            agentDir,
++            workspaceDir,
++            config: cfgWithAgentDefaults,
++            skillsSnapshot,
++            prompt: promptText,
++            lane: resolveNestedAgentLane(params.lane),
++            provider: providerOverride,
++            model: modelOverride,
++            authProfileId,
++            authProfileIdSource,
++            thinkLevel,
++            fastMode: resolveFastModeState({
++              cfg: cfgWithAgentDefaults,
++              provider: providerOverride,
++              model: modelOverride,
++              agentId,
++              sessionEntry: cronSession.sessionEntry,
++            }).enabled,
++            verboseLevel: resolvedVerboseLevel,
++            timeoutMs,
++            bootstrapContextMode: agentPayload?.lightContext ? "lightweight" : undefined,
++            bootstrapContextRunKind: "cron",
++            runId: cronSession.sessionEntry.sessionId,
++            requireExplicitMessageTarget: toolPolicy.requireExplicitMessageTarget,
++            disableMessageTool: toolPolicy.disableMessageTool,
++            allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
++            abortSignal,
++            bootstrapPromptWarningSignaturesSeen,
++            bootstrapPromptWarningSignature,
++          });
++          bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
++            result.meta?.systemPromptReport,
++          );
++          return result;
++        },
++      });
++      runResult = fallbackResult.result;
++      fallbackProvider = fallbackResult.provider;
++      fallbackModel = fallbackResult.model;
++      provider = fallbackResult.provider;
++      model = fallbackResult.model;
++      runEndedAt = Date.now();
++    };
++
++    await runPrompt(commandBody);
++    if (!runResult) {
++      throw new Error("cron isolated run returned no result");
++    }
++
++    // Guardrail for cron jobs: if the first turn is only an interim ack
++    // (e.g. "on it") and no descendants are active, run one focused follow-up
++    // turn so the cron run returns an actual completion.
++    if (!isAborted()) {
++      const interimRunResult = runResult;
++      const interimPayloads = interimRunResult.payloads ?? [];
++      const {
++        deliveryPayloadHasStructuredContent: interimPayloadHasStructuredContent,
++        outputText: interimOutputText,
++      } = resolveCronPayloadOutcome({
++        payloads: interimPayloads,
++        runLevelError: interimRunResult.meta?.error,
++      });
++      const interimText = interimOutputText?.trim() ?? "";
++      const hasDescendantsSinceRunStart = listDescendantRunsForRequester(agentSessionKey).some(
++        (entry) => {
++          const descendantStartedAt =
++            typeof entry.startedAt === "number" ? entry.startedAt : entry.createdAt;
++          return typeof descendantStartedAt === "number" && descendantStartedAt >= runStartedAt;
++        },
++      );
++      const shouldRetryInterimAck =
++        !interimRunResult.meta?.error &&
++        !interimRunResult.didSendViaMessagingTool &&
++        !interimPayloadHasStructuredContent &&
++        !interimPayloads.some((payload) => payload?.isError === true) &&
++        countActiveDescendantRuns(agentSessionKey) === 0 &&
++        !hasDescendantsSinceRunStart &&
++        isLikelyInterimCronMessage(interimText);
++
++      if (shouldRetryInterimAck) {
++        const continuationPrompt = [
++          "Your previous response was only an acknowledgement and did not complete this cron task.",
++          "Complete the original task now.",
++          "Do not send a status update like 'on it'.",
++          "Use tools when needed, including sessions_spawn for parallel subtasks, wait for spawned subagents to finish, then return only the final summary.",
++        ].join(" ");
++        await runPrompt(continuationPrompt);
++      }
++    }
++  } catch (err) {
++    return withRunSession({ status: "error", error: String(err) });
++  }
++
++  if (isAborted()) {
++    return withRunSession({ status: "error", error: abortReason() });
++  }
++  if (!runResult) {
++    return withRunSession({ status: "error", error: "cron isolated run returned no result" });
++  }
++  const finalRunResult = runResult;
++  const payloads = finalRunResult.payloads ?? [];
++
++  // Update token+model fields in the session store.
++  // Also collect best-effort telemetry for the cron run log.
++  let telemetry: CronRunTelemetry | undefined;
++  {
++    if (finalRunResult.meta?.systemPromptReport) {
++      cronSession.sessionEntry.systemPromptReport = finalRunResult.meta.systemPromptReport;
++    }
++    const usage = finalRunResult.meta?.agentMeta?.usage;
++    const promptTokens = finalRunResult.meta?.agentMeta?.promptTokens;
++    const modelUsed = finalRunResult.meta?.agentMeta?.model ?? fallbackModel ?? model;
++    const providerUsed = finalRunResult.meta?.agentMeta?.provider ?? fallbackProvider ?? provider;
++    const contextTokens =
++      agentCfg?.contextTokens ??
++      lookupContextTokens(modelUsed, { allowAsyncLoad: false }) ??
++      DEFAULT_CONTEXT_TOKENS;
++
++    setSessionRuntimeModel(cronSession.sessionEntry, {
++      provider: providerUsed,
++      model: modelUsed,
++    });
++    cronSession.sessionEntry.contextTokens = contextTokens;
++    if (isCliProvider(providerUsed, cfgWithAgentDefaults)) {
 +      const cliSessionBinding = finalRunResult.meta?.agentMeta?.cliSessionBinding;
 +      if (cliSessionBinding?.sessionId?.trim()) {
 +        setCliSessionBinding(cronSession.sessionEntry, providerUsed, cliSessionBinding);
@@ -2866,75 +3089,153 @@ index 367a7da5f1..fb3aa92e4e 100644
 +        if (cliSessionId) {
 +          setCliSessionId(cronSession.sessionEntry, providerUsed, cliSessionId);
 +        }
-       }
-     }
-     if (hasNonzeroUsage(usage)) {
-diff --git a/src/memory/manager.async-search.test.ts b/src/memory/manager.async-search.test.ts
-index 7968c4e129..69cb566b37 100644
---- a/src/memory/manager.async-search.test.ts
-+++ b/src/memory/manager.async-search.test.ts
-@@ -3,21 +3,16 @@ import os from "node:os";
- import path from "node:path";
- import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
- import type { OpenClawConfig } from "../config/config.js";
--import type { MemoryIndexManager } from "./index.js";
--import { closeAllMemorySearchManagers } from "./index.js";
-+import "./test-runtime-mocks.js";
- import { createOpenAIEmbeddingProviderMock } from "./test-embeddings-mock.js";
--import { createMemoryManagerOrThrow } from "./test-manager.js";
-+
-+type MemoryIndexManager = import("./index.js").MemoryIndexManager;
-+type MemoryIndexModule = typeof import("./index.js");
- 
- const embedBatch = vi.fn(async (_input: string[]): Promise<number[][]> => []);
- const embedQuery = vi.fn(async (_input: string): Promise<number[]> => [0.2, 0.2, 0.2]);
--
--vi.mock("./embeddings.js", () => ({
--  createEmbeddingProvider: async (_options: unknown) =>
--    createOpenAIEmbeddingProviderMock({
--      embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
--      embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
--    }),
--}));
-+let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
-+let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
- 
- describe("memory search async sync", () => {
-   let workspaceDir: string;
-@@ -43,6 +38,15 @@ describe("memory search async sync", () => {
-     }) as OpenClawConfig;
- 
-   beforeEach(async () => {
-+    vi.resetModules();
-+    vi.doMock("./embeddings.js", () => ({
-+      createEmbeddingProvider: async (_options: unknown) =>
-+        createOpenAIEmbeddingProviderMock({
-+          embedQuery: embedQuery as unknown as (input: string) => Promise<number[]>,
-+          embedBatch: embedBatch as unknown as (input: string[]) => Promise<number[][]>,
-+        }),
-+    }));
-+    ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
-     await closeAllMemorySearchManagers();
-     embedBatch.mockClear();
-     embedBatch.mockImplementation(async (input: string[]) => input.map(() => [0.2, 0.2, 0.2]));
-@@ -62,6 +66,17 @@ describe("memory search async sync", () => {
-     await fs.rm(workspaceDir, { recursive: true, force: true });
-   });
- 
-+  async function createMemoryManagerOrThrow(
-+    cfg: OpenClawConfig,
-+    agentId = "main",
-+  ): Promise<MemoryIndexManager> {
-+    const result = await getMemorySearchManager({ cfg, agentId });
-+    if (!result.manager) {
-+      throw new Error("manager missing");
++      }
 +    }
-+    return result.manager as unknown as MemoryIndexManager;
++    if (hasNonzeroUsage(usage)) {
++      const input = usage.input ?? 0;
++      const output = usage.output ?? 0;
++      const totalTokens = deriveSessionTotalTokens({
++        usage,
++        contextTokens,
++        promptTokens,
++      });
++      const runEstimatedCostUsd = resolveNonNegativeNumber(
++        estimateUsageCost({
++          usage,
++          cost: resolveModelCostConfig({
++            provider: providerUsed,
++            model: modelUsed,
++            config: cfgWithAgentDefaults,
++          }),
++        }),
++      );
++      cronSession.sessionEntry.inputTokens = input;
++      cronSession.sessionEntry.outputTokens = output;
++      const telemetryUsage: NonNullable<CronRunTelemetry["usage"]> = {
++        input_tokens: input,
++        output_tokens: output,
++      };
++      if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
++        cronSession.sessionEntry.totalTokens = totalTokens;
++        cronSession.sessionEntry.totalTokensFresh = true;
++        telemetryUsage.total_tokens = totalTokens;
++      } else {
++        cronSession.sessionEntry.totalTokens = undefined;
++        cronSession.sessionEntry.totalTokensFresh = false;
++      }
++      cronSession.sessionEntry.cacheRead = usage.cacheRead ?? 0;
++      cronSession.sessionEntry.cacheWrite = usage.cacheWrite ?? 0;
++      if (runEstimatedCostUsd !== undefined) {
++        cronSession.sessionEntry.estimatedCostUsd =
++          (resolveNonNegativeNumber(cronSession.sessionEntry.estimatedCostUsd) ?? 0) +
++          runEstimatedCostUsd;
++      }
++
++      telemetry = {
++        model: modelUsed,
++        provider: providerUsed,
++        usage: telemetryUsage,
++      };
++    } else {
++      telemetry = {
++        model: modelUsed,
++        provider: providerUsed,
++      };
++    }
++    await persistSessionEntry();
 +  }
 +
-   it("does not await sync when searching", async () => {
-     const cfg = buildConfig();
-     manager = await createMemoryManagerOrThrow(cfg);
++  if (isAborted()) {
++    return withRunSession({ status: "error", error: abortReason(), ...telemetry });
++  }
++  let {
++    summary,
++    outputText,
++    synthesizedText,
++    deliveryPayloads,
++    deliveryPayloadHasStructuredContent,
++    hasFatalErrorPayload,
++    embeddedRunError,
++  } = resolveCronPayloadOutcome({
++    payloads,
++    runLevelError: finalRunResult.meta?.error,
++  });
++  const deliveryBestEffort = resolveCronDeliveryBestEffort(params.job);
++  const resolveRunOutcome = (params?: { delivered?: boolean; deliveryAttempted?: boolean }) =>
++    withRunSession({
++      status: hasFatalErrorPayload ? "error" : "ok",
++      ...(hasFatalErrorPayload
++        ? { error: embeddedRunError ?? "cron isolated run returned an error payload" }
++        : {}),
++      summary,
++      outputText,
++      delivered: params?.delivered,
++      deliveryAttempted: params?.deliveryAttempted,
++      ...telemetry,
++    });
++
++  // Skip delivery for heartbeat-only responses (HEARTBEAT_OK with no real content).
++  const ackMaxChars = resolveHeartbeatAckMaxChars(agentCfg);
++  const skipHeartbeatDelivery = deliveryRequested && isHeartbeatOnlyResponse(payloads, ackMaxChars);
++  const skipMessagingToolDelivery =
++    deliveryContract === "shared" &&
++    deliveryRequested &&
++    finalRunResult.didSendViaMessagingTool === true &&
++    (finalRunResult.messagingToolSentTargets ?? []).some((target) =>
++      matchesMessagingToolDeliveryTarget(target, {
++        channel: resolvedDelivery.channel,
++        to: resolvedDelivery.to,
++        accountId: resolvedDelivery.accountId,
++      }),
++    );
++  const deliveryResult = await dispatchCronDelivery({
++    cfg: params.cfg,
++    cfgWithAgentDefaults,
++    deps: params.deps,
++    job: params.job,
++    agentId,
++    agentSessionKey,
++    runSessionId,
++    runStartedAt,
++    runEndedAt,
++    timeoutMs,
++    resolvedDelivery,
++    deliveryRequested,
++    skipHeartbeatDelivery,
++    skipMessagingToolDelivery,
++    deliveryBestEffort,
++    deliveryPayloadHasStructuredContent,
++    deliveryPayloads,
++    synthesizedText,
++    summary,
++    outputText,
++    telemetry,
++    abortSignal,
++    isAborted,
++    abortReason,
++    withRunSession,
++  });
++  if (deliveryResult.result) {
++    const resultWithDeliveryMeta: RunCronAgentTurnResult = {
++      ...deliveryResult.result,
++      deliveryAttempted:
++        deliveryResult.result.deliveryAttempted ?? deliveryResult.deliveryAttempted,
++    };
++    if (!hasFatalErrorPayload || deliveryResult.result.status !== "ok") {
++      return resultWithDeliveryMeta;
++    }
++    return resolveRunOutcome({
++      delivered: deliveryResult.result.delivered,
++      deliveryAttempted: resultWithDeliveryMeta.deliveryAttempted,
++    });
++  }
++  const delivered = deliveryResult.delivered;
++  const deliveryAttempted = deliveryResult.deliveryAttempted;
++  summary = deliveryResult.summary;
++  outputText = deliveryResult.outputText;
++
++  return resolveRunOutcome({ delivered, deliveryAttempted });
+ }
 -- 
 2.50.1 (Apple Git-155)
 

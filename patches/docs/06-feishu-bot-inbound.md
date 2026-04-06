@@ -25,12 +25,22 @@
 | `extensions/feishu/src/bot-content.ts` | 修复 `normalizeMentions()`：按 key 长度降序排序，构建单一联合正则，避免级联替换 |
 | `extensions/feishu/src/quoted-message.ts` | **新文件**：引用消息内容解析，支持 live session / 磁盘 session / 数据库 / API 四级回退 |
 | `extensions/feishu/src/quoted-message.test.ts` | 新文件：引用消息解析完整测试 |
-| `extensions/feishu/src/bot.ts` | DM 引用消息走 `resolveQuotedFeishuMessageContent()` 而非直接调飞书 API；新增 `createDirectReplyMirrorHandler()` 将 bot 回复写入 session transcript；新增 `openDirectCommandsAllowed` 逻辑；新增 `dispatchMode=plugin` 分支 |
+| `extensions/feishu/src/bot.ts` | DM 引用消息走 `resolveQuotedFeishuMessageContent()` 而非直接调飞书 API；新增 `createDirectReplyMirrorHandler()` 将 bot 回复写入 session transcript；新增 `openDirectCommandsAllowed` 逻辑；新增 `dispatchMode=plugin` 分支；`handleFeishuMessage` 新增 `botOpenIdsByAccount` 参数；ChannelData 块传递（messageId、chatType、accountId、mentions、media 等字段通过 `finalizeInboundContext` 传入）；bound thread session 检测（`getSessionBindingService().resolveByConversation`） |
 | `extensions/feishu/src/bot-sender-name.ts` | 新增 `isNoUserAuthorityError()` 检测和 `senderLookupBackoff` map，对 code 41050 做 10 分钟退避 |
 | `extensions/feishu/src/monitor.ts` | 新增 `im.message.recalled_v1` 事件处理器 |
 | `extensions/feishu/src/monitor.utils.ts` | **新文件**：`buildRecalledEventSummary()` 从多种事件结构中提取撤回信息 |
 | `extensions/feishu/src/config-schema.ts` | 新增 `dispatchMode`（`auto` / `plugin`）、`streamingInThread`、`cardHeader`、`cardNote`、`pluginMode` 配置项 |
+| `extensions/feishu/src/monitor.account.ts` | 122 行修改，飞书账号监控逻辑 |
+| `extensions/feishu/src/types.ts` | 新增 2 个类型字段 |
 | `extensions/feishu/src/typing.ts` | typing reaction 清理增加 `pickTypingReactionIdForCleanup()` fallback 逻辑 |
+| `extensions/feishu/src/bot.test.ts` | 550+ 行新增测试，覆盖入站消息处理核心场景 |
+| `extensions/feishu/src/bot.broadcast.test.ts` | session mock 补充 |
+| `extensions/feishu/src/bot.checkBotMentioned.test.ts` | 新增 bot mention 检测测试用例 |
+| `extensions/feishu/src/bot.stripBotMention.test.ts` | 新增 bot mention 剥离测试用例 |
+| `extensions/feishu/src/config-schema.test.ts` | 31 行新增，配置 schema 验证测试 |
+| `extensions/feishu/src/monitor.events.test.ts` | **新文件**：246 行，飞书事件监控测试 |
+| `extensions/feishu/src/typing.reaction-id-fallback.test.ts` | **新文件**：180 行，typing reaction ID fallback 测试 |
+| `extensions/feishu/src/runtime-api.ts` | 移除重复的 `monitorFeishuProvider` 导出；新增 `getGlobalHookRunner` 再导出 |
 
 ---
 
@@ -263,10 +273,12 @@ CommandAuthorized = true --> /stop 命令被执行
 | 302 | `collectProviderMessageIds()` — 合并 messageId/messageIds 去重 |
 | 320 | `createDirectReplyMirrorHandler()` — 将 bot 回复写入 session transcript |
 | 491 | `dispatchMode = feishuCfg?.dispatchMode ?? "auto"` |
-| 528-601 | requireMention / bound thread session 检测 |
+| 585-606 | requireMention / bound thread session 检测（`getSessionBindingService().resolveByConversation`） |
 | 606 | `dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot` 门控 |
 | 693-706 | `openDirectCommandsAllowed` 逻辑和双 authorizer 数组 |
 | 900 | DM 引用消息走 `resolveQuotedFeishuMessageContent()` |
+| — | `handleFeishuMessage` 新增 `botOpenIdsByAccount` 参数，用于多账号场景下的 bot open ID 查找 |
+| — | ChannelData 块：`messageId`、`chatType`、`accountId`、`mentions`、`media` 等字段经 `finalizeInboundContext` 传递至下游 |
 
 ### `extensions/feishu/src/bot-content.ts`
 
@@ -310,3 +322,16 @@ CommandAuthorized = true --> /stop 命令被执行
 | 行号 | 内容 |
 |------|------|
 | 69 | `pickTypingReactionIdForCleanup()` — typing reaction 清理 fallback（调用点 226） |
+
+### `extensions/feishu/src/runtime-api.ts`
+
+| 行号 | 内容 |
+|------|------|
+| — | 移除重复的 `monitorFeishuProvider` 导出（commit 12 修复） |
+| — | 新增 `getGlobalHookRunner` 再导出 |
+
+---
+
+## 备注
+
+- **Commit 12 修复**：`runtime-api.ts` 中存在重复的 `monitorFeishuProvider` 导出导致编译警告，已移除重复导出并新增 `getGlobalHookRunner` 再导出以供外部消费。
