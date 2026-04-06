@@ -1,0 +1,234 @@
+From 4b8f8f23684115556da1070409458de731bc757f Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 6 Apr 2026 19:17:11 +0800
+Subject: [PATCH] Docs: align patch notes with current implementation
+
+---
+ .../docs/01-core-dispatch-hooks-plugins.md    | 12 ++++++-----
+ .../docs/03-agents-model-aware-bootstrap.md   | 18 ++++++++---------
+ .../docs/04-cli-runner-session-management.md  |  3 +--
+ patches/docs/05-auto-reply-dispatch.md        | 20 ++++++++-----------
+ patches/docs/06-feishu-bot-inbound.md         | 17 +++++++++++-----
+ patches/docs/10-plugin-sdk-misc.md            |  7 ++++---
+ 6 files changed, 41 insertions(+), 36 deletions(-)
+
+diff --git a/patches/docs/01-core-dispatch-hooks-plugins.md b/patches/docs/01-core-dispatch-hooks-plugins.md
+index b74e26ffcf..0b9842eac0 100644
+--- a/patches/docs/01-core-dispatch-hooks-plugins.md
++++ b/patches/docs/01-core-dispatch-hooks-plugins.md
+@@ -49,15 +49,15 @@ outbound 消息分发管道需要同时处理两类频道级信息：
+ | `src/config/types.gateway.ts` | `GatewayNodesConfig` 增加 `overrides` 映射类型 |
+ | `src/config/types.skills.ts` | 技能类型扩展支持 hook 级别模型覆盖 |
+ | `src/config/types.tools.ts` | 工具类型增加可选元数据字段 |
+-| `src/config/zod-schema.*.ts` | Zod schema 同步更新：override 结构、hook model 字段等 |
++| `src/config/zod-schema.core.ts` / `src/config/zod-schema.hooks.ts` / `src/config/zod-schema.agent-defaults.ts` | Zod schema 同步更新：override 结构、hook model 字段、agent defaults 扩展等 |
+ | `src/plugins/loader.ts` | 嵌入式插件列表新增条目；加载顺序调整 |
+ | `src/plugins/manifest-registry.ts` | 注册表构建时保留 hook 元数据（`model`、`timeout` 等） |
+ | `src/plugins/runtime/index.ts` | 运行时导出新增 agents 和 hooks 公共表面 |
+-| `src/plugins/runtime-model-aware.runtime.ts` | 新增运行时模型感知辅助：`resolveModelRefFromString`、`buildModelAliasIndex` |
++| `src/plugins/runtime/runtime-model-aware.runtime.ts` | 运行时模型感知辅助：`resolveModelRefFromString`、`buildModelAliasIndex` 通过 runtime 公共表面暴露 |
+ | `src/infra/outbound/outbound-send-service.ts` | 新增 `isCancelledPluginActionPayload` 判定；cancelled payload 跳过发送 |
+ | `src/infra/outbound/conversation-id.ts` | 会话 ID 生成增加 `chat:` 前缀支持 |
+-| `src/infra/session-memory/transcript.ts` | delivery-mirror 过滤逻辑：跳过非当前会话的 mirror 条目 |
+-| `src/infra/session-memory/HOOK.md` | 新增 session-memory hook 内部文档 |
++| `src/hooks/bundled/session-memory/transcript.ts` | delivery-mirror 过滤逻辑：跳过非当前会话的 mirror 条目（当前实现路径） |
++| `src/hooks/bundled/session-memory/HOOK.md` | session-memory hook 内部文档（当前实现路径） |
+ | `src/plugins/types.ts` | 新增 `chat_member_user_added` 等 chat member hook 类型；handler map 扩展；元数据字段增加 |
+ | `src/plugins/schema-validator.ts` | Ajv 导入从默认导入重构为命名导入（ESM 兼容） |
+ | `src/hooks/llm-slug-generator.test.ts` | hook 级模型覆盖、CLI 后端回退、超时配置的单元测试 |
+@@ -66,7 +66,7 @@ outbound 消息分发管道需要同时处理两类频道级信息：
+ | `src/infra/outbound/conversation-id.test.ts` | `chat:` 前缀会话 ID 解析的单元测试 |
+ | `src/infra/outbound/deliver.test.ts` | `buildMirrorMessageMeta`、`buildDeliveryResultMetadata` 的单元测试 |
+ | `src/infra/outbound/outbound-send-service.test.ts` | `isCancelledPluginActionPayload` 判定的单元测试 |
+-| `src/infra/session-memory/handler.test.ts` | delivery-mirror 过滤、转录追加逻辑的单元测试 |
++| `src/hooks/bundled/session-memory/handler.test.ts` | delivery-mirror 过滤、转录追加逻辑的单元测试（当前实现路径） |
+ 
+ ---
+ 
+@@ -256,3 +256,5 @@ initializeGlobalHookRunner(registry_B)
+ | `src/config/sessions/transcript.ts` | 168-216 | `appendCliTurnToSessionTranscript()` 函数定义 |
+ | `src/config/sessions/transcript.ts` | 277-310 | `appendAssistantMessageToSessionTranscript()` 的 leafId 保护 |
+ | `src/channels/plugins/registry.ts` | 24 | 频道插件缓存结构增加 `sourceSignature` |
++| `src/hooks/bundled/session-memory/transcript.ts` | 当前实现路径 | delivery-mirror transcript 过滤逻辑 |
++| `src/hooks/bundled/session-memory/HOOK.md` | 当前实现路径 | session-memory hook 内部文档 |
+diff --git a/patches/docs/03-agents-model-aware-bootstrap.md b/patches/docs/03-agents-model-aware-bootstrap.md
+index 57f3f2aa33..77090e016b 100644
+--- a/patches/docs/03-agents-model-aware-bootstrap.md
++++ b/patches/docs/03-agents-model-aware-bootstrap.md
+@@ -44,16 +44,16 @@
+ | `src/agents/system-prompt.ts` | message tool prompt 重写: `target` 替换 `to`，新增 `action=read` |
+ | `src/agents/pi-embedded-runner/types.ts` | `EmbeddedPiAgentMeta.cliPromptLoad` 字段 — CLI prompt 加载元数据 |
+ | `src/agents/tools/session-status-tool.ts` | 输出中包含 `cliPromptLoad` 信息 |
+-| `src/agents/pi-embedded-helpers/bootstrap-budget.ts` | 重新导出 `BootstrapProfile`、`BootstrapProfileConfig` |
++| `src/agents/bootstrap-budget.ts` | 重新导出 `BootstrapProfile`、`BootstrapProfileConfig`（当前文件名） |
+ | `src/agents/pi-embedded-helpers.ts` | barrel 重新导出 — 汇总导出 bootstrap 相关类型 |
+-| `src/agents/cron/isolated-agent/run.ts` | **新文件 (445行)**：完整的 cron 隔离 agent 运行实现 |
++| `src/cron/isolated-agent/run.ts` | cron 隔离 agent 运行入口（后续已从 `src/agents/` 拆分到 `src/cron/isolated-agent/`） |
+ | `src/agents/model-aware-runner.test.ts` | 模型感知运行器测试 |
+ | `src/agents/bootstrap-compaction.test.ts` | bootstrap 压缩测试 |
+ | `src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts` | 图像预分析测试 |
+-| `src/agents/pi-embedded-helpers/errors.test.ts` | 错误分类增强测试 |
+-| `src/agents/pi-embedded-helpers/failover-matches.test.ts` | 故障转移匹配测试 |
+-| `src/agents/pi-embedded-helpers/bootstrap.test.ts` | bootstrap profile 测试 |
+-| `src/agents/pi-embedded-runner/live-session-registry.test.ts` | 活跃会话注册表测试 |
++| `src/agents/model-aware-runner.test.ts` / `src/agents/bootstrap-compaction.test.ts` | 模型感知路由与 bootstrap compaction 核心测试 |
++| `src/agents/pi-embedded-runner/run/image-pre-analysis.test.ts` / `src/agents/pi-embedded-runner/run/image-pre-analysis.behavior.test.ts` | 图像预分析测试 |
++| `src/agents/pi-embedded-helpers.bootstrap-profiles.test.ts` | bootstrap profile 测试 |
++| `src/agents/model-selection.test.ts` | `resolveNonCliModelRef()` 与 alias 路由测试 |
+ | `src/agents/model-selection.test.ts` | 模型选择测试 |
+ 
+ ---
+@@ -399,7 +399,7 @@ prompt(      mainModelSupportsImages?
+ 
+ ---
+ 
+-## Commit 12 修复说明
++## 当前实现说明
+ 
+-- `src/agents/cron/isolated-agent/run.ts`：移除死代码（未使用的变量和不可达分支）
+-- `src/agents/pi-embedded-runner/run/prepare.ts`：移除 `if(true)` 包装，简化条件逻辑
++- 后续重构已把 cron 隔离 agent 相关实现拆到 `src/cron/isolated-agent/` 目录；需求本身未变，只是文件位置更新。
++- `resolveNonCliModelRef()`、bootstrap compaction 和 image pre-analysis 的收口逻辑已在当前分支通过定向回归验证。
+diff --git a/patches/docs/04-cli-runner-session-management.md b/patches/docs/04-cli-runner-session-management.md
+index f137bc1886..21275ed7b3 100644
+--- a/patches/docs/04-cli-runner-session-management.md
++++ b/patches/docs/04-cli-runner-session-management.md
+@@ -45,9 +45,8 @@ CLI runner（`claude-cli` 后端）运行时面临几个关键问题：
+ | `src/agents/cli-runner.test.ts` | 1430+ 行新增，覆盖三层保护、prompt loader、会话恢复等 |
+ | `src/agents/cli-session.test.ts` | 51 行新增，覆盖富绑定存取和 legacy 兼容 |
+ | `src/process/supervisor/supervisor.test.ts` | 新增 `cancelSession` 测试 |
+-| `src/agents/cli-runner/execute.test.ts` | 溢出保护 Layer 1+2 测试 |
+-| `src/agents/cli-runner/prepare.test.ts` | session prompt 文件函数、token 估算测试 |
+ | `src/agents/cli-backends.test.ts` | model alias、permission 规范化测试 |
++| `src/agents/cli-runner.helpers.stream-json.test.ts` / `src/agents/cli-runner.test.ts` / `src/agents/cli-session.test.ts` / `src/process/supervisor/supervisor.test.ts` | 当前保留并覆盖 CLI runner 主路径、stream-json、session binding、cancelSession 等行为 |
+ 
+ ## 伪代码 (Pseudocode)
+ 
+diff --git a/patches/docs/05-auto-reply-dispatch.md b/patches/docs/05-auto-reply-dispatch.md
+index 724b76badb..a450fa41b1 100644
+--- a/patches/docs/05-auto-reply-dispatch.md
++++ b/patches/docs/05-auto-reply-dispatch.md
+@@ -26,7 +26,7 @@
+ | `src/auto-reply/reply/agent-runner.ts` | 处理 `kind:"aborted"` 返回值；传递 `cliSessionBinding` 和 `cliPromptLoad` 参数 |
+ | `src/auto-reply/reply/dispatch-from-config.ts` | 最终回复去重逻辑；飞书 mention 标签归一化 |
+ | `src/auto-reply/reply/followup-runner.ts` | 替换 `runEmbeddedPiAgent` 为 `runModelAwareAgent`；传递 `cliSessionBinding` 和 `cliPromptLoad` |
+-| `src/auto-reply/reply/message-received-hooks.ts` | 新文件，实现 `emitMessageReceivedHooks` — 插件 + 内部钩子双轨触发 |
++| `src/auto-reply/reply/dispatch-from-config.ts` | 当前把 `message_received` 的插件 hook 与内部 hook 双轨触发内联在 dispatch 管道里，而不是单独拆到 `message-received-hooks.ts` |
+ | `src/auto-reply/reply/session-usage.ts` | `applyCliSessionStateToSessionPatch` 替代原 `applyCliSessionIdToSessionPatch`，支持富绑定和 prompt load 状态 |
+ | `src/auto-reply/reply/streaming-directives.ts` | `pendingSilent` 缓冲机制；`couldBeSilentTokenStart` 集成 |
+ | `src/auto-reply/tokens.ts` | 新增 `couldBeSilentTokenStart()` — 宽松前缀匹配（不要求下划线） |
+@@ -34,9 +34,9 @@
+ | `src/auto-reply/reply/get-reply.ts` | 自动轮换（auto-rotation）时通过 `shouldEmitAutoRotationResetHooks` 判断是否触发 session reset hooks；新增 auto-rotation reset hooks 逻辑 |
+ | `src/auto-reply/reply/session.ts` | `previousSessionEntry` 在新会话创建时始终保留 |
+ | `src/auto-reply/reply/abort.ts` | force-stop 集成 `processSupervisor.cancelSession` |
+-| `src/commands/commands-core.ts` | `command` 参数改为可选；新增 `commandSource`、`senderId`、`routeHookMessages` 参数 |
+-| `src/commands/commands-session-abort.ts` | `abortEmbeddedPiRun` 替换为 `abortSessionExecutions` |
+-| `src/templating/templating.ts` | `MsgContext` 新增 `ChannelData` 字段 |
++| `src/auto-reply/reply/commands-core.ts` | `command` 参数改为可选；新增 `commandSource`、`senderId`、`routeHookMessages` 参数 |
++| `src/auto-reply/reply/commands-session-abort.ts` | `abortEmbeddedPiRun` 替换为 `abortSessionExecutions` |
++| `src/auto-reply/templating.ts` | `MsgContext` 新增 `ChannelData` 字段 |
+ | `src/auto-reply/heartbeat.ts` | heartbeat prompt 补充 "do NOT use the message tool" 指令 |
+ 
+ ### 测试文件
+@@ -49,8 +49,7 @@
+ | `src/auto-reply/reply/reply-utils.test.ts` | silent token 缓冲、split streaming 测试 |
+ | `src/auto-reply/tokens.test.ts` | `couldBeSilentTokenStart` 全覆盖 |
+ | `src/auto-reply/status.cli-prompt-load.test.ts` | CLI prompt load 状态渲染测试 |
+-| `src/commands/commands-core.test.ts` | 可选 command 参数及新参数覆盖 |
+-| `src/commands/commands-session-abort.test.ts` | `abortSessionExecutions` 替换验证 |
++| `src/auto-reply/reply/commands-core.test.ts` | 可选 command 参数及新参数覆盖 |
+ 
+ ## 伪代码 (Pseudocode)
+ 
+@@ -433,15 +432,12 @@ Chunk 2: "T really"
+ | `normalizeMentionsForDedup` | 898 | 两种飞书 mention 格式统一为 `<at:$1>` |
+ | 去重判断 | 912 | `if (deliveredFinalTexts.has(normalizedText)) continue` |
+ 
+-### Message-Received Hooks — `src/auto-reply/reply/message-received-hooks.ts`
++### Message-Received Hooks — `src/auto-reply/reply/dispatch-from-config.ts`
+ 
+ | 位置 | 行号 | 说明 |
+ |------|------|------|
+-| 内容解析 | 6 | `resolveInboundContent()` — BodyForCommands → RawBody → Body 优先级 |
+-| 钩子入口 | 19 | `emitMessageReceivedHooks({ ctx })` |
+-| 内容提取 | 26 | `resolveInboundContent(ctx)` 调用 |
+-| 插件 hook 触发 | 33 | `hookRunner.runMessageReceived()` — fire-and-forget |
+-| 内部 hook 触发 | 68-69 | `triggerInternalHook(createInternalHookEvent("message", "received", ...))` |
++| 插件 hook 触发 | 477-484 | `hookRunner.runMessageReceived()` — fire-and-forget |
++| 内部 hook 触发 | 487-496 | `triggerInternalHook(createInternalHookEvent("message", "received", ...))` |
+ 
+ ### Silent Token 缓冲 — `src/auto-reply/tokens.ts`
+ 
+diff --git a/patches/docs/06-feishu-bot-inbound.md b/patches/docs/06-feishu-bot-inbound.md
+index d17362d921..89467affb8 100644
+--- a/patches/docs/06-feishu-bot-inbound.md
++++ b/patches/docs/06-feishu-bot-inbound.md
+@@ -40,7 +40,7 @@
+ | `extensions/feishu/src/config-schema.test.ts` | 31 行新增，配置 schema 验证测试 |
+ | `extensions/feishu/src/monitor.events.test.ts` | **新文件**：246 行，飞书事件监控测试 |
+ | `extensions/feishu/src/typing.reaction-id-fallback.test.ts` | **新文件**：180 行，typing reaction ID fallback 测试 |
+-| `extensions/feishu/src/runtime-api.ts` | 移除重复的 `monitorFeishuProvider` 导出；新增 `getGlobalHookRunner` 再导出 |
++| `extensions/feishu/runtime-api.ts` / `extensions/feishu/src/bot-runtime-api.ts` | 当前通过顶层 runtime barrel 与 bot-local runtime barrel 暴露 `getGlobalHookRunner`、session transcript 等能力，避免直接自导入 `plugin-sdk/feishu` |
+ 
+ ---
+ 
+@@ -274,12 +274,19 @@ CommandAuthorized = true --> /stop 命令被执行
+ | 320 | `createDirectReplyMirrorHandler()` — 将 bot 回复写入 session transcript |
+ | 491 | `dispatchMode = feishuCfg?.dispatchMode ?? "auto"` |
+ | 585-606 | requireMention / bound thread session 检测（`getSessionBindingService().resolveByConversation`） |
+-| 606 | `dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot` 门控 |
+-| 693-706 | `openDirectCommandsAllowed` 逻辑和双 authorizer 数组 |
+-| 900 | DM 引用消息走 `resolveQuotedFeishuMessageContent()` |
++| 610 | `dispatchMode !== "plugin" && requireMention && !ctx.mentionedBot` 门控 |
++| 697-710 | `openDirectCommandsAllowed` 逻辑和双 authorizer 数组 |
++| 904 | DM 引用消息走 `resolveQuotedFeishuMessageContent()` |
+ | — | `handleFeishuMessage` 新增 `botOpenIdsByAccount` 参数，用于多账号场景下的 bot open ID 查找 |
+ | — | ChannelData 块：`messageId`、`chatType`、`accountId`、`mentions`、`media` 等字段经 `finalizeInboundContext` 传递至下游 |
+ 
++### `extensions/feishu/runtime-api.ts` / `extensions/feishu/src/bot-runtime-api.ts`
++
++| 行号 | 内容 |
++|------|------|
++| `extensions/feishu/runtime-api.ts:31-45` | 通过本地 runtime barrel 暴露 `getGlobalHookRunner`、`appendAssistantMessageToSessionTranscript`、request body guard 等能力 |
++| `extensions/feishu/src/bot-runtime-api.ts:1-9` | bot 本地 runtime barrel 汇总 transcript / context visibility / routing 等导出 |
++
+ ### `extensions/feishu/src/bot-content.ts`
+ 
+ | 行号 | 内容 |
+@@ -323,7 +330,7 @@ CommandAuthorized = true --> /stop 命令被执行
+ |------|------|
+ | 69 | `pickTypingReactionIdForCleanup()` — typing reaction 清理 fallback（调用点 226） |
+ 
+-### `extensions/feishu/src/runtime-api.ts`
++### `extensions/feishu/runtime-api.ts`
+ 
+ | 行号 | 内容 |
+ |------|------|
+diff --git a/patches/docs/10-plugin-sdk-misc.md b/patches/docs/10-plugin-sdk-misc.md
+index ca519774b3..233c62cb48 100644
+--- a/patches/docs/10-plugin-sdk-misc.md
++++ b/patches/docs/10-plugin-sdk-misc.md
+@@ -16,7 +16,7 @@ Patch 09 引入了飞书线程绑定管理器，该管理器依赖多个 core 
+ | `src/plugin-sdk/index.ts` | 新增大量运行时导出和类型导出 |
+ | `src/plugin-sdk/feishu.ts` | 新增飞书专用导出（hook runner、session、sanitize 等） |
+ | `src/plugins/contracts/plugin-sdk-index.test.ts` | 更新运行时导出快照 |
+-| `src/plugin-sdk/channel-import-guardrails.test.ts` | 新增飞书文件到例外列表 |
++| `src/plugin-sdk/channel-import-guardrails.test.ts` | 新增飞书文件到例外列表；当前还包含 BlueBubbles test-support 的显式例外，反映仓库现状 |
+ | `test/helpers/plugins/plugin-runtime-mock.ts` | 新增 `agents` 和 `hooks` Mock |
+ | `.gitignore` | 新增 `skills/skillstore-plugin-publisher/` |
+ 
+@@ -310,8 +310,9 @@ mergeDeep(base, overrides)               [plugin-runtime-mock.ts:23-36]
+ | 行号 | 内容 |
+ |------|------|
+ | 167-174 | `LOCAL_EXTENSION_API_BARREL_EXCEPTIONS` 数组 |
+-| 172 | `"extensions/feishu/src/quoted-message.ts"` (新增例外) |
+-| 173 | `"extensions/feishu/src/thread-bindings.manager.ts"` (新增例外) |
++| 172 | `"extensions/feishu/src/quoted-message.ts"` (飞书例外) |
++| 173 | `"extensions/feishu/src/thread-bindings.manager.ts"` (飞书例外) |
++| 174 | `"extensions/bluebubbles/src/test-support/monitor-test-support.ts"` (当前 guardrail 也显式忽略的测试支撑文件) |
+ 
+ ### `src/plugins/contracts/plugin-sdk-index.test.ts`
+ 
+-- 
+2.47.1
+

@@ -1,0 +1,755 @@
+From 95eeb81b70e3c6ce0449d8769dff1bcfe4296671 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 6 Apr 2026 11:05:37 +0800
+Subject: [PATCH] fix: 14 remaining issues from best-practice and UX review
+
+Quick fixes:
+1. Dedup regex: handle quoted id= variants in normalizeMentionsForDedup
+   to match mention.ts AT_ID_TAG_RE (prevents false-negative dedup)
+2. closeStreaming: add closingInProgress guard to prevent concurrent entry
+3. Streaming renewal: retry after 30s on failure instead of waiting 8min
+4. ZERO_USAGE: Object.freeze to prevent accidental mutation
+5. Slug generator: cache isCliProvider result to avoid redundant call
+6. removeActiveTool: log warning on toolCallId mismatch pop fallback
+
+Medium fixes:
+7. Token estimation: linear interpolation (4 - cjkRatio*2.5) replaces
+   binary 30% threshold that caused 2.67x discontinuity
+8. Sender name cache: add 60-min periodic cleanup for expired entries
+   and backoff timestamps to prevent unbounded Map growth
+9. Bootstrap compaction: validate LLM output contains markdown headers
+   before caching, preventing garbage output from polluting sessions
+10. restrictToStoreDir: default to true for session archive path safety
+11. transcriptHasIdempotencyKey: deduplicate into shared canonical impl
+12. Hook cancel feedback: show "[Message filtered by policy]" to user
+    when message_sending hook cancels a final delivery
+
+UX improvements:
+14. Tool elapsed time: show "Running tool... (30s)" with 10s refresh
+    timer in thinking panel during long tool executions
+15. Image pre-analysis: parallel execution via Promise.allSettled
+    instead of sequential per-image analysis
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/bot-sender-name.ts      |  26 +++
+ extensions/feishu/src/reply-dispatcher.ts     | 215 +++++++++++-------
+ extensions/feishu/src/streaming-card.ts       |  19 +-
+ src/agents/bootstrap-compaction.ts            |  21 ++
+ src/agents/cli-runner/prepare.ts              |  10 +-
+ .../run/image-pre-analysis.ts                 |  51 +++--
+ src/auto-reply/reply/dispatch-from-config.ts  |   2 +-
+ src/config/sessions/transcript.ts             |  28 ++-
+ src/gateway/server-methods/chat.ts            |  17 +-
+ src/gateway/session-archive.fs.ts             |   4 +-
+ src/gateway/session-transcript-files.fs.ts    |   3 +-
+ src/hooks/llm-slug-generator.ts               |   5 +-
+ 12 files changed, 272 insertions(+), 129 deletions(-)
+
+diff --git a/extensions/feishu/src/bot-sender-name.ts b/extensions/feishu/src/bot-sender-name.ts
+index 67246c9cf2..088b69a09d 100644
+--- a/extensions/feishu/src/bot-sender-name.ts
++++ b/extensions/feishu/src/bot-sender-name.ts
+@@ -29,6 +29,28 @@ const SENDER_NAME_NOAUTH_BACKOFF_MS = 10 * 60 * 1000;
+ const senderNameCache = new Map<string, { name: string; expireAt: number }>();
+ const senderLookupBackoff = new Map<string, number>();
+ 
++const SENDER_NAME_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
++
++function cleanupExpiredSenderEntries(): void {
++  const now = Date.now();
++  for (const [key, entry] of senderNameCache) {
++    if (entry.expireAt < now) {
++      senderNameCache.delete(key);
++    }
++  }
++  for (const [key, backoffUntil] of senderLookupBackoff) {
++    if (backoffUntil < now) {
++      senderLookupBackoff.delete(key);
++    }
++  }
++}
++
++const senderNameCleanupTimer = setInterval(
++  cleanupExpiredSenderEntries,
++  SENDER_NAME_CLEANUP_INTERVAL_MS,
++);
++senderNameCleanupTimer.unref();
++
+ function correctFeishuScopeInUrl(url: string): string {
+   let corrected = url;
+   for (const [wrong, right] of Object.entries(FEISHU_SCOPE_CORRECTIONS)) {
+@@ -100,6 +122,10 @@ export function resetFeishuSenderNameCacheForTests(): void {
+   senderLookupBackoff.clear();
+ }
+ 
++export function stopSenderNameCleanup(): void {
++  clearInterval(senderNameCleanupTimer);
++}
++
+ export async function resolveFeishuSenderName(params: {
+   account: ResolvedFeishuAccount;
+   senderId: string;
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 2f308d1e61..886c35d1ed 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -372,7 +372,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   let hasVisibleTextInReply = false;
+   let replaceNextPartialAfterTool = false;
+   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
+-  const activeTools: Array<{ toolCallId?: string; name: string }> = [];
++  const activeTools: Array<{ toolCallId?: string; name: string; startedAt: number }> = [];
++  let toolElapsedTimer: ReturnType<typeof setInterval> | null = null;
+   let toolCallCount = 0;
+   let lastRenderedStreamContent = "";
+   let hasThinkingPrelude = false;
+@@ -496,6 +497,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     return current?.name?.trim() ? current.name.trim() : undefined;
+   };
+ 
++  const clearToolElapsedTimer = (): void => {
++    if (toolElapsedTimer !== null) {
++      clearInterval(toolElapsedTimer);
++      toolElapsedTimer = null;
++    }
++  };
++
+   const removeActiveTool = (toolCallId: string | undefined): void => {
+     if (activeTools.length === 0) {
+       return;
+@@ -505,10 +513,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       const index = activeTools.findIndex((entry) => entry.toolCallId === normalizedId);
+       if (index >= 0) {
+         activeTools.splice(index, 1);
++        if (activeTools.length === 0) {
++          clearToolElapsedTimer();
++        }
+         return;
+       }
+     }
++    logDispatcher(
++      `removeActiveTool: toolCallId=${normalizedId ?? "none"} did not match any entry, falling back to pop`,
++    );
+     activeTools.pop();
++    if (activeTools.length === 0) {
++      clearToolElapsedTimer();
++    }
+   };
+ 
+   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
+@@ -576,10 +593,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+     if (toolCallCount > 0) {
+       const currentRunningTool =
+         !options?.final && streamPhase === "tool" ? getActiveRunningToolName() : undefined;
++      const elapsedSuffix = (): string => {
++        if (options?.final || activeTools.length === 0) {
++          return "";
++        }
++        const oldest = activeTools[0];
++        if (!oldest) {
++          return "";
++        }
++        const elapsedSec = Math.round((Date.now() - oldest.startedAt) / 1000);
++        return elapsedSec >= 5 ? ` (${elapsedSec}s)` : "";
++      };
+       const toolStatus = currentRunningTool
+-        ? `⏳ Running ${currentRunningTool}...`
++        ? `⏳ Running ${currentRunningTool}...${elapsedSuffix()}`
+         : !options?.final && streamPhase === "tool" && activeTools.length > 0
+-          ? "⏳ Running tool..."
++          ? `⏳ Running tool...${elapsedSuffix()}`
+           : "";
+       if (toolOnlyPanel) {
+         // Show a completed summary when no tool is actively running, instead
+@@ -749,88 +777,99 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+   // Guard: when true, onIdle must skip closeStreaming to avoid racing with
+   // an in-flight deliver callback that is awaiting the message_sending hook.
+   let deliverInFlight = false;
++  let closingInProgress = false;
+ 
+   const closeStreaming = async (options?: {
+     emitFinalText?: boolean;
+     reason?: "idle" | "error";
+   }) => {
+-    if (streamingStartPromise) {
+-      await streamingStartPromise;
++    if (closingInProgress) {
++      logDispatcher(`closeStreaming skipped — already closing`);
++      return;
+     }
+-    await partialUpdateQueue;
+-    const streamMessageId = streaming?.getMessageId();
+-    logDispatcher(
+-      `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
+-    );
+-    if (streaming?.isActive()) {
+-      const finalText = streamText;
+-      const finalThinking = composeThinkingContent({ final: true });
+-      const hasFinalText = finalText.trim().length > 0;
+-      const hasFinalThinking = finalThinking.text.trim().length > 0;
+-      const closeReason = options?.reason ?? "idle";
+-      if (!hasFinalText) {
+-        // No final user-visible text — discard the card to avoid ghost cards.
+-        // Even if thinking content exists, a card with only thinking and no
+-        // reply text is confusing for users (appears stuck on "Thinking...").
+-        logStreamingDecision("close", {
+-          action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
+-          finalText,
+-          thinkingText: finalThinking.text,
+-          emitFinalText: options?.emitFinalText,
+-          messageId: streamMessageId,
+-        });
+-        await streaming.discard(
+-          hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
+-        );
+-      } else {
+-        logStreamingDecision("close", {
+-          action: "close-final-card",
+-          finalText,
+-          thinkingText: finalThinking.text,
+-          emitFinalText: options?.emitFinalText,
+-          messageId: streamMessageId,
+-        });
+-        logDispatcher(
+-          `closeStreaming final path streamMessageId=${streamMessageId ?? "unknown"} finalChars=${finalText.trim().length} thinkingChars=${finalThinking.text.trim().length}`,
+-        );
+-        // Store thinking content for the collapsed panel in the final card
+-        if (finalThinking.text) {
+-          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
+-        }
+-        let text = finalText;
+-        if (mentionTargets?.length) {
+-          text = buildMentionedCardContent(mentionTargets, text);
+-        }
+-        // Normalize any <at user_id="xxx"> tags (e.g. appended by message_sending
+-        // hooks) into the card-compatible <at id=xxx></at> format so they render
+-        // as blue mention links in the streaming card.
+-        text = normalizeMentionTagsForCard(text);
+-        const finalNote = showCardNote
+-          ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+-          : undefined;
+-        await streaming.close(text, {
+-          ...(finalNote !== undefined ? { note: finalNote } : {}),
+-        });
+-        hasVisibleTextInReply = true;
+-        deliveredFinalTexts.add(finalText);
+-        deliveredFinalTexts.add(normalizeMentionTagsForCard(finalText));
+-        deliveredFinalTexts.add(stripMentionTags(finalText));
+-        if (options?.emitFinalText && finalText.trim()) {
+-          emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+-          await emitFinalTextIfNeeded(
++    closingInProgress = true;
++    try {
++      if (streamingStartPromise) {
++        await streamingStartPromise;
++      }
++      await partialUpdateQueue;
++      const streamMessageId = streaming?.getMessageId();
++      logDispatcher(
++        `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
++      );
++      if (streaming?.isActive()) {
++        const finalText = streamText;
++        const finalThinking = composeThinkingContent({ final: true });
++        const hasFinalText = finalText.trim().length > 0;
++        const hasFinalThinking = finalThinking.text.trim().length > 0;
++        const closeReason = options?.reason ?? "idle";
++        if (!hasFinalText) {
++          // No final user-visible text — discard the card to avoid ghost cards.
++          // Even if thinking content exists, a card with only thinking and no
++          // reply text is confusing for users (appears stuck on "Thinking...").
++          logStreamingDecision("close", {
++            action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
+             finalText,
+-            streamMessageId ? { messageId: streamMessageId } : undefined,
++            thinkingText: finalThinking.text,
++            emitFinalText: options?.emitFinalText,
++            messageId: streamMessageId,
++          });
++          await streaming.discard(
++            hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
+           );
++        } else {
++          logStreamingDecision("close", {
++            action: "close-final-card",
++            finalText,
++            thinkingText: finalThinking.text,
++            emitFinalText: options?.emitFinalText,
++            messageId: streamMessageId,
++          });
++          logDispatcher(
++            `closeStreaming final path streamMessageId=${streamMessageId ?? "unknown"} finalChars=${finalText.trim().length} thinkingChars=${finalThinking.text.trim().length}`,
++          );
++          // Store thinking content for the collapsed panel in the final card
++          if (finalThinking.text) {
++            await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
++          }
++          let text = finalText;
++          if (mentionTargets?.length) {
++            text = buildMentionedCardContent(mentionTargets, text);
++          }
++          // Normalize any <at user_id="xxx"> tags (e.g. appended by message_sending
++          // hooks) into the card-compatible <at id=xxx></at> format so they render
++          // as blue mention links in the streaming card.
++          text = normalizeMentionTagsForCard(text);
++          const finalNote = showCardNote
++            ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
++            : undefined;
++          await streaming.close(text, {
++            ...(finalNote !== undefined ? { note: finalNote } : {}),
++          });
++          hasVisibleTextInReply = true;
++          deliveredFinalTexts.add(finalText);
++          deliveredFinalTexts.add(normalizeMentionTagsForCard(finalText));
++          deliveredFinalTexts.add(stripMentionTags(finalText));
++          if (options?.emitFinalText && finalText.trim()) {
++            emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
++            await emitFinalTextIfNeeded(
++              finalText,
++              streamMessageId ? { messageId: streamMessageId } : undefined,
++            );
++          }
+         }
+       }
++      streaming = null;
++      streamingStartPromise = null;
++      streamText = "";
++      lastPartial = "";
++      reasoningText = "";
++      thinkingCollapsed = false;
++      activeTools.length = 0;
++      clearToolElapsedTimer();
++    } finally {
++      closingInProgress = false;
+     }
+-    streaming = null;
+-    streamingStartPromise = null;
+-    streamText = "";
+-    lastPartial = "";
+-    reasoningText = "";
+-    thinkingCollapsed = false;
+-    activeTools.length = 0;
+   };
+ 
+   const sendChunkedTextReply = async (params: {
+@@ -880,6 +919,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+           thinkingCollapsed = false;
+           streamPhase = "idle";
+           activeTools.length = 0;
++          clearToolElapsedTimer();
+           toolCallCount = 0;
+           lastRenderedStreamContent = "";
+           replaceNextPartialAfterTool = false;
+@@ -913,9 +953,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+             deliverInFlight = false;
+           }
+           if (hookResult.cancelled) {
++            const policyNote = "[Message filtered by policy]";
+             if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
+-              streamText = "";
+-              await closeStreaming({ emitFinalText: false, reason: "error" });
++              // Show a brief note in the streaming card so the user sees
++              // feedback rather than a silently discarded empty card.
++              streamText = policyNote;
++              await closeStreaming({ emitFinalText: true, reason: "error" });
++            } else if (info?.kind === "final") {
++              // No streaming session — send a plain text notification so the
++              // user is not left with zero feedback after the hook cancellation.
++              await sendMessageFeishu({
++                cfg,
++                to: chatId,
++                text: policyNote,
++                replyToMessageId: sendReplyToMessageId,
++                replyInThread: effectiveReplyInThread,
++                accountId,
++              });
+             }
+             return;
+           }
+@@ -1180,9 +1234,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+               activeTools.push({
+                 name: trackedName,
+                 toolCallId: payload.toolCallId?.trim() || undefined,
++                startedAt: Date.now(),
+               });
+               toolCallCount += 1;
+               replaceNextPartialAfterTool = Boolean(streamText);
++              if (toolElapsedTimer === null) {
++                toolElapsedTimer = setInterval(() => {
++                  if (activeTools.length > 0) {
++                    queueThinkingPanelUpdate();
++                  }
++                }, 10_000);
++                toolElapsedTimer.unref?.();
++              }
+             }
+             queueThinkingPrelude();
+             streamPhase = "tool";
+diff --git a/extensions/feishu/src/streaming-card.ts b/extensions/feishu/src/streaming-card.ts
+index ce8f178b7d..62770325d1 100644
+--- a/extensions/feishu/src/streaming-card.ts
++++ b/extensions/feishu/src/streaming-card.ts
+@@ -189,8 +189,10 @@ export class FeishuStreamingSession {
+   private updateThrottleMs = 100; // Throttle updates to max 10/sec
+   private lastStreamingModeRenewAt = 0;
+   private renewTimer: ReturnType<typeof setInterval> | null = null;
++  private renewRetryTimer: ReturnType<typeof setTimeout> | null = null;
+   // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
+   private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
++  private static readonly STREAMING_MODE_RETRY_MS = 30_000;
+ 
+   constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
+     this.client = client;
+@@ -318,6 +320,10 @@ export class FeishuStreamingSession {
+       clearInterval(this.renewTimer);
+       this.renewTimer = null;
+     }
++    if (this.renewRetryTimer !== null) {
++      clearTimeout(this.renewRetryTimer);
++      this.renewRetryTimer = null;
++    }
+   }
+ 
+   private scheduleRenewStreamingMode(): void {
+@@ -378,7 +384,18 @@ export class FeishuStreamingSession {
+   }
+ 
+   private async renewStreamingMode(): Promise<void> {
+-    await this.setStreamingModeEnabled({ reason: "renew" });
++    const ok = await this.setStreamingModeEnabled({ reason: "renew" });
++    if (!ok && !this.closed && this.state) {
++      // Schedule a short retry instead of waiting for the next 8-minute interval.
++      if (this.renewRetryTimer !== null) {
++        clearTimeout(this.renewRetryTimer);
++      }
++      this.renewRetryTimer = setTimeout(() => {
++        this.renewRetryTimer = null;
++        this.scheduleRenewStreamingMode();
++      }, FeishuStreamingSession.STREAMING_MODE_RETRY_MS);
++      this.renewRetryTimer.unref();
++    }
+   }
+ 
+   private async pushElementContent(elementId: string, text: string): Promise<void> {
+diff --git a/src/agents/bootstrap-compaction.ts b/src/agents/bootstrap-compaction.ts
+index 2b095c1b5a..0f3b00a0a0 100644
+--- a/src/agents/bootstrap-compaction.ts
++++ b/src/agents/bootstrap-compaction.ts
+@@ -159,6 +159,8 @@ export async function compactBootstrapFile(params: {
+   /** Resolved "provider/model" used for compaction. Included in cache key so switching models invalidates. */
+   modelRef: string;
+   signal?: AbortSignal;
++  /** Optional logger for diagnostic warnings. */
++  log?: (msg: string) => void;
+ }): Promise<{ compacted: string; result: CompactionResult }> {
+   const { content, filePath, signal } = params;
+   const charsBefore = content.length;
+@@ -215,6 +217,25 @@ export async function compactBootstrapFile(params: {
+       };
+     }
+ 
++    // Guard: LLM output should contain at least one markdown header,
++    // indicating it followed the expected structured template.
++    const hasMarkdownHeader = /^#{1,2}\s/m.test(compacted);
++    if (!hasMarkdownHeader) {
++      params.log?.(
++        `compaction: output missing expected markdown headers for ${filePath}, falling back to truncated original`,
++      );
++      return {
++        compacted: content,
++        result: {
++          path: filePath,
++          charsBefore,
++          charsAfter: charsBefore,
++          success: false,
++          fallbackReason: "compacted output missing expected markdown section headers",
++        },
++      };
++    }
++
+     cacheSet(filePath, { hash: contentHash, compacted });
+ 
+     return {
+diff --git a/src/agents/cli-runner/prepare.ts b/src/agents/cli-runner/prepare.ts
+index d9db015107..6eedef6b5a 100644
+--- a/src/agents/cli-runner/prepare.ts
++++ b/src/agents/cli-runner/prepare.ts
+@@ -148,10 +148,10 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
+ }
+ 
+ /**
+- * Rough token estimate. Uses chars/1.5 for CJK-heavy content (>30% CJK chars),
+- * chars/4 for English-heavy content. CJK characters typically tokenize at 1-3
+- * tokens per character, so chars/4 severely underestimates for Chinese/Japanese
+- * text -- which is common in feishu deployments.
++ * Rough token estimate. Linearly interpolates chars-per-token between 4
++ * (pure Latin) and 1.5 (pure CJK) based on the CJK character ratio.
++ * CJK characters typically tokenize at 1-3 tokens per character, so a
++ * smooth ramp avoids the discontinuity of the old 30% binary threshold.
+  */
+ export function estimatePromptTokens(text: string): number {
+   if (!text) {
+@@ -161,7 +161,7 @@ export function estimatePromptTokens(text: string): number {
+     text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
+       ?.length ?? 0;
+   const cjkRatio = cjkCount / text.length;
+-  const charsPerToken = cjkRatio > 0.3 ? 1.5 : 4;
++  const charsPerToken = Math.max(1.5, Math.min(4, 4 - cjkRatio * 2.5));
+   return Math.ceil(text.length / charsPerToken);
+ }
+ 
+diff --git a/src/agents/pi-embedded-runner/run/image-pre-analysis.ts b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+index a21d0ded79..2dc5d1a9a4 100644
+--- a/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
++++ b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+@@ -79,23 +79,25 @@ export async function analyzeImagesWithImageModel(params: {
+     ? `User's question about this image: "${params.userPrompt}"\n\nPlease describe the image in detail to help answer the user's question.`
+     : DEFAULT_IMAGE_ANALYSIS_PROMPT;
+ 
+-  const analyses: string[] = [];
+-  let analyzedCount = 0;
+-  let successCount = 0;
+-  let lastProvider = "";
+-  let lastModel = "";
+-
+-  // Analyze each image
++  // Build tasks for all valid images, then run in parallel.
++  const tasks: Array<{ index: number; image: ImageContent; label: string }> = [];
+   for (let i = 0; i < images.length; i++) {
+     const image = images[i];
+     if (!image || image.type !== "image") {
+       continue;
+     }
++    tasks.push({
++      index: i,
++      image,
++      label: images.length > 1 ? `Image ${i + 1}` : "Image",
++    });
++  }
+ 
+-    analyzedCount += 1;
+-    const imageLabel = images.length > 1 ? `Image ${i + 1}` : "Image";
++  let lastProvider = "";
++  let lastModel = "";
+ 
+-    try {
++  const settled = await Promise.allSettled(
++    tasks.map(async (task) => {
+       const result = await runWithImageModelFallback({
+         cfg: config,
+         run: async (provider, modelId) => {
+@@ -128,8 +130,8 @@ export async function analyzeImagesWithImageModel(params: {
+                   { type: "text" as const, text: analysisPrompt },
+                   {
+                     type: "image" as const,
+-                    data: image.data,
+-                    mimeType: image.mimeType,
++                    data: task.image.data,
++                    mimeType: task.image.mimeType,
+                   },
+                 ],
+               },
+@@ -160,19 +162,30 @@ export async function analyzeImagesWithImageModel(params: {
+           return { text: text.trim(), provider, model: modelId };
+         },
+       });
++      return { label: task.label, result };
++    }),
++  );
++
++  // Collect results in original order.
++  const analyses: string[] = [];
++  const analyzedCount = tasks.length;
++  let successCount = 0;
+ 
+-      analyses.push(`[${imageLabel} Analysis]\n${result.result.text}`);
++  for (const outcome of settled) {
++    if (outcome.status === "fulfilled") {
++      const { label, result } = outcome.value;
++      analyses.push(`[${label} Analysis]\n${result.result.text}`);
+       successCount += 1;
+       lastProvider = result.result.provider;
+       lastModel = result.result.model;
+-
+       log.debug(
+-        `Image pre-analysis: analyzed ${imageLabel} with ${result.result.provider}/${result.result.model}`,
++        `Image pre-analysis: analyzed ${label} with ${result.result.provider}/${result.result.model}`,
+       );
+-    } catch (err) {
+-      const errorMsg = err instanceof Error ? err.message : String(err);
+-      log.warn(`Image pre-analysis failed for ${imageLabel}: ${errorMsg}`);
+-      analyses.push(`[${imageLabel}]\n(Image analysis failed.)`);
++    } else {
++      const errorMsg =
++        outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
++      log.warn(`Image pre-analysis failed: ${errorMsg}`);
++      analyses.push(`[Image]\n(Image analysis failed.)`);
+     }
+   }
+ 
+diff --git a/src/auto-reply/reply/dispatch-from-config.ts b/src/auto-reply/reply/dispatch-from-config.ts
+index 02c2c6c3a7..b8f0eaec1b 100644
+--- a/src/auto-reply/reply/dispatch-from-config.ts
++++ b/src/auto-reply/reply/dispatch-from-config.ts
+@@ -959,7 +959,7 @@ export async function dispatchReplyFromConfig(params: {
+     const normalizeMentionsForDedup = (t: string): string =>
+       t
+         .replace(/<at\s+user_id="([^"]+)">[^<]*<\/at>/g, "<at:$1>")
+-        .replace(/<at\s+id=([^>]+)><\/at>/g, "<at:$1>")
++        .replace(/<at\s+id=(?:"([^"]+)"|'([^']+)'|([^>\s]+))><\/at>/g, "<at:$1$2$3>")
+         .trim();
+     for (const reply of replies) {
+       // Suppress reasoning payloads from channel delivery — channels using this
+diff --git a/src/config/sessions/transcript.ts b/src/config/sessions/transcript.ts
+index 8860c00f53..5f9f9aa280 100644
+--- a/src/config/sessions/transcript.ts
++++ b/src/config/sessions/transcript.ts
+@@ -88,20 +88,20 @@ type CliTurnUsage = {
+   total?: number;
+ };
+ 
+-const ZERO_USAGE = {
++const ZERO_USAGE = Object.freeze({
+   input: 0,
+   output: 0,
+   cacheRead: 0,
+   cacheWrite: 0,
+   totalTokens: 0,
+-  cost: {
++  cost: Object.freeze({
+     input: 0,
+     output: 0,
+     cacheRead: 0,
+     cacheWrite: 0,
+     total: 0,
+-  },
+-};
++  }),
++});
+ 
+ export type SessionTranscriptMessageMeta = {
+   channel?: string;
+@@ -318,12 +318,19 @@ export async function appendAssistantMessageToSessionTranscript(params: {
+   return { ok: true, sessionFile, messageId };
+ }
+ 
+-async function transcriptHasIdempotencyKey(
++/**
++ * Synchronously scan a transcript JSONL file for a message entry with the given
++ * idempotency key. Returns the entry id when found, undefined otherwise.
++ *
++ * This is the canonical implementation — callers such as chat.ts import this
++ * instead of maintaining a separate copy.
++ */
++export function transcriptFindIdempotencyKey(
+   transcriptPath: string,
+   idempotencyKey: string,
+-): Promise<string | undefined> {
++): string | undefined {
+   try {
+-    const raw = await fs.promises.readFile(transcriptPath, "utf-8");
++    const raw = fs.readFileSync(transcriptPath, "utf-8");
+     for (const line of raw.split(/\r?\n/)) {
+       if (!line.trim()) {
+         continue;
+@@ -349,3 +356,10 @@ async function transcriptHasIdempotencyKey(
+   }
+   return undefined;
+ }
++
++async function transcriptHasIdempotencyKey(
++  transcriptPath: string,
++  idempotencyKey: string,
++): Promise<string | undefined> {
++  return transcriptFindIdempotencyKey(transcriptPath, idempotencyKey);
++}
+diff --git a/src/gateway/server-methods/chat.ts b/src/gateway/server-methods/chat.ts
+index b76ebbfe98..66bd9a3009 100644
+--- a/src/gateway/server-methods/chat.ts
++++ b/src/gateway/server-methods/chat.ts
+@@ -11,6 +11,7 @@ import type { MsgContext } from "../../auto-reply/templating.js";
+ import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+ import type { ReplyPayload } from "../../auto-reply/types.js";
+ import { resolveSessionFilePath } from "../../config/sessions.js";
++import { transcriptFindIdempotencyKey } from "../../config/sessions/transcript.js";
+ import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
+ import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
+ import { type SavedMedia, saveMediaBuffer } from "../../media/store.js";
+@@ -815,21 +816,7 @@ function ensureTranscriptFile(params: { transcriptPath: string; sessionId: strin
+ }
+ 
+ function transcriptHasIdempotencyKey(transcriptPath: string, idempotencyKey: string): boolean {
+-  try {
+-    const lines = fs.readFileSync(transcriptPath, "utf-8").split(/\r?\n/);
+-    for (const line of lines) {
+-      if (!line.trim()) {
+-        continue;
+-      }
+-      const parsed = JSON.parse(line) as { message?: { idempotencyKey?: unknown } };
+-      if (parsed?.message?.idempotencyKey === idempotencyKey) {
+-        return true;
+-      }
+-    }
+-    return false;
+-  } catch {
+-    return false;
+-  }
++  return transcriptFindIdempotencyKey(transcriptPath, idempotencyKey) !== undefined;
+ }
+ 
+ function appendAssistantTranscriptMessage(params: {
+diff --git a/src/gateway/session-archive.fs.ts b/src/gateway/session-archive.fs.ts
+index 7b9b244efa..80f50e075c 100644
+--- a/src/gateway/session-archive.fs.ts
++++ b/src/gateway/session-archive.fs.ts
+@@ -1,4 +1,3 @@
+-
+ import fs from "node:fs";
+ import os from "node:os";
+ import path from "node:path";
+@@ -87,8 +86,9 @@ export function archiveSessionTranscripts(opts: {
+   restrictToStoreDir?: boolean;
+ }): string[] {
+   const archived: string[] = [];
++  const restrictToStoreDir = opts.restrictToStoreDir ?? true;
+   const storeDir =
+-    opts.restrictToStoreDir && opts.storePath
++    restrictToStoreDir && opts.storePath
+       ? canonicalizePathForComparison(path.dirname(opts.storePath))
+       : null;
+   for (const candidate of resolveSessionTranscriptCandidates(
+diff --git a/src/gateway/session-transcript-files.fs.ts b/src/gateway/session-transcript-files.fs.ts
+index 3fd0cf1137..6b880c37a6 100644
+--- a/src/gateway/session-transcript-files.fs.ts
++++ b/src/gateway/session-transcript-files.fs.ts
+@@ -158,8 +158,9 @@ export function archiveSessionTranscriptsDetailed(opts: {
+   restrictToStoreDir?: boolean;
+ }): ArchivedSessionTranscript[] {
+   const archived: ArchivedSessionTranscript[] = [];
++  const restrictToStoreDir = opts.restrictToStoreDir ?? true;
+   const storeDir =
+-    opts.restrictToStoreDir && opts.storePath
++    restrictToStoreDir && opts.storePath
+       ? canonicalizePathForComparison(path.dirname(opts.storePath))
+       : null;
+   for (const candidate of resolveSessionTranscriptCandidates(
+diff --git a/src/hooks/llm-slug-generator.ts b/src/hooks/llm-slug-generator.ts
+index ca3c822d68..754a12dd10 100644
+--- a/src/hooks/llm-slug-generator.ts
++++ b/src/hooks/llm-slug-generator.ts
+@@ -112,8 +112,9 @@ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design",
+       const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
+       const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
+       // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
+-      provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
+-      model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
++      const isCli = isCliProvider(rawProvider, params.cfg);
++      provider = isCli ? DEFAULT_PROVIDER : rawProvider;
++      model = isCli ? DEFAULT_MODEL : rawModel;
+     }
+     const timeoutMs = resolveSlugTimeoutMs(params.cfg);
+ 
+-- 
+2.47.1
+
