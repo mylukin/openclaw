@@ -332,6 +332,10 @@ export async function prepareCliRunContext(
 
   {
     const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
+
+    // For very small context windows (<30K tokens), force the budget guard to trigger
+    // immediately. The reserve=max(tokens*0.3, 30K) formula produces negative available
+    // budget for windows <30K, so dynamic sizing is meaningless — go straight to profiles.
     let estimatedTokens =
       estimatePromptTokens(systemPrompt) + estimatePromptTokens(params.prompt) + imageTokenEstimate;
 
@@ -342,7 +346,9 @@ export async function prepareCliRunContext(
       });
 
       let lastProfileContextFiles = contextFiles;
-      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
+      // Skip "reduced" for very small context windows — go straight to "minimal"
+      const profilesToTry: BootstrapProfile[] =
+        contextWindowTokens < 30_000 ? ["minimal"] : ["reduced", "minimal"];
       let compactionDone = false;
 
       for (const profile of profilesToTry) {

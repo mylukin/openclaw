@@ -384,14 +384,15 @@ function buildDeliveryResultMetadata(
     return undefined;
   }
   const meta: Record<string, unknown> = {};
+  // Namespace channel adapter meta to prevent overwriting known fields
+  if (result.meta && Object.keys(result.meta).length > 0) {
+    meta.channelMeta = result.meta;
+  }
   if (result.chatId) {
     meta.chatId = result.chatId;
   }
   if (result.channelId) {
     meta.channelId = result.channelId;
-  }
-  if (result.meta) {
-    Object.assign(meta, result.meta);
   }
   return Object.keys(meta).length > 0 ? meta : undefined;
 }

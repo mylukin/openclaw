@@ -286,10 +286,14 @@ export function createFeishuThreadBindingManager(
           accountId,
         });
         rootId = result.messageId;
-      } catch {
+      } catch (err) {
+        console.warn(`bind: failed to send intro message to chat=${chatId}: ${String(err)}`);
         return null;
       }
-      if (!rootId || rootId === "unknown") return null;
+      if (!rootId || rootId === "unknown") {
+        console.warn(`bind: intro message returned no valid rootId for chat=${chatId}`);
+        return null;
+      }
 
       // Reply in-thread to activate topic thread in Feishu UI
       try {
@@ -322,7 +326,7 @@ export function createFeishuThreadBindingManager(
         maxAgeMs,
       };
       setBindingRecord(record);
-      if (persist) saveBindingsToDisk();
+      if (persist) saveBindingsToDisk({ force: true });
       return record;
     },
 
@@ -330,7 +334,7 @@ export function createFeishuThreadBindingManager(
       const key = toBindingKey(accountId, chatId, rootId);
       const removed = removeBindingRecord(key);
       if (!removed) return null;
-      if (persist) saveBindingsToDisk();
+      if (persist) saveBindingsToDisk({ force: true });
       if (opts?.sendFarewell !== false) {
         const text = opts?.farewellText || opts?.reason || "Thread binding ended.";
         sendFarewellInThread(removed, text);
@@ -463,7 +467,7 @@ export function createFeishuThreadBindingManager(
         maxAgeMs,
       };
       setBindingRecord(record);
-      if (persist) saveBindingsToDisk();
+      if (persist) saveBindingsToDisk({ force: true });
       return toSessionBindingRecord(record, defaults);
     },
 

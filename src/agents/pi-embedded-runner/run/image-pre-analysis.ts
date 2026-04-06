@@ -177,8 +177,8 @@ export async function analyzeImagesWithImageModel(params: {
   }
 
   const analysisText =
-    analyses.length > 0
-      ? `\n\n---\n${successCount > 0 ? `The following image analysis was performed by a vision model (${lastProvider}/${lastModel}):\n\n` : ""}${analyses.join("\n\n")}\n---\n`
+    successCount > 0 && analyses.length > 0
+      ? `\n\n---\nThe following image analysis was performed by a vision model (${lastProvider}/${lastModel}):\n\n${analyses.filter((a) => !a.includes("(Image analysis failed.)")).join("\n\n")}\n---\n`
       : "";
 
   return {

@@ -277,11 +277,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         } catch (err) {
           // Log the error for debugging
           console.error(`[feishu] sendMediaFeishu failed:`, err);
-          // Fallback to URL link if upload fails
+          // Fallback: send user-friendly error instead of exposing internal paths
+          const isLocalPath = !mediaUrl.startsWith("http://") && !mediaUrl.startsWith("https://");
+          const fallbackText = isLocalPath ? "📎 [Media upload failed]" : `📎 ${mediaUrl}`;
           return await sendOutboundText({
             cfg,
             to,
-            text: `📎 ${mediaUrl}`,
+            text: fallbackText,
             accountId: accountId ?? undefined,
             replyToMessageId,
           });
