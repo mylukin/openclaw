@@ -1,0 +1,253 @@
+From bc7415c313ae864916d6ba67ba4b13d706f27b77 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Mon, 6 Apr 2026 10:55:42 +0800
+Subject: [PATCH] fix: 8 critical bugs from best-practice and UX review
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. Thread bindings: bind/unbind now force-persist immediately instead
+   of being throttled by the 15s touch interval. Prevents binding loss
+   on restart. Also log warnings on bind intro message failures.
+
+2. Image pre-analysis: clear analysisText when all images fail instead
+   of leaking "(Image analysis failed.)" into the main model prompt.
+
+3. Streaming cards: discard thinking-only cards on NO_REPLY/idle instead
+   of preserving them as ghost cards stuck on "Thinking..." forever.
+
+4. Delivery metadata: namespace channel adapter meta under channelMeta
+   key to prevent Object.assign from overwriting chatId/channelId.
+
+5. Media upload fallback: hide internal file paths (/tmp/openclaw/...)
+   from users when media upload fails — show "[Media upload failed]"
+   for local paths, keep URL for remote paths.
+
+6. Context overflow: emit user-visible "Compacting context..." system
+   event before sending /compact, eliminating 30-90s black screen.
+
+7. Small context windows: skip "reduced" profile and go straight to
+   "minimal" when context window < 30K tokens, avoiding negative
+   available budget from the reserve=max(tokens*0.3, 30K) formula.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ extensions/feishu/src/outbound.ts             |  6 ++-
+ extensions/feishu/src/reply-dispatcher.ts     | 46 ++++++-------------
+ .../feishu/src/thread-bindings.manager.ts     | 14 ++++--
+ src/agents/cli-runner/execute.ts              |  6 +++
+ src/agents/cli-runner/prepare.ts              |  8 +++-
+ .../run/image-pre-analysis.ts                 |  4 +-
+ src/infra/outbound/deliver.ts                 |  7 +--
+ 7 files changed, 45 insertions(+), 46 deletions(-)
+
+diff --git a/extensions/feishu/src/outbound.ts b/extensions/feishu/src/outbound.ts
+index de1a2759e7..553659d564 100644
+--- a/extensions/feishu/src/outbound.ts
++++ b/extensions/feishu/src/outbound.ts
+@@ -277,11 +277,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
+         } catch (err) {
+           // Log the error for debugging
+           console.error(`[feishu] sendMediaFeishu failed:`, err);
+-          // Fallback to URL link if upload fails
++          // Fallback: send user-friendly error instead of exposing internal paths
++          const isLocalPath = !mediaUrl.startsWith("http://") && !mediaUrl.startsWith("https://");
++          const fallbackText = isLocalPath ? "📎 [Media upload failed]" : `📎 ${mediaUrl}`;
+           return await sendOutboundText({
+             cfg,
+             to,
+-            text: `📎 ${mediaUrl}`,
++            text: fallbackText,
+             accountId: accountId ?? undefined,
+             replyToMessageId,
+           });
+diff --git a/extensions/feishu/src/reply-dispatcher.ts b/extensions/feishu/src/reply-dispatcher.ts
+index 33afa12f32..2f308d1e61 100644
+--- a/extensions/feishu/src/reply-dispatcher.ts
++++ b/extensions/feishu/src/reply-dispatcher.ts
+@@ -769,39 +769,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
+       const hasFinalThinking = finalThinking.text.trim().length > 0;
+       const closeReason = options?.reason ?? "idle";
+       if (!hasFinalText) {
+-        if (hasFinalThinking && closeReason === "idle") {
+-          logStreamingDecision("close", {
+-            action: "preserve-thinking-only-card",
+-            finalText,
+-            thinkingText: finalThinking.text,
+-            emitFinalText: options?.emitFinalText,
+-            messageId: streamMessageId,
+-          });
+-          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
+-          const finalNote = showCardNote
+-            ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+-            : undefined;
+-          await streaming.close("", {
+-            ...(finalNote !== undefined ? { note: finalNote } : {}),
+-          });
+-        } else {
+-          // No final user-visible text and no reasoning/tool content left to preserve.
+-          logStreamingDecision("close", {
+-            action:
+-              hasFinalThinking && closeReason === "error"
+-                ? "discard-error-thinking-only-card"
+-                : "discard-empty-card",
+-            finalText,
+-            thinkingText: finalThinking.text,
+-            emitFinalText: options?.emitFinalText,
+-            messageId: streamMessageId,
+-          });
+-          await streaming.discard(
+-            hasFinalThinking && closeReason === "error"
+-              ? "error-without-final-text"
+-              : "empty-final-and-empty-thinking",
+-          );
+-        }
++        // No final user-visible text — discard the card to avoid ghost cards.
++        // Even if thinking content exists, a card with only thinking and no
++        // reply text is confusing for users (appears stuck on "Thinking...").
++        logStreamingDecision("close", {
++          action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
++          finalText,
++          thinkingText: finalThinking.text,
++          emitFinalText: options?.emitFinalText,
++          messageId: streamMessageId,
++        });
++        await streaming.discard(
++          hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
++        );
+       } else {
+         logStreamingDecision("close", {
+           action: "close-final-card",
+diff --git a/extensions/feishu/src/thread-bindings.manager.ts b/extensions/feishu/src/thread-bindings.manager.ts
+index 0fae1f4551..9ddd59c429 100644
+--- a/extensions/feishu/src/thread-bindings.manager.ts
++++ b/extensions/feishu/src/thread-bindings.manager.ts
+@@ -286,10 +286,14 @@ export function createFeishuThreadBindingManager(
+           accountId,
+         });
+         rootId = result.messageId;
+-      } catch {
++      } catch (err) {
++        console.warn(`bind: failed to send intro message to chat=${chatId}: ${String(err)}`);
++        return null;
++      }
++      if (!rootId || rootId === "unknown") {
++        console.warn(`bind: intro message returned no valid rootId for chat=${chatId}`);
+         return null;
+       }
+-      if (!rootId || rootId === "unknown") return null;
+ 
+       // Reply in-thread to activate topic thread in Feishu UI
+       try {
+@@ -322,7 +326,7 @@ export function createFeishuThreadBindingManager(
+         maxAgeMs,
+       };
+       setBindingRecord(record);
+-      if (persist) saveBindingsToDisk();
++      if (persist) saveBindingsToDisk({ force: true });
+       return record;
+     },
+ 
+@@ -330,7 +334,7 @@ export function createFeishuThreadBindingManager(
+       const key = toBindingKey(accountId, chatId, rootId);
+       const removed = removeBindingRecord(key);
+       if (!removed) return null;
+-      if (persist) saveBindingsToDisk();
++      if (persist) saveBindingsToDisk({ force: true });
+       if (opts?.sendFarewell !== false) {
+         const text = opts?.farewellText || opts?.reason || "Thread binding ended.";
+         sendFarewellInThread(removed, text);
+@@ -463,7 +467,7 @@ export function createFeishuThreadBindingManager(
+         maxAgeMs,
+       };
+       setBindingRecord(record);
+-      if (persist) saveBindingsToDisk();
++      if (persist) saveBindingsToDisk({ force: true });
+       return toSessionBindingRecord(record, defaults);
+     },
+ 
+diff --git a/src/agents/cli-runner/execute.ts b/src/agents/cli-runner/execute.ts
+index 09fde48207..1f11050281 100644
+--- a/src/agents/cli-runner/execute.ts
++++ b/src/agents/cli-runner/execute.ts
+@@ -895,6 +895,12 @@ export async function executeWithOverflowProtection(
+       if (sessionToCompact && context.isClaude) {
+         try {
+           cliBackendLog.warn(`cli-runner: context overflow detected, sending /compact to session`);
++          if (params.sessionKey) {
++            executeDeps.enqueueSystemEvent(
++              "Context window limit reached. Compacting conversation context, please wait...",
++              { sessionKey: params.sessionKey },
++            );
++          }
+           await executeCliWithSession(sessionToCompact, "/compact", true, false, "normal");
+           compactSucceeded = true;
+           compactionsThisRun += 1;
+diff --git a/src/agents/cli-runner/prepare.ts b/src/agents/cli-runner/prepare.ts
+index edb3e1b66d..d9db015107 100644
+--- a/src/agents/cli-runner/prepare.ts
++++ b/src/agents/cli-runner/prepare.ts
+@@ -332,6 +332,10 @@ export async function prepareCliRunContext(
+ 
+   {
+     const hardLimitTokens = Math.floor(contextWindowTokens * 0.7);
++
++    // For very small context windows (<30K tokens), force the budget guard to trigger
++    // immediately. The reserve=max(tokens*0.3, 30K) formula produces negative available
++    // budget for windows <30K, so dynamic sizing is meaningless — go straight to profiles.
+     let estimatedTokens =
+       estimatePromptTokens(systemPrompt) + estimatePromptTokens(params.prompt) + imageTokenEstimate;
+ 
+@@ -342,7 +346,9 @@ export async function prepareCliRunContext(
+       });
+ 
+       let lastProfileContextFiles = contextFiles;
+-      const profilesToTry: BootstrapProfile[] = ["reduced", "minimal"];
++      // Skip "reduced" for very small context windows — go straight to "minimal"
++      const profilesToTry: BootstrapProfile[] =
++        contextWindowTokens < 30_000 ? ["minimal"] : ["reduced", "minimal"];
+       let compactionDone = false;
+ 
+       for (const profile of profilesToTry) {
+diff --git a/src/agents/pi-embedded-runner/run/image-pre-analysis.ts b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+index 282e1c95a4..a21d0ded79 100644
+--- a/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
++++ b/src/agents/pi-embedded-runner/run/image-pre-analysis.ts
+@@ -177,8 +177,8 @@ export async function analyzeImagesWithImageModel(params: {
+   }
+ 
+   const analysisText =
+-    analyses.length > 0
+-      ? `\n\n---\n${successCount > 0 ? `The following image analysis was performed by a vision model (${lastProvider}/${lastModel}):\n\n` : ""}${analyses.join("\n\n")}\n---\n`
++    successCount > 0 && analyses.length > 0
++      ? `\n\n---\nThe following image analysis was performed by a vision model (${lastProvider}/${lastModel}):\n\n${analyses.filter((a) => !a.includes("(Image analysis failed.)")).join("\n\n")}\n---\n`
+       : "";
+ 
+   return {
+diff --git a/src/infra/outbound/deliver.ts b/src/infra/outbound/deliver.ts
+index 44afc612f2..df71580e66 100644
+--- a/src/infra/outbound/deliver.ts
++++ b/src/infra/outbound/deliver.ts
+@@ -384,15 +384,16 @@ function buildDeliveryResultMetadata(
+     return undefined;
+   }
+   const meta: Record<string, unknown> = {};
++  // Namespace channel adapter meta to prevent overwriting known fields
++  if (result.meta && Object.keys(result.meta).length > 0) {
++    meta.channelMeta = result.meta;
++  }
+   if (result.chatId) {
+     meta.chatId = result.chatId;
+   }
+   if (result.channelId) {
+     meta.channelId = result.channelId;
+   }
+-  if (result.meta) {
+-    Object.assign(meta, result.meta);
+-  }
+   return Object.keys(meta).length > 0 ? meta : undefined;
+ }
+ 
+-- 
+2.47.1
+
