@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const resolveFeishuAccountMock = vi.hoisted(() => vi.fn());
+const resolveFeishuRuntimeAccountMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const shouldLogVerboseMock = vi.hoisted(() => vi.fn(() => false));
 
 vi.mock("./accounts.js", () => ({
-  resolveFeishuAccount: resolveFeishuAccountMock,
+  resolveFeishuRuntimeAccount: resolveFeishuRuntimeAccountMock,
 }));
 
 vi.mock("./client.js", () => ({
@@ -38,7 +38,7 @@ function createMockClient(options?: { createResponse?: unknown; listResponse?: u
 describe("addTypingIndicator reaction-id fallback", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resolveFeishuAccountMock.mockReturnValue({
+    resolveFeishuRuntimeAccountMock.mockReturnValue({
       configured: true,
       accountId: "main",
       appId: "app_id",

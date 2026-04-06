@@ -4,7 +4,9 @@ type StreamingSessionStub = {
   active: boolean;
   start: ReturnType<typeof vi.fn>;
   update: ReturnType<typeof vi.fn>;
+  updateThinking: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  discard: ReturnType<typeof vi.fn>;
   isActive: ReturnType<typeof vi.fn>;
 };
 

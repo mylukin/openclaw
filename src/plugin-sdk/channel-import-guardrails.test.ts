@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -171,6 +171,8 @@ const LOCAL_EXTENSION_API_BARREL_EXCEPTIONS = [
   // These feishu extension files import types/helpers directly from the SDK barrel
   "extensions/feishu/src/quoted-message.ts",
   "extensions/feishu/src/thread-bindings.manager.ts",
+  // Test support uses the external surface intentionally to exercise contract drift.
+  "extensions/bluebubbles/src/test-support/monitor-test-support.ts",
 ] as const;
 
 const sourceTextCache = new Map<string, string>();
@@ -312,6 +314,10 @@ function collectExtensionFiles(extensionId: string): string[] {
     return cached;
   }
   const extensionDir = resolve(ROOT_DIR, "..", "extensions", extensionId);
+  if (!existsSync(extensionDir)) {
+    extensionFilesCache.set(extensionId, []);
+    return [];
+  }
   const files: string[] = [];
   const stack = [extensionDir];
   while (stack.length > 0) {

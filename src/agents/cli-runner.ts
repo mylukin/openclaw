@@ -1,10 +1,7 @@
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
-import {
-  executeWithOverflowProtection,
-  executePreparedCliRun,
-} from "./cli-runner/execute.js";
+import { executeWithOverflowProtection } from "./cli-runner/execute.js";
 import { prepareCliRunContext } from "./cli-runner/prepare.js";
 import type { RunCliAgentParams } from "./cli-runner/types.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";

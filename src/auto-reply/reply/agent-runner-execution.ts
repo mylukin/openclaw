@@ -9,8 +9,8 @@ import { runCliAgent } from "../../agents/cli-runner.js";
 import { getCliSessionBinding } from "../../agents/cli-session.js";
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
-import { isCliProvider } from "../../agents/model-selection.js";
 import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
+import { isCliProvider } from "../../agents/model-selection.js";
 import {
   BILLING_ERROR_USER_MESSAGE,
   isCompactionFailureError,
@@ -61,7 +61,6 @@ import type { FollowupRun } from "./queue.js";
 import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
 import { createReplyMediaPathNormalizer } from "./reply-media-paths.runtime.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
-import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
 // Maximum number of LiveSessionModelSwitchError retries before surfacing a
@@ -742,38 +741,13 @@ export async function runAgentTurnWithFallback(params: {
               // forward to onPartialReply.  Awaiting this chain after the CLI run
               // ensures markRunComplete() isn't called before streaming initialises.
               let streamingChain: Promise<void> = Promise.resolve();
-              const streamingDirectiveAccumulator = createStreamingDirectiveAccumulator();
               let cliReasoningOpen = false;
-              let assistantMessageStartQueued = false;
               const queueStreamingStep = (step: () => Promise<void>) => {
                 streamingChain = streamingChain.then(step).catch((err) => {
                   defaultRuntime.error(
                     `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
                   );
                 });
-              };
-              const queueAssistantMessageStart = () => {
-                if (assistantMessageStartQueued) {
-                  return;
-                }
-                assistantMessageStartQueued = true;
-                queueStreamingStep(async () => {
-                  await params.typingSignals.signalMessageStart();
-                  await params.opts?.onAssistantMessageStart?.();
-                });
-              };
-              const escapeMarkdownItalic = (value: string): string =>
-                value.replaceAll("\\", "\\\\").replaceAll("_", "\\_").replaceAll("*", "\\*");
-              const formatReasoningPayload = (text: string): string => {
-                const trimmed = text.trim();
-                if (!trimmed) {
-                  return "";
-                }
-                const lines = escapeMarkdownItalic(trimmed)
-                  .split("\n")
-                  .map((line) => line.trim());
-                const italicized = lines.map((line) => (line ? `_${line}_` : "")).join("\n");
-                return `Reasoning:\n${italicized}`;
               };
               const queueReasoningEndIfNeeded = () => {
                 if (!cliReasoningOpen) {

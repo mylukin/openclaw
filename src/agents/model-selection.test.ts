@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
+import { DEFAULT_PROVIDER } from "./defaults.js";
 import {
   buildAllowedModelSet,
   inferUniqueProviderFromConfiguredModels,
@@ -1028,7 +1029,7 @@ describe("resolveNonCliModelRef", () => {
     expect(result.model).toBe("o4-mini");
   });
 
-  it("falls back to DEFAULT_PROVIDER (anthropic) for unknown custom CLI backend", () => {
+  it("falls back to DEFAULT_PROVIDER for unknown custom CLI backend", () => {
     const cfg = {
       agents: {
         defaults: {
@@ -1040,7 +1041,7 @@ describe("resolveNonCliModelRef", () => {
     } as never;
     const ref = { provider: "my-custom-cli", model: "some-model" };
     const result = resolveNonCliModelRef(ref, cfg);
-    expect(result.provider).toBe("anthropic");
+    expect(result.provider).toBe(DEFAULT_PROVIDER);
     expect(result.model).toBe("some-model");
   });
 

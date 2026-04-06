@@ -91,6 +91,7 @@ describe("broadcast dispatch", () => {
       },
       session: {
         resolveStorePath: vi.fn(() => "/tmp/feishu-session-store.json"),
+        readSessionUpdatedAt: vi.fn(() => undefined),
       },
       reply: {
         resolveEnvelopeFormatOptions: resolveEnvelopeFormatOptionsMock,
@@ -112,10 +113,6 @@ describe("broadcast dispatch", () => {
         readAllowFromStore: vi.fn().mockResolvedValue([]),
         upsertPairingRequest: vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false }),
         buildPairingReply: vi.fn(() => "Pairing response"),
-      },
-      session: {
-        resolveStorePath: vi.fn(() => "/tmp/sessions.json"),
-        readSessionUpdatedAt: vi.fn(() => undefined),
       },
     },
     media: {

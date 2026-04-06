@@ -10,7 +10,6 @@ import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { isCliProvider } from "../../agents/model-selection.js";
-import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";

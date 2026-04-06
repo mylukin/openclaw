@@ -9,7 +9,7 @@ import { lookupContextTokens } from "../../agents/context.js";
 import { resolveCronStyleNow } from "../../agents/current-time.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { loadModelCatalog } from "../../agents/model-catalog.js";
-import { isCliProvider, resolveThinkingDefault } from "../../agents/model-selection.js";
+import { resolveThinkingDefault } from "../../agents/model-selection.js";
 import type { SkillSnapshot } from "../../agents/skills.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { deriveSessionTotalTokens, hasNonzeroUsage } from "../../agents/usage.js";

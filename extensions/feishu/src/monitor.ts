@@ -1,11 +1,12 @@
 import * as http from "http";
 import * as Lark from "@larksuiteoapi/node-sdk";
-import type { ClawdbotConfig, RuntimeEnv } from "../runtime-api.js";
 import {
   getGlobalHookRunner,
   installRequestBodyLimitGuard,
+  type ClawdbotConfig,
   type HistoryEntry,
-} from "openclaw/plugin-sdk/feishu";
+  type RuntimeEnv,
+} from "../runtime-api.js";
 import {
   listEnabledFeishuAccounts,
   resolveFeishuAccount,

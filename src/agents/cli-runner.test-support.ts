@@ -50,6 +50,7 @@ setCliRunnerExecuteTestDeps({
     spawn: (params: Parameters<SupervisorSpawnFn>[0]) =>
       supervisorSpawnMock(params) as ReturnType<SupervisorSpawnFn>,
     cancel: vi.fn(),
+    cancelSession: vi.fn(() => 0),
     cancelScope: vi.fn(),
     reconcileOrphans: vi.fn(),
     getRecord: vi.fn(),

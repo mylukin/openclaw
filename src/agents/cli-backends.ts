@@ -5,11 +5,11 @@ import {
 } from "../../extensions/anthropic/cli-backend-api.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { CliBackendConfig } from "../config/types.js";
+import { resolveRuntimeCliBackends } from "../plugins/cli-backends.runtime.js";
 import {
   CLI_FRESH_WATCHDOG_DEFAULTS,
   CLI_RESUME_WATCHDOG_DEFAULTS,
 } from "./cli-watchdog-defaults.js";
-import { resolveRuntimeCliBackends } from "../plugins/cli-backends.runtime.js";
 import { normalizeProviderId } from "./model-selection.js";
 
 export type ResolvedCliBackend = {
@@ -100,6 +100,10 @@ const FALLBACK_CLI_BACKEND_POLICIES: Record<string, FallbackCliBackendPolicy> = 
     baseConfig: {
       ...buildAnthropicCliBackend().config,
       modelAliases: CLAUDE_MODEL_ALIASES,
+      mcp: {
+        enabled: true,
+        strict: true,
+      },
     },
     normalizeConfig: normalizeClaudeBackendConfig,
   },
@@ -250,7 +254,10 @@ export function resolveCliBackendConfig(
   const override = pickBackendConfig(configured, normalized);
   const registered = resolveRegisteredBackend(normalized);
   if (registered) {
-    const merged = mergeBackendConfig(registered.config, override);
+    const registeredBase = fallbackPolicy?.baseConfig
+      ? mergeBackendConfig(fallbackPolicy.baseConfig, registered.config)
+      : registered.config;
+    const merged = mergeBackendConfig(registeredBase, override);
     const config = registered.normalizeConfig ? registered.normalizeConfig(merged) : merged;
     const command = config.command?.trim();
     if (!command) {

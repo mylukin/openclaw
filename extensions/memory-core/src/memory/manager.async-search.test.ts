@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeAllMemorySearchManagers } from "./index.js";
+import { closeAllMemorySearchManagers as closeAllMemorySearchManagersImport } from "./index.js";
 import "./test-runtime-mocks.js";
 import { createOpenAIEmbeddingProviderMock } from "./test-embeddings-mock.js";
 
@@ -48,7 +48,7 @@ describe("memory search async sync", () => {
         }),
     }));
     ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
-    await closeAllMemorySearchManagers();
+    await closeAllMemorySearchManagersImport();
     embedBatch.mockClear();
     embedBatch.mockImplementation(async (input: string[]) => input.map(() => [0.2, 0.2, 0.2]));
     workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-async-"));

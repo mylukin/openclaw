@@ -22,8 +22,8 @@ vi.mock("./client.js", () => ({
   createEventDispatcher: createEventDispatcherMock,
 }));
 
-vi.mock("../runtime-api.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../runtime-api.js")>();
+vi.mock("openclaw/plugin-sdk/feishu", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/feishu")>();
   return {
     ...actual,
     getGlobalHookRunner: () => hookRunnerMocks,

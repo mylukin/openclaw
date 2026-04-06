@@ -201,10 +201,24 @@ export async function compactBootstrapFile(params: {
 
   try {
     const compacted = await params.llmFn(inputContent, signal);
+    const normalizedCompacted = compacted.trim();
+
+    if (!normalizedCompacted) {
+      return {
+        compacted: content,
+        result: {
+          path: filePath,
+          charsBefore,
+          charsAfter: charsBefore,
+          success: false,
+          fallbackReason: "compacted output was empty",
+        },
+      };
+    }
 
     // Guard: if LLM output is not shorter than original, compaction is
     // counter-productive — fall back to original content.
-    if (compacted.length >= charsBefore) {
+    if (normalizedCompacted.length >= charsBefore) {
       return {
         compacted: content,
         result: {
@@ -212,38 +226,19 @@ export async function compactBootstrapFile(params: {
           charsBefore,
           charsAfter: charsBefore,
           success: false,
-          fallbackReason: `compacted output (${compacted.length} chars) not shorter than original (${charsBefore} chars)`,
+          fallbackReason: `compacted output (${normalizedCompacted.length} chars) not shorter than original (${charsBefore} chars)`,
         },
       };
     }
 
-    // Guard: LLM output should contain at least one markdown header,
-    // indicating it followed the expected structured template.
-    const hasMarkdownHeader = /^#{1,2}\s/m.test(compacted);
-    if (!hasMarkdownHeader) {
-      params.log?.(
-        `compaction: output missing expected markdown headers for ${filePath}, falling back to truncated original`,
-      );
-      return {
-        compacted: content,
-        result: {
-          path: filePath,
-          charsBefore,
-          charsAfter: charsBefore,
-          success: false,
-          fallbackReason: "compacted output missing expected markdown section headers",
-        },
-      };
-    }
-
-    cacheSet(filePath, { hash: contentHash, compacted });
+    cacheSet(filePath, { hash: contentHash, compacted: normalizedCompacted });
 
     return {
-      compacted,
+      compacted: normalizedCompacted,
       result: {
         path: filePath,
         charsBefore,
-        charsAfter: compacted.length,
+        charsAfter: normalizedCompacted.length,
         success: true,
       },
     };

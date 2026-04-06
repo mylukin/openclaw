@@ -776,12 +776,12 @@ describe("deliverOutboundPayloads", () => {
         text: "report.pdf",
         idempotencyKey: "idem-deliver-1",
         messageMeta: {
-          channel: "telegram",
+          channel: "line",
           accountId: undefined,
-          chatId: "c1",
+          chatId: undefined,
           chatType: "direct",
-          providerMessageId: "m1",
-          providerMessageIds: ["m1"],
+          providerMessageId: "caption",
+          providerMessageIds: ["caption"],
         },
       }),
     );

@@ -112,6 +112,9 @@ export {
 
 export function isCliProvider(provider: string, cfg?: OpenClawConfig): boolean {
   const normalized = normalizeProviderId(provider);
+  if (normalized === "claude-cli" || normalized === "codex-cli") {
+    return true;
+  }
   const cliBackends = loadCliBackendRuntime()?.resolveRuntimeCliBackends() ?? [];
   if (cliBackends.some((backend) => normalizeProviderId(backend.id) === normalized)) {
     return true;

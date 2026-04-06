@@ -4,7 +4,6 @@ import {
   resolveConfiguredBindingRoute,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-runtime";
-import { appendAssistantMessageToSessionTranscript } from "openclaw/plugin-sdk/feishu";
 import { resolveAgentOutboundIdentity } from "openclaw/plugin-sdk/outbound-runtime";
 import {
   buildPendingHistoryContextFromMap,
@@ -32,6 +31,7 @@ import {
   toMessageResourceType,
 } from "./bot-content.js";
 import {
+  appendAssistantMessageToSessionTranscript,
   buildAgentMediaPayload,
   evaluateSupplementalContextVisibility,
   filterSupplementalContextItems,

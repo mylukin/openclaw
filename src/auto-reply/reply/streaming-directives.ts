@@ -89,9 +89,25 @@ export function createStreamingDirectiveAccumulator() {
   };
 
   const consume = (raw: string, options: ConsumeOptions = {}): ReplyDirectiveParseResult | null => {
-    const withSilent = `${pendingSilent}${raw ?? ""}`;
-    pendingSilent = "";
-    let combined = `${pendingTail}${withSilent}`;
+    const silentToken = options.silentToken ?? SILENT_REPLY_TOKEN;
+    let normalizedRaw = raw ?? "";
+    if (pendingSilent) {
+      const resumed = `${pendingSilent}${normalizedRaw}`;
+      pendingSilent = "";
+      if (!options.final && couldBeSilentTokenStart(resumed, silentToken)) {
+        pendingSilent = resumed;
+        return null;
+      }
+      if (
+        isSilentReplyText(resumed, silentToken) ||
+        (!options.final && isSilentReplyPrefixText(resumed, silentToken))
+      ) {
+        return null;
+      }
+      normalizedRaw = resumed;
+    }
+
+    let combined = `${pendingTail}${normalizedRaw}`;
     pendingTail = "";
 
     if (!options.final) {
@@ -104,12 +120,21 @@ export function createStreamingDirectiveAccumulator() {
       return null;
     }
 
-    const parsed = parseChunk(combined, { silentToken: options.silentToken });
+    if (!options.final && couldBeSilentTokenStart(combined, silentToken)) {
+      pendingSilent = combined;
+      return null;
+    }
+
+    const parsed =
+      options.final &&
+      isSilentReplyPrefixText(combined, silentToken) &&
+      !isSilentReplyText(combined, silentToken)
+        ? parseChunk(combined, { silentToken: "__OPENCLAW_NO_SILENT_PREFIX__" })
+        : parseChunk(combined, { silentToken: options.silentToken });
 
     // Buffer potential silent-token prefixes (e.g. "NO" from split "NO_REPLY").
     // Wait for the next chunk to decide: if it completes to "NO_REPLY" → swallow;
     // if it doesn't (e.g. "NOT really") → flush as normal text.
-    const silentToken = options.silentToken ?? SILENT_REPLY_TOKEN;
     if (
       !options.final &&
       !parsed.isSilent &&

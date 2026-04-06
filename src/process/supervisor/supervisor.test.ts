@@ -206,6 +206,18 @@ describe("process supervisor", () => {
   });
 
   it("cancels active runs by sessionId", async () => {
+    const firstAdapter = createStubChildAdapter({
+      onKill: (signal, current) => {
+        current.settle(null, signal ?? "SIGKILL");
+      },
+    });
+    const secondAdapter = createStubChildAdapter({
+      onKill: (signal, current) => {
+        current.settle(null, signal ?? "SIGKILL");
+      },
+    });
+    createChildAdapterMock.mockResolvedValueOnce(firstAdapter).mockResolvedValueOnce(secondAdapter);
+
     const supervisor = createProcessSupervisor();
     const first = await spawnChild(supervisor, {
       sessionId: "session-a",
@@ -223,9 +235,12 @@ describe("process supervisor", () => {
     expect(supervisor.cancelSession("session-a")).toBe(1);
     const firstExit = await first.wait();
     expect(firstExit.reason === "manual-cancel" || firstExit.reason === "signal").toBe(true);
+    expect(firstAdapter.killMock).toHaveBeenCalledWith("SIGKILL");
 
     supervisor.cancelSession("session-b");
-    await second.wait();
+    const secondExit = await second.wait();
+    expect(secondExit.reason === "manual-cancel" || secondExit.reason === "signal").toBe(true);
+    expect(secondAdapter.killMock).toHaveBeenCalledWith("SIGKILL");
   });
 
   it("applies overall timeout even for near-immediate timer firing", async () => {
