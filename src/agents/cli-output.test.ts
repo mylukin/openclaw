@@ -355,4 +355,64 @@ describe("createCliJsonlStreamingParser", () => {
     expect(onToolUse).toHaveBeenCalledTimes(1);
     expect(onAssistantDelta).not.toHaveBeenCalled();
   });
+
+  it("re-emits tool use when later Claude records fill in the tool input", () => {
+    const onToolUse = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: {
+        command: "claude",
+        output: "jsonl",
+        sessionIdFields: ["session_id"],
+      },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onToolUse,
+    });
+
+    parser.push(
+      [
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "session-rich",
+          event: {
+            type: "content_block_start",
+            content_block: {
+              type: "tool_use",
+              id: "toolu_rich",
+              name: "Read",
+              input: {},
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          session_id: "session-rich",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_rich",
+                name: "Read",
+                input: { file_path: "/tmp/prompt.txt", limit: 200 },
+              },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+    parser.finish();
+
+    expect(onToolUse).toHaveBeenCalledTimes(2);
+    expect(onToolUse.mock.calls[0]?.[0]).toEqual({
+      name: "Read",
+      toolUseId: "toolu_rich",
+      input: {},
+    });
+    expect(onToolUse.mock.calls[1]?.[0]).toEqual({
+      name: "Read",
+      toolUseId: "toolu_rich",
+      input: { file_path: "/tmp/prompt.txt", limit: 200 },
+    });
+  });
 });

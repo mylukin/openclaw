@@ -193,6 +193,7 @@ export async function executeWithOverflowProtection(
       | "direct_fallback_disabled"
       | undefined;
     let promptFileTrustedFromBinding = false;
+    const emittedToolStarts = new Set<string>();
     const cliDebugEnabled = cliBackendLog.isEnabled("debug");
 
     const matchingCliSessionBinding =
@@ -480,10 +481,15 @@ export async function executeWithOverflowProtection(
                   }
                 },
                 onToolUse: ({ name, toolUseId, input }) => {
-                  params.onToolUseEvent?.({ name, toolUseId, input });
-                  cliBackendLog.info(
-                    `cli tool start: ${name}${toolUseId ? ` (${toolUseId})` : ""}`,
-                  );
+                  const toolStartKey =
+                    toolUseId?.trim() || `${name}:${JSON.stringify(input ?? null)}`;
+                  if (!emittedToolStarts.has(toolStartKey)) {
+                    emittedToolStarts.add(toolStartKey);
+                    params.onToolUseEvent?.({ name, toolUseId, input });
+                    cliBackendLog.info(
+                      `cli tool start: ${name}${toolUseId ? ` (${toolUseId})` : ""}`,
+                    );
+                  }
                   if (!(mustVerifyPromptFileRead && cliSystemPromptFile)) {
                     return;
                   }

@@ -390,7 +390,7 @@ export function createCliJsonlStreamingParser(params: {
       return;
     }
     const emit = (payload: CliToolUsePayload) => {
-      const key = `${payload.name}:${payload.toolUseId ?? JSON.stringify(payload.input ?? null)}`;
+      const key = `${payload.name}:${payload.toolUseId ?? "no-id"}:${JSON.stringify(payload.input ?? null)}`;
       if (emittedToolUseKeys.has(key)) {
         return;
       }

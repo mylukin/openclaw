@@ -372,6 +372,91 @@ describe("runCliAgent with process supervisor", () => {
     expect(onAssistantTurn).toHaveBeenCalledWith("Hello");
   });
 
+  it("verifies prompt file reads when Claude first emits an empty tool input", async () => {
+    const sessionFile = "/tmp/session.jsonl";
+    const promptFilePath = resolveClaudePromptFilePath(sessionFile);
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sid-rich" }),
+          JSON.stringify({
+            type: "stream_event",
+            session_id: "sid-rich",
+            event: {
+              type: "content_block_start",
+              content_block: {
+                type: "tool_use",
+                id: "toolu_rich",
+                name: "Read",
+                input: {},
+              },
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-rich",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_rich",
+                  name: "Read",
+                  input: { file_path: promptFilePath, limit: 200 },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "user",
+            session_id: "sid-rich",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_rich",
+                  content: "prompt chunk",
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "result",
+            session_id: "sid-rich",
+            result: "ok",
+          }),
+        ].join("\n"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    const result = await runCliAgent({
+      sessionId: "s-rich",
+      sessionFile,
+      workspaceDir: "/tmp",
+      prompt: "hi",
+      provider: "claude-cli",
+      model: "sonnet",
+      timeoutMs: 1_000,
+      runId: "run-rich",
+    });
+
+    expect(result.payloads?.[0]?.text).toBe("ok");
+    expect(result.meta.agentMeta?.cliPromptLoad).toEqual(
+      expect.objectContaining({
+        loaderMode: "normal",
+        verifiedRead: true,
+      }),
+    );
+  });
+
   it("writes prompt and assistant reply into the OpenClaw session transcript", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-transcript-"));
     const sessionFile = path.join(tempDir, "session.jsonl");
