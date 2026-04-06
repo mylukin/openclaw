@@ -159,6 +159,8 @@ export async function compactBootstrapFile(params: {
   /** Resolved "provider/model" used for compaction. Included in cache key so switching models invalidates. */
   modelRef: string;
   signal?: AbortSignal;
+  /** Optional logger for diagnostic warnings. */
+  log?: (msg: string) => void;
 }): Promise<{ compacted: string; result: CompactionResult }> {
   const { content, filePath, signal } = params;
   const charsBefore = content.length;
@@ -211,6 +213,25 @@ export async function compactBootstrapFile(params: {
           charsAfter: charsBefore,
           success: false,
           fallbackReason: `compacted output (${compacted.length} chars) not shorter than original (${charsBefore} chars)`,
+        },
+      };
+    }
+
+    // Guard: LLM output should contain at least one markdown header,
+    // indicating it followed the expected structured template.
+    const hasMarkdownHeader = /^#{1,2}\s/m.test(compacted);
+    if (!hasMarkdownHeader) {
+      params.log?.(
+        `compaction: output missing expected markdown headers for ${filePath}, falling back to truncated original`,
+      );
+      return {
+        compacted: content,
+        result: {
+          path: filePath,
+          charsBefore,
+          charsAfter: charsBefore,
+          success: false,
+          fallbackReason: "compacted output missing expected markdown section headers",
         },
       };
     }

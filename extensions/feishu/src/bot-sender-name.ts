@@ -29,6 +29,28 @@ const SENDER_NAME_NOAUTH_BACKOFF_MS = 10 * 60 * 1000;
 const senderNameCache = new Map<string, { name: string; expireAt: number }>();
 const senderLookupBackoff = new Map<string, number>();
 
+const SENDER_NAME_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+
+function cleanupExpiredSenderEntries(): void {
+  const now = Date.now();
+  for (const [key, entry] of senderNameCache) {
+    if (entry.expireAt < now) {
+      senderNameCache.delete(key);
+    }
+  }
+  for (const [key, backoffUntil] of senderLookupBackoff) {
+    if (backoffUntil < now) {
+      senderLookupBackoff.delete(key);
+    }
+  }
+}
+
+const senderNameCleanupTimer = setInterval(
+  cleanupExpiredSenderEntries,
+  SENDER_NAME_CLEANUP_INTERVAL_MS,
+);
+senderNameCleanupTimer.unref();
+
 function correctFeishuScopeInUrl(url: string): string {
   let corrected = url;
   for (const [wrong, right] of Object.entries(FEISHU_SCOPE_CORRECTIONS)) {
@@ -98,6 +120,10 @@ function isNoUserAuthorityError(err: unknown): boolean {
 export function resetFeishuSenderNameCacheForTests(): void {
   senderNameCache.clear();
   senderLookupBackoff.clear();
+}
+
+export function stopSenderNameCleanup(): void {
+  clearInterval(senderNameCleanupTimer);
 }
 
 export async function resolveFeishuSenderName(params: {

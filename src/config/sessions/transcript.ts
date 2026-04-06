@@ -88,20 +88,20 @@ type CliTurnUsage = {
   total?: number;
 };
 
-const ZERO_USAGE = {
+const ZERO_USAGE = Object.freeze({
   input: 0,
   output: 0,
   cacheRead: 0,
   cacheWrite: 0,
   totalTokens: 0,
-  cost: {
+  cost: Object.freeze({
     input: 0,
     output: 0,
     cacheRead: 0,
     cacheWrite: 0,
     total: 0,
-  },
-};
+  }),
+});
 
 export type SessionTranscriptMessageMeta = {
   channel?: string;
@@ -318,12 +318,19 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   return { ok: true, sessionFile, messageId };
 }
 
-async function transcriptHasIdempotencyKey(
+/**
+ * Synchronously scan a transcript JSONL file for a message entry with the given
+ * idempotency key. Returns the entry id when found, undefined otherwise.
+ *
+ * This is the canonical implementation — callers such as chat.ts import this
+ * instead of maintaining a separate copy.
+ */
+export function transcriptFindIdempotencyKey(
   transcriptPath: string,
   idempotencyKey: string,
-): Promise<string | undefined> {
+): string | undefined {
   try {
-    const raw = await fs.promises.readFile(transcriptPath, "utf-8");
+    const raw = fs.readFileSync(transcriptPath, "utf-8");
     for (const line of raw.split(/\r?\n/)) {
       if (!line.trim()) {
         continue;
@@ -348,4 +355,11 @@ async function transcriptHasIdempotencyKey(
     return undefined;
   }
   return undefined;
+}
+
+async function transcriptHasIdempotencyKey(
+  transcriptPath: string,
+  idempotencyKey: string,
+): Promise<string | undefined> {
+  return transcriptFindIdempotencyKey(transcriptPath, idempotencyKey);
 }

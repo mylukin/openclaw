@@ -112,8 +112,9 @@ Reply with ONLY the slug, nothing else. Examples: "vendor-pitch", "api-design", 
       const rawProvider = resolved?.ref.provider ?? DEFAULT_PROVIDER;
       const rawModel = resolved?.ref.model ?? DEFAULT_MODEL;
       // Slug generation is a lightweight embedded LLM call — CLI backends are not supported.
-      provider = isCliProvider(rawProvider, params.cfg) ? DEFAULT_PROVIDER : rawProvider;
-      model = isCliProvider(rawProvider, params.cfg) ? DEFAULT_MODEL : rawModel;
+      const isCli = isCliProvider(rawProvider, params.cfg);
+      provider = isCli ? DEFAULT_PROVIDER : rawProvider;
+      model = isCli ? DEFAULT_MODEL : rawModel;
     }
     const timeoutMs = resolveSlugTimeoutMs(params.cfg);
 

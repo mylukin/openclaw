@@ -189,8 +189,10 @@ export class FeishuStreamingSession {
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
   private lastStreamingModeRenewAt = 0;
   private renewTimer: ReturnType<typeof setInterval> | null = null;
+  private renewRetryTimer: ReturnType<typeof setTimeout> | null = null;
   // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
   private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
+  private static readonly STREAMING_MODE_RETRY_MS = 30_000;
 
   constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
@@ -318,6 +320,10 @@ export class FeishuStreamingSession {
       clearInterval(this.renewTimer);
       this.renewTimer = null;
     }
+    if (this.renewRetryTimer !== null) {
+      clearTimeout(this.renewRetryTimer);
+      this.renewRetryTimer = null;
+    }
   }
 
   private scheduleRenewStreamingMode(): void {
@@ -378,7 +384,18 @@ export class FeishuStreamingSession {
   }
 
   private async renewStreamingMode(): Promise<void> {
-    await this.setStreamingModeEnabled({ reason: "renew" });
+    const ok = await this.setStreamingModeEnabled({ reason: "renew" });
+    if (!ok && !this.closed && this.state) {
+      // Schedule a short retry instead of waiting for the next 8-minute interval.
+      if (this.renewRetryTimer !== null) {
+        clearTimeout(this.renewRetryTimer);
+      }
+      this.renewRetryTimer = setTimeout(() => {
+        this.renewRetryTimer = null;
+        this.scheduleRenewStreamingMode();
+      }, FeishuStreamingSession.STREAMING_MODE_RETRY_MS);
+      this.renewRetryTimer.unref();
+    }
   }
 
   private async pushElementContent(elementId: string, text: string): Promise<void> {
