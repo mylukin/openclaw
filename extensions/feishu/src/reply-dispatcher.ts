@@ -372,7 +372,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let hasVisibleTextInReply = false;
   let replaceNextPartialAfterTool = false;
   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
-  const activeTools: Array<{ toolCallId?: string; name: string }> = [];
+  const activeTools: Array<{ toolCallId?: string; name: string; startedAt: number }> = [];
+  let toolElapsedTimer: ReturnType<typeof setInterval> | null = null;
   let toolCallCount = 0;
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
@@ -496,6 +497,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return current?.name?.trim() ? current.name.trim() : undefined;
   };
 
+  const clearToolElapsedTimer = (): void => {
+    if (toolElapsedTimer !== null) {
+      clearInterval(toolElapsedTimer);
+      toolElapsedTimer = null;
+    }
+  };
+
   const removeActiveTool = (toolCallId: string | undefined): void => {
     if (activeTools.length === 0) {
       return;
@@ -505,10 +513,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       const index = activeTools.findIndex((entry) => entry.toolCallId === normalizedId);
       if (index >= 0) {
         activeTools.splice(index, 1);
+        if (activeTools.length === 0) {
+          clearToolElapsedTimer();
+        }
         return;
       }
     }
+    logDispatcher(
+      `removeActiveTool: toolCallId=${normalizedId ?? "none"} did not match any entry, falling back to pop`,
+    );
     activeTools.pop();
+    if (activeTools.length === 0) {
+      clearToolElapsedTimer();
+    }
   };
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
@@ -576,10 +593,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (toolCallCount > 0) {
       const currentRunningTool =
         !options?.final && streamPhase === "tool" ? getActiveRunningToolName() : undefined;
+      const elapsedSuffix = (): string => {
+        if (options?.final || activeTools.length === 0) {
+          return "";
+        }
+        const oldest = activeTools[0];
+        if (!oldest) {
+          return "";
+        }
+        const elapsedSec = Math.round((Date.now() - oldest.startedAt) / 1000);
+        return elapsedSec >= 5 ? ` (${elapsedSec}s)` : "";
+      };
       const toolStatus = currentRunningTool
-        ? `⏳ Running ${currentRunningTool}...`
+        ? `⏳ Running ${currentRunningTool}...${elapsedSuffix()}`
         : !options?.final && streamPhase === "tool" && activeTools.length > 0
-          ? "⏳ Running tool..."
+          ? `⏳ Running tool...${elapsedSuffix()}`
           : "";
       if (toolOnlyPanel) {
         // Show a completed summary when no tool is actively running, instead
@@ -749,88 +777,99 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   // Guard: when true, onIdle must skip closeStreaming to avoid racing with
   // an in-flight deliver callback that is awaiting the message_sending hook.
   let deliverInFlight = false;
+  let closingInProgress = false;
 
   const closeStreaming = async (options?: {
     emitFinalText?: boolean;
     reason?: "idle" | "error";
   }) => {
-    if (streamingStartPromise) {
-      await streamingStartPromise;
+    if (closingInProgress) {
+      logDispatcher(`closeStreaming skipped — already closing`);
+      return;
     }
-    await partialUpdateQueue;
-    const streamMessageId = streaming?.getMessageId();
-    logDispatcher(
-      `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
-    );
-    if (streaming?.isActive()) {
-      const finalText = streamText;
-      const finalThinking = composeThinkingContent({ final: true });
-      const hasFinalText = finalText.trim().length > 0;
-      const hasFinalThinking = finalThinking.text.trim().length > 0;
-      const closeReason = options?.reason ?? "idle";
-      if (!hasFinalText) {
-        // No final user-visible text — discard the card to avoid ghost cards.
-        // Even if thinking content exists, a card with only thinking and no
-        // reply text is confusing for users (appears stuck on "Thinking...").
-        logStreamingDecision("close", {
-          action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
-          finalText,
-          thinkingText: finalThinking.text,
-          emitFinalText: options?.emitFinalText,
-          messageId: streamMessageId,
-        });
-        await streaming.discard(
-          hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
-        );
-      } else {
-        logStreamingDecision("close", {
-          action: "close-final-card",
-          finalText,
-          thinkingText: finalThinking.text,
-          emitFinalText: options?.emitFinalText,
-          messageId: streamMessageId,
-        });
-        logDispatcher(
-          `closeStreaming final path streamMessageId=${streamMessageId ?? "unknown"} finalChars=${finalText.trim().length} thinkingChars=${finalThinking.text.trim().length}`,
-        );
-        // Store thinking content for the collapsed panel in the final card
-        if (finalThinking.text) {
-          await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
-        }
-        let text = finalText;
-        if (mentionTargets?.length) {
-          text = buildMentionedCardContent(mentionTargets, text);
-        }
-        // Normalize any <at user_id="xxx"> tags (e.g. appended by message_sending
-        // hooks) into the card-compatible <at id=xxx></at> format so they render
-        // as blue mention links in the streaming card.
-        text = normalizeMentionTagsForCard(text);
-        const finalNote = showCardNote
-          ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
-          : undefined;
-        await streaming.close(text, {
-          ...(finalNote !== undefined ? { note: finalNote } : {}),
-        });
-        hasVisibleTextInReply = true;
-        deliveredFinalTexts.add(finalText);
-        deliveredFinalTexts.add(normalizeMentionTagsForCard(finalText));
-        deliveredFinalTexts.add(stripMentionTags(finalText));
-        if (options?.emitFinalText && finalText.trim()) {
-          emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
-          await emitFinalTextIfNeeded(
+    closingInProgress = true;
+    try {
+      if (streamingStartPromise) {
+        await streamingStartPromise;
+      }
+      await partialUpdateQueue;
+      const streamMessageId = streaming?.getMessageId();
+      logDispatcher(
+        `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
+      );
+      if (streaming?.isActive()) {
+        const finalText = streamText;
+        const finalThinking = composeThinkingContent({ final: true });
+        const hasFinalText = finalText.trim().length > 0;
+        const hasFinalThinking = finalThinking.text.trim().length > 0;
+        const closeReason = options?.reason ?? "idle";
+        if (!hasFinalText) {
+          // No final user-visible text — discard the card to avoid ghost cards.
+          // Even if thinking content exists, a card with only thinking and no
+          // reply text is confusing for users (appears stuck on "Thinking...").
+          logStreamingDecision("close", {
+            action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
             finalText,
-            streamMessageId ? { messageId: streamMessageId } : undefined,
+            thinkingText: finalThinking.text,
+            emitFinalText: options?.emitFinalText,
+            messageId: streamMessageId,
+          });
+          await streaming.discard(
+            hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
           );
+        } else {
+          logStreamingDecision("close", {
+            action: "close-final-card",
+            finalText,
+            thinkingText: finalThinking.text,
+            emitFinalText: options?.emitFinalText,
+            messageId: streamMessageId,
+          });
+          logDispatcher(
+            `closeStreaming final path streamMessageId=${streamMessageId ?? "unknown"} finalChars=${finalText.trim().length} thinkingChars=${finalThinking.text.trim().length}`,
+          );
+          // Store thinking content for the collapsed panel in the final card
+          if (finalThinking.text) {
+            await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
+          }
+          let text = finalText;
+          if (mentionTargets?.length) {
+            text = buildMentionedCardContent(mentionTargets, text);
+          }
+          // Normalize any <at user_id="xxx"> tags (e.g. appended by message_sending
+          // hooks) into the card-compatible <at id=xxx></at> format so they render
+          // as blue mention links in the streaming card.
+          text = normalizeMentionTagsForCard(text);
+          const finalNote = showCardNote
+            ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+            : undefined;
+          await streaming.close(text, {
+            ...(finalNote !== undefined ? { note: finalNote } : {}),
+          });
+          hasVisibleTextInReply = true;
+          deliveredFinalTexts.add(finalText);
+          deliveredFinalTexts.add(normalizeMentionTagsForCard(finalText));
+          deliveredFinalTexts.add(stripMentionTags(finalText));
+          if (options?.emitFinalText && finalText.trim()) {
+            emitMessageSent({ content: finalText, success: true, messageId: streamMessageId });
+            await emitFinalTextIfNeeded(
+              finalText,
+              streamMessageId ? { messageId: streamMessageId } : undefined,
+            );
+          }
         }
       }
+      streaming = null;
+      streamingStartPromise = null;
+      streamText = "";
+      lastPartial = "";
+      reasoningText = "";
+      thinkingCollapsed = false;
+      activeTools.length = 0;
+      clearToolElapsedTimer();
+    } finally {
+      closingInProgress = false;
     }
-    streaming = null;
-    streamingStartPromise = null;
-    streamText = "";
-    lastPartial = "";
-    reasoningText = "";
-    thinkingCollapsed = false;
-    activeTools.length = 0;
   };
 
   const sendChunkedTextReply = async (params: {
@@ -880,6 +919,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           thinkingCollapsed = false;
           streamPhase = "idle";
           activeTools.length = 0;
+          clearToolElapsedTimer();
           toolCallCount = 0;
           lastRenderedStreamContent = "";
           replaceNextPartialAfterTool = false;
@@ -913,9 +953,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             deliverInFlight = false;
           }
           if (hookResult.cancelled) {
+            const policyNote = "[Message filtered by policy]";
             if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
-              streamText = "";
-              await closeStreaming({ emitFinalText: false, reason: "error" });
+              // Show a brief note in the streaming card so the user sees
+              // feedback rather than a silently discarded empty card.
+              streamText = policyNote;
+              await closeStreaming({ emitFinalText: true, reason: "error" });
+            } else if (info?.kind === "final") {
+              // No streaming session — send a plain text notification so the
+              // user is not left with zero feedback after the hook cancellation.
+              await sendMessageFeishu({
+                cfg,
+                to: chatId,
+                text: policyNote,
+                replyToMessageId: sendReplyToMessageId,
+                replyInThread: effectiveReplyInThread,
+                accountId,
+              });
             }
             return;
           }
@@ -1180,9 +1234,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               activeTools.push({
                 name: trackedName,
                 toolCallId: payload.toolCallId?.trim() || undefined,
+                startedAt: Date.now(),
               });
               toolCallCount += 1;
               replaceNextPartialAfterTool = Boolean(streamText);
+              if (toolElapsedTimer === null) {
+                toolElapsedTimer = setInterval(() => {
+                  if (activeTools.length > 0) {
+                    queueThinkingPanelUpdate();
+                  }
+                }, 10_000);
+                toolElapsedTimer.unref?.();
+              }
             }
             queueThinkingPrelude();
             streamPhase = "tool";

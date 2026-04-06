@@ -1,4 +1,3 @@
-
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -87,8 +86,9 @@ export function archiveSessionTranscripts(opts: {
   restrictToStoreDir?: boolean;
 }): string[] {
   const archived: string[] = [];
+  const restrictToStoreDir = opts.restrictToStoreDir ?? true;
   const storeDir =
-    opts.restrictToStoreDir && opts.storePath
+    restrictToStoreDir && opts.storePath
       ? canonicalizePathForComparison(path.dirname(opts.storePath))
       : null;
   for (const candidate of resolveSessionTranscriptCandidates(

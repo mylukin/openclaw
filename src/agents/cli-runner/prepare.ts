@@ -148,10 +148,10 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
 }
 
 /**
- * Rough token estimate. Uses chars/1.5 for CJK-heavy content (>30% CJK chars),
- * chars/4 for English-heavy content. CJK characters typically tokenize at 1-3
- * tokens per character, so chars/4 severely underestimates for Chinese/Japanese
- * text -- which is common in feishu deployments.
+ * Rough token estimate. Linearly interpolates chars-per-token between 4
+ * (pure Latin) and 1.5 (pure CJK) based on the CJK character ratio.
+ * CJK characters typically tokenize at 1-3 tokens per character, so a
+ * smooth ramp avoids the discontinuity of the old 30% binary threshold.
  */
 export function estimatePromptTokens(text: string): number {
   if (!text) {
@@ -161,7 +161,7 @@ export function estimatePromptTokens(text: string): number {
     text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
       ?.length ?? 0;
   const cjkRatio = cjkCount / text.length;
-  const charsPerToken = cjkRatio > 0.3 ? 1.5 : 4;
+  const charsPerToken = Math.max(1.5, Math.min(4, 4 - cjkRatio * 2.5));
   return Math.ceil(text.length / charsPerToken);
 }
 

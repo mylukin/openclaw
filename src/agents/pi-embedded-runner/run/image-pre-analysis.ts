@@ -79,23 +79,25 @@ export async function analyzeImagesWithImageModel(params: {
     ? `User's question about this image: "${params.userPrompt}"\n\nPlease describe the image in detail to help answer the user's question.`
     : DEFAULT_IMAGE_ANALYSIS_PROMPT;
 
-  const analyses: string[] = [];
-  let analyzedCount = 0;
-  let successCount = 0;
-  let lastProvider = "";
-  let lastModel = "";
-
-  // Analyze each image
+  // Build tasks for all valid images, then run in parallel.
+  const tasks: Array<{ index: number; image: ImageContent; label: string }> = [];
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
     if (!image || image.type !== "image") {
       continue;
     }
+    tasks.push({
+      index: i,
+      image,
+      label: images.length > 1 ? `Image ${i + 1}` : "Image",
+    });
+  }
 
-    analyzedCount += 1;
-    const imageLabel = images.length > 1 ? `Image ${i + 1}` : "Image";
+  let lastProvider = "";
+  let lastModel = "";
 
-    try {
+  const settled = await Promise.allSettled(
+    tasks.map(async (task) => {
       const result = await runWithImageModelFallback({
         cfg: config,
         run: async (provider, modelId) => {
@@ -128,8 +130,8 @@ export async function analyzeImagesWithImageModel(params: {
                   { type: "text" as const, text: analysisPrompt },
                   {
                     type: "image" as const,
-                    data: image.data,
-                    mimeType: image.mimeType,
+                    data: task.image.data,
+                    mimeType: task.image.mimeType,
                   },
                 ],
               },
@@ -160,19 +162,30 @@ export async function analyzeImagesWithImageModel(params: {
           return { text: text.trim(), provider, model: modelId };
         },
       });
+      return { label: task.label, result };
+    }),
+  );
 
-      analyses.push(`[${imageLabel} Analysis]\n${result.result.text}`);
+  // Collect results in original order.
+  const analyses: string[] = [];
+  const analyzedCount = tasks.length;
+  let successCount = 0;
+
+  for (const outcome of settled) {
+    if (outcome.status === "fulfilled") {
+      const { label, result } = outcome.value;
+      analyses.push(`[${label} Analysis]\n${result.result.text}`);
       successCount += 1;
       lastProvider = result.result.provider;
       lastModel = result.result.model;
-
       log.debug(
-        `Image pre-analysis: analyzed ${imageLabel} with ${result.result.provider}/${result.result.model}`,
+        `Image pre-analysis: analyzed ${label} with ${result.result.provider}/${result.result.model}`,
       );
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      log.warn(`Image pre-analysis failed for ${imageLabel}: ${errorMsg}`);
-      analyses.push(`[${imageLabel}]\n(Image analysis failed.)`);
+    } else {
+      const errorMsg =
+        outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+      log.warn(`Image pre-analysis failed: ${errorMsg}`);
+      analyses.push(`[Image]\n(Image analysis failed.)`);
     }
   }
 

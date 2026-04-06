@@ -959,7 +959,7 @@ export async function dispatchReplyFromConfig(params: {
     const normalizeMentionsForDedup = (t: string): string =>
       t
         .replace(/<at\s+user_id="([^"]+)">[^<]*<\/at>/g, "<at:$1>")
-        .replace(/<at\s+id=([^>]+)><\/at>/g, "<at:$1>")
+        .replace(/<at\s+id=(?:"([^"]+)"|'([^']+)'|([^>\s]+))><\/at>/g, "<at:$1$2$3>")
         .trim();
     for (const reply of replies) {
       // Suppress reasoning payloads from channel delivery — channels using this
