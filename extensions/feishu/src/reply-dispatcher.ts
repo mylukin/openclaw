@@ -804,19 +804,39 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         const hasFinalThinking = finalThinking.text.trim().length > 0;
         const closeReason = options?.reason ?? "idle";
         if (!hasFinalText) {
-          // No final user-visible text — discard the card to avoid ghost cards.
-          // Even if thinking content exists, a card with only thinking and no
-          // reply text is confusing for users (appears stuck on "Thinking...").
-          logStreamingDecision("close", {
-            action: hasFinalThinking ? "discard-thinking-only-card" : "discard-empty-card",
-            finalText,
-            thinkingText: finalThinking.text,
-            emitFinalText: options?.emitFinalText,
-            messageId: streamMessageId,
-          });
-          await streaming.discard(
-            hasFinalThinking ? "thinking-only-no-final-text" : "empty-final-and-empty-thinking",
-          );
+          if (hasFinalThinking && closeReason === "idle") {
+            logStreamingDecision("close", {
+              action: "preserve-thinking-only-card",
+              finalText,
+              thinkingText: finalThinking.text,
+              emitFinalText: options?.emitFinalText,
+              messageId: streamMessageId,
+            });
+            await streaming.updateThinking(finalThinking.text, { title: finalThinking.title });
+            const finalNote = showCardNote
+              ? resolveCardNote(agentId, identity, prefixContext.prefixContext)
+              : undefined;
+            await streaming.close("", {
+              ...(finalNote !== undefined ? { note: finalNote } : {}),
+            });
+          } else {
+            // No final user-visible text and no reasoning/tool content left to preserve.
+            logStreamingDecision("close", {
+              action:
+                hasFinalThinking && closeReason === "error"
+                  ? "discard-error-thinking-only-card"
+                  : "discard-empty-card",
+              finalText,
+              thinkingText: finalThinking.text,
+              emitFinalText: options?.emitFinalText,
+              messageId: streamMessageId,
+            });
+            await streaming.discard(
+              hasFinalThinking && closeReason === "error"
+                ? "error-without-final-text"
+                : "empty-final-and-empty-thinking",
+            );
+          }
         } else {
           logStreamingDecision("close", {
             action: "close-final-card",

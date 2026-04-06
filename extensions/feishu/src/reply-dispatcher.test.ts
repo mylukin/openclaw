@@ -1262,7 +1262,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(result.replyOptions.onReasoningEnd).toBeTypeOf("function");
   });
 
-  it("discards reasoning-only streaming cards when no answer text arrives", async () => {
+  it("preserves reasoning-only streaming cards when no answer text arrives", async () => {
     const { result, options } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
       allowReasoningPreview: true,
@@ -1274,10 +1274,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.onIdle?.();
 
     expect(streamingInstances).toHaveLength(1);
-    // Cards with only thinking and no reply text are discarded to avoid
-    // ghost cards that appear stuck on "Thinking..."
-    expect(streamingInstances[0].discard).toHaveBeenCalledWith("thinking-only-no-final-text");
-    expect(streamingInstances[0].close).not.toHaveBeenCalled();
+    expect(streamingInstances[0].updateThinking).toHaveBeenCalledWith("deep thought", {
+      title: "💭 Thinking",
+    });
+    expect(streamingInstances[0].discard).not.toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("", {
+      note: "Agent: agent",
+    });
   });
 
   it("ignores empty reasoning payloads", async () => {
@@ -1561,7 +1564,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
   });
 
-  it("discards reasoning/tool cards when no final assistant text arrives", async () => {
+  it("preserves reasoning/tool cards when no final assistant text arrives", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
       appId: "app_id",
@@ -1589,10 +1592,14 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.onIdle?.();
 
     expect(streamingInstances).toHaveLength(1);
-    // Cards with thinking/tools but no final text are discarded to avoid
-    // ghost cards that appear stuck.
-    expect(streamingInstances[0].discard).toHaveBeenCalledWith("thinking-only-no-final-text");
-    expect(streamingInstances[0].close).not.toHaveBeenCalled();
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      "thinking\n\n🔧 Tool calls (1)",
+      { title: "💭 Thinking" },
+    );
+    expect(streamingInstances[0].discard).not.toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("", {
+      note: "Agent: agent",
+    });
   });
 
   it("discards reasoning/tool cards on error when no final assistant text arrives", async () => {
