@@ -148,10 +148,14 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
 }
 
 /**
- * Rough token estimate. Linearly interpolates chars-per-token between 4
- * (pure Latin) and 1.5 (pure CJK) based on the CJK character ratio.
- * CJK characters typically tokenize at 1-3 tokens per character, so a
- * smooth ramp avoids the discontinuity of the old 30% binary threshold.
+ * Rough token estimate. Smoothly interpolates chars-per-token between 4
+ * (pure Latin) and 1.5 (pure CJK) using a quadratic curve that is
+ * deliberately conservative for mixed-language text. At 30% CJK the
+ * estimate is ~1.9 chars/token (close to the old 1.5 threshold behavior),
+ * avoiding the binary jump while staying protective for Feishu-style
+ * mixed Chinese/English prompts.
+ *
+ * Curve: charsPerToken = 4 - 2.5 * cjkRatio^0.5  (clamped to [1.5, 4])
  */
 export function estimatePromptTokens(text: string): number {
   if (!text) {
@@ -161,7 +165,9 @@ export function estimatePromptTokens(text: string): number {
     text.match(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uff00-\uffef]/g)
       ?.length ?? 0;
   const cjkRatio = cjkCount / text.length;
-  const charsPerToken = Math.max(1.5, Math.min(4, 4 - cjkRatio * 2.5));
+  // Quadratic curve: drops fast with even small CJK ratios, staying
+  // conservative for mixed-language content (the primary risk case).
+  const charsPerToken = Math.max(1.5, Math.min(4, 4 - 2.5 * Math.sqrt(cjkRatio)));
   return Math.ceil(text.length / charsPerToken);
 }
 

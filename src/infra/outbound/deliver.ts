@@ -384,9 +384,10 @@ function buildDeliveryResultMetadata(
     return undefined;
   }
   const meta: Record<string, unknown> = {};
-  // Namespace channel adapter meta to prevent overwriting known fields
-  if (result.meta && Object.keys(result.meta).length > 0) {
-    meta.channelMeta = result.meta;
+  // Spread adapter meta first, then set known fields so they cannot be
+  // overwritten by an adapter accidentally returning a colliding key.
+  if (result.meta) {
+    Object.assign(meta, result.meta);
   }
   if (result.chatId) {
     meta.chatId = result.chatId;
