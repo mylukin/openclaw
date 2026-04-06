@@ -895,6 +895,12 @@ export async function executeWithOverflowProtection(
       if (sessionToCompact && context.isClaude) {
         try {
           cliBackendLog.warn(`cli-runner: context overflow detected, sending /compact to session`);
+          if (params.sessionKey) {
+            executeDeps.enqueueSystemEvent(
+              "Context window limit reached. Compacting conversation context, please wait...",
+              { sessionKey: params.sessionKey },
+            );
+          }
           await executeCliWithSession(sessionToCompact, "/compact", true, false, "normal");
           compactSucceeded = true;
           compactionsThisRun += 1;
