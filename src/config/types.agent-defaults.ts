@@ -204,6 +204,8 @@ export type AgentDefaultsConfig = {
   llm?: AgentLlmConfig;
   /** Compaction tuning and pre-compaction memory flush behavior. */
   compaction?: AgentCompactionConfig;
+  /** Per-CLI-backend configuration overrides keyed by provider id. */
+  cliBackends?: Record<string, CliBackendConfig>;
   /** Embedded Pi runner hardening and compatibility controls. */
   embeddedPi?: {
     /**

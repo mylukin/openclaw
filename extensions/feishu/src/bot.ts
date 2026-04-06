@@ -4,8 +4,8 @@ import {
   resolveConfiguredBindingRoute,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-runtime";
-import { resolveAgentOutboundIdentity } from "openclaw/plugin-sdk/outbound-runtime";
 import { appendAssistantMessageToSessionTranscript } from "openclaw/plugin-sdk/feishu";
+import { resolveAgentOutboundIdentity } from "openclaw/plugin-sdk/outbound-runtime";
 import {
   buildPendingHistoryContextFromMap,
   clearHistoryEntriesIfEnabled,
@@ -50,8 +50,8 @@ import {
   resolveFeishuAllowlistMatch,
   isFeishuGroupAllowed,
 } from "./policy.js";
-import { resolveFeishuReasoningPreviewEnabled } from "./reasoning-preview.js";
 import { resolveQuotedFeishuMessageContent } from "./quoted-message.js";
+import { resolveFeishuReasoningPreviewEnabled } from "./reasoning-preview.js";
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
@@ -142,6 +142,7 @@ export function parseFeishuMessageEvent(
   event: FeishuMessageEvent,
   botOpenId?: string,
   _botName?: string,
+  allBotOpenIds?: Iterable<string | undefined>,
 ): FeishuMessageContext {
   const rawContent = parseMessageContent(event.message.content, event.message.message_type);
   const mentionedBot = checkBotMentioned(event, botOpenId);
@@ -173,9 +174,9 @@ export function parseFeishuMessageEvent(
     contentType: event.message.message_type,
   };
 
-  // Detect mention forward request: message mentions bot + at least one other user
-  if (isMentionForwardRequest(event, botOpenId)) {
-    const mentionTargets = extractMentionTargets(event, botOpenId);
+  // Detect mention forward request: message mentions bot + at least one non-bot user
+  if (isMentionForwardRequest(event, botOpenId, allBotOpenIds)) {
+    const mentionTargets = extractMentionTargets(event, botOpenId, allBotOpenIds);
     if (mentionTargets.length > 0) {
       ctx.mentionTargets = mentionTargets;
     }
@@ -413,7 +414,10 @@ export async function handleFeishuMessage(params: {
     return;
   }
 
-  let ctx = parseFeishuMessageEvent(event, botOpenId, botName);
+  const allBotOpenIds = params.botOpenIdsByAccount
+    ? Object.values(params.botOpenIdsByAccount)
+    : undefined;
+  let ctx = parseFeishuMessageEvent(event, botOpenId, botName, allBotOpenIds);
   const isGroup = ctx.chatType === "group";
   const isDirect = !isGroup;
   const senderUserId = event.sender.sender_id.user_id?.trim() || undefined;

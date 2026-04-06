@@ -975,7 +975,7 @@ export async function dispatchReplyFromConfig(params: {
         }
         deliveredFinalTexts.add(normalizedText);
       }
-      const ttsReply = await maybeApplyTtsToPayload({
+      const ttsReply = await maybeApplyTtsToReplyPayload({
         payload: reply,
         cfg,
         channel: ttsChannel,

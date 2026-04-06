@@ -69,6 +69,7 @@ export type PluginManifestRecord = {
   kind?: PluginKind | PluginKind[];
   channels: string[];
   providers: string[];
+  cliBackends?: string[];
   modelSupport?: PluginManifestModelSupport;
   providerAuthEnvVars?: Record<string, string[]>;
   providerAuthChoices?: PluginManifest["providerAuthChoices"];

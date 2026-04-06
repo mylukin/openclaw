@@ -9,6 +9,7 @@ const {
   mockResolveAgentEffectiveModelPrimary,
   mockBuildModelAliasIndex,
   mockResolveModelRefFromString,
+  mockIsCliProvider,
   mockRunEmbeddedPiAgent,
 } = vi.hoisted(() => ({
   mockResolveDefaultAgentId: vi.fn(),
@@ -17,6 +18,7 @@ const {
   mockResolveAgentEffectiveModelPrimary: vi.fn(),
   mockBuildModelAliasIndex: vi.fn(),
   mockResolveModelRefFromString: vi.fn(),
+  mockIsCliProvider: vi.fn(),
   mockRunEmbeddedPiAgent: vi.fn(),
 }));
 
@@ -33,6 +35,7 @@ vi.mock("../agents/model-selection.js", async (importOriginal) => {
     ...orig,
     buildModelAliasIndex: mockBuildModelAliasIndex,
     resolveModelRefFromString: mockResolveModelRefFromString,
+    isCliProvider: mockIsCliProvider,
   };
 });
 
@@ -53,6 +56,7 @@ describe("generateSlugViaLLM", () => {
     mockResolveModelRefFromString.mockReturnValue({
       ref: { provider: "minimax", model: "minimax" },
     });
+    mockIsCliProvider.mockReturnValue(false);
     mockRunEmbeddedPiAgent.mockResolvedValue({ payloads: [{ text: "Vendor Pitch" }] });
   });
 
@@ -128,6 +132,7 @@ describe("generateSlugViaLLM", () => {
     mockResolveModelRefFromString.mockReturnValue({
       ref: { provider: "claude-cli", model: "sonnet" },
     });
+    mockIsCliProvider.mockReturnValue(true);
 
     await generateSlugViaLLM({
       sessionContent: "Conversation body",

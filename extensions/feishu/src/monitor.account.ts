@@ -377,7 +377,7 @@ function resolveFeishuDebounceMentions(params: {
   }
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    if (isMentionForwardRequest(entry, botOpenId)) {
+    if (isMentionForwardRequest(entry, botOpenId, botOpenIds.values())) {
       // Keep mention-forward semantics scoped to a single source message.
       return mergeFeishuDebounceMentions([entry]);
     }
@@ -444,7 +444,12 @@ function registerEventHandlers(
   };
   const resolveDebounceText = (event: FeishuMessageEvent): string => {
     const botOpenId = botOpenIds.get(accountId);
-    const parsed = parseFeishuMessageEvent(event, botOpenId, botNames.get(accountId));
+    const parsed = parseFeishuMessageEvent(
+      event,
+      botOpenId,
+      botNames.get(accountId),
+      botOpenIds.values(),
+    );
     return parsed.content.trim();
   };
   const recordSuppressedMessageIds = async (
@@ -624,10 +629,7 @@ function registerEventHandlers(
         log(`feishu[${accountId}]: bot removed from chat ${chatId}`);
         const hookRunner = getGlobalHookRunner();
         if (hookRunner?.hasHooks("chat_member_bot_deleted")) {
-          void hookRunner.runChatMemberBotDeleted(
-            { chatId },
-            { channelId: "feishu", accountId },
-          );
+          void hookRunner.runChatMemberBotDeleted({ chatId }, { channelId: "feishu", accountId });
         }
       } catch (err) {
         error(`feishu[${accountId}]: error handling bot removed event: ${String(err)}`);

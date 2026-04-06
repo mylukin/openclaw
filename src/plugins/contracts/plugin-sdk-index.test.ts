@@ -97,9 +97,6 @@ describe("plugin-sdk exports", () => {
     const runtimeExports = await readIndexRuntimeExports();
     expect([...runtimeExports].toSorted()).toEqual([
       "SessionBindingError",
-      "buildFalImageGenerationProvider",
-      "buildGoogleImageGenerationProvider",
-      "buildOpenAIImageGenerationProvider",
       "clamp",
       "delegateCompactionToRuntime",
       "detectMime",

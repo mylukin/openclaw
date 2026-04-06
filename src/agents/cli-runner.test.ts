@@ -31,6 +31,8 @@ const getGlobalHookRunnerMock = vi.hoisted(() => vi.fn(() => null));
 vi.mock("../gateway/mcp-http.js", () => ({
   MCP_PORT_OFFSET: 1,
   ensureMcpConfigFile: (...args: unknown[]) => (ensureMcpConfigFileMock as Function)(...args),
+  getActiveMcpLoopbackRuntime: () => undefined,
+  createMcpLoopbackServerConfig: () => undefined,
 }));
 
 vi.mock("../plugins/hook-runner-global.js", () => ({
@@ -159,6 +161,8 @@ describe("runCliAgent with process supervisor", () => {
     vi.doMock("../gateway/mcp-http.js", () => ({
       MCP_PORT_OFFSET: 1,
       ensureMcpConfigFile: (...args: unknown[]) => (ensureMcpConfigFileMock as Function)(...args),
+      getActiveMcpLoopbackRuntime: () => undefined,
+      createMcpLoopbackServerConfig: () => undefined,
     }));
     vi.doMock("../plugins/hook-runner-global.js", () => ({
       getGlobalHookRunner: (...args: unknown[]) => (getGlobalHookRunnerMock as Function)(...args),
@@ -1691,7 +1695,7 @@ describe("runCliAgent with process supervisor", () => {
 
     await vi.waitFor(() => expect(supervisorSpawnMock).toHaveBeenCalledTimes(1));
     abortController.abort("stop");
-    await expect(runPromise).rejects.toMatchObject({ name: "AbortError" });
+    await expect(runPromise).rejects.toMatchObject({ name: "FailoverError" });
     expect(managedRun.cancel).toHaveBeenCalledWith("manual-cancel");
   });
 
@@ -1720,7 +1724,7 @@ describe("runCliAgent with process supervisor", () => {
         timeoutMs: 1_000,
         runId: "run-session-cancel",
       }),
-    ).rejects.toMatchObject({ name: "AbortError" });
+    ).rejects.toMatchObject({ name: "FailoverError" });
   });
 });
 
