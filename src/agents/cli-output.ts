@@ -23,6 +23,25 @@ export type CliStreamingDelta = {
   usage?: CliUsage;
 };
 
+export type CliThinkingDelta = {
+  text: string;
+  delta: string;
+  sessionId?: string;
+  usage?: CliUsage;
+};
+
+export type CliToolUsePayload = {
+  name: string;
+  toolUseId?: string;
+  input?: unknown;
+};
+
+export type CliToolResultPayload = {
+  toolUseId?: string;
+  text?: string;
+  isError?: boolean;
+};
+
 function extractJsonObjectCandidates(raw: string): string[] {
   const candidates: string[] = [];
   let depth = 0;
@@ -169,6 +188,34 @@ function collectCliText(value: unknown): string {
   return "";
 }
 
+function collectToolResultText(value: unknown): string {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => collectToolResultText(entry)).join("");
+  }
+  if (!isRecord(value)) {
+    return "";
+  }
+  if (typeof value.text === "string") {
+    return value.text;
+  }
+  if (typeof value.result === "string") {
+    return value.result;
+  }
+  if (typeof value.content === "string") {
+    return value.content;
+  }
+  if (Array.isArray(value.content)) {
+    return value.content.map((entry) => collectToolResultText(entry)).join("");
+  }
+  return collectCliText(value);
+}
+
 function pickCliSessionId(
   parsed: Record<string, unknown>,
   backend: CliBackendConfig,
@@ -281,23 +328,77 @@ function parseClaudeCliStreamingDelta(params: {
   };
 }
 
+function parseClaudeCliThinkingDelta(params: {
+  providerId: string;
+  parsed: Record<string, unknown>;
+  textSoFar: string;
+  sessionId?: string;
+  usage?: CliUsage;
+}): CliThinkingDelta | null {
+  if (!isClaudeCliProvider(params.providerId)) {
+    return null;
+  }
+  if (params.parsed.type !== "stream_event" || !isRecord(params.parsed.event)) {
+    return null;
+  }
+  const event = params.parsed.event;
+  if (event.type !== "content_block_delta" || !isRecord(event.delta)) {
+    return null;
+  }
+  const delta = event.delta;
+  if (delta.type !== "thinking_delta") {
+    return null;
+  }
+  const deltaText =
+    typeof delta.thinking === "string"
+      ? delta.thinking
+      : typeof delta.text === "string"
+        ? delta.text
+        : "";
+  if (!deltaText) {
+    return null;
+  }
+  return {
+    text: `${params.textSoFar}${deltaText}`,
+    delta: deltaText,
+    sessionId: params.sessionId,
+    usage: params.usage,
+  };
+}
+
 export function createCliJsonlStreamingParser(params: {
   backend: CliBackendConfig;
   providerId: string;
+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
-  onToolUse?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
+  onThinkingDelta?: (delta: CliThinkingDelta) => void;
+  onToolUse?: (payload: CliToolUsePayload) => void;
+  onToolResult?: (payload: CliToolResultPayload) => void;
 }) {
   let lineBuffer = "";
   let assistantText = "";
+  let thinkingText = "";
   let sessionId: string | undefined;
   let usage: CliUsage | undefined;
+  let sawThinkingStream = false;
+  const seenRecordKeys = new Set<string>();
+  const emittedToolUseKeys = new Set<string>();
+  const emittedToolResultKeys = new Set<string>();
 
   const emitToolUseFromBlock = (block: Record<string, unknown>) => {
     if (!params.onToolUse) {
       return;
     }
+    const emit = (payload: CliToolUsePayload) => {
+      const key = `${payload.name}:${payload.toolUseId ?? JSON.stringify(payload.input ?? null)}`;
+      if (emittedToolUseKeys.has(key)) {
+        return;
+      }
+      emittedToolUseKeys.add(key);
+      params.onToolUse?.(payload);
+    };
     if (block.type === "tool_use" && typeof block.name === "string") {
-      params.onToolUse({
+      emit({
         name: block.name,
         toolUseId: typeof block.id === "string" ? block.id : undefined,
         input: block.input,
@@ -305,7 +406,7 @@ export function createCliJsonlStreamingParser(params: {
       return;
     }
     if (block.type === "toolCall" && typeof block.name === "string") {
-      params.onToolUse({
+      emit({
         name: block.name,
         toolUseId: typeof block.id === "string" ? block.id : undefined,
         input: block.arguments,
@@ -313,7 +414,53 @@ export function createCliJsonlStreamingParser(params: {
     }
   };
 
+  const emitToolResultFromBlock = (block: Record<string, unknown>) => {
+    if (!params.onToolResult || block.type !== "tool_result") {
+      return;
+    }
+    const text = collectToolResultText(block.content).trim() || undefined;
+    const isError = block.is_error === true;
+    const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+    const key = `${toolUseId ?? "unknown"}:${isError ? "error" : "ok"}:${text ?? ""}`;
+    if (emittedToolResultKeys.has(key)) {
+      return;
+    }
+    emittedToolResultKeys.add(key);
+    params.onToolResult({
+      toolUseId,
+      text,
+      ...(isError ? { isError: true } : {}),
+    });
+  };
+
+  const emitThinkingFromBlock = (block: Record<string, unknown>) => {
+    if (!params.onThinkingDelta || sawThinkingStream || block.type !== "thinking") {
+      return;
+    }
+    const delta =
+      typeof block.thinking === "string"
+        ? block.thinking
+        : typeof block.text === "string"
+          ? block.text
+          : "";
+    if (!delta) {
+      return;
+    }
+    thinkingText = `${thinkingText}${delta}`;
+    params.onThinkingDelta({
+      text: thinkingText,
+      delta,
+      sessionId,
+      usage,
+    });
+  };
+
   const handleParsedRecord = (parsed: Record<string, unknown>) => {
+    const recordKey = JSON.stringify(parsed);
+    if (seenRecordKeys.has(recordKey)) {
+      return;
+    }
+    seenRecordKeys.add(recordKey);
     sessionId = pickCliSessionId(parsed, params.backend) ?? sessionId;
     if (!sessionId && typeof parsed.thread_id === "string") {
       sessionId = parsed.thread_id.trim();
@@ -321,19 +468,36 @@ export function createCliJsonlStreamingParser(params: {
     if (isRecord(parsed.usage)) {
       usage = toCliUsage(parsed.usage) ?? usage;
     }
+    if (
+      params.onSystemInit &&
+      (parsed.type === "system" || parsed.type === "init") &&
+      typeof parsed.subtype === "string"
+    ) {
+      params.onSystemInit({
+        subtype: parsed.subtype,
+        ...(sessionId ? { sessionId } : {}),
+      });
+    }
 
     // Detect tool_use events from content_block_start
-    if (params.onToolUse && isClaudeCliProvider(params.providerId)) {
+    if (
+      isClaudeCliProvider(params.providerId) &&
+      (params.onToolUse || params.onToolResult || params.onThinkingDelta)
+    ) {
       const event = isRecord(parsed.event) ? parsed.event : parsed;
       if (event.type === "content_block_start" && isRecord(event.content_block)) {
         emitToolUseFromBlock(event.content_block);
+        emitToolResultFromBlock(event.content_block);
+        emitThinkingFromBlock(event.content_block);
       }
 
       const message = isRecord(parsed.message) ? parsed.message : undefined;
-      if (message?.role === "assistant" && Array.isArray(message.content)) {
+      if (Array.isArray(message?.content)) {
         for (const entry of message.content) {
           if (isRecord(entry)) {
             emitToolUseFromBlock(entry);
+            emitToolResultFromBlock(entry);
+            emitThinkingFromBlock(entry);
           }
         }
       }
@@ -342,9 +506,24 @@ export function createCliJsonlStreamingParser(params: {
         for (const entry of parsed.content) {
           if (isRecord(entry)) {
             emitToolUseFromBlock(entry);
+            emitToolResultFromBlock(entry);
+            emitThinkingFromBlock(entry);
           }
         }
       }
+    }
+
+    const thinkingDelta = parseClaudeCliThinkingDelta({
+      providerId: params.providerId,
+      parsed,
+      textSoFar: thinkingText,
+      sessionId,
+      usage,
+    });
+    if (thinkingDelta) {
+      sawThinkingStream = true;
+      thinkingText = thinkingDelta.text;
+      params.onThinkingDelta?.(thinkingDelta);
     }
 
     const delta = parseClaudeCliStreamingDelta({

@@ -47,6 +47,8 @@ export type RunCliAgentParams = {
   abortSignal?: AbortSignal;
   /** What triggered this agent run. */
   trigger?: EmbeddedRunTrigger;
+  /** Called when the CLI emits a system/init record. */
+  onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   /** Called with each assistant text chunk as it streams in. */
   onAssistantTurn?: (text: string) => void;
   /** Called with each thinking/reasoning chunk as it streams in. */

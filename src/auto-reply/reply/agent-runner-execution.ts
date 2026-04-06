@@ -23,6 +23,7 @@ import {
   sanitizeUserFacingText,
 } from "../../agents/pi-embedded-helpers.js";
 import { isLikelyExecutionAckPrompt } from "../../agents/pi-embedded-runner/run/incomplete-turn.js";
+import { formatReasoningMessage } from "../../agents/pi-embedded-utils.js";
 import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import {
   resolveGroupSessionKey,
@@ -742,11 +743,22 @@ export async function runAgentTurnWithFallback(params: {
               // ensures markRunComplete() isn't called before streaming initialises.
               let streamingChain: Promise<void> = Promise.resolve();
               let cliReasoningOpen = false;
+              let assistantMessageStartQueued = false;
               const queueStreamingStep = (step: () => Promise<void>) => {
                 streamingChain = streamingChain.then(step).catch((err) => {
                   defaultRuntime.error(
                     `cli streaming chain error: ${err instanceof Error ? err.message : String(err)}`,
                   );
+                });
+              };
+              const queueAssistantMessageStart = () => {
+                if (assistantMessageStartQueued) {
+                  return;
+                }
+                assistantMessageStartQueued = true;
+                queueStreamingStep(async () => {
+                  await params.typingSignals.signalMessageStart();
+                  await params.opts?.onAssistantMessageStart?.();
                 });
               };
               const queueReasoningEndIfNeeded = () => {
@@ -786,6 +798,121 @@ export async function runAgentTurnWithFallback(params: {
                   imageOrder: params.opts?.imageOrder,
                   messageProvider: params.followupRun.run.messageProvider,
                   agentAccountId: params.followupRun.run.agentAccountId,
+                  onSystemInit: ({ subtype }) => {
+                    if (subtype === "init") {
+                      queueAssistantMessageStart();
+                    }
+                  },
+                  onAssistantTurn: (text) => {
+                    queueAssistantMessageStart();
+                    queueReasoningEndIfNeeded();
+                    emitAgentEvent({
+                      runId,
+                      stream: "assistant",
+                      data: { text },
+                    });
+                    queueStreamingStep(async () => {
+                      const textForTyping = await handlePartialForTyping({ text });
+                      if (!params.opts?.onPartialReply || textForTyping === undefined) {
+                        return;
+                      }
+                      await params.opts.onPartialReply({ text: textForTyping });
+                    });
+                  },
+                  onThinkingTurn: (payload) => {
+                    if (!payload.text.trim()) {
+                      return;
+                    }
+                    queueAssistantMessageStart();
+                    cliReasoningOpen = true;
+                    emitAgentEvent({
+                      runId,
+                      stream: "thinking",
+                      data: payload.delta
+                        ? { text: payload.text, delta: payload.delta }
+                        : { text: payload.text },
+                    });
+                    queueStreamingStep(async () => {
+                      await params.typingSignals.signalReasoningDelta();
+                      const formatted = formatReasoningMessage(payload.text);
+                      if (!formatted) {
+                        return;
+                      }
+                      await params.opts?.onReasoningStream?.({
+                        text: formatted,
+                        isReasoning: true,
+                      });
+                    });
+                  },
+                  onToolUseEvent: (payload) => {
+                    queueAssistantMessageStart();
+                    queueReasoningEndIfNeeded();
+                    emitAgentEvent({
+                      runId,
+                      stream: "tool",
+                      data: {
+                        phase: "start",
+                        name: payload.name,
+                        ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                        ...(payload.input !== undefined ? { input: payload.input } : {}),
+                      },
+                    });
+                    queueStreamingStep(async () => {
+                      await params.typingSignals.signalToolStart();
+                      await params.opts?.onToolStart?.({
+                        name: payload.name,
+                        phase: "start",
+                        toolCallId: payload.toolUseId,
+                      });
+                    });
+                  },
+                  onToolResult: onToolResult
+                    ? (() => {
+                        let toolResultChain: Promise<void> = Promise.resolve();
+                        return (payload) => {
+                          queueReasoningEndIfNeeded();
+                          const preview =
+                            typeof payload.text === "string" && payload.text.trim()
+                              ? payload.text.trim().slice(0, 1_200)
+                              : undefined;
+                          emitAgentEvent({
+                            runId,
+                            stream: "tool",
+                            data: {
+                              phase: "result",
+                              ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                              ...(preview ? { partialResult: preview, result: preview } : {}),
+                              ...(payload.isError ? { isError: true } : {}),
+                            },
+                          });
+                          toolResultChain = toolResultChain
+                            .then(async () => {
+                              const { text, skip } = normalizeStreamingText({
+                                text: payload.text,
+                                ...(payload.isError ? { isError: true } : {}),
+                              });
+                              if (skip) {
+                                return;
+                              }
+                              if (text !== undefined) {
+                                await params.typingSignals.signalTextDelta(text);
+                              }
+                              await onToolResult({
+                                ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
+                                ...(text !== undefined ? { text } : {}),
+                                ...(payload.isError ? { isError: true } : {}),
+                              });
+                            })
+                            .catch((err) => {
+                              logVerbose(`cli tool result delivery failed: ${String(err)}`);
+                            });
+                          const task = toolResultChain.finally(() => {
+                            params.pendingToolTasks.delete(task);
+                          });
+                          params.pendingToolTasks.add(task);
+                        };
+                      })()
+                    : undefined,
                 });
                 bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
                   result.meta?.systemPromptReport,

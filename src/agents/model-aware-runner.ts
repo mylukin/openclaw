@@ -96,6 +96,7 @@ export async function runModelAwareAgent(
       if (payload.text || payload.isError) {
         void params.onToolResult?.({
           text: payload.text,
+          ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
         });
       }
       emitAgentEvent(params.onAgentEvent, {

@@ -115,7 +115,7 @@ describe("runModelAwareAgent", () => {
 
     expect(onPartialReply).toHaveBeenCalledWith({ text: "assistant text" });
     expect(onReasoningStream).toHaveBeenCalledWith({ text: "thinking text" });
-    expect(onToolResult).toHaveBeenCalledWith({ text: "tool done" });
+    expect(onToolResult).toHaveBeenCalledWith({ text: "tool done", toolCallId: "tool_1" });
     expect(onAgentEvent).toHaveBeenCalledWith({
       stream: "assistant",
       data: { text: "assistant text" },

@@ -214,6 +214,7 @@ describe("parseCliJsonl", () => {
 describe("createCliJsonlStreamingParser", () => {
   it("emits Claude Read tool calls from assistant message content blocks", () => {
     const onToolUse = vi.fn();
+    const onSystemInit = vi.fn();
     const parser = createCliJsonlStreamingParser({
       backend: {
         command: "claude",
@@ -221,6 +222,7 @@ describe("createCliJsonlStreamingParser", () => {
         sessionIdFields: ["session_id"],
       },
       providerId: "claude-cli",
+      onSystemInit,
       onAssistantDelta: vi.fn(),
       onToolUse,
     });
@@ -252,5 +254,105 @@ describe("createCliJsonlStreamingParser", () => {
       toolUseId: "call_function_1",
       input: { path: "/tmp/session.claude-system-prompt.txt" },
     });
+    expect(onSystemInit).toHaveBeenCalledWith({
+      subtype: "init",
+      sessionId: "session-123",
+    });
+  });
+
+  it("emits Claude thinking deltas and tool results", () => {
+    const onThinkingDelta = vi.fn();
+    const onToolResult = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: {
+        command: "claude",
+        output: "jsonl",
+        sessionIdFields: ["session_id"],
+      },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onThinkingDelta,
+      onToolResult,
+    });
+
+    parser.push(
+      [
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "session-321",
+          event: {
+            type: "content_block_delta",
+            delta: {
+              type: "thinking_delta",
+              thinking: "Inspecting files",
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "user",
+          session_id: "session-321",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_123",
+                is_error: true,
+                content: [{ type: "text", text: "Read failed" }],
+              },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+    parser.finish();
+
+    expect(onThinkingDelta).toHaveBeenCalledWith({
+      text: "Inspecting files",
+      delta: "Inspecting files",
+      sessionId: "session-321",
+      usage: undefined,
+    });
+    expect(onToolResult).toHaveBeenCalledWith({
+      toolUseId: "toolu_123",
+      text: "Read failed",
+      isError: true,
+    });
+  });
+
+  it("deduplicates repeated Claude records from mixed stdout replay", () => {
+    const onAssistantDelta = vi.fn();
+    const onToolUse = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: {
+        command: "claude",
+        output: "jsonl",
+        sessionIdFields: ["session_id"],
+      },
+      providerId: "claude-cli",
+      onAssistantDelta,
+      onToolUse,
+    });
+
+    const line = JSON.stringify({
+      type: "stream_event",
+      session_id: "session-dup",
+      event: {
+        type: "content_block_start",
+        content_block: {
+          type: "tool_use",
+          id: "toolu_dup",
+          name: "Read",
+          input: { file_path: "/tmp/test.txt" },
+        },
+      },
+    });
+
+    parser.push(`${line}\n`);
+    parser.push(`${line}\n`);
+    parser.finish();
+
+    expect(onToolUse).toHaveBeenCalledTimes(1);
+    expect(onAssistantDelta).not.toHaveBeenCalled();
   });
 });

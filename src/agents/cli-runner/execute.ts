@@ -1,6 +1,5 @@
 import path from "node:path";
 import { shouldLogVerbose } from "../../globals.js";
-import { emitAgentEvent } from "../../infra/agent-events.js";
 import { isTruthyEnvValue } from "../../infra/env.js";
 import { requestHeartbeatNow as requestHeartbeatNowImpl } from "../../infra/heartbeat-wake.js";
 import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
@@ -128,6 +127,14 @@ export type CliPromptLoadResult = {
 };
 
 const ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK = false;
+
+function formatCliLogValue(value: string | undefined, maxChars = 240): string {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return "<empty>";
+  }
+  return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars)}...` : trimmed;
+}
 
 /**
  * Wraps executePreparedCliRun with:
@@ -447,7 +454,11 @@ export async function executeWithOverflowProtection(
             ? createCliJsonlStreamingParser({
                 backend,
                 providerId: context.backendResolved.id,
+                onSystemInit: ({ subtype, sessionId: initSessionId }) => {
+                  params.onSystemInit?.({ subtype, sessionId: initSessionId });
+                },
                 onAssistantDelta: ({ text, delta }) => {
+                  params.onAssistantTurn?.(delta);
                   if (cliDebugEnabled) {
                     cliBackendLog.debug("cli assistant delta", {
                       sessionId: resolvedSessionId ?? sessionId ?? null,
@@ -456,49 +467,64 @@ export async function executeWithOverflowProtection(
                       delta,
                     });
                   }
-                  emitAgentEvent({
-                    runId: params.runId,
-                    stream: "assistant",
-                    data: { text, delta },
-                  });
                 },
-                onToolUse:
-                  mustVerifyPromptFileRead && cliSystemPromptFile
-                    ? ({ name, input }) => {
-                        const filePath = resolveReadToolFilePath(input);
-                        const normalizedFilePath = filePath ? path.resolve(filePath) : undefined;
-                        const expectedPromptFile = path.resolve(cliSystemPromptFile.filePath);
-                        const matchedPromptFile =
-                          normalizedFilePath !== undefined &&
-                          normalizedFilePath === expectedPromptFile;
-                        if (cliDebugEnabled) {
-                          cliBackendLog.debug("cli loader verifier saw tool use", {
-                            sessionId: resolvedSessionId ?? sessionId ?? null,
-                            toolName: name,
-                            filePath: normalizedFilePath ?? null,
-                            expectedPromptFile,
-                            matchedPromptFile,
-                            input,
-                          });
-                        }
-                        if (promptFileReadVerified) {
-                          return;
-                        }
-                        if (name !== "Read" && name !== "read") {
-                          return;
-                        }
-                        if (matchedPromptFile) {
-                          promptFileReadVerified = true;
-                          if (cliDebugEnabled) {
-                            cliBackendLog.debug("cli loader verifier matched prompt file read", {
-                              sessionId: resolvedSessionId ?? sessionId ?? null,
-                              toolName: name,
-                              promptFile: expectedPromptFile,
-                            });
-                          }
-                        }
-                      }
-                    : undefined,
+                onThinkingDelta: ({ text, delta }) => {
+                  params.onThinkingTurn?.({ text, delta });
+                  if (cliDebugEnabled) {
+                    cliBackendLog.debug("cli thinking delta", {
+                      sessionId: resolvedSessionId ?? sessionId ?? null,
+                      deltaChars: delta.length,
+                      totalChars: text.length,
+                      delta,
+                    });
+                  }
+                },
+                onToolUse: ({ name, toolUseId, input }) => {
+                  params.onToolUseEvent?.({ name, toolUseId, input });
+                  cliBackendLog.info(
+                    `cli tool start: ${name}${toolUseId ? ` (${toolUseId})` : ""}`,
+                  );
+                  if (!(mustVerifyPromptFileRead && cliSystemPromptFile)) {
+                    return;
+                  }
+                  const filePath = resolveReadToolFilePath(input);
+                  const normalizedFilePath = filePath ? path.resolve(filePath) : undefined;
+                  const expectedPromptFile = path.resolve(cliSystemPromptFile.filePath);
+                  const matchedPromptFile =
+                    normalizedFilePath !== undefined && normalizedFilePath === expectedPromptFile;
+                  if (cliDebugEnabled) {
+                    cliBackendLog.debug("cli loader verifier saw tool use", {
+                      sessionId: resolvedSessionId ?? sessionId ?? null,
+                      toolName: name,
+                      filePath: normalizedFilePath ?? null,
+                      expectedPromptFile,
+                      matchedPromptFile,
+                      input,
+                    });
+                  }
+                  if (promptFileReadVerified) {
+                    return;
+                  }
+                  if (name !== "Read" && name !== "read") {
+                    return;
+                  }
+                  if (matchedPromptFile) {
+                    promptFileReadVerified = true;
+                    if (cliDebugEnabled) {
+                      cliBackendLog.debug("cli loader verifier matched prompt file read", {
+                        sessionId: resolvedSessionId ?? sessionId ?? null,
+                        toolName: name,
+                        promptFile: expectedPromptFile,
+                      });
+                    }
+                  }
+                },
+                onToolResult: ({ toolUseId, text, isError }) => {
+                  params.onToolResult?.({ toolUseId, text, isError });
+                  cliBackendLog.info(
+                    `cli tool result${toolUseId ? ` (${toolUseId})` : ""}: ${formatCliLogValue(text)}`,
+                  );
+                },
               })
             : null;
         const supervisor = executeDeps.getProcessSupervisor();
@@ -622,6 +648,9 @@ export async function executeWithOverflowProtection(
           outputMode: useResume ? (backend.resumeOutput ?? backend.output) : backend.output,
           fallbackSessionId: resolvedSessionId,
         });
+        cliBackendLog.info(
+          `cli exec complete: provider=${params.provider} model=${context.modelId} session=${cliOutput.sessionId ?? resolvedSessionId ?? "new"} chars=${cliOutput.text.length}`,
+        );
 
         // Layer 1: Verify prompt file was read
         if (mustVerifyPromptFileRead && !promptFileReadVerified) {

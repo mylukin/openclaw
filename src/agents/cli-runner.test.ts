@@ -270,6 +270,108 @@ describe("runCliAgent with process supervisor", () => {
     expect(ensureMcpConfigFileMock).not.toHaveBeenCalled();
   });
 
+  it("forwards Claude streaming callbacks for assistant, thinking, and tool events", async () => {
+    const sessionFile = "/tmp/session.jsonl";
+    const onAssistantTurn = vi.fn();
+    const onThinkingTurn = vi.fn();
+    const onToolUseEvent = vi.fn();
+    const onToolResult = vi.fn();
+    const streamOutput = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sid-stream" }),
+      JSON.stringify({
+        type: "stream_event",
+        session_id: "sid-stream",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "thinking_delta", thinking: "Inspecting files" },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        session_id: "sid-stream",
+        event: {
+          type: "content_block_start",
+          content_block: {
+            type: "tool_use",
+            id: "toolu_stream",
+            name: "Read",
+            input: { file_path: resolveClaudePromptFilePath(sessionFile) },
+          },
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        session_id: "sid-stream",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_stream",
+              content: "prompt file",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        session_id: "sid-stream",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "Hello" },
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        session_id: "sid-stream",
+        result: "Hello",
+      }),
+    ].join("\n");
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: streamOutput,
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    const result = await runCliAgent({
+      sessionId: "s-stream",
+      sessionFile,
+      workspaceDir: "/tmp",
+      prompt: "hi",
+      provider: "claude-cli",
+      model: "opus",
+      timeoutMs: 1_000,
+      runId: "run-stream",
+      onAssistantTurn,
+      onThinkingTurn,
+      onToolUseEvent,
+      onToolResult,
+    });
+
+    expect(result.payloads?.[0]?.text).toBe("Hello");
+    expect(onThinkingTurn).toHaveBeenCalledWith({
+      text: "Inspecting files",
+      delta: "Inspecting files",
+    });
+    expect(onToolUseEvent).toHaveBeenCalledWith({
+      name: "Read",
+      toolUseId: "toolu_stream",
+      input: { file_path: resolveClaudePromptFilePath(sessionFile) },
+    });
+    expect(onToolResult).toHaveBeenCalledWith({
+      toolUseId: "toolu_stream",
+      text: "prompt file",
+    });
+    expect(onAssistantTurn).toHaveBeenCalledWith("Hello");
+  });
+
   it("writes prompt and assistant reply into the OpenClaw session transcript", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-runner-transcript-"));
     const sessionFile = path.join(tempDir, "session.jsonl");
