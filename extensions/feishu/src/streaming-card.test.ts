@@ -147,6 +147,37 @@ describe("FeishuStreamingSession.update", () => {
     expect((session as any).state.currentText).toBe("🔧 正在使用Read工具...");
   });
 
+  it("strips inline reply tags before updating visible card content", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    const updateCardContentSpy = vi
+      .spyOn(session as any, "updateCardContent")
+      .mockResolvedValue(undefined);
+
+    await session.update("[[reply_to_current]] 让我去扒一下这个项目。", { replace: true });
+
+    expect(updateCardContentSpy).toHaveBeenCalledWith(
+      "让我去扒一下这个项目。",
+      expect.any(Function),
+    );
+    expect((session as any).state.currentText).toBe("让我去扒一下这个项目。");
+  });
+
   it("stores a custom thinking panel title for tool-only updates", async () => {
     const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {
@@ -206,6 +237,40 @@ describe("FeishuStreamingSession.update", () => {
       "second thought",
       expect.any(Function),
     );
+  });
+
+  it("strips inline reply tags before updating thinking content", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "first thought",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    const updateElementSpy = vi
+      .spyOn(session as any, "updateElementContent")
+      .mockResolvedValue(true);
+
+    await session.updateThinking("[[reply_to_current]] 让我去扒一下这个项目。", {
+      title: "💭 Thinking",
+    });
+
+    expect(updateElementSpy).toHaveBeenCalledWith(
+      "thinking_content",
+      "让我去扒一下这个项目。",
+      expect.any(Function),
+    );
+    expect((session as any).state.thinkingText).toBe("让我去扒一下这个项目。");
   });
 
   it("rolls back thinking state after a failed full-card update so identical retries are still allowed", async () => {
@@ -470,6 +535,34 @@ describe("FeishuStreamingSession.close", () => {
     expect(updateCardContentSpy).toHaveBeenCalledWith(
       "能 review。\n\n原因就一个：\n- working tree clean",
     );
+  });
+
+  it("strips inline reply tags from explicit final text before closing the card", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "旧内容",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "",
+      thinkingExpanded: true,
+      thinkingPanelRendered: false,
+    };
+    (session as any).lastStreamingModeRenewAt = Date.now();
+    const updateCardContentSpy = vi
+      .spyOn(session as any, "updateCardContent")
+      .mockResolvedValue(true);
+
+    await session.close("[[reply_to_current]] 让我去扒一下这个项目。");
+
+    expect(updateCardContentSpy).toHaveBeenCalledWith("让我去扒一下这个项目。");
   });
 
   it("keeps pending merge behavior when final text is omitted", async () => {

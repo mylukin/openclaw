@@ -4,6 +4,7 @@
 
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import { stripInlineDirectiveTagsForDisplay } from "openclaw/plugin-sdk/text-runtime";
 import { resolveFeishuCardTemplate, type CardHeaderConfig } from "./send.js";
 import type { FeishuDomain } from "./types.js";
 
@@ -127,6 +128,15 @@ function stripHtmlTagsToText(text: string): string {
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'");
+}
+
+function sanitizeVisibleCardText(text: string | undefined): string {
+  if (!text) {
+    return "";
+  }
+  return stripInlineDirectiveTagsForDisplay(text)
+    .text.replace(/([^\s])[ \t]{2,}([^\s])/g, "$1 $2")
+    .replace(/(^|\n)[ \t]+(?=\S)/g, "$1");
 }
 
 export function mergeStreamingText(
@@ -470,6 +480,7 @@ export class FeishuStreamingSession {
   /** Build the full elements array for full card updates, including thinking panel. */
   private buildFullElements(text: string, options?: { note?: string }): Record<string, unknown>[] {
     const elements: Record<string, unknown>[] = [];
+    const visibleText = sanitizeVisibleCardText(text);
     // Include thinking panel if there's thinking content
     if (this.state?.thinkingText) {
       elements.push({
@@ -487,7 +498,7 @@ export class FeishuStreamingSession {
         ],
       });
     }
-    elements.push({ tag: "markdown", content: text, element_id: "content" });
+    elements.push({ tag: "markdown", content: visibleText, element_id: "content" });
     if (this.state?.hasNote) {
       elements.push({ tag: "hr" });
       const noteSource = options?.note ?? this.state.noteText;
@@ -554,9 +565,10 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
+    const visibleText = sanitizeVisibleCardText(text);
     const resolvedInput = options?.replace
-      ? text
-      : mergeStreamingText(this.pendingText ?? this.state.currentText, text);
+      ? visibleText
+      : mergeStreamingText(this.pendingText ?? this.state.currentText, visibleText);
     if (!resolvedInput || resolvedInput === this.state.currentText) {
       return;
     }
@@ -618,7 +630,7 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
-    const normalized = text.trim();
+    const normalized = sanitizeVisibleCardText(text).trim();
     const previousText = this.state.thinkingText;
     const previousTitle = this.state.thinkingTitle;
     const nextTitle = options?.title?.trim() || this.state.thinkingTitle || "💭 Thinking";
@@ -718,7 +730,10 @@ export class FeishuStreamingSession {
     // present, treat it as authoritative instead of merging it with the last
     // streamed preview, otherwise stale status/preview text can be duplicated
     // into the terminal card content.
-    const text = finalText !== undefined ? finalText : pendingMerged;
+    const text =
+      finalText !== undefined
+        ? sanitizeVisibleCardText(finalText)
+        : sanitizeVisibleCardText(pendingMerged);
 
     const hadThinkingPanel = this.state.thinkingPanelRendered || Boolean(this.state.thinkingText);
     if (options?.dropThinkingPanel) {
