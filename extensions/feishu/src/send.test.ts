@@ -41,15 +41,6 @@ vi.mock("openclaw/plugin-sdk/config-runtime", () => ({
 
 vi.mock("openclaw/plugin-sdk/text-runtime", () => ({
   convertMarkdownTables: mockConvertMarkdownTables,
-  stripInlineDirectiveTagsForDelivery: vi.fn((text: string) => ({
-    text: text
-      .replace(
-        /\s*(?:\[\[\s*audio_as_voice\s*\]\]|\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\])\s*/gi,
-        " ",
-      )
-      .trim(),
-    changed: true,
-  })),
 }));
 
 vi.mock("./client.js", () => ({
@@ -397,39 +388,6 @@ describe("sendMessageFeishu", () => {
     );
     expect(result).toEqual(expect.objectContaining({ messageId: "om_card" }));
   });
-
-  it("strips inline reply tags before sending post text", async () => {
-    const create = vi.fn().mockResolvedValue({
-      code: 0,
-      data: { message_id: "om_post" },
-    });
-    mockCreateFeishuClient.mockReturnValue({
-      im: {
-        message: {
-          create,
-          reply: vi.fn(),
-        },
-      },
-    });
-
-    await sendMessageFeishu({
-      cfg: {} as ClawdbotConfig,
-      to: "chat:oc_group_1",
-      text: "[[reply_to_current]] hello",
-    });
-
-    expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          content: JSON.stringify({
-            zh_cn: {
-              content: [[{ tag: "md", text: "hello" }]],
-            },
-          }),
-        }),
-      }),
-    );
-  });
 });
 
 describe("shouldUseFeishuMarkdownCard", () => {
@@ -653,34 +611,6 @@ describe("editMessageFeishu", () => {
     expect(result).toEqual({ messageId: "om_edit_card_mentions", contentType: "interactive" });
   });
 
-  it("strips inline reply tags before patching text content", async () => {
-    mockClientPatch.mockResolvedValueOnce({ code: 0 });
-
-    await editMessageFeishu({
-      cfg: {} as ClawdbotConfig,
-      messageId: "om_edit_strip_tag",
-      text: "[[reply_to_current]] updated body",
-    });
-
-    expect(mockClientPatch).toHaveBeenCalledWith({
-      path: { message_id: "om_edit_strip_tag" },
-      data: {
-        content: JSON.stringify({
-          zh_cn: {
-            content: [
-              [
-                {
-                  tag: "md",
-                  text: "updated body",
-                },
-              ],
-            ],
-          },
-        }),
-      },
-    });
-  });
-
   it("patches interactive content for text edits in auto mode when markdown needs cards", async () => {
     mockClientPatch.mockResolvedValueOnce({ code: 0 });
     mockResolveFeishuAccount.mockReturnValue({
@@ -768,18 +698,6 @@ describe("buildStructuredCard", () => {
     );
   });
 
-  it("strips inline reply tags from markdown body content", () => {
-    const card = buildStructuredCard("[[reply_to_current]] hello");
-
-    expect(card).toEqual(
-      expect.objectContaining({
-        body: {
-          elements: [{ tag: "markdown", content: "hello" }],
-        },
-      }),
-    );
-  });
-
   it("renders thinking as a collapsible panel instead of blockquote markdown", () => {
     const card = buildStructuredCard("final answer", {
       thinkingTitle: "💭 Thinking",
@@ -824,20 +742,6 @@ describe("buildMarkdownCard", () => {
       },
       body: {
         elements: [{ tag: "markdown", content: "<at id=ou_123></at> hello" }],
-      },
-    });
-  });
-
-  it("strips inline reply tags before building markdown cards", () => {
-    const card = buildMarkdownCard("[[reply_to_current]] hello");
-
-    expect(card).toEqual({
-      schema: "2.0",
-      config: {
-        width_mode: "fill",
-      },
-      body: {
-        elements: [{ tag: "markdown", content: "hello" }],
       },
     });
   });

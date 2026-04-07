@@ -5,7 +5,6 @@ import {
   resolveSendableOutboundReplyParts,
   resolveTextChunksWithFallback,
 } from "openclaw/plugin-sdk/reply-payload";
-import { stripInlineDirectiveTagsForDelivery } from "openclaw/plugin-sdk/text-runtime";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { resolveMediaContentType } from "./media-types.js";
@@ -352,8 +351,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     account.config?.streaming !== false &&
     renderMode !== "raw" &&
     (!threadReplyMode || streamingInThread === true);
-  const reasoningPreviewEnabled = params.allowReasoningPreview === true && renderMode !== "raw";
-  const liveThinkingPreviewEnabled = streamingEnabled && reasoningPreviewEnabled;
+  const reasoningPreviewEnabled = streamingEnabled && params.allowReasoningPreview === true;
+  // Reasoning callbacks should fire even when streaming is disabled (e.g. thread
+  // replies without streamingInThread) so reasoningText gets accumulated and can
+  // be included in non-streaming card output.  Only skip for raw text mode.
+  const reasoningEnabled = renderMode !== "raw";
 
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
@@ -746,12 +748,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       lastPartial = nextText;
     }
     streamPhase = "streaming";
-    if (liveThinkingPreviewEnabled) {
-      bumpThinkingActivity();
-      queueThinkingPanelUpdate();
-      // Collapse thinking panel when first assistant text arrives
-      markThinkingDone();
-    }
+    bumpThinkingActivity();
+    queueThinkingPanelUpdate();
+    // Collapse thinking panel when first assistant text arrives
+    markThinkingDone();
     queueStreamingRender();
   };
 
@@ -867,9 +867,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         } else {
           logStreamingDecision("close", {
-            action: hasFinalThinking
-              ? "close-final-card"
-              : "close-final-card-drop-status-only-panel",
+            action: "close-final-card",
             finalText,
             thinkingText: finalThinking.text,
             emitFinalText: options?.emitFinalText,
@@ -895,7 +893,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             : undefined;
           await streaming.close(text, {
             ...(finalNote !== undefined ? { note: finalNote } : {}),
-            ...(hasFinalThinking ? {} : { dropThinkingPanel: true }),
           });
           hasVisibleTextInReply = true;
           deliveredFinalTexts.add(finalText);
@@ -977,7 +974,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           replaceNextPartialAfterTool = false;
           thinkingActivityTick = 0;
         }
-        if (liveThinkingPreviewEnabled && renderMode === "card") {
+        if (streamingEnabled && renderMode === "card") {
           startStreaming();
         }
         await typingCallbacks?.onReplyStart?.();
@@ -1032,7 +1029,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               ? hookResult.metadata
               : undefined;
         }
-        text = stripInlineDirectiveTagsForDelivery(text).text;
         const hasText = text.trim().length > 0;
         const hasMedia = originalReply.hasMedia;
         const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
@@ -1252,18 +1248,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     replyOptions: {
       ...replyOptions,
       onModelSelected: prefixContext.onModelSelected,
-      onAssistantMessageStart: liveThinkingPreviewEnabled
+      onAssistantMessageStart: streamingEnabled
         ? () => {
             queueThinkingPrelude();
             startStreaming();
           }
         : undefined,
-      onReasoningStream: reasoningPreviewEnabled
+      onReasoningStream: reasoningEnabled
         ? (payload?: { text?: string; mediaUrls?: string[]; isReasoning?: boolean }) => {
             queueThinkingPrelude();
             streamPhase = "thinking";
             if (payload?.text) {
-              if (liveThinkingPreviewEnabled) {
+              if (streamingEnabled) {
                 startStreaming();
                 queueReasoningUpdate(payload.text);
               } else {
@@ -1272,7 +1268,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
           }
         : undefined,
-      onReasoningEnd: reasoningPreviewEnabled
+      onReasoningEnd: reasoningEnabled
         ? () => {
             if (streamPhase !== "thinking") {
               return;
@@ -1280,7 +1276,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             streamPhase = streamText ? "streaming" : "idle";
           }
         : undefined,
-      onToolStart: liveThinkingPreviewEnabled
+      onToolStart: streamingEnabled
         ? (payload: { name?: string; phase?: string; toolCallId?: string }) => {
             const isStartPhase = !payload?.phase || payload.phase === "start";
             if (isStartPhase) {
@@ -1311,7 +1307,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             queueThinkingPanelUpdate();
           }
         : undefined,
-      onToolResult: liveThinkingPreviewEnabled
+      onToolResult: streamingEnabled
         ? (payload: ReplyPayload) => {
             removeActiveTool(payload.toolCallId);
             if (activeTools.length === 0 && streamPhase === "tool") {
@@ -1326,19 +1322,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            const cleanedText = stripInlineDirectiveTagsForDelivery(payload.text ?? "").text;
-            if (!cleanedText) {
+            if (!payload.text) {
               return;
             }
             if (suppressAssistantTextStreaming) {
               params.runtime.log?.(
-                `feishu[${account.accountId}] streaming partial suppressed by message_sending hooks: textChars=${cleanedText.trim().length}`,
+                `feishu[${account.accountId}] streaming partial suppressed by message_sending hooks: textChars=${payload.text.trim().length}`,
               );
               return;
             }
             queueThinkingPrelude();
             startStreaming();
-            queueStreamingUpdate(cleanedText, { dedupeWithLastPartial: true });
+            queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
           }
         : undefined,
     },
