@@ -118,7 +118,7 @@ describe("runModelAwareAgent", () => {
     expect(onToolResult).toHaveBeenCalledWith({ text: "tool done", toolCallId: "tool_1" });
     expect(onAgentEvent).toHaveBeenCalledWith({
       stream: "assistant",
-      data: { text: "assistant text" },
+      data: { text: "assistant text", delta: "assistant text" },
     });
     expect(onAgentEvent).toHaveBeenCalledWith({
       stream: "thinking",
@@ -143,5 +143,45 @@ describe("runModelAwareAgent", () => {
       },
     });
     expect(result).toEqual({ payloads: [{ text: "cli-ok" }] });
+  });
+
+  it("suppresses split NO_REPLY fragments from CLI partial output", async () => {
+    runCliAgentMock.mockImplementation(async (params: Record<string, unknown>) => {
+      const onAssistantTurn = params.onAssistantTurn as ((text: string) => void) | undefined;
+      onAssistantTurn?.("NO");
+      onAssistantTurn?.("_REPLY");
+      onAssistantTurn?.("Actual answer");
+      return { payloads: [{ text: "cli-ok" }] };
+    });
+
+    const onPartialReply = vi.fn();
+    const onAgentEvent = vi.fn();
+
+    await runModelAwareAgent({
+      ...baseParams,
+      provider: "claude-cli",
+      model: "opus",
+      config: {
+        agents: {
+          defaults: {
+            cliBackends: {
+              "claude-cli": {
+                command: "claude",
+              },
+            },
+          },
+        },
+      } as OpenClawConfig,
+      onPartialReply,
+      onAgentEvent,
+    });
+
+    expect(onPartialReply).toHaveBeenCalledTimes(1);
+    expect(onPartialReply).toHaveBeenCalledWith({ text: "Actual answer" });
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+    expect(onAgentEvent).toHaveBeenCalledWith({
+      stream: "assistant",
+      data: { text: "Actual answer", delta: "Actual answer" },
+    });
   });
 });

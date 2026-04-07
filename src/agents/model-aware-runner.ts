@@ -1,4 +1,5 @@
 import { runCliAgent } from "./cli-runner.js";
+import { createAcpVisibleTextAccumulator } from "./command/attempt-execution.js";
 import { DEFAULT_PROVIDER } from "./defaults.js";
 import { isCliProvider } from "./model-selection.js";
 import type { RunEmbeddedPiAgentParams } from "./pi-embedded-runner/run/params.js";
@@ -41,6 +42,7 @@ export async function runModelAwareAgent(
     extraSystemPrompt: params.extraSystemPrompt,
     disableTools: params.disableTools,
   });
+  const visibleTextAccumulator = createAcpVisibleTextAccumulator();
 
   return runCliAgent({
     sessionId: params.sessionId,
@@ -64,12 +66,16 @@ export async function runModelAwareAgent(
     trigger: params.trigger,
     messageChannel,
     onAssistantTurn: (text) => {
-      if (text.trim()) {
-        void params.onPartialReply?.({ text });
+      const visibleUpdate = visibleTextAccumulator.consume(text);
+      if (!visibleUpdate) {
+        return;
+      }
+      if (visibleUpdate.delta.trim()) {
+        void params.onPartialReply?.({ text: visibleUpdate.delta });
       }
       emitAgentEvent(params.onAgentEvent, {
         stream: "assistant",
-        data: { text },
+        data: { text: visibleUpdate.text, delta: visibleUpdate.delta },
       });
     },
     onThinkingTurn: (payload) => {
