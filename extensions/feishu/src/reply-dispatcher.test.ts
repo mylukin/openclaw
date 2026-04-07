@@ -216,6 +216,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     return {
@@ -234,6 +235,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: {} as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
       ...overrides,
     });
 
@@ -348,6 +350,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
@@ -377,6 +380,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
@@ -389,9 +393,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
     await options.onIdle?.();
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "第一段答案",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("uses streaming session for auto mode markdown payloads", async () => {
@@ -429,9 +437,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].start).toHaveBeenCalledTimes(1);
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("```md\npartial answer\n```", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "```md\npartial answer\n```",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("delivers distinct final payloads after streaming close", async () => {
@@ -443,15 +455,20 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(2);
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("```md\n完整回复第一段\n```", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "```md\n完整回复第一段\n```",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
     expect(streamingInstances[1].close).toHaveBeenCalledTimes(1);
     expect(streamingInstances[1].close).toHaveBeenCalledWith(
       "```md\n完整回复第一段 + 第二段\n```",
-      {
+      expect.objectContaining({
+        dropThinkingPanel: true,
         note: "Agent: agent",
-      },
+      }),
     );
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
     expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
@@ -466,9 +483,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     expect(streamingInstances).toHaveLength(1);
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("```md\n同一条回复\n```", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "```md\n同一条回复\n```",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
     expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
   });
@@ -583,9 +604,13 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.deliver({ text: "lo world" }, { kind: "block" });
     await options.onIdle?.();
     expect(streamingInstances).toHaveLength(1);
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("hello world", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "hello world",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("shows accumulated reasoning and tool history while keeping streamed text separate", async () => {
@@ -605,6 +630,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -672,6 +698,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -691,9 +718,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
 
     await options.onIdle?.();
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "第一段答案",
+      expect.objectContaining({
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("starts the streaming card for tool-only updates in auto mode", async () => {
@@ -702,6 +732,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
@@ -720,6 +751,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
@@ -753,6 +785,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "exec", phase: "start" });
@@ -784,6 +817,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "memory_search", phase: "start" });
@@ -817,6 +851,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
@@ -853,6 +888,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -866,9 +902,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
       title: "🔧 Tool calls (1)",
     });
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
-      note: "Agent: agent",
-    });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "第一段答案",
+      expect.objectContaining({
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("keeps the tool-only final panel when card note is disabled", async () => {
@@ -889,6 +928,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -918,6 +958,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -955,6 +996,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
     const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
 
@@ -988,6 +1030,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
@@ -1019,6 +1062,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "Bash", phase: "start" });
@@ -1048,6 +1092,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({
@@ -1091,6 +1136,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "memory_search", phase: "start" });
@@ -1126,6 +1172,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onToolStart?.({ name: "exec", phase: "start" });
@@ -1254,9 +1301,57 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(thinkingCalls.at(-1)).toContain("thinking step 1");
     expect(thinkingCalls.at(-1)).toContain("step 2");
     expect(thinkingCalls.at(-1)).not.toContain("Reasoning:");
-    expect(streamingInstances[0].close).toHaveBeenCalledWith("answer part final", {
-      note: "Agent: agent",
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "answer part final",
+      expect.objectContaining({
+        note: "Agent: agent",
+      }),
+    );
+  });
+
+  it("does not expose thinking or tool panels when reasoning preview is disabled", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      allowReasoningPreview: false,
     });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onAssistantMessageStart?.();
+    result.replyOptions.onReasoningStream?.({ text: "Reasoning:\n_hidden thought_" });
+    result.replyOptions.onToolStart?.({ name: "mcp__openclaw__browser" });
+    result.replyOptions.onPartialReply?.({ text: "answer part" });
+    await options.deliver({ text: "answer part final" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].updateThinking).not.toHaveBeenCalled();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "answer part final",
+      expect.objectContaining({
+        note: "Agent: agent",
+      }),
+    );
+  });
+
+  it("strips inline reply tags from streamed partial and final card content", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      allowReasoningPreview: false,
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onPartialReply?.({ text: "[[reply_to_current]] hello" });
+    await flushAsyncTasks();
+    await options.deliver({ text: "[[reply_to_current]] hello final" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenCalledWith("hello", { replace: true });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "hello final",
+      expect.objectContaining({
+        dropThinkingPanel: true,
+        note: "Agent: agent",
+      }),
+    );
   });
 
   it("accumulates fragmented reasoning payloads in the live thinking panel", async () => {
@@ -1630,6 +1725,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       agentId: "agent",
       runtime: { log: vi.fn(), error: vi.fn() } as never,
       chatId: "oc_chat",
+      allowReasoningPreview: true,
     });
 
     await dispatcher.replyOptions.onReasoningStream?.({ text: "thinking", isReasoning: true });
@@ -1705,6 +1801,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         agentId: "agent",
         runtime: { log: vi.fn(), error: errorMock } as never,
         chatId: "oc_chat",
+        allowReasoningPreview: true,
       });
 
       const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
