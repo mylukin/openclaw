@@ -51,7 +51,6 @@ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
 
 const CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG = "--dangerously-skip-permissions";
 const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
-const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
 
 const DEFAULT_CODEX_BACKEND: CliBackendConfig = {
   command: "codex",
@@ -199,20 +198,21 @@ function normalizeClaudePermissionArgs(args?: string[]): string[] | undefined {
     return args;
   }
   const normalized: string[] = [];
-  let sawLegacySkip = false;
   let hasPermissionMode = false;
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG) {
-      sawLegacySkip = true;
       continue;
     }
     if (arg === CLAUDE_PERMISSION_MODE_ARG) {
-      hasPermissionMode = true;
-      normalized.push(arg);
       const maybeValue = args[i + 1];
-      if (typeof maybeValue === "string") {
-        normalized.push(maybeValue);
+      if (
+        typeof maybeValue === "string" &&
+        maybeValue.trim().length > 0 &&
+        !maybeValue.startsWith("-")
+      ) {
+        hasPermissionMode = true;
+        normalized.push(arg, maybeValue);
         i += 1;
       }
       continue;
@@ -222,8 +222,8 @@ function normalizeClaudePermissionArgs(args?: string[]): string[] | undefined {
     }
     normalized.push(arg);
   }
-  if (sawLegacySkip && !hasPermissionMode) {
-    normalized.push(CLAUDE_PERMISSION_MODE_ARG, CLAUDE_BYPASS_PERMISSIONS_MODE);
+  if (!hasPermissionMode) {
+    normalized.push(CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG);
   }
   return normalized;
 }

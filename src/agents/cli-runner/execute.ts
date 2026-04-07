@@ -788,7 +788,7 @@ export async function executeWithOverflowProtection(
               const stallNotice = [
                 `CLI agent (${params.provider}) produced no output for ${Math.round(noOutputTimeoutMs / 1000)}s and was terminated.`,
                 "It may have been waiting for interactive input or an approval prompt.",
-                "For Claude Code, prefer --permission-mode bypassPermissions --print.",
+                "For Claude Code, prefer --dangerously-skip-permissions --print.",
               ].join(" ");
               executeDeps.enqueueSystemEvent(stallNotice, { sessionKey: params.sessionKey });
               executeDeps.requestHeartbeatNow(

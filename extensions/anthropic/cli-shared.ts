@@ -63,7 +63,6 @@ export const CLAUDE_CLI_CLEAR_ENV = [
 
 const CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG = "--dangerously-skip-permissions";
 const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
-const CLAUDE_BYPASS_PERMISSIONS_MODE = "bypassPermissions";
 const CLAUDE_SETTING_SOURCES_ARG = "--setting-sources";
 const CLAUDE_SAFE_SETTING_SOURCES = "user";
 
@@ -102,7 +101,7 @@ export function normalizeClaudePermissionArgs(args?: string[]): string[] | undef
     normalized.push(arg);
   }
   if (!hasPermissionMode) {
-    normalized.push(CLAUDE_PERMISSION_MODE_ARG, CLAUDE_BYPASS_PERMISSIONS_MODE);
+    normalized.push(CLAUDE_LEGACY_SKIP_PERMISSIONS_ARG);
   }
   return normalized;
 }
