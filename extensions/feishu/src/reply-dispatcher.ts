@@ -5,6 +5,7 @@ import {
   resolveSendableOutboundReplyParts,
   resolveTextChunksWithFallback,
 } from "openclaw/plugin-sdk/reply-payload";
+import { stripInlineDirectiveTagsForDelivery } from "openclaw/plugin-sdk/text-runtime";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { resolveMediaContentType } from "./media-types.js";
@@ -1029,6 +1030,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               ? hookResult.metadata
               : undefined;
         }
+        text = stripInlineDirectiveTagsForDelivery(text).text;
         const hasText = text.trim().length > 0;
         const hasMedia = originalReply.hasMedia;
         const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
@@ -1322,18 +1324,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            if (!payload.text) {
+            const cleanedText = stripInlineDirectiveTagsForDelivery(payload.text ?? "").text;
+            if (!cleanedText) {
               return;
             }
             if (suppressAssistantTextStreaming) {
               params.runtime.log?.(
-                `feishu[${account.accountId}] streaming partial suppressed by message_sending hooks: textChars=${payload.text.trim().length}`,
+                `feishu[${account.accountId}] streaming partial suppressed by message_sending hooks: textChars=${cleanedText.trim().length}`,
               );
               return;
             }
             queueThinkingPrelude();
             startStreaming();
-            queueStreamingUpdate(payload.text, { dedupeWithLastPartial: true });
+            queueStreamingUpdate(cleanedText, { dedupeWithLastPartial: true });
           }
         : undefined,
     },

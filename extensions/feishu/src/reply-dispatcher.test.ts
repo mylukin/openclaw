@@ -1349,6 +1349,24 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(closeArg).toBe("```ts\ncode\n```");
   });
 
+  it("strips inline reply tags from streamed partial and final card content", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      allowReasoningPreview: false,
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onPartialReply?.({ text: "[[reply_to_current]] hello" });
+    await flushAsyncTasks();
+    await options.deliver({ text: "[[reply_to_current]] hello final" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].update).toHaveBeenCalledWith("hello", { replace: true });
+    expect(streamingInstances[0].close).toHaveBeenCalledWith("hello final", {
+      note: "Agent: agent",
+    });
+  });
+
   it("deduplicates final text by raw answer payload, not combined card text", async () => {
     const { result, options } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
