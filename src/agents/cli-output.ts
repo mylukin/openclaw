@@ -40,6 +40,9 @@ export type CliToolResultPayload = {
   toolUseId?: string;
   text?: string;
   isError?: boolean;
+  startLine?: number;
+  numLines?: number;
+  totalLines?: number;
 };
 
 function extractJsonObjectCandidates(raw: string): string[] {
@@ -421,7 +424,19 @@ export function createCliJsonlStreamingParser(params: {
     const text = collectToolResultText(block.content).trim() || undefined;
     const isError = block.is_error === true;
     const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
-    const key = `${toolUseId ?? "unknown"}:${isError ? "error" : "ok"}:${text ?? ""}`;
+    const startLine =
+      typeof block.startLine === "number" && Number.isFinite(block.startLine)
+        ? Math.floor(block.startLine)
+        : undefined;
+    const numLines =
+      typeof block.numLines === "number" && Number.isFinite(block.numLines)
+        ? Math.floor(block.numLines)
+        : undefined;
+    const totalLines =
+      typeof block.totalLines === "number" && Number.isFinite(block.totalLines)
+        ? Math.floor(block.totalLines)
+        : undefined;
+    const key = `${toolUseId ?? "unknown"}:${isError ? "error" : "ok"}:${text ?? ""}:${startLine ?? ""}:${numLines ?? ""}:${totalLines ?? ""}`;
     if (emittedToolResultKeys.has(key)) {
       return;
     }
@@ -430,6 +445,9 @@ export function createCliJsonlStreamingParser(params: {
       toolUseId,
       text,
       ...(isError ? { isError: true } : {}),
+      ...(startLine !== undefined ? { startLine } : {}),
+      ...(numLines !== undefined ? { numLines } : {}),
+      ...(totalLines !== undefined ? { totalLines } : {}),
     });
   };
 

@@ -442,15 +442,28 @@ const formatCliPromptLoadLine = (status?: CliPromptLoadStatus): string | null =>
   if (!status) {
     return null;
   }
+  const usesChunks = (status.chunkCount ?? 0) > 1;
+  const progressValue =
+    status.verifiedChunkCount ??
+    (status.verifiedRead ? status.chunkCount : undefined) ??
+    (status.verifiedRead ? 1 : 0);
   const modeLabel =
     status.loaderMode === "disabled"
       ? "direct"
-      : status.loaderMode === "strict"
-        ? "file/strict"
-        : "file";
+      : usesChunks
+        ? status.loaderMode === "strict"
+          ? "chunks/strict"
+          : "chunks"
+        : status.loaderMode === "strict"
+          ? "file/strict"
+          : "file";
+  const progressLabel =
+    usesChunks && typeof status.chunkCount === "number"
+      ? ` (${Math.min(progressValue, status.chunkCount)}/${status.chunkCount})`
+      : "";
   const stateLabel = status.verifiedRead ? "verified" : "unverified";
   const fallbackLabel = status.fallbackReason ? ` · fallback=${status.fallbackReason}` : "";
-  return `📄 CLI prompt: ${modeLabel} · ${stateLabel}${fallbackLabel}`;
+  return `📄 CLI prompt: ${modeLabel}${progressLabel} · ${stateLabel}${fallbackLabel}`;
 };
 
 export function buildStatusMessage(args: StatusArgs): string {

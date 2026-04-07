@@ -56,7 +56,14 @@ export type RunCliAgentParams = {
   /** Called when a tool-use block starts. */
   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
   /** Called when a tool result arrives. */
-  onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
+  onToolResult?: (payload: {
+    toolUseId?: string;
+    text?: string;
+    isError?: boolean;
+    startLine?: number;
+    numLines?: number;
+    totalLines?: number;
+  }) => void;
 };
 
 export type CliPreparedBackend = {

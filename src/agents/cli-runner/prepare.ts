@@ -65,6 +65,15 @@ export function setCliRunnerPrepareTestDeps(overrides: Partial<typeof prepareDep
 // Session prompt file management
 // ---------------------------------------------------------------------------
 
+const CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS = 12_000;
+
+export type ClaudeSystemPromptChunk = {
+  index: number;
+  total: number;
+  filePath: string;
+  eofMarker: string;
+};
+
 export function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
   const resolvedSessionFile = path.resolve(sessionFile);
   const sessionDir = path.dirname(resolvedSessionFile);
@@ -73,39 +82,123 @@ export function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
   return path.join(sessionDir, `${baseName}.claude-system-prompt.txt`);
 }
 
+function resolveClaudeSystemPromptChunkFilePath(sessionFile: string, index: number): string {
+  if (index === 0) {
+    return resolveClaudeSystemPromptFilePath(sessionFile);
+  }
+  const resolvedSessionFile = path.resolve(sessionFile);
+  const sessionDir = path.dirname(resolvedSessionFile);
+  const ext = path.extname(resolvedSessionFile);
+  const baseName = path.basename(resolvedSessionFile, ext);
+  return path.join(
+    sessionDir,
+    `${baseName}.part${String(index + 1).padStart(3, "0")}.claude-system-prompt.txt`,
+  );
+}
+
+export function buildClaudeSystemPromptEofMarker(hash: string): string {
+  return `SYSTEM_PROMPT_CHUNK_EOF sha256:${hash}`;
+}
+
+function splitClaudeSystemPromptIntoChunks(systemPrompt: string): string[] {
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < systemPrompt.length) {
+    let end = Math.min(offset + CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS, systemPrompt.length);
+    if (end < systemPrompt.length) {
+      const newline = systemPrompt.lastIndexOf("\n", end - 1);
+      if (newline >= offset + Math.floor(CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS / 2)) {
+        end = newline + 1;
+      }
+    }
+    chunks.push(systemPrompt.slice(offset, end));
+    offset = end;
+  }
+  return chunks.length > 0 ? chunks : [systemPrompt];
+}
+
+export function buildClaudeSystemPromptFileContents(systemPrompt: string): {
+  contents: Array<{ text: string; eofMarker: string }>;
+  hash: string;
+} {
+  const normalizedPrompt = systemPrompt.endsWith("\n") ? systemPrompt : `${systemPrompt}\n`;
+  const hash = hashCliSessionText(normalizedPrompt) ?? "";
+  const chunkTexts = splitClaudeSystemPromptIntoChunks(normalizedPrompt);
+  return {
+    contents: chunkTexts.map((chunkText, index) => {
+      const markerHash = hashCliSessionText(`${hash}:${index}:${chunkText}`) ?? `${hash}:${index}`;
+      const eofMarker = buildClaudeSystemPromptEofMarker(markerHash);
+      return {
+        text: `${chunkText.endsWith("\n") ? chunkText : `${chunkText}\n`}${eofMarker}\n`,
+        eofMarker,
+      };
+    }),
+    hash,
+  };
+}
+
 export async function writeClaudeSystemPromptFile(params: {
   sessionFile: string;
   systemPrompt: string;
-}): Promise<{ filePath: string; hash: string }> {
+}): Promise<{ filePath: string; hash: string; chunks: ClaudeSystemPromptChunk[] }> {
   const filePath = resolveClaudeSystemPromptFilePath(params.sessionFile);
-  const normalizedPrompt = params.systemPrompt.endsWith("\n")
-    ? params.systemPrompt
-    : `${params.systemPrompt}\n`;
-  const hash = hashCliSessionText(normalizedPrompt) ?? "";
+  const { contents, hash } = buildClaudeSystemPromptFileContents(params.systemPrompt);
+  const chunks = contents.map((entry, index) => ({
+    index,
+    total: contents.length,
+    filePath: resolveClaudeSystemPromptChunkFilePath(params.sessionFile, index),
+    eofMarker: entry.eofMarker,
+  }));
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  try {
-    const existing = await fs.readFile(filePath, "utf-8");
-    if (existing === normalizedPrompt) {
-      return { filePath, hash };
+  let unchanged = true;
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const content = contents[index]?.text ?? "";
+    try {
+      const existing = await fs.readFile(chunk.filePath, "utf-8");
+      if (existing !== content) {
+        unchanged = false;
+      }
+    } catch {
+      unchanged = false;
     }
-  } catch {
-    // file may not exist yet
   }
-  await fs.writeFile(filePath, normalizedPrompt, { mode: 0o600 });
-  return { filePath, hash };
+  if (!unchanged) {
+    for (let index = 0; index < chunks.length; index += 1) {
+      await fs.writeFile(chunks[index]?.filePath ?? filePath, contents[index]?.text ?? "", {
+        mode: 0o600,
+      });
+    }
+  }
+  const staleChunkPattern = `${path.basename(path.resolve(params.sessionFile), path.extname(params.sessionFile))}.part`;
+  const sessionDir = path.dirname(path.resolve(params.sessionFile));
+  for (const entry of await fs.readdir(sessionDir).catch(() => [])) {
+    if (!entry.startsWith(staleChunkPattern) || !entry.endsWith(".claude-system-prompt.txt")) {
+      continue;
+    }
+    const fullPath = path.join(sessionDir, entry);
+    if (!chunks.some((chunk) => chunk.filePath === fullPath)) {
+      await fs.rm(fullPath, { force: true }).catch(() => undefined);
+    }
+  }
+  return { filePath, hash, chunks };
 }
 
 export function buildClaudeSystemPromptLoaderPrompt(params: {
-  filePath: string;
+  chunks: ClaudeSystemPromptChunk[];
   reason: "new-session" | "prompt-changed" | "compaction";
   strict?: boolean;
 }): string {
+  const orderedFiles = params.chunks.map((chunk) => `${chunk.index + 1}. ${chunk.filePath}`);
   const baseLines = [
-    `MANDATORY FIRST STEP: use the Read tool (or lowercase read tool) to read the full session prompt file at ${params.filePath} before you do anything else.`,
-    "Do not read any other file, do not call any other tool, and do not begin session startup until that exact file has been read successfully.",
-    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until you have read that file in this run.",
-    "The file's contents are the authoritative OpenClaw system prompt for this session and override any remembered summaries or stale context.",
-    "You must follow that file strictly for this turn and all subsequent turns in the session.",
+    "MANDATORY FIRST STEP: use the Read tool (or lowercase read tool) to read all of the session prompt files below in exact order before you do anything else.",
+    ...orderedFiles,
+    "Read them sequentially from 1 to N with no offset and no limit. Do not skip, reorder, or stop early.",
+    "Lines beginning with SYSTEM_PROMPT_CHUNK_EOF are chunk delimiters only; they are not additional instructions.",
+    "Do not read any other file, do not call any other tool, and do not begin session startup until every listed file has been read successfully in this run.",
+    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until all listed files have been read in this run.",
+    "The combined contents of these files are the authoritative system prompt for this session and override any remembered summaries or stale context.",
+    "You must follow the combined contents of these files strictly for this turn and all subsequent turns in the session.",
   ];
   if (params.strict) {
     baseLines.unshift(
@@ -114,20 +207,49 @@ export function buildClaudeSystemPromptLoaderPrompt(params: {
   }
   if (params.reason === "compaction") {
     baseLines.unshift(
-      "Session context may have been compacted or summarized. You must re-read the session prompt file now before continuing.",
+      "Session context may have been compacted or summarized. You must re-read every listed session prompt file now before continuing.",
     );
   } else if (params.reason === "prompt-changed") {
     baseLines.unshift(
-      "The session prompt file changed. You must re-read it completely before continuing.",
+      "The session prompt files changed. You must re-read them completely before continuing.",
     );
   }
   return baseLines.join("\n");
 }
 
+export function buildClaudeSystemPromptCompletionPrompt(params: {
+  chunks: ClaudeSystemPromptChunk[];
+  startIndex: number;
+}): string {
+  const remaining = params.chunks.slice(params.startIndex);
+  const orderedFiles = remaining.map((chunk) => `${chunk.index + 1}. ${chunk.filePath}`);
+  return [
+    "You have not yet completed reading all session prompt files.",
+    `MANDATORY NEXT STEP: continue reading the remaining files in exact order, starting with file ${params.startIndex + 1}.`,
+    ...orderedFiles,
+    "Use the Read tool (or lowercase read tool) on each listed path with no offset and no limit.",
+    "Lines beginning with SYSTEM_PROMPT_CHUNK_EOF are chunk delimiters only; they are not additional instructions.",
+    "If you do not call Read on the next unread file, your response will be ignored.",
+    "Do not read any other file first, do not answer the user yet, and do not continue until every remaining file has been read successfully in this run.",
+  ].join("\n");
+}
+
 export class PromptFileReadRequiredError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly reason: "not-read" | "partial-read" | "read-error";
+  readonly sessionId?: string;
+  readonly promptFile?: string;
+
+  constructor(params: {
+    message: string;
+    reason: "not-read" | "partial-read" | "read-error";
+    sessionId?: string;
+    promptFile?: string;
+  }) {
+    super(params.message);
     this.name = "PromptFileReadRequiredError";
+    this.reason = params.reason;
+    this.sessionId = params.sessionId;
+    this.promptFile = params.promptFile;
   }
 }
 
@@ -135,9 +257,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-export function resolveReadToolFilePath(input: unknown): string | undefined {
+export function resolveReadToolRequest(input: unknown): {
+  filePath?: string;
+  offset?: number;
+  limit?: number;
+} {
   if (!isRecord(input)) {
-    return undefined;
+    return {};
   }
   const nestedArguments = isRecord(input.arguments) ? input.arguments : undefined;
   const candidates = [
@@ -148,12 +274,16 @@ export function resolveReadToolFilePath(input: unknown): string | undefined {
     nestedArguments?.filePath,
     nestedArguments?.path,
   ];
+  const pickNumber = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
+  const offset = pickNumber(input.offset) ?? pickNumber(nestedArguments?.offset);
+  const limit = pickNumber(input.limit) ?? pickNumber(nestedArguments?.limit);
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) {
-      return path.resolve(candidate.trim());
+      return { filePath: path.resolve(candidate.trim()), offset, limit };
     }
   }
-  return undefined;
+  return { offset, limit };
 }
 
 /**

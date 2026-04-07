@@ -47,8 +47,26 @@ const hoisted = vi.hoisted(
 
 setCliRunnerExecuteTestDeps({
   getProcessSupervisor: () => ({
-    spawn: (params: Parameters<SupervisorSpawnFn>[0]) =>
-      supervisorSpawnMock(params) as ReturnType<SupervisorSpawnFn>,
+    spawn: async (params: Parameters<SupervisorSpawnFn>[0]) => {
+      const input = params as { onStdout?: (chunk: string) => void };
+      const managedRun = (await supervisorSpawnMock(params)) as
+        | (Awaited<ReturnType<SupervisorSpawnFn>> & { __stdoutForStreaming?: string })
+        | undefined;
+      if (input.onStdout && typeof managedRun?.__stdoutForStreaming === "string") {
+        input.onStdout(managedRun.__stdoutForStreaming);
+      }
+      if (input.onStdout && managedRun?.wait) {
+        const originalWait = managedRun.wait.bind(managedRun);
+        managedRun.wait = async () => {
+          const result = await originalWait();
+          if (typeof result?.stdout === "string") {
+            input.onStdout?.(result.stdout);
+          }
+          return result;
+        };
+      }
+      return managedRun as unknown as ReturnType<SupervisorSpawnFn>;
+    },
     cancel: vi.fn(),
     cancelSession: vi.fn(() => 0),
     cancelScope: vi.fn(),
@@ -96,6 +114,7 @@ type ManagedRunMock = {
   pid: number;
   startedAtMs: number;
   stdin: undefined;
+  __stdoutForStreaming?: string;
   wait: Mock<() => Promise<MockRunExit>>;
   cancel: Mock<() => void>;
 };

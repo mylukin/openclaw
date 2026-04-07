@@ -615,9 +615,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await flushAsyncTasks();
 
     expect(streamingInstances).toHaveLength(1);
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("step", {
-      title: "💭 Thinking",
-    });
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("step\n\n⏳ Thinking"),
+      {
+        title: "💭 Thinking",
+      },
+    );
 
     await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
     await flushAsyncTasks();
@@ -690,6 +693,46 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.onIdle?.();
     expect(streamingInstances[0].close).toHaveBeenCalledWith("第一段答案", {
       note: "Agent: agent",
+    });
+  });
+
+  it("starts the streaming card for tool-only updates in auto mode", async () => {
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onToolStart?.({ name: "Read", phase: "start" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].start).toHaveBeenCalledTimes(1);
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("⏳ Running Read...", {
+      title: "🔧 Tool calls (1)",
+    });
+  });
+
+  it("updates the thinking panel for text-only streaming in auto mode", async () => {
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "第一段答案" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].start).toHaveBeenCalledTimes(1);
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Streaming reply"),
+      { title: "💭 Thinking" },
+    );
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("第一段答案", {
+      replace: true,
     });
   });
 
@@ -785,9 +828,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await dispatcher.replyOptions.onPartialReply?.({ text: "final answer" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
-      title: "🔧 Tool calls (1)",
-    });
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Streaming reply"),
+      {
+        title: "🔧 Tool calls (1)",
+      },
+    );
   });
 
   it("keeps the tool-only final panel in the closing card", async () => {
@@ -884,9 +930,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     await options.deliver({ text: "visible block text" }, { kind: "block" });
     await flushAsyncTasks();
-    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
-      title: "🔧 Tool calls (1)",
-    });
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Streaming reply"),
+      {
+        title: "🔧 Tool calls (1)",
+      },
+    );
   });
 
   it("does not reset cumulative tool count when onReplyStart fires again mid-reply", async () => {

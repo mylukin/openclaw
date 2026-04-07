@@ -378,6 +378,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
   let thinkingCollapsed = false;
+  let thinkingActivityTick = 0;
   let replyCycleInitialized = false;
   /**
    * Deliver media files and emit persistence signals for media-only final payloads.
@@ -581,12 +582,33 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return "💭 Thinking";
   };
 
+  const bumpThinkingActivity = () => {
+    thinkingActivityTick += 1;
+  };
+
+  const resolveThinkingActivityLine = (options?: { final?: boolean }): string => {
+    if (options?.final) {
+      return "";
+    }
+    const frames = [".", "..", "..."];
+    const suffix = frames[thinkingActivityTick % frames.length] ?? "...";
+    switch (streamPhase) {
+      case "thinking":
+        return `⏳ Thinking${suffix}`;
+      case "streaming":
+        return `⏳ Streaming reply${suffix}`;
+      default:
+        return "";
+    }
+  };
+
   /** Build the full thinking panel content from reasoning text and tool status. */
   const composeThinkingContent = (options?: {
     final?: boolean;
   }): { title: string; text: string } => {
     const sections: string[] = [];
     const toolOnlyPanel = !hasReasoningText() && toolCallCount > 0;
+    const genericActivityLine = resolveThinkingActivityLine(options);
     if (reasoningText) {
       sections.push(reasoningText);
     }
@@ -612,12 +634,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (toolOnlyPanel) {
         // Show a completed summary when no tool is actively running, instead
         // of a zero-width space that renders as a blank panel.
-        sections.push(toolStatus || `✓ ${toolCallCount} completed`);
+        sections.push(toolStatus || genericActivityLine || `✓ ${toolCallCount} completed`);
       } else {
         sections.push(
-          [`🔧 Tool calls (${toolCallCount})`, ...(toolStatus ? ["", toolStatus] : [])].join("\n"),
+          [
+            `🔧 Tool calls (${toolCallCount})`,
+            ...(toolStatus || genericActivityLine ? ["", toolStatus || genericActivityLine] : []),
+          ].join("\n"),
         );
       }
+    }
+    if (genericActivityLine && !toolOnlyPanel && toolCallCount === 0) {
+      sections.push(genericActivityLine);
     }
     return {
       title: resolveThinkingPanelTitle(),
@@ -719,10 +747,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
-    if (activeTools.length > 0) {
-      streamPhase = "streaming";
-      queueThinkingPanelUpdate();
-    }
+    streamPhase = "streaming";
+    bumpThinkingActivity();
+    queueThinkingPanelUpdate();
     // Collapse thinking panel when first assistant text arrives
     markThinkingDone();
     queueStreamingRender();
@@ -731,6 +758,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const queueReasoningUpdate = (nextThinking: string) => {
     if (!nextThinking) return;
     reasoningText = mergeReasoningDisplayText(reasoningText, nextThinking);
+    bumpThinkingActivity();
     queueThinkingPanelUpdate();
   };
 
@@ -885,6 +913,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       lastPartial = "";
       reasoningText = "";
       thinkingCollapsed = false;
+      thinkingActivityTick = 0;
       activeTools.length = 0;
       clearToolElapsedTimer();
     } finally {
@@ -943,6 +972,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           toolCallCount = 0;
           lastRenderedStreamContent = "";
           replaceNextPartialAfterTool = false;
+          thinkingActivityTick = 0;
         }
         if (streamingEnabled && renderMode === "card") {
           startStreaming();
@@ -1269,9 +1299,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             queueThinkingPrelude();
             streamPhase = "tool";
-            if (!shouldRenderStreamingStatus()) {
-              return;
-            }
+            bumpThinkingActivity();
+            // Tool-only runs need to bootstrap the streaming card even in
+            // auto mode; otherwise the first visible event is dropped and the
+            // thinking panel stays blank until assistant text arrives.
             startStreaming();
             queueThinkingPanelUpdate();
           }
@@ -1282,6 +1313,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             if (activeTools.length === 0 && streamPhase === "tool") {
               streamPhase = streamText ? "streaming" : "idle";
             }
+            bumpThinkingActivity();
             if (!shouldRenderStreamingStatus()) {
               return;
             }

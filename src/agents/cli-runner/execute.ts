@@ -43,9 +43,11 @@ import {
 import {
   resolveClaudeSystemPromptFilePath,
   writeClaudeSystemPromptFile,
+  buildClaudeSystemPromptCompletionPrompt,
   buildClaudeSystemPromptLoaderPrompt,
+  type ClaudeSystemPromptChunk,
   PromptFileReadRequiredError,
-  resolveReadToolFilePath,
+  resolveReadToolRequest,
   estimatePromptTokens,
   ESTIMATED_TOKENS_PER_IMAGE,
 } from "./prepare.js";
@@ -117,8 +119,12 @@ export type CliSessionBindingResult = {
 
 export type CliPromptLoadResult = {
   sessionPromptFile?: string;
+  currentSessionPromptFile?: string;
+  sessionPromptFiles?: string[];
   loaderMode: "normal" | "strict" | "disabled";
   verifiedRead: boolean;
+  chunkCount?: number;
+  verifiedChunkCount?: number;
   fallbackReason?:
     | "write_failed"
     | "verification_retry"
@@ -127,6 +133,7 @@ export type CliPromptLoadResult = {
 };
 
 const ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK = false;
+const MAX_COMPLETION_PROMPT_RETRIES = 5;
 
 function formatCliLogValue(value: string | undefined, maxChars = 240): string {
   const trimmed = value?.trim();
@@ -134,6 +141,51 @@ function formatCliLogValue(value: string | undefined, maxChars = 240): string {
     return "<empty>";
   }
   return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars)}...` : trimmed;
+}
+
+function looksLikePartialReadToolResult(text: string | undefined): boolean {
+  if (!text) {
+    return false;
+  }
+  return /\[(?:Read output capped at .*?Use offset=\d+ to continue\.|Showing lines [^\]]*?Use offset=\d+ to continue\.|\d+ more lines in file\. Use offset=\d+ to continue\.)\]\s*$/i.test(
+    text,
+  );
+}
+
+function isCompletePromptFileRead(params: {
+  partialReadRequest: boolean;
+  eofMarker: string;
+  startLine?: number;
+  numLines?: number;
+  totalLines?: number;
+  text?: string;
+}): boolean {
+  if (params.partialReadRequest) {
+    return false;
+  }
+  if (params.text?.includes(params.eofMarker)) {
+    return true;
+  }
+  if (
+    typeof params.startLine === "number" &&
+    typeof params.numLines === "number" &&
+    typeof params.totalLines === "number"
+  ) {
+    return params.startLine === 1 && params.numLines === params.totalLines;
+  }
+  return !looksLikePartialReadToolResult(params.text);
+}
+
+function resolveChunkIndexByPath(
+  chunks: ClaudeSystemPromptChunk[],
+  filePath: string | undefined,
+): number | undefined {
+  if (!filePath) {
+    return undefined;
+  }
+  const normalized = path.resolve(filePath);
+  const chunk = chunks.find((entry) => path.resolve(entry.filePath) === normalized);
+  return chunk?.index;
 }
 
 /**
@@ -163,6 +215,47 @@ export async function executeWithOverflowProtection(
   let compactionsThisRun = 0;
   let latestCliSessionBinding: CliSessionBindingResult | undefined;
   let latestCliPromptLoad: CliPromptLoadResult | undefined;
+  let latestPromptChunks: ClaudeSystemPromptChunk[] = [];
+  const verifiedPromptChunkCounts = new Map<string, number>();
+  const buildCliPromptLoadState = (params: {
+    sessionPromptFile?: string;
+    currentSessionPromptFile?: string;
+    loaderMode: "normal" | "strict" | "disabled";
+    verifiedRead: boolean;
+    fallbackReason?:
+      | "write_failed"
+      | "verification_retry"
+      | "direct_injection_fallback"
+      | "direct_fallback_disabled";
+    verifiedChunkCount?: number;
+  }): CliPromptLoadResult => ({
+    ...(params.sessionPromptFile ? { sessionPromptFile: params.sessionPromptFile } : {}),
+    ...(params.currentSessionPromptFile
+      ? { currentSessionPromptFile: params.currentSessionPromptFile }
+      : {}),
+    ...(latestPromptChunks.length > 0
+      ? { sessionPromptFiles: latestPromptChunks.map((chunk) => chunk.filePath) }
+      : {}),
+    loaderMode: params.loaderMode,
+    verifiedRead: params.verifiedRead,
+    ...(latestPromptChunks.length > 0 ? { chunkCount: latestPromptChunks.length } : {}),
+    ...(latestPromptChunks.length > 0
+      ? {
+          verifiedChunkCount: Math.min(
+            params.verifiedChunkCount ?? (params.verifiedRead ? latestPromptChunks.length : 0),
+            latestPromptChunks.length,
+          ),
+        }
+      : {}),
+    ...(params.fallbackReason ? { fallbackReason: params.fallbackReason } : {}),
+  });
+  const resolveCurrentPromptFileForSession = (sessionId?: string): string | undefined => {
+    const normalizedSessionId = sessionId?.trim();
+    const chunkIndex = normalizedSessionId
+      ? (verifiedPromptChunkCounts.get(normalizedSessionId) ?? 0)
+      : 0;
+    return latestPromptChunks[chunkIndex]?.filePath ?? latestPromptChunks[0]?.filePath;
+  };
 
   // Inner function: execute with a given session and loader mode, handling
   // prompt file writing and read verification for Claude CLI.
@@ -183,9 +276,14 @@ export async function executeWithOverflowProtection(
     const useResume = Boolean(
       sessionId && resolvedSessionId && backend.resumeArgs && backend.resumeArgs.length > 0,
     );
+    let verifiedPromptChunkCount = resolvedSessionId
+      ? (verifiedPromptChunkCounts.get(resolvedSessionId) ?? 0)
+      : 0;
 
     let systemPromptToSend: string | undefined = systemPrompt;
-    let cliSystemPromptFile: { filePath: string; hash: string } | undefined;
+    let cliSystemPromptFile:
+      | { filePath: string; hash: string; chunks: ClaudeSystemPromptChunk[] }
+      | undefined;
     let loaderFallbackReason:
       | "write_failed"
       | "verification_retry"
@@ -193,6 +291,17 @@ export async function executeWithOverflowProtection(
       | "direct_fallback_disabled"
       | undefined;
     let promptFileTrustedFromBinding = false;
+    let promptFileReadAttempted = false;
+    let promptFileReadAttemptedPartially = false;
+    let promptFileReadErrored = false;
+    const promptFileReadRequests = new Map<
+      string,
+      {
+        filePath: string;
+        partialReadRequest: boolean;
+        chunkIndex: number;
+      }
+    >();
     const emittedToolStarts = new Set<string>();
     const cliDebugEnabled = cliBackendLog.isEnabled("debug");
 
@@ -210,6 +319,7 @@ export async function executeWithOverflowProtection(
           sessionFile: params.sessionFile,
           systemPrompt,
         });
+        latestPromptChunks = cliSystemPromptFile.chunks;
         const reloadReason = (() => {
           if (!resolvedSessionId || !cliSystemPromptFile) {
             return undefined;
@@ -256,7 +366,7 @@ export async function executeWithOverflowProtection(
             ? systemPrompt
             : reloadReason && cliSystemPromptFile
               ? buildClaudeSystemPromptLoaderPrompt({
-                  filePath: cliSystemPromptFile.filePath,
+                  chunks: cliSystemPromptFile.chunks,
                   reason: reloadReason,
                   strict: loaderPromptMode === "strict",
                 })
@@ -493,11 +603,23 @@ export async function executeWithOverflowProtection(
                   if (!(mustVerifyPromptFileRead && cliSystemPromptFile)) {
                     return;
                   }
-                  const filePath = resolveReadToolFilePath(input);
-                  const normalizedFilePath = filePath ? path.resolve(filePath) : undefined;
-                  const expectedPromptFile = path.resolve(cliSystemPromptFile.filePath);
-                  const matchedPromptFile =
-                    normalizedFilePath !== undefined && normalizedFilePath === expectedPromptFile;
+                  const readRequest = resolveReadToolRequest(input);
+                  const normalizedFilePath = readRequest.filePath
+                    ? path.resolve(readRequest.filePath)
+                    : undefined;
+                  const chunkIndex = resolveChunkIndexByPath(
+                    cliSystemPromptFile.chunks,
+                    normalizedFilePath,
+                  );
+                  const matchedPromptFile = chunkIndex !== undefined;
+                  const expectedPromptFile =
+                    chunkIndex !== undefined
+                      ? path.resolve(cliSystemPromptFile.chunks[chunkIndex]?.filePath ?? "")
+                      : null;
+                  const partialReadRequest =
+                    matchedPromptFile &&
+                    ((typeof readRequest.offset === "number" && readRequest.offset > 1) ||
+                      typeof readRequest.limit === "number");
                   if (cliDebugEnabled) {
                     cliBackendLog.debug("cli loader verifier saw tool use", {
                       sessionId: resolvedSessionId ?? sessionId ?? null,
@@ -505,6 +627,7 @@ export async function executeWithOverflowProtection(
                       filePath: normalizedFilePath ?? null,
                       expectedPromptFile,
                       matchedPromptFile,
+                      partialReadRequest,
                       input,
                     });
                   }
@@ -515,21 +638,73 @@ export async function executeWithOverflowProtection(
                     return;
                   }
                   if (matchedPromptFile) {
-                    promptFileReadVerified = true;
-                    if (cliDebugEnabled) {
-                      cliBackendLog.debug("cli loader verifier matched prompt file read", {
-                        sessionId: resolvedSessionId ?? sessionId ?? null,
-                        toolName: name,
-                        promptFile: expectedPromptFile,
+                    promptFileReadAttempted = true;
+                    promptFileReadAttemptedPartially = partialReadRequest;
+                    if (toolUseId?.trim() && chunkIndex !== undefined && expectedPromptFile) {
+                      promptFileReadRequests.set(toolUseId.trim(), {
+                        filePath: expectedPromptFile,
+                        partialReadRequest,
+                        chunkIndex,
                       });
                     }
                   }
                 },
-                onToolResult: ({ toolUseId, text, isError }) => {
-                  params.onToolResult?.({ toolUseId, text, isError });
+                onToolResult: ({ toolUseId, text, isError, startLine, numLines, totalLines }) => {
+                  params.onToolResult?.({
+                    toolUseId,
+                    text,
+                    isError,
+                    startLine,
+                    numLines,
+                    totalLines,
+                  });
                   cliBackendLog.info(
                     `cli tool result${toolUseId ? ` (${toolUseId})` : ""}: ${formatCliLogValue(text)}`,
                   );
+                  if (!(mustVerifyPromptFileRead && cliSystemPromptFile && toolUseId)) {
+                    return;
+                  }
+                  const request = promptFileReadRequests.get(toolUseId);
+                  promptFileReadRequests.delete(toolUseId);
+                  if (!request) {
+                    return;
+                  }
+                  const chunk = cliSystemPromptFile.chunks[request.chunkIndex];
+                  if (!chunk) {
+                    return;
+                  }
+                  const expectedPromptFile = path.resolve(chunk.filePath);
+                  if (request.filePath !== expectedPromptFile) {
+                    return;
+                  }
+                  promptFileReadAttempted = true;
+                  if (isError) {
+                    promptFileReadErrored = true;
+                    return;
+                  }
+                  if (request.chunkIndex !== verifiedPromptChunkCount) {
+                    promptFileReadAttemptedPartially = true;
+                    return;
+                  }
+                  if (
+                    !isCompletePromptFileRead({
+                      partialReadRequest: request.partialReadRequest,
+                      eofMarker: chunk.eofMarker,
+                      startLine,
+                      numLines,
+                      totalLines,
+                      text,
+                    })
+                  ) {
+                    promptFileReadAttemptedPartially = true;
+                    return;
+                  }
+                  verifiedPromptChunkCount += 1;
+                  if (resolvedSessionId) {
+                    verifiedPromptChunkCounts.set(resolvedSessionId, verifiedPromptChunkCount);
+                  }
+                  promptFileReadVerified =
+                    verifiedPromptChunkCount >= cliSystemPromptFile.chunks.length;
                 },
               })
             : null;
@@ -660,9 +835,18 @@ export async function executeWithOverflowProtection(
 
         // Layer 1: Verify prompt file was read
         if (mustVerifyPromptFileRead && !promptFileReadVerified) {
-          throw new PromptFileReadRequiredError(
-            `Claude session did not verify a successful Read of ${cliSystemPromptFile?.filePath ?? "the session prompt file"}.`,
-          );
+          const nextUnreadChunk =
+            cliSystemPromptFile?.chunks[verifiedPromptChunkCount] ?? cliSystemPromptFile?.chunks[0];
+          throw new PromptFileReadRequiredError({
+            message: `Claude session did not verify a successful complete Read of ${cliSystemPromptFile?.filePath ?? "the session prompt file"}.`,
+            reason: promptFileReadErrored
+              ? "read-error"
+              : promptFileReadAttempted || promptFileReadAttemptedPartially
+                ? "partial-read"
+                : "not-read",
+            sessionId: cliOutput.sessionId ?? resolvedSessionId,
+            promptFile: nextUnreadChunk?.filePath ?? cliSystemPromptFile?.filePath,
+          });
         }
 
         // Track session binding metadata
@@ -692,14 +876,24 @@ export async function executeWithOverflowProtection(
                 }
               : undefined;
           latestCliPromptLoad = context.isClaude
-            ? {
-                ...(cliSystemPromptFile ? { sessionPromptFile: cliSystemPromptFile.filePath } : {}),
+            ? buildCliPromptLoadState({
+                sessionPromptFile: cliSystemPromptFile?.filePath,
+                currentSessionPromptFile:
+                  verifiedPromptChunkCount < latestPromptChunks.length
+                    ? latestPromptChunks[verifiedPromptChunkCount]?.filePath
+                    : (latestPromptChunks.at(-1)?.filePath ?? cliSystemPromptFile?.filePath),
                 loaderMode: loaderPromptMode,
                 verifiedRead: mustVerifyPromptFileRead
                   ? promptFileReadVerified
                   : promptFileTrustedFromBinding,
-                ...(loaderFallbackReason ? { fallbackReason: loaderFallbackReason } : {}),
-              }
+                fallbackReason: loaderFallbackReason,
+                verifiedChunkCount:
+                  mustVerifyPromptFileRead && resolvedSessionId
+                    ? (verifiedPromptChunkCounts.get(resolvedSessionId) ?? verifiedPromptChunkCount)
+                    : promptFileTrustedFromBinding
+                      ? latestPromptChunks.length
+                      : 0,
+              })
             : undefined;
         }
 
@@ -713,7 +907,7 @@ export async function executeWithOverflowProtection(
     }
   };
 
-  // Layer 1 fallback chain: normal -> strict -> disabled
+  // Layer 1 fallback chain: normal -> same-session completion retries -> strict -> disabled
   const executeCliWithLoaderFallback = async (runParams: {
     cliSessionId?: string;
     promptOverride?: string;
@@ -732,18 +926,67 @@ export async function executeWithOverflowProtection(
       if (!(error instanceof PromptFileReadRequiredError)) {
         throw error;
       }
+      if (error.sessionId?.trim() && error.promptFile?.trim()) {
+        let completionError: PromptFileReadRequiredError = error;
+        let completionAttempt = 0;
+        while (
+          completionAttempt < MAX_COMPLETION_PROMPT_RETRIES &&
+          completionError.sessionId?.trim() &&
+          completionError.promptFile?.trim()
+        ) {
+          const completionSessionId = completionError.sessionId.trim();
+          completionAttempt += 1;
+          cliBackendLog.warn(
+            `cli prompt file read is still unverified (${completionError.reason}); retrying in the same session with a completion prompt (${completionAttempt}/${MAX_COMPLETION_PROMPT_RETRIES}) (session_prompt_file=${completionError.promptFile} session=${completionError.sessionId})`,
+          );
+          latestCliPromptLoad = buildCliPromptLoadState({
+            sessionPromptFile: completionError.promptFile,
+            currentSessionPromptFile: completionError.promptFile,
+            loaderMode: "normal",
+            verifiedRead: false,
+            fallbackReason: "verification_retry",
+            verifiedChunkCount: verifiedPromptChunkCounts.get(completionSessionId) ?? 0,
+          });
+          try {
+            return await executeCliWithSession(
+              completionSessionId,
+              buildClaudeSystemPromptCompletionPrompt({
+                chunks: latestPromptChunks,
+                startIndex: verifiedPromptChunkCounts.get(completionSessionId) ?? 0,
+              }),
+              runParams.isSystemCall ?? false,
+              runParams.forceReloadSystemPromptFile ?? false,
+              "strict",
+            );
+          } catch (nextCompletionError) {
+            if (!(nextCompletionError instanceof PromptFileReadRequiredError)) {
+              throw nextCompletionError;
+            }
+            completionError = nextCompletionError;
+          }
+        }
+        cliBackendLog.warn(
+          `cli completion prompt did not verify a full prompt-file read after ${completionAttempt} same-session retries; retrying with strict loader prompt (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${completionError.message}`,
+        );
+      }
       cliBackendLog.warn(
         `cli loader prompt verification failed; retrying with strict loader prompt (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
       );
-      latestCliPromptLoad = {
+      latestCliPromptLoad = buildCliPromptLoadState({
         sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+        currentSessionPromptFile:
+          resolveCurrentPromptFileForSession(error.sessionId) ??
+          resolveClaudeSystemPromptFilePath(params.sessionFile),
         loaderMode: "normal",
         verifiedRead: false,
         fallbackReason: "verification_retry",
-      };
+      });
     }
 
     try {
+      if (runParams.cliSessionId?.trim()) {
+        verifiedPromptChunkCounts.delete(runParams.cliSessionId.trim());
+      }
       const output = await executeCliWithSession(
         runParams.cliSessionId,
         runParams.promptOverride,
@@ -763,12 +1006,15 @@ export async function executeWithOverflowProtection(
         throw error;
       }
       if (!ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK) {
-        latestCliPromptLoad = {
+        latestCliPromptLoad = buildCliPromptLoadState({
           sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+          currentSessionPromptFile:
+            resolveCurrentPromptFileForSession(runParams.cliSessionId) ??
+            resolveClaudeSystemPromptFilePath(params.sessionFile),
           loaderMode: "strict",
           verifiedRead: false,
           fallbackReason: "direct_fallback_disabled",
-        };
+        });
         cliBackendLog.warn(
           `cli loader prompt verification failed again; direct system prompt injection fallback is disabled (session_prompt_file=${resolveClaudeSystemPromptFilePath(params.sessionFile)}): ${error.message}`,
         );
@@ -785,12 +1031,15 @@ export async function executeWithOverflowProtection(
       cliBackendLog.warn(
         `cli loader prompt verification failed again; falling back to direct system prompt injection: ${error.message}`,
       );
-      latestCliPromptLoad = {
+      latestCliPromptLoad = buildCliPromptLoadState({
         sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
+        currentSessionPromptFile:
+          resolveCurrentPromptFileForSession(runParams.cliSessionId) ??
+          resolveClaudeSystemPromptFilePath(params.sessionFile),
         loaderMode: "strict",
         verifiedRead: false,
         fallbackReason: "direct_injection_fallback",
-      };
+      });
       const output = await executeCliWithSession(
         runParams.cliSessionId,
         runParams.promptOverride,
@@ -798,15 +1047,19 @@ export async function executeWithOverflowProtection(
         runParams.forceReloadSystemPromptFile ?? false,
         "disabled",
       );
-      latestCliPromptLoad = {
-        ...(latestCliPromptLoad ?? {
-          sessionPromptFile: resolveClaudeSystemPromptFilePath(params.sessionFile),
-          verifiedRead: false,
-        }),
+      latestCliPromptLoad = buildCliPromptLoadState({
+        sessionPromptFile:
+          latestCliPromptLoad?.sessionPromptFile ??
+          resolveClaudeSystemPromptFilePath(params.sessionFile),
+        currentSessionPromptFile:
+          latestCliPromptLoad?.currentSessionPromptFile ??
+          resolveCurrentPromptFileForSession(runParams.cliSessionId) ??
+          resolveClaudeSystemPromptFilePath(params.sessionFile),
         loaderMode: "disabled",
         verifiedRead: false,
         fallbackReason: "direct_injection_fallback",
-      };
+        verifiedChunkCount: latestCliPromptLoad?.verifiedChunkCount ?? 0,
+      });
       return output;
     }
   };

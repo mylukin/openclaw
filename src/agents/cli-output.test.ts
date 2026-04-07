@@ -320,6 +320,49 @@ describe("createCliJsonlStreamingParser", () => {
     });
   });
 
+  it("emits Claude tool result line metadata when available", () => {
+    const onToolResult = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: {
+        command: "claude",
+        output: "jsonl",
+        sessionIdFields: ["session_id"],
+      },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onToolResult,
+    });
+
+    parser.push(
+      JSON.stringify({
+        type: "user",
+        session_id: "session-lines",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_lines",
+              startLine: 1,
+              numLines: 10,
+              totalLines: 10,
+              content: "full file",
+            },
+          ],
+        },
+      }),
+    );
+    parser.finish();
+
+    expect(onToolResult).toHaveBeenCalledWith({
+      toolUseId: "toolu_lines",
+      text: "full file",
+      startLine: 1,
+      numLines: 10,
+      totalLines: 10,
+    });
+  });
+
   it("deduplicates repeated Claude records from mixed stdout replay", () => {
     const onAssistantDelta = vi.fn();
     const onToolUse = vi.fn();

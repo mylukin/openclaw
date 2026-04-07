@@ -137,7 +137,16 @@ function createClaudeStreamSuccess(sessionFile: string, text = "ok", sessionId =
       session_id: sessionId,
       message: {
         role: "user",
-        content: [{ type: "tool_result", tool_use_id: toolUseId, content: "prompt file" }],
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            startLine: 1,
+            numLines: 2,
+            totalLines: 2,
+            content: "prompt file",
+          },
+        ],
       },
     }),
     JSON.stringify({
@@ -372,7 +381,7 @@ describe("runCliAgent with process supervisor", () => {
     expect(onAssistantTurn).toHaveBeenCalledWith("Hello");
   });
 
-  it("verifies prompt file reads when Claude first emits an empty tool input", async () => {
+  it("retries incomplete prompt-file reads in the same session until the full file is read", async () => {
     const sessionFile = "/tmp/session.jsonl";
     const promptFilePath = resolveClaudePromptFilePath(sessionFile);
     supervisorSpawnMock.mockResolvedValueOnce(
@@ -404,7 +413,7 @@ describe("runCliAgent with process supervisor", () => {
               content: [
                 {
                   type: "tool_use",
-                  id: "toolu_rich",
+                  id: "toolu_partial",
                   name: "Read",
                   input: { file_path: promptFilePath, limit: 200 },
                 },
@@ -419,11 +428,67 @@ describe("runCliAgent with process supervisor", () => {
               content: [
                 {
                   type: "tool_result",
-                  tool_use_id: "toolu_rich",
+                  tool_use_id: "toolu_partial",
                   content: "prompt chunk",
                 },
               ],
             },
+          }),
+          JSON.stringify({
+            type: "result",
+            session_id: "sid-rich",
+            result: "ok",
+          }),
+        ].join("\n"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sid-rich" }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-rich",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_complete",
+                  name: "Read",
+                  input: { file_path: promptFilePath },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "user",
+            session_id: "sid-rich",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_complete",
+                  startLine: 1,
+                  numLines: 2,
+                  totalLines: 2,
+                  content: "full prompt file",
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-rich",
+            message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
           }),
           JSON.stringify({
             type: "result",
@@ -449,12 +514,172 @@ describe("runCliAgent with process supervisor", () => {
     });
 
     expect(result.payloads?.[0]?.text).toBe("ok");
+    expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
+    const firstInput = supervisorSpawnMock.mock.calls[0]?.[0] as { argv?: string[] };
+    const secondInput = supervisorSpawnMock.mock.calls[1]?.[0] as {
+      argv?: string[];
+      input?: string;
+    };
+    expect(firstInput.argv).toContain("--session-id");
+    expect(secondInput.argv).toContain("--resume");
+    expect(secondInput.argv).toContain("sid-rich");
+    expect(secondInput.argv).not.toContain("--session-id");
+    expect(secondInput.input).toContain("continue reading the remaining files in exact order");
     expect(result.meta.agentMeta?.cliPromptLoad).toEqual(
       expect.objectContaining({
-        loaderMode: "normal",
+        loaderMode: "strict",
         verifiedRead: true,
       }),
     );
+  });
+
+  it("keeps retrying in the same session when a completion prompt gets no read at all", async () => {
+    const sessionFile = "/tmp/session.jsonl";
+    const promptFilePath = resolveClaudePromptFilePath(sessionFile);
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sid-sticky" }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-sticky",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_partial_again",
+                  name: "Read",
+                  input: { file_path: promptFilePath, limit: 200 },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "user",
+            session_id: "sid-sticky",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_partial_again",
+                  content: "prompt chunk",
+                },
+              ],
+            },
+          }),
+          JSON.stringify({ type: "result", session_id: "sid-sticky", result: "partial" }),
+        ].join("\n"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sid-sticky" }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-sticky",
+            message: { role: "assistant", content: [{ type: "text", text: "still thinking" }] },
+          }),
+          JSON.stringify({ type: "result", session_id: "sid-sticky", result: "no read" }),
+        ].join("\n"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "sid-sticky" }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-sticky",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_complete_again",
+                  name: "Read",
+                  input: { file_path: promptFilePath },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "user",
+            session_id: "sid-sticky",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_complete_again",
+                  startLine: 1,
+                  numLines: 2,
+                  totalLines: 2,
+                  content: "full prompt file",
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "sid-sticky",
+            message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+          }),
+          JSON.stringify({ type: "result", session_id: "sid-sticky", result: "ok" }),
+        ].join("\n"),
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    const result = await runCliAgent({
+      sessionId: "s-sticky",
+      sessionFile,
+      workspaceDir: "/tmp",
+      prompt: "hi",
+      provider: "claude-cli",
+      model: "sonnet",
+      timeoutMs: 1_000,
+      runId: "run-sticky",
+    });
+
+    expect(result.payloads?.[0]?.text).toBe("ok");
+    expect(supervisorSpawnMock).toHaveBeenCalledTimes(3);
+    const secondInput = supervisorSpawnMock.mock.calls[1]?.[0] as {
+      argv?: string[];
+      input?: string;
+    };
+    const thirdInput = supervisorSpawnMock.mock.calls[2]?.[0] as {
+      argv?: string[];
+      input?: string;
+    };
+    expect(secondInput.argv).toContain("--resume");
+    expect(secondInput.argv).toContain("sid-sticky");
+    expect(secondInput.input).toContain("continue reading the remaining files in exact order");
+    expect(thirdInput.argv).toContain("--resume");
+    expect(thirdInput.argv).toContain("sid-sticky");
+    expect(thirdInput.input).toContain("continue reading the remaining files in exact order");
   });
 
   it("writes prompt and assistant reply into the OpenClaw session transcript", async () => {

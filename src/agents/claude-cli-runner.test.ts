@@ -72,7 +72,14 @@ function successExit(payload: { message: string; session_id: string }) {
         message: {
           role: "user",
           content: [
-            { type: "tool_result", tool_use_id: "toolu_test_read", content: "prompt file" },
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_test_read",
+              startLine: 1,
+              numLines: 2,
+              totalLines: 2,
+              content: "prompt file",
+            },
           ],
         },
       }),
