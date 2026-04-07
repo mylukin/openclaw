@@ -374,7 +374,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let replaceNextPartialAfterTool = false;
   let streamPhase: "idle" | "thinking" | "tool" | "streaming" = "idle";
   const activeTools: Array<{ toolCallId?: string; name: string; startedAt: number }> = [];
+  const seenToolCallIds = new Set<string>();
   let toolElapsedTimer: ReturnType<typeof setInterval> | null = null;
+  let streamingActivityTimer: ReturnType<typeof setInterval> | null = null;
   let toolCallCount = 0;
   let lastRenderedStreamContent = "";
   let hasThinkingPrelude = false;
@@ -506,6 +508,28 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
   };
 
+  const clearStreamingActivityTimer = (): void => {
+    if (streamingActivityTimer !== null) {
+      clearInterval(streamingActivityTimer);
+      streamingActivityTimer = null;
+    }
+  };
+
+  const ensureStreamingActivityTimer = (): void => {
+    if (streamingActivityTimer !== null) {
+      return;
+    }
+    streamingActivityTimer = setInterval(() => {
+      if (streamPhase !== "streaming" || !shouldRenderStreamingStatus()) {
+        clearStreamingActivityTimer();
+        return;
+      }
+      bumpThinkingActivity();
+      queueThinkingPanelUpdate();
+    }, 1_500);
+    streamingActivityTimer.unref?.();
+  };
+
   const removeActiveTool = (toolCallId: string | undefined): void => {
     if (activeTools.length === 0) {
       return;
@@ -528,6 +552,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (activeTools.length === 0) {
       clearToolElapsedTimer();
     }
+  };
+
+  const noteToolCallSeen = (payload: { toolCallId?: string; name?: string }): boolean => {
+    const normalizedId = payload.toolCallId?.trim();
+    if (!normalizedId) {
+      return false;
+    }
+    if (seenToolCallIds.has(normalizedId)) {
+      return false;
+    }
+    seenToolCallIds.add(normalizedId);
+    return true;
   };
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
@@ -749,6 +785,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       lastPartial = nextText;
     }
     streamPhase = "streaming";
+    ensureStreamingActivityTimer();
     bumpThinkingActivity();
     queueThinkingPanelUpdate();
     // Collapse thinking panel when first assistant text arrives
@@ -868,7 +905,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         } else {
           logStreamingDecision("close", {
-            action: "close-final-card",
+            action: hasFinalThinking
+              ? "close-final-card"
+              : "close-final-card-drop-status-only-panel",
             finalText,
             thinkingText: finalThinking.text,
             emitFinalText: options?.emitFinalText,
@@ -894,6 +933,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             : undefined;
           await streaming.close(text, {
             ...(finalNote !== undefined ? { note: finalNote } : {}),
+            ...(hasFinalThinking ? {} : { dropThinkingPanel: true }),
           });
           hasVisibleTextInReply = true;
           deliveredFinalTexts.add(finalText);
@@ -917,6 +957,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       thinkingActivityTick = 0;
       activeTools.length = 0;
       clearToolElapsedTimer();
+      clearStreamingActivityTimer();
+      seenToolCallIds.clear();
     } finally {
       closingInProgress = false;
     }
@@ -970,6 +1012,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           streamPhase = "idle";
           activeTools.length = 0;
           clearToolElapsedTimer();
+          clearStreamingActivityTimer();
+          seenToolCallIds.clear();
           toolCallCount = 0;
           lastRenderedStreamContent = "";
           replaceNextPartialAfterTool = false;
@@ -1254,6 +1298,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ? () => {
             queueThinkingPrelude();
             startStreaming();
+            queueThinkingPanelUpdate();
           }
         : undefined,
       onReasoningStream: reasoningEnabled
@@ -1282,6 +1327,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ? (payload: { name?: string; phase?: string; toolCallId?: string }) => {
             const isStartPhase = !payload?.phase || payload.phase === "start";
             if (isStartPhase) {
+              noteToolCallSeen(payload);
               const trackedName = resolveTrackedToolName(payload?.name);
               activeTools.push({
                 name: trackedName,
@@ -1301,6 +1347,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             }
             queueThinkingPrelude();
             streamPhase = "tool";
+            clearStreamingActivityTimer();
             bumpThinkingActivity();
             // Tool-only runs need to bootstrap the streaming card even in
             // auto mode; otherwise the first visible event is dropped and the
@@ -1311,6 +1358,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onToolResult: streamingEnabled
         ? (payload: ReplyPayload) => {
+            const synthesizedToolCall = noteToolCallSeen({
+              toolCallId: payload.toolCallId,
+            });
+            if (synthesizedToolCall) {
+              toolCallCount += 1;
+              queueThinkingPrelude();
+              streamPhase = "tool";
+              startStreaming();
+            }
             removeActiveTool(payload.toolCallId);
             if (activeTools.length === 0 && streamPhase === "tool") {
               streamPhase = streamText ? "streaming" : "idle";
