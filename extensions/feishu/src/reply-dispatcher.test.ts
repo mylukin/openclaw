@@ -900,6 +900,43 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
+  it("tracks tool lifecycle from low-level agent events", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+    });
+
+    await options.onReplyStart?.();
+    await result.replyOptions.onAgentEvent?.({
+      stream: "tool",
+      data: {
+        phase: "start",
+        name: "Read",
+        toolUseId: "toolu_evt_1",
+      },
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("⏳ Running Read..."),
+      { title: "🔧 Tool calls (1)" },
+    );
+
+    await result.replyOptions.onAgentEvent?.({
+      stream: "tool",
+      data: {
+        phase: "result",
+        toolUseId: "toolu_evt_1",
+        result: "README contents",
+      },
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith("✓ 1 completed", {
+      title: "🔧 Tool calls (1)",
+    });
+  });
+
   it("clears running tool status as soon as assistant text starts streaming", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
@@ -1359,6 +1396,28 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
+  it("strips inline reply tags from live reasoning preview content", async () => {
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      allowReasoningPreview: true,
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onReasoningStream?.({
+      text: "Reasoning:\n[[reply_to_current]] 好，我去克隆下来扫一遍代码。",
+    });
+    result.replyOptions.onPartialReply?.({ text: "answer part" });
+    result.replyOptions.onReasoningEnd?.();
+    await options.deliver({ text: "answer part final" }, { kind: "final" });
+
+    expect(streamingInstances).toHaveLength(1);
+    const thinkingCalls = streamingInstances[0].updateThinking.mock.calls.map(
+      (call: unknown[]) => call[0] as string,
+    );
+    expect(thinkingCalls.at(-1)).toContain("好，我去克隆下来扫一遍代码。");
+    expect(thinkingCalls.at(-1)).not.toContain("[[reply_to_current]]");
+  });
+
   it("accumulates fragmented reasoning payloads in the live thinking panel", async () => {
     const { result, options } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
@@ -1598,6 +1657,42 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
         text: "final answer",
         thinkingTitle: "💭 Thinking",
         thinkingText: "step one\n\nstep two\n\nstep three",
+        thinkingExpanded: false,
+      }),
+    );
+  });
+
+  it("strips inline reply tags from non-streaming reasoning cards", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: {
+        renderMode: "card",
+        streaming: false,
+      },
+    });
+
+    const { result, options } = createDispatcherHarness({
+      runtime: createRuntimeLogger(),
+      replyToMessageId: "om_msg",
+      replyInThread: false,
+      threadReply: true,
+      rootId: "om_root_topic",
+    });
+
+    await result.replyOptions.onReasoningStream?.({
+      text: "Reasoning:\n[[reply_to_current]] thinking step",
+    });
+    await result.replyOptions.onReasoningEnd?.();
+    await options.deliver({ text: "final answer" }, { kind: "final" });
+
+    expect(sendStructuredCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "final answer",
+        thinkingTitle: "💭 Thinking",
+        thinkingText: "thinking step",
         thinkingExpanded: false,
       }),
     );

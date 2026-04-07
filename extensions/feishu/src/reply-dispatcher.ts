@@ -5,7 +5,10 @@ import {
   resolveSendableOutboundReplyParts,
   resolveTextChunksWithFallback,
 } from "openclaw/plugin-sdk/reply-payload";
-import { stripInlineDirectiveTagsForDelivery } from "openclaw/plugin-sdk/text-runtime";
+import {
+  stripInlineDirectiveTagsForDelivery,
+  stripInlineDirectiveTagsForDisplay,
+} from "openclaw/plugin-sdk/text-runtime";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { resolveMediaContentType } from "./media-types.js";
@@ -554,16 +557,90 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
   };
 
-  const noteToolCallSeen = (payload: { toolCallId?: string; name?: string }): boolean => {
+  const noteToolCallSeen = (
+    payload: { toolCallId?: string; name?: string },
+    options?: { allowUnnamed?: boolean },
+  ): boolean => {
     const normalizedId = payload.toolCallId?.trim();
     if (!normalizedId) {
-      return false;
+      return options?.allowUnnamed === true;
     }
     if (seenToolCallIds.has(normalizedId)) {
       return false;
     }
     seenToolCallIds.add(normalizedId);
     return true;
+  };
+
+  const handleToolStartLikeEvent = (
+    payload: {
+      name?: string;
+      phase?: string;
+      toolCallId?: string;
+    },
+    options?: { allowUnnamed?: boolean },
+  ) => {
+    const isStartPhase = !payload?.phase || payload.phase === "start" || payload.phase === "update";
+    if (isStartPhase) {
+      const isNewToolCall = noteToolCallSeen(payload, options);
+      if (isNewToolCall) {
+        const trackedName = resolveTrackedToolName(payload?.name);
+        activeTools.push({
+          name: trackedName,
+          toolCallId: payload.toolCallId?.trim() || undefined,
+          startedAt: Date.now(),
+        });
+        toolCallCount += 1;
+        replaceNextPartialAfterTool = Boolean(streamText);
+        if (toolElapsedTimer === null) {
+          toolElapsedTimer = setInterval(() => {
+            if (activeTools.length > 0) {
+              queueThinkingPanelUpdate();
+            }
+          }, 10_000);
+          toolElapsedTimer.unref?.();
+        }
+      }
+    }
+    queueThinkingPrelude();
+    streamPhase = "tool";
+    clearStreamingActivityTimer();
+    bumpThinkingActivity();
+    // Tool-only runs need to bootstrap the streaming card even in auto mode.
+    startStreaming();
+    queueThinkingPanelUpdate();
+  };
+
+  const handleToolResultLikeEvent = (payload: {
+    toolCallId?: string;
+    text?: string;
+    isError?: boolean;
+  }) => {
+    const synthesizedToolCall = payload.toolCallId
+      ? noteToolCallSeen({
+          toolCallId: payload.toolCallId,
+        })
+      : false;
+    if (synthesizedToolCall) {
+      activeTools.push({
+        name: "Tool",
+        toolCallId: payload.toolCallId?.trim() || undefined,
+        startedAt: Date.now(),
+      });
+      toolCallCount += 1;
+      queueThinkingPrelude();
+      streamPhase = "tool";
+      startStreaming();
+    }
+    removeActiveTool(payload.toolCallId);
+    if (activeTools.length === 0 && streamPhase === "tool") {
+      streamPhase = streamText ? "streaming" : "idle";
+    }
+    bumpThinkingActivity();
+    if (!shouldRenderStreamingStatus()) {
+      return;
+    }
+    queueThinkingPanelUpdate();
   };
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
@@ -1294,6 +1371,33 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     replyOptions: {
       ...replyOptions,
       onModelSelected: prefixContext.onModelSelected,
+      onAgentEvent: async (evt: { stream: string; data: Record<string, unknown> }) => {
+        if (evt.stream !== "tool") {
+          return;
+        }
+        const phase = typeof evt.data.phase === "string" ? evt.data.phase : undefined;
+        const toolCallId =
+          typeof evt.data.toolUseId === "string"
+            ? evt.data.toolUseId
+            : typeof evt.data.toolCallId === "string"
+              ? evt.data.toolCallId
+              : undefined;
+        const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
+        if (phase === "start" || phase === "update") {
+          handleToolStartLikeEvent({ name, phase, toolCallId });
+          return;
+        }
+        if (phase === "result") {
+          const text =
+            typeof evt.data.result === "string"
+              ? evt.data.result
+              : typeof evt.data.partialResult === "string"
+                ? evt.data.partialResult
+                : undefined;
+          const isError = evt.data.isError === true;
+          handleToolResultLikeEvent({ toolCallId, text, isError });
+        }
+      },
       onAssistantMessageStart: streamingEnabled
         ? () => {
             queueThinkingPrelude();
@@ -1305,12 +1409,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ? (payload?: { text?: string; mediaUrls?: string[]; isReasoning?: boolean }) => {
             queueThinkingPrelude();
             streamPhase = "thinking";
-            if (payload?.text) {
+            const cleanedReasoningText = stripInlineDirectiveTagsForDisplay(
+              payload?.text ?? "",
+            ).text;
+            if (cleanedReasoningText) {
               if (streamingEnabled) {
                 startStreaming();
-                queueReasoningUpdate(payload.text);
+                queueReasoningUpdate(cleanedReasoningText);
               } else {
-                reasoningText = mergeReasoningDisplayText(reasoningText, payload.text);
+                reasoningText = mergeReasoningDisplayText(reasoningText, cleanedReasoningText);
               }
             }
           }
@@ -1324,59 +1431,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         : undefined,
       onToolStart: streamingEnabled
-        ? (payload: { name?: string; phase?: string; toolCallId?: string }) => {
-            const isStartPhase = !payload?.phase || payload.phase === "start";
-            if (isStartPhase) {
-              noteToolCallSeen(payload);
-              const trackedName = resolveTrackedToolName(payload?.name);
-              activeTools.push({
-                name: trackedName,
-                toolCallId: payload.toolCallId?.trim() || undefined,
-                startedAt: Date.now(),
-              });
-              toolCallCount += 1;
-              replaceNextPartialAfterTool = Boolean(streamText);
-              if (toolElapsedTimer === null) {
-                toolElapsedTimer = setInterval(() => {
-                  if (activeTools.length > 0) {
-                    queueThinkingPanelUpdate();
-                  }
-                }, 10_000);
-                toolElapsedTimer.unref?.();
-              }
-            }
-            queueThinkingPrelude();
-            streamPhase = "tool";
-            clearStreamingActivityTimer();
-            bumpThinkingActivity();
-            // Tool-only runs need to bootstrap the streaming card even in
-            // auto mode; otherwise the first visible event is dropped and the
-            // thinking panel stays blank until assistant text arrives.
-            startStreaming();
-            queueThinkingPanelUpdate();
-          }
+        ? (payload: { name?: string; phase?: string; toolCallId?: string }) =>
+            handleToolStartLikeEvent(payload, { allowUnnamed: true })
         : undefined,
       onToolResult: streamingEnabled
-        ? (payload: ReplyPayload) => {
-            const synthesizedToolCall = noteToolCallSeen({
+        ? (payload: ReplyPayload) =>
+            handleToolResultLikeEvent({
               toolCallId: payload.toolCallId,
-            });
-            if (synthesizedToolCall) {
-              toolCallCount += 1;
-              queueThinkingPrelude();
-              streamPhase = "tool";
-              startStreaming();
-            }
-            removeActiveTool(payload.toolCallId);
-            if (activeTools.length === 0 && streamPhase === "tool") {
-              streamPhase = streamText ? "streaming" : "idle";
-            }
-            bumpThinkingActivity();
-            if (!shouldRenderStreamingStatus()) {
-              return;
-            }
-            queueThinkingPanelUpdate();
-          }
+              text: payload.text,
+              isError: payload.isError,
+            })
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {

@@ -858,6 +858,15 @@ export async function runAgentTurnWithFallback(params: {
                       },
                     });
                     queueStreamingStep(async () => {
+                      await params.opts?.onAgentEvent?.({
+                        stream: "tool",
+                        data: {
+                          phase: "start",
+                          name: payload.name,
+                          ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                          ...(payload.input !== undefined ? { input: payload.input } : {}),
+                        },
+                      });
                       await params.typingSignals.signalToolStart();
                       await params.opts?.onToolStart?.({
                         name: payload.name,
@@ -887,6 +896,15 @@ export async function runAgentTurnWithFallback(params: {
                           });
                           toolResultChain = toolResultChain
                             .then(async () => {
+                              await params.opts?.onAgentEvent?.({
+                                stream: "tool",
+                                data: {
+                                  phase: "result",
+                                  ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                                  ...(preview ? { partialResult: preview, result: preview } : {}),
+                                  ...(payload.isError ? { isError: true } : {}),
+                                },
+                              });
                               const { text, skip } = normalizeStreamingText({
                                 text: payload.text,
                                 ...(payload.isError ? { isError: true } : {}),
@@ -1064,6 +1082,7 @@ export async function runAgentTurnWithFallback(params: {
                     : undefined,
                 onReasoningEnd: params.opts?.onReasoningEnd,
                 onAgentEvent: async (evt) => {
+                  await params.opts?.onAgentEvent?.(evt);
                   // Signal run start only after the embedded agent emits real activity.
                   const hasLifecyclePhase =
                     evt.stream === "lifecycle" && typeof evt.data.phase === "string";
