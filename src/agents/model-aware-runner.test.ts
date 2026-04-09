@@ -107,9 +107,10 @@ describe("runModelAwareAgent", () => {
     expect(runCliAgentMock).toHaveBeenCalledTimes(1);
     expect(runEmbeddedPiAgentMock).not.toHaveBeenCalled();
     const cliCallArg = runCliAgentMock.mock.calls[0]?.[0] as
-      | { messageChannel?: string; extraSystemPrompt?: string }
+      | { messageChannel?: string; extraSystemPrompt?: string; disableTools?: boolean }
       | undefined;
     expect(cliCallArg?.messageChannel).toBe("feishu");
+    expect(cliCallArg?.disableTools).toBe(true);
     expect(cliCallArg?.extraSystemPrompt).toContain("BASE_SYSTEM");
     expect(cliCallArg?.extraSystemPrompt).toContain("Tools are disabled in this session.");
 

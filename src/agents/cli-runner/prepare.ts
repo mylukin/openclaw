@@ -43,6 +43,8 @@ import {
   type BootstrapProfile,
 } from "../pi-embedded-helpers.js";
 import { resolveModel } from "../pi-embedded-runner/model.js";
+import { createOpenClawCodingTools } from "../pi-tools.js";
+import { buildWorkspaceSkillSnapshot, resolveSkillsPromptForRun } from "../skills.js";
 import { buildSystemPromptReport } from "../system-prompt-report.js";
 import { redactRunIdentifier, resolveRunWorkspaceDir } from "../workspace-run.js";
 import { prepareCliBundleMcpConfig } from "./bundle-mcp.js";
@@ -408,7 +410,7 @@ export async function prepareCliRunContext(
   const mcpLoopbackRuntime =
     backendResolved.id === "claude-cli" ? prepareDeps.getActiveMcpLoopbackRuntime() : undefined;
   const preparedBackend = await prepareCliBundleMcpConfig({
-    enabled: backendResolved.bundleMcp,
+    enabled: backendResolved.bundleMcp && params.disableTools !== true,
     backend: backendResolved.config,
     workspaceDir,
     config: params.config,
@@ -444,6 +446,42 @@ export async function prepareCliRunContext(
     sessionAgentId === defaultAgentId
       ? resolveHeartbeatPrompt(params.config?.agents?.defaults?.heartbeat?.prompt)
       : undefined;
+  const promptTools =
+    params.disableTools !== true &&
+    backendResolved.bundleMcp &&
+    backendResolved.config.mcp?.enabled !== false
+      ? createOpenClawCodingTools({
+          agentId: sessionAgentId,
+          messageProvider: params.messageChannel ?? params.messageProvider,
+          agentAccountId: params.agentAccountId,
+          sessionKey: params.sessionKey,
+          sessionId: params.sessionId,
+          runId: params.runId,
+          workspaceDir,
+          config: params.config,
+          abortSignal: params.abortSignal,
+          modelProvider: params.provider,
+          modelId,
+        })
+      : [];
+  const effectiveSkillsSnapshot =
+    params.skillsSnapshot ??
+    (() => {
+      try {
+        return buildWorkspaceSkillSnapshot(workspaceDir, {
+          config: params.config,
+          agentId: sessionAgentId,
+        });
+      } catch {
+        return undefined;
+      }
+    })();
+  const skillsPrompt = resolveSkillsPromptForRun({
+    skillsSnapshot: params.disableTools === true ? undefined : effectiveSkillsSnapshot,
+    config: params.config,
+    workspaceDir,
+    agentId: sessionAgentId,
+  });
   const docsPath = await resolveOpenClawDocsPath({
     workspaceDir,
     argv1: process.argv[1],
@@ -455,10 +493,11 @@ export async function prepareCliRunContext(
     config: params.config,
     defaultThinkLevel: params.thinkLevel,
     extraSystemPrompt,
+    skillsPrompt,
     ownerNumbers: params.ownerNumbers,
     heartbeatPrompt,
     docsPath: docsPath ?? undefined,
-    tools: [],
+    tools: promptTools,
     contextFiles,
     modelDisplay,
     agentId: sessionAgentId,
@@ -599,10 +638,11 @@ export async function prepareCliRunContext(
                   config: params.config,
                   defaultThinkLevel: params.thinkLevel,
                   extraSystemPrompt,
+                  skillsPrompt,
                   ownerNumbers: params.ownerNumbers,
                   heartbeatPrompt,
                   docsPath: docsPath ?? undefined,
-                  tools: [],
+                  tools: promptTools,
                   contextFiles: compactedContextFiles,
                   modelDisplay,
                   agentId: sessionAgentId,
@@ -653,10 +693,11 @@ export async function prepareCliRunContext(
             config: params.config,
             defaultThinkLevel: params.thinkLevel,
             extraSystemPrompt,
+            skillsPrompt,
             ownerNumbers: params.ownerNumbers,
             heartbeatPrompt,
             docsPath: docsPath ?? undefined,
-            tools: [],
+            tools: promptTools,
             contextFiles: profileContextFiles,
             modelDisplay,
             agentId: sessionAgentId,
@@ -728,8 +769,8 @@ export async function prepareCliRunContext(
       systemPrompt,
       bootstrapFiles,
       injectedFiles: activeContextFiles,
-      skillsPrompt: "",
-      tools: [],
+      skillsPrompt,
+      tools: promptTools,
     });
   };
   const systemPromptReport = buildReportForActiveContext();
@@ -745,6 +786,7 @@ export async function prepareCliRunContext(
     normalizedModel,
     systemPrompt,
     systemPromptReport,
+    promptTools,
     bootstrapPromptWarningLines: bootstrapPromptWarning.lines,
     heartbeatPrompt,
     authEpoch,
@@ -759,6 +801,8 @@ export async function prepareCliRunContext(
     isClaude,
     bootstrapMaxChars,
     bootstrapTotalMaxChars,
+    skillsPrompt,
+    effectiveSkillsSnapshot,
     docsPath: docsPath ?? undefined,
     extraSystemPrompt,
   };

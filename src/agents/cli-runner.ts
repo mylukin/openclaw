@@ -7,9 +7,17 @@ import type { RunCliAgentParams } from "./cli-runner/types.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import { classifyFailoverReason, isFailoverErrorMessage } from "./pi-embedded-helpers.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
+import { applySkillEnvOverridesFromSnapshot } from "./skills.js";
 
 export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPiRunResult> {
   const context = await prepareCliRunContext(params);
+  const restoreSkillEnv =
+    params.disableTools !== true
+      ? applySkillEnvOverridesFromSnapshot({
+          snapshot: context.effectiveSkillsSnapshot,
+          config: params.config,
+        })
+      : () => {};
 
   // Try with the provided CLI session ID first
   try {
@@ -137,6 +145,7 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
       throw err;
     }
   } finally {
+    restoreSkillEnv();
     await context.preparedBackend.cleanup?.();
   }
 }

@@ -1,3 +1,4 @@
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -41,6 +42,8 @@ export type RunCliAgentParams = {
   messageChannel?: string;
   /** Skills snapshot for the current workspace/agent context. */
   skillsSnapshot?: SkillSnapshot;
+  /** Disable built-in/MCP tools for this run. */
+  disableTools?: boolean;
   /** Number of compactions that have already occurred on this session before this run. */
   sessionCompactionCount?: number;
   /** Abort signal to cancel the run early. */
@@ -89,6 +92,7 @@ export type PreparedCliRunContext = {
   normalizedModel: string;
   systemPrompt: string;
   systemPromptReport: SessionSystemPromptReport;
+  promptTools: AgentTool[];
   bootstrapPromptWarningLines: string[];
   heartbeatPrompt?: string;
   authEpoch?: string;
@@ -115,6 +119,8 @@ export type PreparedCliRunContext = {
   bootstrapTotalMaxChars: number;
   /** Skills prompt for the run (undefined if not applicable). */
   skillsPrompt?: string;
+  /** Effective skill snapshot used to build the run prompt/env. */
+  effectiveSkillsSnapshot?: SkillSnapshot;
   /** Docs path resolved for the run workspace. */
   docsPath?: string;
   /** Extra system prompt used in the build. */

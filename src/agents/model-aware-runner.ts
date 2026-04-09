@@ -59,6 +59,7 @@ export async function runModelAwareAgent(
     runId: params.runId,
     extraSystemPrompt,
     skillsSnapshot: params.skillsSnapshot,
+    disableTools: params.disableTools,
     ownerNumbers: params.ownerNumbers,
     cliSessionId: params.cliSessionId,
     images: params.images,
