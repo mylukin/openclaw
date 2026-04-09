@@ -157,6 +157,11 @@ async function resolveClaudeBareManagedEnv(params: {
 // ---------------------------------------------------------------------------
 
 const CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS = 12_000;
+// Below this size, a trailing chunk is considered an "orphan" — a tiny
+// fragment left over from snap-to-newline that confuses the reading agent
+// (e.g. a single line like "Reasoning: off…" becoming its own part file).
+// Such tails are merged back into the previous chunk.
+const CLAUDE_SYSTEM_PROMPT_MIN_TAIL_CHUNK_CHARS = 1_000;
 
 export type ClaudeSystemPromptChunk = {
   index: number;
@@ -206,21 +211,42 @@ function countLines(text: string): number {
   return count;
 }
 
-function splitClaudeSystemPromptIntoChunks(systemPrompt: string): string[] {
+export function splitClaudeSystemPromptIntoChunks(systemPrompt: string): string[] {
   const chunks: string[] = [];
   let offset = 0;
   while (offset < systemPrompt.length) {
     let end = Math.min(offset + CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS, systemPrompt.length);
     if (end < systemPrompt.length) {
-      const newline = systemPrompt.lastIndexOf("\n", end - 1);
-      if (newline >= offset + Math.floor(CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS / 2)) {
-        end = newline + 1;
+      const remaining = systemPrompt.length - end;
+      // Avoid leaving a tiny tail chunk behind: if snapping to the chunk
+      // boundary would leave less than MIN_TAIL_CHUNK_CHARS for the final
+      // part, just absorb the whole remainder into this chunk.
+      if (remaining < CLAUDE_SYSTEM_PROMPT_MIN_TAIL_CHUNK_CHARS) {
+        end = systemPrompt.length;
+      } else {
+        const newline = systemPrompt.lastIndexOf("\n", end - 1);
+        if (newline >= offset + Math.floor(CLAUDE_SYSTEM_PROMPT_CHUNK_MAX_CHARS / 2)) {
+          end = newline + 1;
+        }
       }
     }
     chunks.push(systemPrompt.slice(offset, end));
     offset = end;
   }
-  return chunks.length > 0 ? chunks : [systemPrompt];
+  if (chunks.length === 0) {
+    return [systemPrompt];
+  }
+  // Belt-and-suspenders: if a final chunk still ended up below the tail
+  // threshold (e.g. because a snap-to-newline shifted content), merge it
+  // into the previous chunk.
+  if (
+    chunks.length >= 2 &&
+    (chunks[chunks.length - 1]?.length ?? 0) < CLAUDE_SYSTEM_PROMPT_MIN_TAIL_CHUNK_CHARS
+  ) {
+    const tail = chunks.pop() ?? "";
+    chunks[chunks.length - 1] = `${chunks[chunks.length - 1] ?? ""}${tail}`;
+  }
+  return chunks;
 }
 
 export function buildClaudeSystemPromptFileContents(systemPrompt: string): {
