@@ -96,14 +96,14 @@ describe("buildSemanticLoaderPrompt", () => {
     sessionHash: "abc123",
   };
 
-  it("lists all files as numbered items", () => {
+  it("lists session file first, context files after", () => {
     const out = buildSemanticLoaderPrompt({
       files,
       reason: "new-session",
     });
-    expect(out).toContain("1. /a/AGENTS.md");
-    expect(out).toContain("2. /a/SOUL.md");
-    expect(out).toContain("3. /b/session.system-prompt.txt");
+    expect(out).toContain("1. /b/session.system-prompt.txt");
+    expect(out).toContain("2. /a/AGENTS.md");
+    expect(out).toContain("3. /a/SOUL.md");
   });
 
   it("contains parallel instruction", () => {

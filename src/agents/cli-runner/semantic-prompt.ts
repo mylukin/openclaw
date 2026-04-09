@@ -70,7 +70,8 @@ export function buildSemanticLoaderPrompt(params: {
     "",
   );
 
-  const allPaths = [...params.files.contextFiles, params.files.sessionFile];
+  // Session file first — it is the core system prompt; workspace files come after.
+  const allPaths = [params.files.sessionFile, ...params.files.contextFiles];
   for (let i = 0; i < allPaths.length; i++) {
     lines.push(`${i + 1}. ${allPaths[i]}`);
   }
