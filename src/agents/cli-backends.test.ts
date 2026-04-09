@@ -36,6 +36,7 @@ beforeEach(() => {
           "stream-json",
           "--include-partial-messages",
           "--verbose",
+          "--bare",
           "--setting-sources",
           "user",
           "--dangerously-skip-permissions",
@@ -44,6 +45,7 @@ beforeEach(() => {
           "stream-json",
           "--include-partial-messages",
           "--verbose",
+          "--bare",
           "--setting-sources",
           "user",
           "--dangerously-skip-permissions",
@@ -240,6 +242,7 @@ describe("resolveCliBackendConfig claude-cli defaults", () => {
     expect(resolved?.config.args).toContain("stream-json");
     expect(resolved?.config.args).toContain("--include-partial-messages");
     expect(resolved?.config.args).toContain("--verbose");
+    expect(resolved?.config.args).toContain("--bare");
     expect(resolved?.config.args).toContain("--setting-sources");
     expect(resolved?.config.args).toContain("user");
     expect(resolved?.config.args).toContain("--dangerously-skip-permissions");
@@ -248,6 +251,7 @@ describe("resolveCliBackendConfig claude-cli defaults", () => {
     expect(resolved?.config.resumeArgs).toContain("stream-json");
     expect(resolved?.config.resumeArgs).toContain("--include-partial-messages");
     expect(resolved?.config.resumeArgs).toContain("--verbose");
+    expect(resolved?.config.resumeArgs).toContain("--bare");
     expect(resolved?.config.resumeArgs).toContain("--setting-sources");
     expect(resolved?.config.resumeArgs).toContain("user");
     expect(resolved?.config.resumeArgs).toContain("--dangerously-skip-permissions");

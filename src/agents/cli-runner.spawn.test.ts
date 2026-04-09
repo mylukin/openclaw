@@ -388,6 +388,58 @@ describe("runCliAgent spawn path", () => {
     expect(input.env?.ANTHROPIC_UNIX_SOCKET).toBeUndefined();
   });
 
+  it("injects managed Anthropic API auth for bare Claude CLI runs", async () => {
+    const runCliAgent = await setupCliRunnerTestModule();
+    mockSuccessfulCliRun();
+
+    await runCliAgent({
+      sessionId: "s1",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      config: {
+        models: {
+          providers: {
+            anthropic: {
+              baseUrl: "https://relay.example.com/anthropic",
+              apiKey: "sk-ant-test-secret",
+              api: "anthropic-messages",
+              models: [
+                {
+                  id: "claude-sonnet-4-6",
+                  name: "Claude Sonnet 4.6",
+                  reasoning: true,
+                  input: ["text", "image"],
+                  cost: {
+                    input: 3,
+                    output: 15,
+                    cacheRead: 0.3,
+                    cacheWrite: 3.75,
+                  },
+                  contextWindow: 200_000,
+                  maxTokens: 64_000,
+                },
+              ],
+            },
+          },
+        },
+      } satisfies OpenClawConfig,
+      prompt: "hi",
+      provider: "claude-cli",
+      model: "claude-sonnet-4-6",
+      timeoutMs: 1_000,
+      runId: "run-claude-bare-managed-auth",
+    });
+
+    const input = supervisorSpawnMock.mock.calls[0]?.[0] as {
+      argv?: string[];
+      env?: Record<string, string | undefined>;
+    };
+    expect(input.argv).toContain("--bare");
+    expect(input.env?.ANTHROPIC_API_KEY).toBe("sk-ant-test-secret");
+    expect(input.env?.ANTHROPIC_BASE_URL).toBe("https://relay.example.com/anthropic");
+    expect(input.env?.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe("1");
+  });
+
   it("prepends bootstrap warnings to the CLI prompt body", async () => {
     const runCliAgent = await setupCliRunnerTestModule();
     supervisorSpawnMock.mockResolvedValueOnce(

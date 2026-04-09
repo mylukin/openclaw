@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { completeSimple } from "@mariozechner/pi-ai";
 import { resolveHeartbeatPrompt } from "../../auto-reply/heartbeat.js";
+import type { OpenClawConfig } from "../../config/config.js";
+import type { CliBackendConfig } from "../../config/types.js";
 import {
   createMcpLoopbackServerConfig,
   getActiveMcpLoopbackRuntime,
@@ -28,9 +30,15 @@ import { resolveCliBackendConfig } from "../cli-backends.js";
 import { hashCliSessionText, resolveCliSessionReuse } from "../cli-session.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { resolveOpenClawDocsPath } from "../docs-path.js";
-import { getApiKeyForModel, requireApiKey } from "../model-auth.js";
+import {
+  getApiKeyForModel,
+  requireApiKey,
+  resolveApiKeyForProvider,
+  resolveUsableCustomProviderApiKey,
+} from "../model-auth.js";
 import {
   isCliProvider,
+  normalizeProviderId,
   resolveDefaultModelForAgent,
   resolveNonCliModelRef,
 } from "../model-selection.js";
@@ -61,6 +69,87 @@ const prepareDeps = {
 
 export function setCliRunnerPrepareTestDeps(overrides: Partial<typeof prepareDeps>): void {
   Object.assign(prepareDeps, overrides);
+}
+
+function hasCliFlag(args: string[] | undefined, flag: string): boolean {
+  return args?.some((entry) => entry === flag || entry.startsWith(`${flag}=`)) ?? false;
+}
+
+function resolveProviderBaseUrl(
+  config: OpenClawConfig | undefined,
+  provider: string,
+): string | undefined {
+  const providers = config?.models?.providers ?? {};
+  const normalizedProvider = normalizeProviderId(provider);
+  for (const [key, value] of Object.entries(providers)) {
+    if (normalizeProviderId(key) !== normalizedProvider) {
+      continue;
+    }
+    const baseUrl =
+      value &&
+      typeof value === "object" &&
+      typeof (value as { baseUrl?: unknown }).baseUrl === "string"
+        ? (value as { baseUrl: string }).baseUrl.trim()
+        : "";
+    if (baseUrl) {
+      return baseUrl;
+    }
+  }
+  return undefined;
+}
+
+async function resolveClaudeBareManagedEnv(params: {
+  config: OpenClawConfig | undefined;
+  backendId: string;
+  backendConfig: CliBackendConfig;
+  authProfileId?: string;
+}): Promise<Record<string, string> | undefined> {
+  // `claude --bare` ignores Claude's local OAuth/keychain state, so pipe any
+  // OpenClaw-managed Anthropic API auth into the child environment explicitly.
+  if (params.backendId !== "claude-cli") {
+    return undefined;
+  }
+  if (
+    !hasCliFlag(params.backendConfig.args, "--bare") &&
+    !hasCliFlag(params.backendConfig.resumeArgs, "--bare")
+  ) {
+    return undefined;
+  }
+
+  const explicitProviderKey = resolveUsableCustomProviderApiKey({
+    cfg: params.config,
+    provider: "anthropic",
+  });
+
+  let managedApiKey = explicitProviderKey?.apiKey;
+  if (!managedApiKey) {
+    const resolvedAuth =
+      (await resolveApiKeyForProvider({
+        provider: "anthropic",
+        cfg: params.config,
+        ...(params.authProfileId ? { profileId: params.authProfileId } : {}),
+      }).catch(() => null)) ??
+      (await resolveApiKeyForProvider({
+        provider: "anthropic",
+        cfg: params.config,
+      }).catch(() => null));
+    if (resolvedAuth?.mode === "api-key") {
+      managedApiKey = resolvedAuth.apiKey;
+    }
+  }
+
+  if (!managedApiKey) {
+    return undefined;
+  }
+
+  const managedEnv: Record<string, string> = {
+    ANTHROPIC_API_KEY: managedApiKey,
+  };
+  const providerBaseUrl = resolveProviderBaseUrl(params.config, "anthropic");
+  if (providerBaseUrl) {
+    managedEnv.ANTHROPIC_BASE_URL = providerBaseUrl;
+  }
+  return managedEnv;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +498,12 @@ export async function prepareCliRunContext(
   });
   const mcpLoopbackRuntime =
     backendResolved.id === "claude-cli" ? prepareDeps.getActiveMcpLoopbackRuntime() : undefined;
+  const managedClaudeBareEnv = await resolveClaudeBareManagedEnv({
+    config: params.config,
+    backendId: backendResolved.id,
+    backendConfig: backendResolved.config,
+    authProfileId: params.authProfileId,
+  });
   const preparedBackend = await prepareCliBundleMcpConfig({
     enabled: backendResolved.bundleMcp && params.disableTools !== true,
     backend: backendResolved.config,
@@ -417,15 +512,18 @@ export async function prepareCliRunContext(
     additionalConfig: mcpLoopbackRuntime
       ? prepareDeps.createMcpLoopbackServerConfig(mcpLoopbackRuntime.port)
       : undefined,
-    env: mcpLoopbackRuntime
-      ? {
-          OPENCLAW_MCP_TOKEN: mcpLoopbackRuntime.token,
-          OPENCLAW_MCP_AGENT_ID: sessionAgentId ?? "",
-          OPENCLAW_MCP_ACCOUNT_ID: params.agentAccountId ?? "",
-          OPENCLAW_MCP_SESSION_KEY: params.sessionKey ?? "",
-          OPENCLAW_MCP_MESSAGE_CHANNEL: params.messageProvider ?? "",
-        }
-      : undefined,
+    env: {
+      ...managedClaudeBareEnv,
+      ...(mcpLoopbackRuntime
+        ? {
+            OPENCLAW_MCP_TOKEN: mcpLoopbackRuntime.token,
+            OPENCLAW_MCP_AGENT_ID: sessionAgentId ?? "",
+            OPENCLAW_MCP_ACCOUNT_ID: params.agentAccountId ?? "",
+            OPENCLAW_MCP_SESSION_KEY: params.sessionKey ?? "",
+            OPENCLAW_MCP_MESSAGE_CHANNEL: params.messageProvider ?? "",
+          }
+        : {}),
+    },
     warn: (message) => cliBackendLog.warn(message),
   });
   const reusableCliSession = resolveCliSessionReuse({
