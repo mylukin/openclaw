@@ -770,6 +770,38 @@ export function buildAgentSystemPrompt(params: {
   return lines.filter(Boolean).join("\n");
 }
 
+export function buildAgentSystemPromptSplit(
+  params: Parameters<typeof buildAgentSystemPrompt>[0] & {
+    omitContextFileContent?: boolean;
+  },
+): {
+  prompt: string;
+  contextFilePaths: string[];
+} {
+  const contextFiles = params.contextFiles ?? [];
+  const validContextFiles = contextFiles.filter(
+    (file) => typeof file.path === "string" && file.path.trim().length > 0,
+  );
+  const contextFilePaths = validContextFiles.map((file) => file.path);
+
+  if (!params.omitContextFileContent) {
+    return {
+      prompt: buildAgentSystemPrompt(params),
+      contextFilePaths,
+    };
+  }
+
+  const promptWithoutContext = buildAgentSystemPrompt({
+    ...params,
+    contextFiles: [],
+  });
+
+  return {
+    prompt: promptWithoutContext,
+    contextFilePaths,
+  };
+}
+
 export function buildRuntimeLine(
   runtimeInfo?: {
     agentId?: string;

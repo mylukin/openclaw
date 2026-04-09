@@ -364,18 +364,21 @@ export class PromptFileReadRequiredError extends Error {
   readonly reason: "not-read" | "partial-read" | "read-error";
   readonly sessionId?: string;
   readonly promptFile?: string;
+  readonly unverifiedPaths?: string[];
 
   constructor(params: {
     message: string;
     reason: "not-read" | "partial-read" | "read-error";
     sessionId?: string;
     promptFile?: string;
+    unverifiedPaths?: string[];
   }) {
     super(params.message);
     this.name = "PromptFileReadRequiredError";
     this.reason = params.reason;
     this.sessionId = params.sessionId;
     this.promptFile = params.promptFile;
+    this.unverifiedPaths = params.unverifiedPaths;
   }
 }
 
