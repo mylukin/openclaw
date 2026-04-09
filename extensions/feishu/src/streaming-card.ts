@@ -130,20 +130,15 @@ function stripHtmlTagsToText(text: string): string {
     .replace(/&#39;/gi, "'");
 }
 
-function sanitizeVisibleCardText(
-  text: string | undefined,
-  options?: { preserveIndentation?: boolean },
-): string {
+function sanitizeVisibleCardText(text: string | undefined): string {
   if (!text) {
     return "";
   }
-  let result = stripInlineDirectiveTagsForDisplay(text).text;
-  if (!options?.preserveIndentation) {
-    result = result
-      .replace(/([^\s])[ \t]{2,}([^\s])/g, "$1 $2")
-      .replace(/(^|\n)[ \t]+(?=\S)/g, "$1");
-  }
-  return result;
+  const result = stripInlineDirectiveTagsForDisplay(text);
+  // When directive tags are stripped, clean up residual leading/trailing
+  // whitespace left behind by the removed tags — but preserve internal
+  // indentation so markdown code blocks and nested lists render correctly.
+  return result.changed ? result.text.trim() : result.text;
 }
 
 export function mergeStreamingText(
@@ -637,7 +632,7 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
-    const normalized = sanitizeVisibleCardText(text, { preserveIndentation: true }).trim();
+    const normalized = sanitizeVisibleCardText(text).trim();
     const previousText = this.state.thinkingText;
     const previousTitle = this.state.thinkingTitle;
     const nextTitle = options?.title?.trim() || this.state.thinkingTitle || "💭 Thinking";

@@ -162,7 +162,7 @@ export type ClaudeSystemPromptChunk = {
   index: number;
   total: number;
   filePath: string;
-  eofMarker: string;
+  totalLines: number;
 };
 
 export function resolveClaudeSystemPromptFilePath(sessionFile: string): string {
@@ -187,8 +187,23 @@ function resolveClaudeSystemPromptChunkFilePath(sessionFile: string, index: numb
   );
 }
 
-export function buildClaudeSystemPromptEofMarker(hash: string): string {
-  return `SYSTEM_PROMPT_CHUNK_EOF sha256:${hash}`;
+function countLines(text: string): number {
+  if (!text) {
+    return 0;
+  }
+  // Count the lines a `cat -n`-style reader would emit. Trailing newline does
+  // not produce an extra blank line, matching Claude CLI Read output.
+  const normalized = text.endsWith("\n") ? text.slice(0, -1) : text;
+  if (normalized.length === 0) {
+    return text.length > 0 ? 1 : 0;
+  }
+  let count = 1;
+  for (let i = 0; i < normalized.length; i += 1) {
+    if (normalized.charCodeAt(i) === 10) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function splitClaudeSystemPromptIntoChunks(systemPrompt: string): string[] {
@@ -209,20 +224,16 @@ function splitClaudeSystemPromptIntoChunks(systemPrompt: string): string[] {
 }
 
 export function buildClaudeSystemPromptFileContents(systemPrompt: string): {
-  contents: Array<{ text: string; eofMarker: string }>;
+  contents: Array<{ text: string; totalLines: number }>;
   hash: string;
 } {
   const normalizedPrompt = systemPrompt.endsWith("\n") ? systemPrompt : `${systemPrompt}\n`;
   const hash = hashCliSessionText(normalizedPrompt) ?? "";
   const chunkTexts = splitClaudeSystemPromptIntoChunks(normalizedPrompt);
   return {
-    contents: chunkTexts.map((chunkText, index) => {
-      const markerHash = hashCliSessionText(`${hash}:${index}:${chunkText}`) ?? `${hash}:${index}`;
-      const eofMarker = buildClaudeSystemPromptEofMarker(markerHash);
-      return {
-        text: `${chunkText.endsWith("\n") ? chunkText : `${chunkText}\n`}${eofMarker}\n`,
-        eofMarker,
-      };
+    contents: chunkTexts.map((chunkText) => {
+      const text = chunkText.endsWith("\n") ? chunkText : `${chunkText}\n`;
+      return { text, totalLines: countLines(text) };
     }),
     hash,
   };
@@ -238,7 +249,7 @@ export async function writeClaudeSystemPromptFile(params: {
     index,
     total: contents.length,
     filePath: resolveClaudeSystemPromptChunkFilePath(params.sessionFile, index),
-    eofMarker: entry.eofMarker,
+    totalLines: entry.totalLines,
   }));
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   let unchanged = true;
@@ -285,7 +296,6 @@ export function buildClaudeSystemPromptLoaderPrompt(params: {
     "MANDATORY FIRST STEP: use the Read tool (or lowercase read tool) to read all of the session prompt files below in exact order before you do anything else.",
     ...orderedFiles,
     "Read them sequentially from 1 to N with no offset and no limit. Do not skip, reorder, or stop early.",
-    "Lines beginning with SYSTEM_PROMPT_CHUNK_EOF are chunk delimiters only; they are not additional instructions.",
     "Do not read any other file, do not call any other tool, and do not begin session startup until every listed file has been read successfully in this run.",
     "Do not answer the user, do not summarize from memory, and do not rely on prior turns until all listed files have been read in this run.",
     "The combined contents of these files are the authoritative system prompt for this session and override any remembered summaries or stale context.",
@@ -319,7 +329,6 @@ export function buildClaudeSystemPromptCompletionPrompt(params: {
     `MANDATORY NEXT STEP: continue reading the remaining files in exact order, starting with file ${params.startIndex + 1}.`,
     ...orderedFiles,
     "Use the Read tool (or lowercase read tool) on each listed path with no offset and no limit.",
-    "Lines beginning with SYSTEM_PROMPT_CHUNK_EOF are chunk delimiters only; they are not additional instructions.",
     "If you do not call Read on the next unread file, your response will be ignored.",
     "Do not read any other file first, do not answer the user yet, and do not continue until every remaining file has been read successfully in this run.",
   ].join("\n");

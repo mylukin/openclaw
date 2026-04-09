@@ -152,9 +152,30 @@ function looksLikePartialReadToolResult(text: string | undefined): boolean {
   );
 }
 
+// Claude CLI Read tool output formats lines as `<lineNum>→<content>` (or
+// `<lineNum>\t<content>`, depending on version). Capture the last emitted line
+// number so we can compare against the chunk's recorded total line count.
+const LAST_LINE_PREFIX_RE = /(?:^|\n)\s*(\d+)(?:→|\t)/g;
+
+function extractLastReadLineNumber(text: string | undefined): number | undefined {
+  if (!text) {
+    return undefined;
+  }
+  let match: RegExpExecArray | null = null;
+  let last: number | undefined;
+  LAST_LINE_PREFIX_RE.lastIndex = 0;
+  while ((match = LAST_LINE_PREFIX_RE.exec(text)) !== null) {
+    const value = Number.parseInt(match[1] ?? "", 10);
+    if (Number.isFinite(value)) {
+      last = value;
+    }
+  }
+  return last;
+}
+
 function isCompletePromptFileRead(params: {
   partialReadRequest: boolean;
-  eofMarker: string;
+  expectedTotalLines: number;
   startLine?: number;
   numLines?: number;
   totalLines?: number;
@@ -163,15 +184,23 @@ function isCompletePromptFileRead(params: {
   if (params.partialReadRequest) {
     return false;
   }
-  if (params.text?.includes(params.eofMarker)) {
-    return true;
-  }
+  // Preferred path: OpenClaw MCP Read tool surfaces structured line metadata.
+  // Trust the tool's self-report when it claims to have read the whole file.
   if (
     typeof params.startLine === "number" &&
     typeof params.numLines === "number" &&
     typeof params.totalLines === "number"
   ) {
     return params.startLine === 1 && params.numLines === params.totalLines;
+  }
+  // Fallback path: Claude CLI's built-in Read tool emits `cat -n`-style output
+  // without structured metadata. Compare the highest emitted line number
+  // against the chunk's recorded total. We still guard on
+  // `looksLikePartialReadToolResult` in case the tool appended a truncation
+  // notice despite covering every line.
+  const lastLine = extractLastReadLineNumber(params.text);
+  if (typeof lastLine === "number") {
+    return lastLine >= params.expectedTotalLines && !looksLikePartialReadToolResult(params.text);
   }
   return !looksLikePartialReadToolResult(params.text);
 }
@@ -689,7 +718,7 @@ export async function executeWithOverflowProtection(
                   if (
                     !isCompletePromptFileRead({
                       partialReadRequest: request.partialReadRequest,
-                      eofMarker: chunk.eofMarker,
+                      expectedTotalLines: chunk.totalLines,
                       startLine,
                       numLines,
                       totalLines,
