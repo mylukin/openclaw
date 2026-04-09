@@ -130,13 +130,20 @@ function stripHtmlTagsToText(text: string): string {
     .replace(/&#39;/gi, "'");
 }
 
-function sanitizeVisibleCardText(text: string | undefined): string {
+function sanitizeVisibleCardText(
+  text: string | undefined,
+  options?: { preserveIndentation?: boolean },
+): string {
   if (!text) {
     return "";
   }
-  return stripInlineDirectiveTagsForDisplay(text)
-    .text.replace(/([^\s])[ \t]{2,}([^\s])/g, "$1 $2")
-    .replace(/(^|\n)[ \t]+(?=\S)/g, "$1");
+  let result = stripInlineDirectiveTagsForDisplay(text).text;
+  if (!options?.preserveIndentation) {
+    result = result
+      .replace(/([^\s])[ \t]{2,}([^\s])/g, "$1 $2")
+      .replace(/(^|\n)[ \t]+(?=\S)/g, "$1");
+  }
+  return result;
 }
 
 export function mergeStreamingText(
@@ -630,7 +637,7 @@ export class FeishuStreamingSession {
     if (!this.state || this.closed) {
       return;
     }
-    const normalized = sanitizeVisibleCardText(text).trim();
+    const normalized = sanitizeVisibleCardText(text, { preserveIndentation: true }).trim();
     const previousText = this.state.thinkingText;
     const previousTitle = this.state.thinkingTitle;
     const nextTitle = options?.title?.trim() || this.state.thinkingTitle || "💭 Thinking";
