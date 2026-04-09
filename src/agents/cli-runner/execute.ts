@@ -563,6 +563,21 @@ export async function executeWithOverflowProtection(
       prependBootstrapPromptWarning(params.prompt, context.bootstrapPromptWarningLines, {
         preserveExactPrompt: context.heartbeatPrompt,
       });
+    // On resume, Claude CLI does not accept --append-system-prompt, so
+    // buildCliArgs will drop systemPromptToSend. When a reload is required
+    // (compaction, prompt-changed), prepend the loader instruction to the
+    // user message so the agent sees the "re-read files" directive on the
+    // first call instead of only after a verification-retry round-trip.
+    if (
+      !promptOverride &&
+      context.isClaude &&
+      !isSystemCall &&
+      useResume &&
+      systemPromptToSend &&
+      systemPromptToSend !== systemPrompt
+    ) {
+      prompt = `${systemPromptToSend}\n\n---\n\n${prompt}`;
+    }
     const resolvedImages =
       !promptOverride && params.images && params.images.length > 0
         ? params.images
@@ -1092,11 +1107,24 @@ export async function executeWithOverflowProtection(
 
         // Track session binding metadata
         if (!isSystemCall && ENABLE_SEMANTIC_PROMPT_LOADER && latestSemanticFiles) {
+          // Persist semantic binding fields when:
+          //   (a) verification just passed, OR
+          //   (b) verification was not required because the current binding already
+          //       trusts this prompt (trust carry-over — keep the fields across
+          //       trusted resumes so the next turn also skips re-reads).
+          const persistSemanticMetadata =
+            loaderPromptMode !== "disabled" &&
+            (promptFileReadVerified ||
+              (!mustVerifyPromptFileRead &&
+                JSON.stringify(matchingCliSessionBinding?.semanticContextFiles ?? []) ===
+                  JSON.stringify(latestSemanticFiles.contextFiles) &&
+                matchingCliSessionBinding?.semanticSessionHash?.trim() ===
+                  latestSemanticFiles.sessionHash));
           latestCliSessionBinding =
             cliOutput.sessionId || resolvedSessionId
               ? {
                   sessionId: cliOutput.sessionId ?? resolvedSessionId ?? "",
-                  ...(promptFileReadVerified
+                  ...(persistSemanticMetadata
                     ? {
                         semanticContextFiles: latestSemanticFiles.contextFiles,
                         semanticSessionFile: latestSemanticFiles.sessionFile,
