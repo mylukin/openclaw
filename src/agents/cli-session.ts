@@ -105,6 +105,23 @@ export function setCliSessionBinding(
             systemPromptCompactionCount: Math.floor(binding.systemPromptCompactionCount),
           }
         : {}),
+      // Semantic prompt loader fields
+      ...(Array.isArray(binding.semanticContextFiles) && binding.semanticContextFiles.length > 0
+        ? { semanticContextFiles: binding.semanticContextFiles }
+        : {}),
+      ...(trimOptional(binding.semanticSessionFile)
+        ? { semanticSessionFile: trimOptional(binding.semanticSessionFile) }
+        : {}),
+      ...(trimOptional(binding.semanticSessionHash)
+        ? { semanticSessionHash: trimOptional(binding.semanticSessionHash) }
+        : {}),
+      ...(typeof binding.semanticCompactionCount === "number" &&
+      Number.isFinite(binding.semanticCompactionCount) &&
+      binding.semanticCompactionCount >= 0
+        ? {
+            semanticCompactionCount: Math.floor(binding.semanticCompactionCount),
+          }
+        : {}),
     },
   };
   entry.cliSessionIds = { ...entry.cliSessionIds, [normalized]: trimmed };
