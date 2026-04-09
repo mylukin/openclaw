@@ -42,6 +42,20 @@ export function getCliSessionBinding(
         fromBindings.systemPromptCompactionCount >= 0
           ? fromBindings.systemPromptCompactionCount
           : undefined,
+      // Semantic prompt loader fields
+      semanticContextFiles:
+        Array.isArray(fromBindings?.semanticContextFiles) &&
+        fromBindings.semanticContextFiles.length > 0
+          ? fromBindings.semanticContextFiles
+          : undefined,
+      semanticSessionFile: trimOptional(fromBindings?.semanticSessionFile),
+      semanticSessionHash: trimOptional(fromBindings?.semanticSessionHash),
+      semanticCompactionCount:
+        typeof fromBindings?.semanticCompactionCount === "number" &&
+        Number.isFinite(fromBindings.semanticCompactionCount) &&
+        fromBindings.semanticCompactionCount >= 0
+          ? fromBindings.semanticCompactionCount
+          : undefined,
     };
   }
   const fromMap = entry.cliSessionIds?.[normalized];
