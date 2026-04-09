@@ -32,7 +32,7 @@ export async function writeSemanticSessionFile(params: {
   }
 
   if (existing !== content) {
-    await fs.writeFile(filePath, content, "utf-8");
+    await fs.writeFile(filePath, content, { encoding: "utf-8", mode: 0o600 });
   }
 
   return { filePath, hash };

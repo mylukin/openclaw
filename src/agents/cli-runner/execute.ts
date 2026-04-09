@@ -857,6 +857,12 @@ export async function executeWithOverflowProtection(
                       promptFileReadAttemptedPartially = true;
                       return;
                     }
+                    // Guard against tool-side truncation (e.g., large file exceeding
+                    // Read output limit) even when the request had no offset/limit.
+                    if (looksLikePartialReadToolResult(text)) {
+                      promptFileReadAttemptedPartially = true;
+                      return;
+                    }
                     // No sequential order check — just add to verified set.
                     let verifiedSet = verifiedPromptFileSets.get(resolvedSessionId ?? "");
                     if (!verifiedSet) {
