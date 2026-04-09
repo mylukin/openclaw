@@ -77,7 +77,8 @@ export function buildSemanticLoaderPrompt(params: {
 
   lines.push(
     "",
-    "Read each file with no offset and no limit. Do not skip any file.",
+    "Read each file with no offset and no limit.",
+    "If a file does not exist or Read returns an error, skip it and continue with the remaining files.",
     "The combined contents of these files are the authoritative system prompt for this session and override any remembered summaries or stale context.",
     "You must follow the combined contents of these files strictly for this turn and all subsequent turns in the session.",
     "Do not answer the user, do not summarize from memory, and do not rely on prior turns until all listed files have been read in this run.",
@@ -105,8 +106,8 @@ export function buildSemanticCompletionPrompt(params: {
   lines.push(
     "",
     "Use the Read tool (or lowercase read tool) on each listed path with no offset and no limit.",
-    "If you do not call Read on these files, your response will be ignored.",
-    "Do not read any other file first, do not answer the user yet, and do not continue until every listed file has been read successfully in this run.",
+    "If a file does not exist or Read returns an error, skip it and continue with the remaining files.",
+    "Do not read any other file first, do not answer the user yet, and do not continue until every listed file has been read or confirmed missing in this run.",
   );
 
   return lines.join("\n");

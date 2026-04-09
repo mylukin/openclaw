@@ -850,7 +850,17 @@ export async function executeWithOverflowProtection(
                     }
                     promptFileReadAttempted = true;
                     if (isError) {
-                      promptFileReadErrored = true;
+                      // File not found or read error — treat as "confirmed absent"
+                      // so we don't retry it endlessly. Add to verified set and move on.
+                      let verifiedSet = verifiedPromptFileSets.get(resolvedSessionId ?? "");
+                      if (!verifiedSet) {
+                        verifiedSet = new Set();
+                        if (resolvedSessionId) {
+                          verifiedPromptFileSets.set(resolvedSessionId, verifiedSet);
+                        }
+                      }
+                      verifiedSet.add(request.filePath);
+                      promptFileReadVerified = verifiedSet.size >= expectedFiles.size;
                       return;
                     }
                     if (request.partialReadRequest) {
