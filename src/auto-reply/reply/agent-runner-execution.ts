@@ -48,6 +48,7 @@ import {
   couldBeSilentTokenStart,
   HEARTBEAT_TOKEN,
   isSilentReplyPrefixText,
+  isSilentReplyTailFragmentText,
   isSilentReplyText,
   SILENT_REPLY_TOKEN,
 } from "../tokens.js";
@@ -625,6 +626,9 @@ export async function runAgentTurnWithFallback(params: {
           text = stripped.text;
         }
         if (isSilentReplyText(text, SILENT_REPLY_TOKEN)) {
+          return { skip: true };
+        }
+        if (isSilentReplyTailFragmentText(text, SILENT_REPLY_TOKEN)) {
           return { skip: true };
         }
         if (
