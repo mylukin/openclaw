@@ -21,6 +21,7 @@ import {
   getBootstrapProfileConfig,
   isContextOverflowError,
 } from "../pi-embedded-helpers.js";
+import { ENABLE_SEMANTIC_PROMPT_LOADER } from "./flags.js";
 import {
   appendImagePathsToPrompt,
   buildCliSupervisorScopeKey,
@@ -146,7 +147,6 @@ export type CliPromptLoadResult = {
 };
 
 const ENABLE_DIRECT_SYSTEM_PROMPT_FALLBACK = false;
-const ENABLE_SEMANTIC_PROMPT_LOADER = true;
 const MAX_COMPLETION_PROMPT_RETRIES = 5;
 
 function formatCliLogValue(value: string | undefined, maxChars = 240): string {
