@@ -931,6 +931,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       return;
     }
     closingInProgress = true;
+    // Switch to idle before draining the queue so any late-arriving
+    // queueThinkingPanelUpdate steps compose without the "Streaming reply..."
+    // activity line and can't overwrite the final panel.
+    streamPhase = "idle";
+    clearStreamingActivityTimer();
     try {
       if (streamingStartPromise) {
         await streamingStartPromise;
