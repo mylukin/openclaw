@@ -1508,7 +1508,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(closeArg).toBe("```ts\ncode\n```");
   });
 
-  it("strips inline reply tags from streamed partial and final card content", async () => {
+  it("preserves raw partial text and only strips inline reply tags at final delivery", async () => {
     const { result, options } = createDispatcherHarness({
       runtime: createRuntimeLogger(),
       allowReasoningPreview: false,
@@ -1520,7 +1520,12 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     await options.deliver({ text: "[[reply_to_current]] hello final" }, { kind: "final" });
 
     expect(streamingInstances).toHaveLength(1);
-    expect(streamingInstances[0].update).toHaveBeenCalledWith("hello", { replace: true });
+    // Partials are passed through unchanged so markdown formatting (tables,
+    // lists, fences) is never disturbed mid-stream.
+    expect(streamingInstances[0].update).toHaveBeenCalledWith("[[reply_to_current]] hello", {
+      replace: true,
+    });
+    // Final delivery still strips directive tags before sending.
     expect(streamingInstances[0].close).toHaveBeenCalledWith(
       "hello final",
       expect.objectContaining({

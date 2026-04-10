@@ -74,12 +74,19 @@ describe("mergeStreamingText", () => {
     expect(mergeStreamingText("line1", "line2")).toBe("line1line2");
   });
 
-  it("merges overlap between adjacent partial snapshots", () => {
-    expect(mergeStreamingText("好的，让我", "让我再读取一遍")).toBe("好的，让我再读取一遍");
-    expect(mergeStreamingText("revision_id: 552", "2，一点变化都没有")).toBe(
-      "revision_id: 552，一点变化都没有",
-    );
-    expect(mergeStreamingText("abc", "cabc")).toBe("cabc");
+  it("treats overlapping delta chunks as plain appends to preserve markdown", () => {
+    // Delta streams from model-aware-runner emit token fragments that may
+    // share characters at chunk boundaries (e.g. `|` separators in markdown
+    // tables, or `l` in `install` + `lossless`).  A tail-head overlap collapse
+    // would eat real content — the simple append below is the correct
+    // behavior for genuine delta streams and preserves NO_REPLY-style token
+    // splits like "NO" + "_REPLY" → "NO_REPLY".
+    expect(mergeStreamingText("install", "lossless")).toBe("installlossless");
+    expect(mergeStreamingText("abc| |", "| |xyz")).toBe("abc| || |xyz");
+    expect(mergeStreamingText("NO", "_REPLY")).toBe("NO_REPLY");
+    // `next.includes(previous)` still short-circuits for genuine snapshot
+    // cases where the new chunk embeds the old chunk.
+    expect(mergeStreamingText("abc", "xxabcxx")).toBe("xxabcxx");
   });
 });
 
@@ -147,7 +154,7 @@ describe("FeishuStreamingSession.update", () => {
     expect((session as any).state.currentText).toBe("🔧 正在使用Read工具...");
   });
 
-  it("strips inline reply tags before updating visible card content", async () => {
+  it("passes raw replace-mode content through unchanged to preserve markdown", async () => {
     const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {
       appId: "app",
@@ -169,13 +176,12 @@ describe("FeishuStreamingSession.update", () => {
       .spyOn(session as any, "updateCardContent")
       .mockResolvedValue(undefined);
 
-    await session.update("[[reply_to_current]] 让我去扒一下这个项目。", { replace: true });
+    const markdown =
+      "当前共有 **28** 个 skills:\n\n| 类别 | 数量 |\n|------|------|\n| 开发工具 | 5 |";
+    await session.update(markdown, { replace: true });
 
-    expect(updateCardContentSpy).toHaveBeenCalledWith(
-      "让我去扒一下这个项目。",
-      expect.any(Function),
-    );
-    expect((session as any).state.currentText).toBe("让我去扒一下这个项目。");
+    expect(updateCardContentSpy).toHaveBeenCalledWith(markdown, expect.any(Function));
+    expect((session as any).state.currentText).toBe(markdown);
   });
 
   it("stores a custom thinking panel title for tool-only updates", async () => {
@@ -239,7 +245,7 @@ describe("FeishuStreamingSession.update", () => {
     );
   });
 
-  it("strips inline reply tags before updating thinking content", async () => {
+  it("passes thinking content through unchanged (directive stripping deferred to upstream)", async () => {
     const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {
       appId: "app",
@@ -265,12 +271,14 @@ describe("FeishuStreamingSession.update", () => {
       title: "💭 Thinking",
     });
 
+    // Raw text passes through — directive tags are stripped by the
+    // reply-dispatcher at final delivery, not inside the streaming session.
     expect(updateElementSpy).toHaveBeenCalledWith(
       "thinking_content",
-      "让我去扒一下这个项目。",
+      "[[reply_to_current]] 让我去扒一下这个项目。",
       expect.any(Function),
     );
-    expect((session as any).state.thinkingText).toBe("让我去扒一下这个项目。");
+    expect((session as any).state.thinkingText).toBe("[[reply_to_current]] 让我去扒一下这个项目。");
   });
 
   it("rolls back thinking state after a failed full-card update so identical retries are still allowed", async () => {
@@ -537,7 +545,7 @@ describe("FeishuStreamingSession.close", () => {
     );
   });
 
-  it("strips inline reply tags from explicit final text before closing the card", async () => {
+  it("passes final text through unchanged on close (directive stripping deferred to upstream)", async () => {
     const { client } = createClientMock();
     const session = new FeishuStreamingSession(client, {
       appId: "app",
@@ -562,7 +570,11 @@ describe("FeishuStreamingSession.close", () => {
 
     await session.close("[[reply_to_current]] 让我去扒一下这个项目。");
 
-    expect(updateCardContentSpy).toHaveBeenCalledWith("让我去扒一下这个项目。");
+    // Raw text passes through — directive tags are stripped by the
+    // reply-dispatcher at final delivery, not inside the streaming session.
+    expect(updateCardContentSpy).toHaveBeenCalledWith(
+      "[[reply_to_current]] 让我去扒一下这个项目。",
+    );
   });
 
   it("keeps pending merge behavior when final text is omitted", async () => {

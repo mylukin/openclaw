@@ -941,7 +941,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         `closeStreaming called reason=${options?.reason ?? "none"} emitFinalText=${options?.emitFinalText ? "true" : "false"} active=${streaming?.isActive() ? "true" : "false"} streamMsgId=${streamMessageId ?? "none"} streamTextChars=${streamText.trim().length}`,
       );
       if (streaming?.isActive()) {
-        const finalText = streamText;
+        // Strip directive tags that were preserved in raw partials — they must
+        // not leak into the closed card when onIdle fires without a final deliver.
+        const finalText = stripInlineDirectiveTagsForDelivery(streamText).text;
         const finalThinking = composeThinkingContent({ final: true });
         const hasFinalText = finalText.trim().length > 0;
         const hasFinalThinking = finalThinking.text.trim().length > 0;
@@ -1444,7 +1446,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         : undefined,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            const cleanedText = stripInlineDirectiveTagsForDelivery(payload.text ?? "").text;
+            // Pass raw cumulative text through — directive tag stripping is
+            // deferred to final delivery (L1154) so streaming partials preserve
+            // all whitespace/newlines in markdown tables, lists, and fences.
+            // The `INLINE_DIRECTIVE_TAG_WITH_PADDING_RE` regex used by
+            // stripInlineDirectiveTagsForDelivery has `\s*` padding that eats
+            // newlines around directive tags, which collapses markdown rows.
+            const cleanedText = payload.text ?? "";
             if (!cleanedText) {
               return;
             }
