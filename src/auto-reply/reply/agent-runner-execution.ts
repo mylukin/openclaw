@@ -644,6 +644,14 @@ export async function runAgentTurnWithFallback(params: {
           }
           return { skip: true };
         }
+        // Pure-whitespace deltas (single space, newline) are valid streaming
+        // tokens — they preserve markdown spacing between words and bullet
+        // markers. sanitizeUserFacingText would .trim() them to "" and drop
+        // them entirely. They contain no patterns worth sanitizing, so pass
+        // them through as-is.
+        if (!text.trim()) {
+          return { text, skip: false };
+        }
         const sanitized = sanitizeUserFacingText(text, {
           errorContext: Boolean(payload.isError),
         });
