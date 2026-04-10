@@ -867,7 +867,11 @@ export function buildStatusMessage(args: StatusArgs): string {
     : null;
   const commit = resolveCommitHash({ moduleUrl: import.meta.url });
   const versionLine = `🦞 OpenClaw ${VERSION}${commit ? ` (${commit})` : ""}`;
-  const usagePair = formatUsagePair(inputTokens, outputTokens);
+  // Use totalTokens (= lastCall prompt size: input + cacheRead + cacheWrite)
+  // for the "in" display so it reflects real context usage, not just the
+  // uncached delta. Falls back to inputTokens when totalTokens is unknown
+  // (e.g. cleared after compaction).
+  const usagePair = formatUsagePair(totalTokens ?? inputTokens, outputTokens);
   const cacheLine = formatCacheLine(inputTokens, cacheRead, cacheWrite);
   const costLine = costLabel ? `💵 Cost: ${costLabel}` : null;
   const usageCostLine =
