@@ -146,13 +146,11 @@ export function mergeStreamingText(
   if (next.startsWith(previous)) {
     return next;
   }
-  // Previous already contains next (duplicate or out-of-order snapshot).
-  if (previous.startsWith(next) || previous.includes(next)) {
-    return previous;
-  }
-  if (next.includes(previous)) {
-    return next;
-  }
+  // NOTE: Do NOT check `previous.startsWith(next)` or `previous.includes(next)`.
+  // Delta producers (model-aware-runner) emit single-character tokens like "|",
+  // "\n", " ", "-" that trivially match as substrings/prefixes of accumulated
+  // text. Those checks silently swallow every repeated character — catastrophic
+  // for markdown tables.
   // Delta fragments (model-aware-runner emits token-level deltas like
   // "NO" + "_REPLY"). Append as-is to preserve every character.
   //

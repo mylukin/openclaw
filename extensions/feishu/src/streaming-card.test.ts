@@ -64,9 +64,9 @@ describe("mergeStreamingText", () => {
     expect(mergeStreamingText("hello", "hello world")).toBe("hello world");
   });
 
-  it("keeps previous text when the next partial is empty or redundant", () => {
+  it("keeps previous text when the next partial is empty or identical", () => {
     expect(mergeStreamingText("hello", "")).toBe("hello");
-    expect(mergeStreamingText("hello world", "hello")).toBe("hello world");
+    expect(mergeStreamingText("hello", "hello")).toBe("hello");
   });
 
   it("appends fragmented chunks without injecting newlines", () => {
@@ -84,9 +84,12 @@ describe("mergeStreamingText", () => {
     expect(mergeStreamingText("install", "lossless")).toBe("installlossless");
     expect(mergeStreamingText("abc| |", "| |xyz")).toBe("abc| || |xyz");
     expect(mergeStreamingText("NO", "_REPLY")).toBe("NO_REPLY");
-    // `next.includes(previous)` still short-circuits for genuine snapshot
-    // cases where the new chunk embeds the old chunk.
-    expect(mergeStreamingText("abc", "xxabcxx")).toBe("xxabcxx");
+    // Delta tokens must never be swallowed even if they appear as substrings
+    // of accumulated text — single chars like "|", "\n", "-" repeat constantly
+    // in markdown tables.
+    expect(mergeStreamingText("| col1 | col2 |", "|")).toBe("| col1 | col2 ||");
+    expect(mergeStreamingText("line1\n", "\n")).toBe("line1\n\n");
+    expect(mergeStreamingText("a b c", " ")).toBe("a b c ");
   });
 });
 
