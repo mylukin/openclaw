@@ -71,7 +71,7 @@ export async function runModelAwareAgent(
       if (!visibleUpdate) {
         return;
       }
-      if (visibleUpdate.delta.trim()) {
+      if (visibleUpdate.delta) {
         void params.onPartialReply?.({ text: visibleUpdate.delta });
       }
       emitAgentEvent(params.onAgentEvent, {
