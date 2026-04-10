@@ -347,17 +347,22 @@ export function buildClaudeSystemPromptLoaderPrompt(params: {
 export function buildClaudeSystemPromptCompletionPrompt(params: {
   chunks: ClaudeSystemPromptChunk[];
   startIndex: number;
+  userPrompt?: string;
 }): string {
   const remaining = params.chunks.slice(params.startIndex);
   const orderedFiles = remaining.map((chunk) => `${chunk.index + 1}. ${chunk.filePath}`);
-  return [
+  const lines = [
     "You have not yet completed reading all session prompt files.",
-    `MANDATORY NEXT STEP: continue reading the remaining files in exact order, starting with file ${params.startIndex + 1}.`,
+    `Read the remaining files in exact order, starting with file ${params.startIndex + 1}, then proceed with the user's task.`,
     ...orderedFiles,
     "Use the Read tool (or lowercase read tool) on each listed path with no offset and no limit.",
     "If you do not call Read on the next unread file, your response will be ignored.",
-    "Do not read any other file first, do not answer the user yet, and do not continue until every remaining file has been read successfully in this run.",
-  ].join("\n");
+    "After reading all listed files, immediately proceed with the user's task below.",
+  ];
+  if (params.userPrompt?.trim()) {
+    lines.push("", "---", "", params.userPrompt.trim());
+  }
+  return lines.join("\n");
 }
 
 export class PromptFileReadRequiredError extends Error {

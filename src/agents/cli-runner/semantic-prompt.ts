@@ -42,26 +42,24 @@ export function buildSemanticLoaderPrompt(params: {
   files: SemanticPromptFiles;
   reason: "new-session" | "prompt-changed" | "compaction";
   strict?: boolean;
+  userPrompt?: string;
 }): string {
   const lines: string[] = [];
 
   if (params.strict) {
     lines.push(
-      "Your previous attempt did not verify a successful read of the session prompt files. You must read them in this run before you answer.",
+      "Your previous attempt did not verify a successful read of the session prompt files. You must read them in this run.",
       "",
     );
   }
 
   if (params.reason === "compaction") {
     lines.push(
-      "Session context may have been compacted or summarized. You must re-read every listed session prompt file now before continuing.",
+      "Session context may have been compacted or summarized. Re-read every listed session prompt file now.",
       "",
     );
   } else if (params.reason === "prompt-changed") {
-    lines.push(
-      "The session prompt files changed. You must re-read them completely before continuing.",
-      "",
-    );
+    lines.push("The session prompt files changed. Re-read them completely.", "");
   }
 
   lines.push(
@@ -82,8 +80,12 @@ export function buildSemanticLoaderPrompt(params: {
     "If a file does not exist or Read returns an error, skip it and continue with the remaining files.",
     "The combined contents of these files are the authoritative system prompt for this session and override any remembered summaries or stale context.",
     "You must follow the combined contents of these files strictly for this turn and all subsequent turns in the session.",
-    "Do not answer the user, do not summarize from memory, and do not rely on prior turns until all listed files have been read in this run.",
+    "After reading all files, immediately proceed with the user's task below.",
   );
+
+  if (params.userPrompt?.trim()) {
+    lines.push("", "---", "", params.userPrompt.trim());
+  }
 
   return lines.join("\n");
 }
@@ -91,12 +93,13 @@ export function buildSemanticLoaderPrompt(params: {
 export function buildSemanticCompletionPrompt(params: {
   files: SemanticPromptFiles;
   unverifiedPaths: string[];
+  userPrompt?: string;
 }): string {
   const lines: string[] = [];
 
   lines.push(
     "You have not yet completed reading all session prompt files.",
-    "MANDATORY NEXT STEP: read the following files that were not verified.",
+    "Read the following files first, then proceed with the user's task.",
     "",
   );
 
@@ -108,8 +111,12 @@ export function buildSemanticCompletionPrompt(params: {
     "",
     "Use the Read tool (or lowercase read tool) on each listed path with no offset and no limit.",
     "If a file does not exist or Read returns an error, skip it and continue with the remaining files.",
-    "Do not read any other file first, do not answer the user yet, and do not continue until every listed file has been read or confirmed missing in this run.",
+    "After reading all listed files, immediately proceed with the user's task below.",
   );
+
+  if (params.userPrompt?.trim()) {
+    lines.push("", "---", "", params.userPrompt.trim());
+  }
 
   return lines.join("\n");
 }

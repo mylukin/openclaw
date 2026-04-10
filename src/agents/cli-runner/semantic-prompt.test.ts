@@ -139,6 +139,24 @@ describe("buildSemanticLoaderPrompt", () => {
     });
     expect(out).toContain("compacted or summarized");
   });
+
+  it("appends user prompt when provided", () => {
+    const out = buildSemanticLoaderPrompt({
+      files,
+      reason: "new-session",
+      userPrompt: "help me debug this",
+    });
+    expect(out).toContain("---");
+    expect(out).toContain("help me debug this");
+  });
+
+  it("omits user prompt section when not provided", () => {
+    const out = buildSemanticLoaderPrompt({
+      files,
+      reason: "new-session",
+    });
+    expect(out).not.toContain("---");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -162,12 +180,30 @@ describe("buildSemanticCompletionPrompt", () => {
     expect(out).not.toContain("/b/session.system-prompt.txt");
   });
 
-  it("contains mandatory instruction", () => {
+  it("contains proceed instruction", () => {
     const out = buildSemanticCompletionPrompt({
       files,
       unverifiedPaths: ["/a/AGENTS.md"],
     });
-    expect(out).toContain("MANDATORY NEXT STEP");
+    expect(out).toContain("proceed with the user's task");
+  });
+
+  it("appends user prompt when provided", () => {
+    const out = buildSemanticCompletionPrompt({
+      files,
+      unverifiedPaths: ["/a/AGENTS.md"],
+      userPrompt: "analyze this repo",
+    });
+    expect(out).toContain("---");
+    expect(out).toContain("analyze this repo");
+  });
+
+  it("omits user prompt section when not provided", () => {
+    const out = buildSemanticCompletionPrompt({
+      files,
+      unverifiedPaths: ["/a/AGENTS.md"],
+    });
+    expect(out).not.toContain("---");
   });
 });
 
