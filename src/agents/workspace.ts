@@ -540,6 +540,15 @@ export async function loadWorkspaceBootstrapFiles(dir: string): Promise<Workspac
         missing: false,
       });
     } else {
+      // BOOTSTRAP.md is an onboarding-only file. Once the agent deletes it
+      // after completing onboarding (per BOOTSTRAP.md's own instructions),
+      // it should disappear from the session prompt loader entirely — not
+      // show up as a `[MISSING]` diagnostic that the model is told to read.
+      // Post-onboarding agents have no BOOTSTRAP.md and should not see it
+      // referenced at all.
+      if (entry.name === DEFAULT_BOOTSTRAP_FILENAME) {
+        continue;
+      }
       result.push({ name: entry.name, path: entry.filePath, missing: true });
     }
   }
