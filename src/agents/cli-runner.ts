@@ -148,14 +148,6 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
         }
         throw err;
       }
-      // AbortError (user /stop) must pass through unchanged so that
-      // agent-runner-execution.ts can recognise it as an expected abort
-      // via `err.name === "AbortError"`.  Without this early return a
-      // future addition to the failover classifier could accidentally
-      // rewrap an AbortError as a FailoverError and lose the name.
-      if (err instanceof Error && err.name === "AbortError") {
-        throw err;
-      }
       const message = err instanceof Error ? err.message : String(err);
       if (isFailoverErrorMessage(message, { provider: params.provider })) {
         const reason = classifyFailoverReason(message, { provider: params.provider }) ?? "unknown";

@@ -21,8 +21,6 @@ import {
   getBootstrapProfileConfig,
   isContextOverflowError,
 } from "../pi-embedded-helpers.js";
-import { resolveProactiveCompactionRatio } from "../pi-settings.js";
-import { derivePromptTokens } from "../usage.js";
 import { ENABLE_SEMANTIC_PROMPT_LOADER } from "./flags.js";
 import {
   appendImagePathsToPrompt,
@@ -63,95 +61,6 @@ import {
   resolveSemanticExpectedFiles,
 } from "./semantic-prompt.js";
 import type { PreparedCliRunContext } from "./types.js";
-
-/**
- * Throws an AbortError when the provided AbortSignal has already fired.
- *
- * Mirrors the embedded runner's `throwIfAborted` helper
- * (src/agents/pi-embedded-runner/run.ts) so CLI-runner JS orchestration
- * exits promptly on user /stop instead of spawning more subprocesses.
- *
- * The thrown error preserves the signal's `reason` when it is an Error
- * instance, matching the embedded runner's behaviour so downstream code
- * in `agent-runner-execution.ts` that checks `err.name === "AbortError"`
- * recognises the abort uniformly across both runtimes.
- */
-export function checkAbortSignal(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) {
-    return;
-  }
-  const reason = signal.reason;
-  if (reason instanceof Error) {
-    throw reason;
-  }
-  const err =
-    reason !== undefined
-      ? new Error("CLI runner aborted", { cause: reason })
-      : new Error("CLI runner aborted");
-  err.name = "AbortError";
-  throw err;
-}
-
-/**
- * Decision result for proactive post-run compaction in the CLI runner.
- * Exported for unit testing; the actual `/compact` invocation is driven
- * by `executeWithOverflowProtection`.
- */
-export type ProactiveCompactionDecision =
-  | { shouldCompact: false; reason: string }
-  | {
-      shouldCompact: true;
-      promptTokens: number;
-      ratio: number;
-      threshold: number;
-    };
-
-/**
- * Pure function: decide whether to send `/compact` proactively after a
- * successful CLI run.  Kept isolated from I/O so it can be unit tested
- * without mocking the whole executeWithOverflowProtection flow.
- */
-export function resolveProactiveCompactionDecision(params: {
-  compactionsThisRun: number;
-  abortSignalAborted: boolean;
-  hasSession: boolean;
-  isClaude: boolean;
-  proactiveRatio: number;
-  promptTokens: number | undefined;
-  contextWindowTokens: number;
-}): ProactiveCompactionDecision {
-  if (params.compactionsThisRun !== 0) {
-    return { shouldCompact: false, reason: "already_compacted_this_run" };
-  }
-  if (params.abortSignalAborted) {
-    return { shouldCompact: false, reason: "aborted" };
-  }
-  if (!params.hasSession) {
-    return { shouldCompact: false, reason: "no_session" };
-  }
-  if (!params.isClaude) {
-    return { shouldCompact: false, reason: "not_claude_cli" };
-  }
-  if (!(params.proactiveRatio > 0)) {
-    return { shouldCompact: false, reason: "disabled_by_config" };
-  }
-  if (params.promptTokens == null) {
-    return { shouldCompact: false, reason: "prompt_tokens_unknown" };
-  }
-  if (!(params.contextWindowTokens > 0)) {
-    return { shouldCompact: false, reason: "context_window_unknown" };
-  }
-  const ratio = params.promptTokens / params.contextWindowTokens;
-  if (!(ratio > params.proactiveRatio)) {
-    return { shouldCompact: false, reason: "ratio_below_threshold" };
-  }
-  return {
-    shouldCompact: true,
-    promptTokens: params.promptTokens,
-    ratio,
-    threshold: params.proactiveRatio,
-  };
-}
 
 const executeDeps = {
   getProcessSupervisor: getProcessSupervisorImpl,
@@ -402,11 +311,6 @@ export async function executeWithOverflowProtection(
     forceReloadSystemPromptFile: boolean,
     loaderPromptMode: "normal" | "strict" | "disabled",
   ): Promise<CliOutput> => {
-    // Fast-exit the JS orchestration before any subprocess spawn.  This is
-    // the single entry point for every spawn in this module (main run,
-    // loader retries, strict/disabled fallbacks, overflow-recovery /compact,
-    // proactive /compact), so the check here covers them all.
-    checkAbortSignal(params.abortSignal);
     const backend = context.preparedBackend.backend;
     const currentCompactionCount =
       Math.max(0, params.sessionCompactionCount ?? 0) + compactionsThisRun;
@@ -1050,14 +954,6 @@ export async function executeWithOverflowProtection(
           cliSessionId: useResume ? resolvedSessionId : undefined,
         });
 
-        // Re-check abort right before spawning.  The top-of-function check
-        // covers the case where /stop fires *before* we entered
-        // executeCliWithSession, but a pending task can sit for a non-trivial
-        // window in enqueueCliRun queue waits, prompt-file writes, and image
-        // loading.  Re-checking here avoids spawning a subprocess that will
-        // immediately be SIGKILL'd by the supervisor path.
-        checkAbortSignal(params.abortSignal);
-
         const managedRun = await supervisor.spawn({
           sessionId: params.sessionId,
           backendId: context.backendResolved.id,
@@ -1355,12 +1251,10 @@ export async function executeWithOverflowProtection(
                     unverifiedPaths: completionError.unverifiedPaths ?? [
                       completionError.promptFile ?? "",
                     ],
-                    userPrompt: runParams.promptOverride,
                   })
                 : buildClaudeSystemPromptCompletionPrompt({
                     chunks: latestPromptChunks,
                     startIndex: verifiedPromptChunkCounts.get(completionSessionId) ?? 0,
-                    userPrompt: runParams.promptOverride,
                   });
             return await executeCliWithSession(
               completionSessionId,
@@ -1478,57 +1372,6 @@ export async function executeWithOverflowProtection(
   // Layer 2: Context overflow recovery
   try {
     const output = await executeCliWithLoaderFallback({ cliSessionId: cliSessionIdToUse });
-
-    // ── Proactive post-run compaction ──────────────────────────────
-    // After a successful run, if prompt tokens exceed the configured
-    // ratio of the context window, send /compact now so the next turn
-    // starts with headroom.  Skip when this run already compacted,
-    // or when there is no reusable session to compact.
-    // NB: output.usage still reflects the pre-compaction high-water
-    // mark.  We intentionally do NOT clear it: the CLI runner path
-    // does not propagate lastCallUsage, so incrementRunCompactionCount
-    // cannot compute a post-compaction tokensAfter estimate regardless.
-    // The session store's tokens will briefly show stale values until
-    // the next run writes fresh numbers.  This matches the embedded
-    // runner's behaviour and is an accepted limitation of proactive
-    // compaction: the feature fixes context overflow for the next turn,
-    // not the session-store display between runs.
-    const proactiveDecision = resolveProactiveCompactionDecision({
-      compactionsThisRun,
-      abortSignalAborted: params.abortSignal?.aborted === true,
-      hasSession: Boolean(cliSessionIdToUse),
-      isClaude: context.isClaude,
-      proactiveRatio: resolveProactiveCompactionRatio(params.config),
-      promptTokens: derivePromptTokens(output.usage),
-      contextWindowTokens: context.contextWindowTokens,
-    });
-    if (proactiveDecision.shouldCompact && cliSessionIdToUse) {
-      try {
-        cliBackendLog.info(
-          `cli-runner: proactive compaction triggered — prompt ${proactiveDecision.promptTokens}/${context.contextWindowTokens} ` +
-            `(${Math.round(proactiveDecision.ratio * 100)}%) > ${Math.round(proactiveDecision.threshold * 100)}% threshold`,
-        );
-        if (params.sessionKey) {
-          executeDeps.enqueueSystemEvent(
-            "Context usage high. Compacting conversation context proactively...",
-            { sessionKey: params.sessionKey },
-          );
-        }
-        await executeCliWithSession(cliSessionIdToUse, "/compact", true, false, "normal");
-        compactionsThisRun += 1;
-        cliBackendLog.info("cli-runner: proactive /compact succeeded");
-      } catch (compactErr) {
-        cliBackendLog.warn(
-          `cli-runner: proactive /compact failed (${compactErr instanceof Error ? compactErr.message : String(compactErr)})`,
-        );
-      }
-      // Re-check abort after the catch above: if the /compact failure was
-      // actually caused by an aborted signal (AbortError swallowed into a
-      // warn log), we must still propagate the abort instead of returning
-      // as if everything was fine.
-      checkAbortSignal(params.abortSignal);
-    }
-
     return {
       output,
       cliSessionBinding: latestCliSessionBinding,
@@ -1538,10 +1381,6 @@ export async function executeWithOverflowProtection(
     };
   } catch (err) {
     if (err instanceof FailoverError && isContextOverflowError(err.message)) {
-      // If the user aborted between the Layer 1 failure and now, don't
-      // attempt /compact + profile downgrade + retry — propagate the
-      // abort immediately.
-      checkAbortSignal(params.abortSignal);
       const backend = context.preparedBackend.backend;
       const imageTokenEstimate = backend.imageArg
         ? (params.images?.length ?? 0) * ESTIMATED_TOKENS_PER_IMAGE
@@ -1571,10 +1410,6 @@ export async function executeWithOverflowProtection(
             `cli-runner: /compact failed (${compactErr instanceof Error ? compactErr.message : String(compactErr)}), proceeding with profile downgrade only`,
           );
         }
-        // Re-check abort: the /compact failure may have swallowed an
-        // AbortError. If so, stop here instead of continuing into the
-        // profile downgrade + retry path.
-        checkAbortSignal(params.abortSignal);
       }
 
       // Step 2b: Downgrade bootstrap profile to minimal
