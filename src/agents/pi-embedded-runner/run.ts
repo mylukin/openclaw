@@ -55,6 +55,7 @@ import {
   parseImageSizeError,
   pickFallbackThinkingLevel,
 } from "../pi-embedded-helpers.js";
+import { resolveProactiveCompactionRatio } from "../pi-settings.js";
 import { ensureRuntimePluginsLoaded } from "../runtime-plugins.js";
 import { derivePromptTokens, normalizeUsage, type UsageLike } from "../usage.js";
 import { redactRunIdentifier, resolveRunWorkspaceDir } from "../workspace-run.js";
@@ -325,6 +326,11 @@ export async function runEmbeddedPiAgent(
 
       const MAX_TIMEOUT_COMPACTION_ATTEMPTS = 2;
       const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
+      // Proactive compaction ratio resolved from config; when the last API
+      // call's prompt size exceeds this fraction of the context window, we
+      // compact the session after a successful run so the next turn starts
+      // with headroom. A value of 0 disables proactive compaction.
+      const proactiveCompactionRatio = resolveProactiveCompactionRatio(params.config);
       const MAX_RUN_LOOP_ITERATIONS = resolveMaxRunRetryIterations(profileCandidates.length);
       let overflowCompactionAttempts = 0;
       let toolResultTruncationAttempted = false;
@@ -1487,6 +1493,118 @@ export async function runEmbeddedPiAgent(
               agentDir: params.agentDir,
             });
           }
+
+          // ── Proactive post-run compaction ────────────────────────────────
+          // After a successful run, if the last API call's prompt size is a
+          // high fraction of the context window, compact now so the next turn
+          // starts with headroom. Skip when this run already compacted (the
+          // fresh session is already small), when we're aborting/timing out,
+          // or when the configured ratio disables proactive compaction.
+          if (!aborted && !timedOut && autoCompactionCount === 0 && proactiveCompactionRatio > 0) {
+            const proactivePromptTokens = derivePromptTokens(lastRunPromptUsage);
+            const proactiveRatio =
+              proactivePromptTokens != null && ctxInfo.tokens > 0
+                ? proactivePromptTokens / ctxInfo.tokens
+                : 0;
+            if (proactiveRatio > proactiveCompactionRatio) {
+              const proactiveDiagId = createCompactionDiagId();
+              log.info(
+                `[proactive-compaction] prompt tokens ${proactivePromptTokens}/${ctxInfo.tokens} ` +
+                  `(${Math.round(proactiveRatio * 100)}%) > ${Math.round(proactiveCompactionRatio * 100)}% threshold; ` +
+                  `compacting after successful run for ${provider}/${modelId} diagId=${proactiveDiagId}`,
+              );
+              let proactiveResult: Awaited<ReturnType<typeof contextEngine.compact>>;
+              await runOwnsCompactionBeforeHook("proactive");
+              try {
+                const proactiveRuntimeContext = {
+                  ...buildEmbeddedCompactionRuntimeContext({
+                    sessionKey: params.sessionKey,
+                    messageChannel: params.messageChannel,
+                    messageProvider: params.messageProvider,
+                    agentAccountId: params.agentAccountId,
+                    currentChannelId: params.currentChannelId,
+                    currentThreadTs: params.currentThreadTs,
+                    currentMessageId: params.currentMessageId,
+                    authProfileId: lastProfileId,
+                    workspaceDir: resolvedWorkspace,
+                    agentDir,
+                    config: params.config,
+                    skillsSnapshot: params.skillsSnapshot,
+                    senderIsOwner: params.senderIsOwner,
+                    senderId: params.senderId,
+                    provider,
+                    modelId,
+                    thinkLevel,
+                    reasoningLevel: params.reasoningLevel,
+                    bashElevated: params.bashElevated,
+                    extraSystemPrompt: params.extraSystemPrompt,
+                    ownerNumbers: params.ownerNumbers,
+                  }),
+                  runId: params.runId,
+                  trigger: "proactive",
+                  currentTokenCount: proactivePromptTokens,
+                  diagId: proactiveDiagId,
+                };
+                proactiveResult = await contextEngine.compact({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  sessionFile: params.sessionFile,
+                  tokenBudget: ctxInfo.tokens,
+                  currentTokenCount: proactivePromptTokens,
+                  force: true,
+                  compactionTarget: "budget",
+                  runtimeContext: proactiveRuntimeContext,
+                });
+                if (proactiveResult.ok && proactiveResult.compacted) {
+                  await runContextEngineMaintenance({
+                    contextEngine,
+                    sessionId: params.sessionId,
+                    sessionKey: params.sessionKey,
+                    sessionFile: params.sessionFile,
+                    reason: "compaction",
+                    runtimeContext: proactiveRuntimeContext,
+                  });
+                }
+              } catch (compactErr) {
+                log.warn(
+                  `[proactive-compaction] contextEngine.compact() threw for ${provider}/${modelId}: ${String(compactErr)}`,
+                );
+                proactiveResult = {
+                  ok: false,
+                  compacted: false,
+                  reason: String(compactErr),
+                };
+              }
+              await runOwnsCompactionAfterHook("proactive", proactiveResult);
+              if (proactiveResult.compacted) {
+                autoCompactionCount += 1;
+                agentMeta.compactionCount = autoCompactionCount;
+                // Clear stale pre-compaction usage from agentMeta so that
+                // persistRunSessionUsage does not overwrite the session entry
+                // with the old high-water totalTokens. The downstream
+                // incrementRunCompactionCount path will write the correct
+                // post-compaction tokensAfter estimate via lastCallUsage.
+                agentMeta.usage = undefined;
+                agentMeta.lastCallUsage = undefined;
+                agentMeta.promptTokens = undefined;
+                if (contextEngine.info.ownsCompaction === true) {
+                  await runPostCompactionSideEffects({
+                    config: params.config,
+                    sessionKey: params.sessionKey,
+                    sessionFile: params.sessionFile,
+                  });
+                }
+                log.info(
+                  `[proactive-compaction] compaction succeeded for ${provider}/${modelId} diagId=${proactiveDiagId}`,
+                );
+              } else {
+                log.warn(
+                  `[proactive-compaction] compaction did not reduce context for ${provider}/${modelId}: ${proactiveResult.reason ?? "unknown"}`,
+                );
+              }
+            }
+          }
+
           return {
             payloads: payloads.length ? payloads : undefined,
             meta: {
