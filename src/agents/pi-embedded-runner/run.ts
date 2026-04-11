@@ -36,7 +36,7 @@ import {
   resolveAuthProfileOrder,
   shouldPreferExplicitConfigApiKeyAuth,
 } from "../model-auth.js";
-import { normalizeProviderId, resolveNonCliModelRef } from "../model-selection.js";
+import { isCliProvider, normalizeProviderId } from "../model-selection.js";
 import { ensureOpenClawModelsJson } from "../models-config.js";
 import { disposeSessionMcpRuntime } from "../pi-bundle-mcp-tools.js";
 import {
@@ -168,11 +168,21 @@ export async function runEmbeddedPiAgent(
       let provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       let modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
 
-      // Resolve CLI provider aliases (e.g. claude-cli/kimi → real provider/model)
-      // before the embedded runner tries to look up the model in the registry.
-      const resolvedCliRef = resolveNonCliModelRef({ provider, model: modelId }, params.config);
-      provider = resolvedCliRef.provider;
-      modelId = resolvedCliRef.model;
+      // Refuse CLI-provider refs loudly rather than silently rewriting them
+      // into a non-CLI model via the alias index. The embedded runner is not
+      // the right path for claude-cli/* or codex-cli/* — callers must dispatch
+      // to cli-runner (runCliAgent) first. Letting a cli ref through here used
+      // to silently map e.g. `claude-cli/sonnet` to `anthropic/claude-sonnet-4-6`
+      // because the "sonnet" alias is also registered on the anthropic provider,
+      // picking up the wrong account pool and returning
+      // "500 No available accounts in group OpenClaw".
+      if (isCliProvider(provider, params.config)) {
+        throw new FailoverError(
+          `CLI-provider model ${provider}/${modelId} was routed to the embedded runner; ` +
+            `caller must dispatch claude-cli/codex-cli refs to runCliAgent.`,
+          { reason: "model_not_found", provider, model: modelId },
+        );
+      }
 
       const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
       const fallbackConfigured = hasConfiguredModelFallbacks({
