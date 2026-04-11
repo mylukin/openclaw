@@ -81,9 +81,7 @@ describe("buildStatusMessage", () => {
     expect(normalized).toContain("Model: anthropic/pi:opus");
     expect(normalized).not.toContain("Last runtime:");
     expect(normalized).toContain("api-key");
-    // Tokens "in" shows totalTokens (= prompt size incl. cache) for
-    // consistency with the Context line; see src/auto-reply/status.ts.
-    expect(normalized).toContain("Tokens: 16k in / 800 out");
+    expect(normalized).toContain("Tokens: 1.2k in / 800 out");
     expect(normalized).toContain("Cost: $0.0020");
     expect(normalized).toContain("Context: 16k/32k (50%)");
     expect(normalized).toContain("Compactions: 2");
