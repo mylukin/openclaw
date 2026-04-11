@@ -116,6 +116,17 @@ async function resolveClaudeBareManagedEnv(params: {
     return undefined;
   }
 
+  // If the user already pinned Anthropic credentials in
+  // `cliBackends.claude-cli.env` (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY),
+  // respect that override and skip auto-injection. Otherwise claude subprocess
+  // receives two conflicting credentials at once and routing relays may pick
+  // the stale one (e.g. Bearer from backend.env + x-api-key from the generic
+  // anthropic provider auto-inject), producing opaque upstream failures.
+  const explicitBackendEnv = params.backendConfig.env ?? {};
+  if (explicitBackendEnv.ANTHROPIC_AUTH_TOKEN || explicitBackendEnv.ANTHROPIC_API_KEY) {
+    return undefined;
+  }
+
   const explicitProviderKey = resolveUsableCustomProviderApiKey({
     cfg: params.config,
     provider: "anthropic",

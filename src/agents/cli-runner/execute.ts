@@ -691,6 +691,20 @@ export async function executeWithOverflowProtection(
             );
           }
           Object.assign(next, context.preparedBackend.env);
+          // Defense in depth: when both ANTHROPIC_AUTH_TOKEN and
+          // ANTHROPIC_API_KEY end up in the claude-cli child env (for example
+          // a stale provider auto-inject colliding with an explicit
+          // cliBackends auth token override), claude CLI would forward both
+          // credentials as Authorization + x-api-key headers at once. Relays
+          // may then pick the wrong one and surface opaque upstream failures.
+          // The more specific AUTH_TOKEN wins; drop the duplicate API_KEY.
+          if (
+            context.backendResolved.id === "claude-cli" &&
+            next.ANTHROPIC_AUTH_TOKEN &&
+            next.ANTHROPIC_API_KEY
+          ) {
+            delete next.ANTHROPIC_API_KEY;
+          }
           return next;
         })();
         const noOutputTimeoutMs = resolveCliNoOutputTimeoutMs({
