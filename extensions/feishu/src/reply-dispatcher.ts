@@ -780,6 +780,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return text.substring(0, lastAtIdx);
   };
 
+  /** Strip a leading [[reply_to_current]] / [[reply_to:<id>]] directive tag
+   *  for render-only display. Only touches the prefix and its surrounding
+   *  whitespace — markdown structure in the middle of the body is preserved.
+   *  streamText itself is left untouched; this runs on the render-time copy. */
+  const stripLeadingReplyDirectiveForRender = (text: string): string =>
+    text.replace(/^\s*\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/i, "");
+
   /** Queue an update to the main content element only. */
   const queueStreamingRender = () => {
     partialUpdateQueue = partialUpdateQueue.then(async () => {
@@ -790,7 +797,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         return;
       }
       const safeRendered = stripIncompleteAtTag(streamText);
-      const renderedForCard = normalizeMentionTagsForCard(safeRendered);
+      const displayRendered = stripLeadingReplyDirectiveForRender(safeRendered);
+      const renderedForCard = normalizeMentionTagsForCard(displayRendered);
       if (!renderedForCard || renderedForCard === lastRenderedStreamContent) {
         return;
       }
