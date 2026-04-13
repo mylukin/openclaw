@@ -21,6 +21,7 @@ function normalizeCreatedAt(raw: RawLesson, fallbackIso: string): string {
 export interface MigrateDiffEntry {
   id: string;
   addedFields: string[];
+  repairedFields: string[];
 }
 
 export interface MigrateResult {
@@ -48,6 +49,7 @@ export function migrateData(
   const rawLessons = Array.isArray(cloned.lessons) ? cloned.lessons : [];
   const migratedLessons: Lesson[] = rawLessons.map((orig) => {
     const added: string[] = [];
+    const repaired: string[] = [];
     const lesson = { ...(orig as Record<string, unknown>) } as Record<string, unknown>;
 
     const addIfMissing = (key: string, value: unknown) => {
@@ -59,10 +61,12 @@ export function migrateData(
 
     addIfMissing("createdAt", normalizeCreatedAt(orig, fallbackIso));
 
-    // severity: preserve existing disk value; only default when missing.
     if (!("severity" in lesson)) {
       lesson.severity = normalizeSeverity(undefined);
       added.push("severity");
+    } else if (!VALID_SEVERITIES.has(lesson.severity as Severity)) {
+      lesson.severity = normalizeSeverity(lesson.severity);
+      repaired.push("severity");
     }
 
     addIfMissing("hitCount", 0);
@@ -71,15 +75,19 @@ export function migrateData(
     addIfMissing("mergedFrom", []);
     addIfMissing("duplicateOf", null);
 
-    if (!("lifecycle" in lesson) || !VALID_LIFECYCLES.has(lesson.lifecycle as string)) {
-      if (!("lifecycle" in lesson)) added.push("lifecycle");
+    if (!("lifecycle" in lesson)) {
       lesson.lifecycle = "active";
+      added.push("lifecycle");
+    } else if (!VALID_LIFECYCLES.has(lesson.lifecycle as string)) {
+      lesson.lifecycle = "active";
+      repaired.push("lifecycle");
     }
 
-    if (added.length > 0) {
+    if (added.length > 0 || repaired.length > 0) {
       diff.push({
         id: String(lesson.id),
         addedFields: added,
+        repairedFields: repaired,
       });
     }
 

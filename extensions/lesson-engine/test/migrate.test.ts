@@ -118,6 +118,62 @@ describe("migrate schema", () => {
     }
   });
 
+  test("repairs invalid severity values (e.g. medium → important)", () => {
+    const raw: RawLessonsFile = {
+      version: 1,
+      lessons: [
+        {
+          id: "lesson-0010",
+          date: "2026-03-01",
+          category: "testing",
+          title: "Bad sev",
+          tags: ["test"],
+          severity: "medium" as any,
+          // all other fields already present to isolate the repair
+          createdAt: "2026-03-01T00:00:00.000Z",
+          hitCount: 0,
+          appliedCount: 0,
+          lastHitAt: null,
+          mergedFrom: [],
+          duplicateOf: null,
+          lifecycle: "active",
+        },
+      ],
+    };
+    const { migrated, diff } = migrateData(raw);
+    expect(migrated.lessons[0].severity).toBe("important");
+    expect(diff).toHaveLength(1);
+    expect(diff[0].repairedFields).toContain("severity");
+    expect(diff[0].addedFields).toEqual([]);
+  });
+
+  test("repairs invalid lifecycle values (e.g. expired → active)", () => {
+    const raw: RawLessonsFile = {
+      version: 1,
+      lessons: [
+        {
+          id: "lesson-0011",
+          date: "2026-03-01",
+          category: "testing",
+          title: "Bad lifecycle",
+          tags: ["test"],
+          severity: "minor",
+          createdAt: "2026-03-01T00:00:00.000Z",
+          hitCount: 0,
+          appliedCount: 0,
+          lastHitAt: null,
+          mergedFrom: [],
+          duplicateOf: null,
+          lifecycle: "expired" as any,
+        },
+      ],
+    };
+    const { migrated, diff } = migrateData(raw);
+    expect(migrated.lessons[0].lifecycle).toBe("active");
+    expect(diff).toHaveLength(1);
+    expect(diff[0].repairedFields).toContain("lifecycle");
+  });
+
   test("dry-run reports diff without writing", () => {
     const fx = makeFixture();
     try {
