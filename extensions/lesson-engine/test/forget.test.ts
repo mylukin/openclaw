@@ -47,6 +47,12 @@ describe("forget scoring", () => {
     const s = scoreLesson(makeLesson({ id: "X", createdAt: "invalid-date" }), NOW);
     expect(s.daysSinceLastHit).toBeGreaterThan(3000);
   });
+
+  test("unknown severities fall back to medium scoring", () => {
+    const lesson = makeLesson({ id: "X", severity: "medium" });
+    (lesson as { severity: string }).severity = "unknown";
+    expect(scoreLesson(lesson, NOW).severity).toBe(0.5);
+  });
 });
 
 describe("forget lifecycle transitions", () => {
@@ -166,6 +172,34 @@ describe("forget file", () => {
       });
       expect(result.wrote).toBe(false);
       expect(fs.readFileSync(filePath, "utf8")).toBe(before);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("apply mode writes transitions and uses file.maxActive when option is omitted", () => {
+    const fx = makeFixture();
+    try {
+      const filePath = writeLessons(fx, "builder", {
+        version: 1,
+        maxActive: 1,
+        lessons: [
+          makeLesson({ id: "a", createdAt: "2026-04-01T00:00:00Z" }),
+          makeLesson({ id: "b", createdAt: "2026-01-01T00:00:00Z" }),
+        ],
+      });
+      const result = forgetFile({
+        filePath,
+        agent: "builder",
+        dryRun: false,
+        now: NOW,
+      });
+      expect(result.wrote).toBe(true);
+      expect(result.maxActive).toBe(1);
+      const after = JSON.parse(fs.readFileSync(filePath, "utf8")) as {
+        lessons: Array<{ id: string; lifecycle: string }>;
+      };
+      expect(after.lessons.filter((lesson) => lesson.lifecycle === "active")).toHaveLength(1);
     } finally {
       fx.cleanup();
     }

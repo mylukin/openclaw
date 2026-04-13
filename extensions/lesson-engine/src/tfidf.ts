@@ -4,10 +4,23 @@
 /** Lowercase + split on anything that's not a letter/number. Empty tokens dropped. */
 export function tokenize(text: string): string[] {
   if (!text) return [];
-  return text
+  const baseTokens = text
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((tok) => tok.length > 0);
+  const tokens = [...baseTokens];
+  for (const token of baseTokens) {
+    const chars = [...token];
+    if (chars.length < 2) continue;
+    const hasCjk = chars.some((char) =>
+      /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(char),
+    );
+    if (!hasCjk) continue;
+    for (let index = 0; index < chars.length - 1; index++) {
+      tokens.push(chars.slice(index, index + 2).join(""));
+    }
+  }
+  return tokens;
 }
 
 export type TfMap = Map<string, number>;

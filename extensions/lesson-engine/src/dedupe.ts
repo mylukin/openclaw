@@ -58,7 +58,7 @@ function unionTags(a: string[] | undefined, b: string[] | undefined): string[] {
   const set = new Set<string>();
   for (const t of a ?? []) set.add(t);
   for (const t of b ?? []) set.add(t);
-  return Array.from(set);
+  return Array.from(set).sort((left, right) => left.localeCompare(right));
 }
 
 /**
@@ -114,8 +114,16 @@ export function dedupeData(
       const tagsAfter = unionTags(keep.tags, merge.tags);
       keep.tags = tagsAfter;
       keep.mergedFrom = Array.isArray(keep.mergedFrom)
-        ? [...keep.mergedFrom, merge.id]
-        : [merge.id];
+        ? Array.from(new Set([...keep.mergedFrom, merge.id, ...(merge.mergedFrom ?? [])]))
+        : [merge.id, ...(merge.mergedFrom ?? [])];
+      keep.hitCount = (keep.hitCount ?? 0) + (merge.hitCount ?? 0);
+      keep.appliedCount = (keep.appliedCount ?? 0) + (merge.appliedCount ?? 0);
+      if (
+        merge.lastHitAt &&
+        (!keep.lastHitAt || Date.parse(merge.lastHitAt) > Date.parse(keep.lastHitAt))
+      ) {
+        keep.lastHitAt = merge.lastHitAt;
+      }
       merge.lifecycle = "archive";
       merge.duplicateOf = keep.id;
       merge.lastHitAt = merge.lastHitAt ?? null;

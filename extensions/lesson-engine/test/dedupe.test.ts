@@ -210,4 +210,48 @@ describe("dedupe file", () => {
       fx.cleanup();
     }
   });
+
+  test("merge carries forward lineage and usage metrics", () => {
+    const file = makeFile([
+      makeLesson({
+        id: "KEEP",
+        title: "same title",
+        tags: ["keep"],
+        category: "workflow",
+        severity: "high",
+        mergedFrom: ["older"],
+        hitCount: 2,
+        appliedCount: 1,
+        lastHitAt: "2026-04-10T00:00:00Z",
+      }),
+      makeLesson({
+        id: "MERGE",
+        title: "same title",
+        tags: ["merge"],
+        category: "workflow",
+        severity: "low",
+        mergedFrom: ["oldest"],
+        hitCount: 5,
+        appliedCount: 2,
+        lastHitAt: "2026-04-12T00:00:00Z",
+      }),
+    ]);
+    const { next } = dedupeData(file);
+    const keep = next.lessons.find((lesson) => lesson.id === "KEEP")!;
+    expect(keep.mergedFrom).toEqual(expect.arrayContaining(["MERGE", "older", "oldest"]));
+    expect(keep.hitCount).toBe(7);
+    expect(keep.appliedCount).toBe(3);
+    expect(keep.lastHitAt).toBe("2026-04-12T00:00:00Z");
+  });
+
+  test("three matching lessons collapse into two merges without double-merging archived losers", () => {
+    const file = makeFile([
+      makeLesson({ id: "A", title: "same title", tags: ["a"], category: "workflow" }),
+      makeLesson({ id: "B", title: "same title", tags: ["b"], category: "workflow" }),
+      makeLesson({ id: "C", title: "same title", tags: ["c"], category: "workflow" }),
+    ]);
+    const { next, merges } = dedupeData(file);
+    expect(merges).toHaveLength(2);
+    expect(next.lessons.filter((lesson) => lesson.lifecycle === "archive")).toHaveLength(2);
+  });
 });
