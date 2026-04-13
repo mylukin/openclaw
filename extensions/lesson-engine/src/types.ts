@@ -1,10 +1,7 @@
 // Types for lesson-engine
 
-export type Severity = "high" | "medium" | "low";
+export type Severity = "critical" | "high" | "important" | "minor";
 export type Lifecycle = "active" | "stale" | "archive";
-
-/** Legacy severity values found in existing lessons-learned.json */
-export type LegacySeverity = "critical" | "important" | "minor";
 
 /** A lesson entry after schema migration (P0 schema). */
 export interface Lesson {
@@ -39,7 +36,7 @@ export interface RawLesson {
   category?: string;
   tags?: string[];
   date?: string;
-  severity?: Severity | LegacySeverity;
+  severity?: Severity;
   [key: string]: unknown;
 }
 

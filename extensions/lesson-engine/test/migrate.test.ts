@@ -5,7 +5,7 @@ import type { RawLessonsFile } from "../src/types.js";
 import { makeFixture, readJson, writeLessons } from "./helpers.js";
 
 describe("migrate schema", () => {
-  test("adds all missing fields with defaults (legacy severity mapped)", () => {
+  test("adds all missing fields with defaults (severity preserved as-is)", () => {
     const raw: RawLessonsFile = {
       version: 1,
       lessons: [
@@ -19,16 +19,17 @@ describe("migrate schema", () => {
         },
       ],
     };
-    const { migrated, diff } = migrateData(raw, { now: new Date("2026-04-13T11:00:00Z") });
+    const now = new Date("2026-04-13T11:00:00Z");
+    const { migrated, diff } = migrateData(raw, { now });
     const l = migrated.lessons[0];
-    expect(l.severity).toBe("high");
+    expect(l.severity).toBe("critical");
     expect(l.hitCount).toBe(0);
     expect(l.appliedCount).toBe(0);
     expect(l.lastHitAt).toBeNull();
     expect(l.mergedFrom).toEqual([]);
     expect(l.duplicateOf).toBeNull();
     expect(l.lifecycle).toBe("active");
-    expect(l.createdAt).toBe("2026-03-03T00:00:00+08:00");
+    expect(l.createdAt).toBe(now.toISOString());
     expect(diff).toHaveLength(1);
     expect(diff[0].addedFields).toEqual(
       expect.arrayContaining([
@@ -92,7 +93,7 @@ describe("migrate schema", () => {
       expect(result.backupPath).toMatch(/\.bak\.2026-04-13T11-50-00-000Z$/);
 
       const after = readJson<{ lessons: { severity: string; hitCount: number }[] }>(filePath);
-      expect(after.lessons[0].severity).toBe("low");
+      expect(after.lessons[0].severity).toBe("minor");
       expect(after.lessons[0].hitCount).toBe(0);
     } finally {
       fx.cleanup();

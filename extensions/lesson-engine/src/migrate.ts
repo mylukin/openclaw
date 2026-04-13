@@ -1,45 +1,26 @@
 import * as fs from "node:fs";
-import type {
-  LegacySeverity,
-  Lesson,
-  LessonsFile,
-  RawLesson,
-  RawLessonsFile,
-  Severity,
-} from "./types.js";
+import type { Lesson, LessonsFile, RawLesson, RawLessonsFile, Severity } from "./types.js";
 import { atomicWriteJson, jsonClone, nowIso, readLessonsFile, writeBackup } from "./utils.js";
 
-const LEGACY_SEVERITY_MAP: Record<LegacySeverity, Severity> = {
-  critical: "high",
-  important: "medium",
-  minor: "low",
-};
-
-const VALID_SEVERITIES = new Set<Severity>(["high", "medium", "low"]);
+const VALID_SEVERITIES = new Set<Severity>(["critical", "high", "important", "minor"]);
 const VALID_LIFECYCLES = new Set(["active", "stale", "archive"]);
 
 function normalizeSeverity(input: unknown): Severity {
-  if (typeof input === "string") {
-    if (VALID_SEVERITIES.has(input as Severity)) return input as Severity;
-    if (input in LEGACY_SEVERITY_MAP) return LEGACY_SEVERITY_MAP[input as LegacySeverity];
+  if (typeof input === "string" && VALID_SEVERITIES.has(input as Severity)) {
+    return input as Severity;
   }
-  return "medium";
+  return "important";
 }
 
 function normalizeCreatedAt(raw: RawLesson, fallbackIso: string): string {
   const existing = raw.createdAt;
   if (typeof existing === "string" && existing.length > 0) return existing;
-  const date = raw.date;
-  if (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return `${date}T00:00:00+08:00`;
-  }
   return fallbackIso;
 }
 
 export interface MigrateDiffEntry {
   id: string;
   addedFields: string[];
-  severityRewrite?: { from: string; to: Severity };
 }
 
 export interface MigrateResult {
@@ -78,16 +59,11 @@ export function migrateData(
 
     addIfMissing("createdAt", normalizeCreatedAt(orig, fallbackIso));
 
-    // severity: always normalize (legacy -> new), but only count as "added" when truly missing
-    const hadSeverity = "severity" in lesson;
-    const severityBefore = hadSeverity ? (lesson.severity as string) : undefined;
-    const severityNormalized = normalizeSeverity(severityBefore);
-    lesson.severity = severityNormalized;
-    const severityRewrite =
-      hadSeverity && severityBefore !== severityNormalized
-        ? { from: String(severityBefore), to: severityNormalized }
-        : undefined;
-    if (!hadSeverity) added.push("severity");
+    // severity: preserve existing disk value; only default when missing.
+    if (!("severity" in lesson)) {
+      lesson.severity = normalizeSeverity(undefined);
+      added.push("severity");
+    }
 
     addIfMissing("hitCount", 0);
     addIfMissing("appliedCount", 0);
@@ -100,11 +76,10 @@ export function migrateData(
       lesson.lifecycle = "active";
     }
 
-    if (added.length > 0 || severityRewrite) {
+    if (added.length > 0) {
       diff.push({
         id: String(lesson.id),
         addedFields: added,
-        ...(severityRewrite ? { severityRewrite } : {}),
       });
     }
 

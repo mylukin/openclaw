@@ -177,6 +177,7 @@ function statusReport(agent: string, root?: string): StatusReport {
 
 function updateMaintenanceState(params: {
   agent: string;
+  migrate: MigrateResult;
   dedupe: DedupeResult;
   forget: ForgetResult;
   root?: string;
@@ -198,6 +199,7 @@ function updateMaintenanceState(params: {
   const prior = state.agents[params.agent] ?? {};
   state.agents[params.agent] = {
     ...prior,
+    lastMigrateAt: iso,
     lastDedupeAt: iso,
     lastForgetAt: iso,
     lastMaintenanceAt: iso,
@@ -272,6 +274,8 @@ function run(argv: string[]): { stdout: unknown; stderr: string[]; exitCode: num
     case "maintenance": {
       const results = agents.map((agent) => {
         const filePath = lessonsFilePath(agent, args.root);
+        // Migrate first so `lifecycle` / severity fields exist before dedupe/forget run.
+        const migrate = migrateFile({ filePath, agent, dryRun, now });
         const dedupe = dedupeFile({ filePath, agent, dryRun, now });
         const forget = forgetFile({
           filePath,
@@ -282,12 +286,20 @@ function run(argv: string[]): { stdout: unknown; stderr: string[]; exitCode: num
         });
         let statePath: string | undefined;
         if (!dryRun) {
-          statePath = updateMaintenanceState({ agent, dedupe, forget, root: args.root, now });
+          statePath = updateMaintenanceState({
+            agent,
+            migrate,
+            dedupe,
+            forget,
+            root: args.root,
+            now,
+          });
         }
+        stderr.push(summarizeMigrate(migrate));
         stderr.push(summarizeDedupe(dedupe));
         stderr.push(summarizeForget(forget));
         if (statePath) stderr.push(`[${agent}] maintenance-state: ${statePath}`);
-        return { agent, filePath, dedupe, forget, statePath };
+        return { agent, filePath, migrate, dedupe, forget, statePath };
       });
       return { stdout: { command: "maintenance", dryRun, results }, stderr, exitCode: 0 };
     }

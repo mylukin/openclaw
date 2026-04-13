@@ -39,7 +39,7 @@ export function makeLesson(partial: Partial<Lesson> & { id: string }): Lesson {
     category: partial.category ?? "general",
     tags: partial.tags ?? [],
     createdAt: partial.createdAt ?? "2026-01-01T00:00:00+08:00",
-    severity: partial.severity ?? "medium",
+    severity: partial.severity ?? "important",
     hitCount: partial.hitCount ?? 0,
     appliedCount: partial.appliedCount ?? 0,
     lastHitAt: partial.lastHitAt ?? null,

@@ -5,6 +5,7 @@ import { main } from "../cli/lesson-engine.js";
 import type { DedupeResult } from "../src/dedupe.js";
 import type { ForgetResult } from "../src/forget.js";
 import type { MigrateResult } from "../src/migrate.js";
+import type { MaintenanceState } from "../src/types.js";
 import { makeFixture, writeLessons } from "./helpers.js";
 
 describe("CLI", () => {
@@ -60,7 +61,7 @@ describe("CLI", () => {
       expect(results[0].wrote).toBe(true);
       expect(fs.existsSync(results[0].backupPath!)).toBe(true);
       const after = JSON.parse(fs.readFileSync(filePath, "utf8"));
-      expect(after.lessons[0].severity).toBe("high");
+      expect(after.lessons[0].severity).toBe("critical");
     } finally {
       fx.cleanup();
     }
@@ -76,7 +77,7 @@ describe("CLI", () => {
           title: `lesson ${i}`,
           category: "general",
           tags: [`t${i}`],
-          severity: "medium",
+          severity: "important",
           createdAt: new Date(Date.now() - i * 86400_000).toISOString(),
           hitCount: 0,
           appliedCount: 0,
@@ -115,6 +116,49 @@ describe("CLI", () => {
         fs.readFileSync(path.join(fx.root, "builder", "memory", "lessons-learned.json"), "utf8"),
       );
       expect(after.lessons.length).toBe(52);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("maintenance migrates unmigrated data before dedupe/forget", () => {
+    const fx = makeFixture();
+    try {
+      // Unmigrated input: no lifecycle, no severity on any lesson.
+      writeLessons(fx, "builder", {
+        version: 1,
+        lessons: [
+          { id: "a", title: "pnpm install hooks", tags: ["pnpm"], category: "infra" },
+          { id: "b", title: "pnpm install hooks", tags: ["pnpm"], category: "infra" },
+        ],
+      });
+      const { stdout, exitCode } = main([
+        "maintenance",
+        "--agent",
+        "builder",
+        "--apply",
+        "--root",
+        fx.root,
+      ]);
+      expect(exitCode).toBe(0);
+      const results = (
+        stdout as {
+          results: {
+            migrate: MigrateResult;
+            dedupe: DedupeResult;
+            forget: ForgetResult;
+            statePath?: string;
+          }[];
+        }
+      ).results;
+      // migrate ran first and mutated both lessons (adding lifecycle + severity)
+      expect(results[0].migrate.wrote).toBe(true);
+      expect(results[0].migrate.mutatedCount).toBe(2);
+      // dedupe then sees two active lessons and merges them
+      expect(results[0].dedupe.merges.length).toBe(1);
+      // state records lastMigrateAt
+      const state = JSON.parse(fs.readFileSync(results[0].statePath!, "utf8")) as MaintenanceState;
+      expect(state.agents.builder.lastMigrateAt).toBeTruthy();
     } finally {
       fx.cleanup();
     }

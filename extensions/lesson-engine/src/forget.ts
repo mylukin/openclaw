@@ -6,9 +6,10 @@ export const DEFAULT_MAX_ACTIVE = 50;
 export const STALE_DAYS = 90;
 
 const SEVERITY_SCORE: Record<Severity, number> = {
-  high: 1.0,
-  medium: 0.5,
-  low: 0.2,
+  critical: 1.0,
+  high: 0.75,
+  important: 0.5,
+  minor: 0.2,
 };
 
 export interface ScoreComponents {
@@ -30,7 +31,7 @@ export function scoreLesson(lesson: Lesson, now: Date): ScoreComponents {
   const applied = lesson.appliedCount ?? 0;
   const usefulness = Math.min(1, (hits + 2 * applied) / 10);
 
-  const severity = SEVERITY_SCORE[lesson.severity] ?? SEVERITY_SCORE.medium;
+  const severity = SEVERITY_SCORE[lesson.severity] ?? SEVERITY_SCORE.important;
 
   const total = 0.4 * recency + 0.4 * usefulness + 0.2 * severity;
   return {

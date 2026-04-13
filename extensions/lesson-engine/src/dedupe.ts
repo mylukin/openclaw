@@ -6,7 +6,12 @@ import { atomicWriteJson, jsonClone, nowIso, readJson } from "./utils.js";
 /** cosine >= this ⇒ duplicate */
 export const DEDUPE_THRESHOLD = 0.6;
 
-const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1 };
+const SEVERITY_RANK: Record<Severity, number> = {
+  critical: 4,
+  high: 3,
+  important: 2,
+  minor: 1,
+};
 
 /** Build the text used for TF-IDF — title + tags + (category * 2). */
 export function lessonDocument(lesson: Lesson): string {

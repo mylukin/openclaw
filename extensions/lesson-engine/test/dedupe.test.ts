@@ -12,7 +12,7 @@ describe("dedupe", () => {
         title: "pnpm install hooks",
         tags: ["pnpm", "install"],
         category: "infra",
-        severity: "medium",
+        severity: "important",
       }),
       makeLesson({
         id: "B",
@@ -71,7 +71,7 @@ describe("dedupe", () => {
         title: "same same same",
         tags: ["y"],
         category: "k",
-        severity: "low",
+        severity: "minor",
       }),
     ]);
     const { next } = dedupeData(file);
@@ -97,7 +97,7 @@ describe("dedupe", () => {
         title: "duplicate tags union test",
         tags: ["b", "c"],
         category: "x",
-        severity: "low",
+        severity: "minor",
       }),
     ]);
     const { next } = dedupeData(file);
@@ -229,7 +229,7 @@ describe("dedupe file", () => {
         title: "same title",
         tags: ["merge"],
         category: "workflow",
-        severity: "low",
+        severity: "minor",
         mergedFrom: ["oldest"],
         hitCount: 5,
         appliedCount: 2,
@@ -276,7 +276,7 @@ describe("dedupe file", () => {
           title: "same title",
           category: "workflow",
           createdAt: "2026-01-01T00:00:00Z",
-          severity: "low",
+          severity: "minor",
           hitCount: 0,
           appliedCount: 0,
           lastHitAt: null,

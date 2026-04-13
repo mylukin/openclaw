@@ -7,10 +7,10 @@ import { makeFile, makeFixture, makeLesson, writeLessons } from "./helpers.js";
 const NOW = new Date("2026-04-13T00:00:00Z");
 
 describe("forget scoring", () => {
-  test("score components for a fresh high-severity lesson", () => {
+  test("score components for a fresh critical-severity lesson", () => {
     const lesson = makeLesson({
       id: "X",
-      severity: "high",
+      severity: "critical",
       createdAt: "2026-04-13T00:00:00Z",
       hitCount: 0,
       appliedCount: 0,
@@ -26,7 +26,7 @@ describe("forget scoring", () => {
   test("usefulness saturates at 1", () => {
     const lesson = makeLesson({
       id: "X",
-      severity: "low",
+      severity: "minor",
       createdAt: "2025-01-01T00:00:00Z",
       hitCount: 2,
       appliedCount: 5, // (2 + 10) / 10 = 1.2 clipped to 1
@@ -36,11 +36,12 @@ describe("forget scoring", () => {
     expect(s.severity).toBe(0.2);
   });
 
-  test("severity weights: high=1.0 medium=0.5 low=0.2", () => {
+  test("severity weights: critical=1.0 high=0.75 important=0.5 minor=0.2", () => {
     const base = { id: "X", createdAt: "2026-04-13T00:00:00Z" } as const;
-    expect(scoreLesson(makeLesson({ ...base, severity: "high" }), NOW).severity).toBe(1.0);
-    expect(scoreLesson(makeLesson({ ...base, severity: "medium" }), NOW).severity).toBe(0.5);
-    expect(scoreLesson(makeLesson({ ...base, severity: "low" }), NOW).severity).toBe(0.2);
+    expect(scoreLesson(makeLesson({ ...base, severity: "critical" }), NOW).severity).toBe(1.0);
+    expect(scoreLesson(makeLesson({ ...base, severity: "high" }), NOW).severity).toBe(0.75);
+    expect(scoreLesson(makeLesson({ ...base, severity: "important" }), NOW).severity).toBe(0.5);
+    expect(scoreLesson(makeLesson({ ...base, severity: "minor" }), NOW).severity).toBe(0.2);
   });
 
   test("invalid timestamps fall back to a very old age", () => {
@@ -48,8 +49,8 @@ describe("forget scoring", () => {
     expect(s.daysSinceLastHit).toBeGreaterThan(3000);
   });
 
-  test("unknown severities fall back to medium scoring", () => {
-    const lesson = makeLesson({ id: "X", severity: "medium" });
+  test("unknown severities fall back to important scoring", () => {
+    const lesson = makeLesson({ id: "X", severity: "important" });
     (lesson as { severity: string }).severity = "unknown";
     expect(scoreLesson(lesson, NOW).severity).toBe(0.5);
   });
@@ -62,7 +63,7 @@ describe("forget lifecycle transitions", () => {
       lessons.push(
         makeLesson({
           id: `L-${i}`,
-          severity: "medium",
+          severity: "important",
           // older (lower recency) ⇒ demoted first
           createdAt: new Date(NOW.getTime() - (i + 1) * 86400_000 * 60).toISOString(),
         }),
@@ -83,14 +84,14 @@ describe("forget lifecycle transitions", () => {
     const lessons = [
       makeLesson({
         id: "old-stale",
-        severity: "low",
+        severity: "minor",
         lifecycle: "stale",
         lastHitAt: null,
         createdAt: new Date(NOW.getTime() - 120 * 86400_000).toISOString(),
       }),
       makeLesson({
         id: "fresh-stale",
-        severity: "low",
+        severity: "minor",
         lifecycle: "stale",
         lastHitAt: new Date(NOW.getTime() - 10 * 86400_000).toISOString(),
       }),
@@ -109,7 +110,7 @@ describe("forget lifecycle transitions", () => {
     const lessons = [
       makeLesson({
         id: "a",
-        severity: "low",
+        severity: "minor",
         lifecycle: "stale",
         createdAt: new Date(NOW.getTime() - 200 * 86400_000).toISOString(),
       }),
