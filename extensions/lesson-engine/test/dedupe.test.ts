@@ -211,7 +211,7 @@ describe("dedupe file", () => {
     }
   });
 
-  test("merge carries forward lineage and usage metrics", () => {
+  test("merge appends merged lesson id to mergedFrom (no lineage flatten, no metric carry)", () => {
     const file = makeFile([
       makeLesson({
         id: "KEEP",
@@ -238,10 +238,10 @@ describe("dedupe file", () => {
     ]);
     const { next } = dedupeData(file);
     const keep = next.lessons.find((lesson) => lesson.id === "KEEP")!;
-    expect(keep.mergedFrom).toEqual(expect.arrayContaining(["MERGE", "older", "oldest"]));
-    expect(keep.hitCount).toBe(7);
-    expect(keep.appliedCount).toBe(3);
-    expect(keep.lastHitAt).toBe("2026-04-12T00:00:00Z");
+    expect(keep.mergedFrom).toEqual(expect.arrayContaining(["older", "MERGE"]));
+    expect(keep.hitCount).toBe(2);
+    expect(keep.appliedCount).toBe(1);
+    expect(keep.lastHitAt).toBe("2026-04-10T00:00:00Z");
   });
 
   test("three matching lessons collapse into two merges without double-merging archived losers", () => {
@@ -253,5 +253,41 @@ describe("dedupe file", () => {
     const { next, merges } = dedupeData(file);
     expect(merges).toHaveLength(2);
     expect(next.lessons.filter((lesson) => lesson.lifecycle === "archive")).toHaveLength(2);
+  });
+
+  test("dedupe tolerates missing tags and mergedFrom arrays", () => {
+    const file = {
+      version: 1,
+      lessons: [
+        {
+          id: "A",
+          title: "same title",
+          category: "workflow",
+          createdAt: "2026-01-01T00:00:00Z",
+          severity: "high",
+          hitCount: 0,
+          appliedCount: 0,
+          lastHitAt: null,
+          duplicateOf: null,
+          lifecycle: "active",
+        },
+        {
+          id: "B",
+          title: "same title",
+          category: "workflow",
+          createdAt: "2026-01-01T00:00:00Z",
+          severity: "low",
+          hitCount: 0,
+          appliedCount: 0,
+          lastHitAt: null,
+          duplicateOf: null,
+          lifecycle: "active",
+        },
+      ],
+    } as unknown as LessonsFile;
+    const { next } = dedupeData(file);
+    const keep = next.lessons.find((lesson) => lesson.id === "A")!;
+    expect(keep.tags).toEqual([]);
+    expect(keep.mergedFrom).toContain("B");
   });
 });

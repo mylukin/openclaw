@@ -130,6 +130,19 @@ describe("forget lifecycle transitions", () => {
     );
     expect(transitions[0]?.id).toBe("a");
   });
+
+  test("forgetData uses file.maxActive and default now when options are omitted", () => {
+    const { next } = forgetData(
+      makeFile(
+        [
+          makeLesson({ id: "a", createdAt: "2026-04-01T00:00:00Z" }),
+          makeLesson({ id: "b", createdAt: "2026-01-01T00:00:00Z" }),
+        ],
+        { maxActive: 1 },
+      ),
+    );
+    expect(next.lessons.filter((lesson) => lesson.lifecycle === "active")).toHaveLength(1);
+  });
 });
 
 describe("forget file", () => {

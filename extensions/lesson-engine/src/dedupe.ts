@@ -114,16 +114,8 @@ export function dedupeData(
       const tagsAfter = unionTags(keep.tags, merge.tags);
       keep.tags = tagsAfter;
       keep.mergedFrom = Array.isArray(keep.mergedFrom)
-        ? Array.from(new Set([...keep.mergedFrom, merge.id, ...(merge.mergedFrom ?? [])]))
-        : [merge.id, ...(merge.mergedFrom ?? [])];
-      keep.hitCount = (keep.hitCount ?? 0) + (merge.hitCount ?? 0);
-      keep.appliedCount = (keep.appliedCount ?? 0) + (merge.appliedCount ?? 0);
-      if (
-        merge.lastHitAt &&
-        (!keep.lastHitAt || Date.parse(merge.lastHitAt) > Date.parse(keep.lastHitAt))
-      ) {
-        keep.lastHitAt = merge.lastHitAt;
-      }
+        ? Array.from(new Set([...keep.mergedFrom, merge.id]))
+        : [merge.id];
       merge.lifecycle = "archive";
       merge.duplicateOf = keep.id;
       merge.lastHitAt = merge.lastHitAt ?? null;
