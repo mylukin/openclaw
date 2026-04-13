@@ -17,6 +17,8 @@ export function isValidAgent(name: string): name is AgentName {
 /** Resolve $AGENT_DATA_ROOT (default ~/AgentData). */
 export function agentDataRoot(root?: string): string {
   if (root && root.length > 0) return root;
+  const lessonEngineRoot = process.env.LESSON_ENGINE_AGENT_DATA_DIR;
+  if (lessonEngineRoot && lessonEngineRoot.length > 0) return lessonEngineRoot;
   const envRoot = process.env.AGENT_DATA_ROOT;
   if (envRoot && envRoot.length > 0) return envRoot;
   return path.join(os.homedir(), "AgentData");

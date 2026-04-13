@@ -1,6 +1,8 @@
+import * as fs from "node:fs";
 import { describe, expect, test } from "vitest";
-import { dedupeData, DEDUPE_THRESHOLD } from "../src/dedupe.js";
-import { makeFile, makeLesson } from "./helpers.js";
+import { DEDUPE_THRESHOLD, dedupeData, dedupeFile } from "../src/dedupe.js";
+import type { LessonsFile } from "../src/types.js";
+import { makeFile, makeFixture, makeLesson, readJson, writeLessons } from "./helpers.js";
 
 describe("dedupe", () => {
   test("merge keeps higher-severity lesson and archives the loser", () => {
@@ -121,5 +123,91 @@ describe("dedupe", () => {
     const { merges, next } = dedupeData(file);
     expect(merges).toHaveLength(0);
     expect(next.lessons.every((l) => l.lifecycle === "active")).toBe(true);
+  });
+
+  test("falls back to lexicographic id when severity, hitCount, and createdAt tie", () => {
+    const file = makeFile([
+      makeLesson({
+        id: "B",
+        title: "same title",
+        tags: ["same"],
+        category: "same",
+        createdAt: "invalid",
+      }),
+      makeLesson({
+        id: "A",
+        title: "same title",
+        tags: ["same"],
+        category: "same",
+        createdAt: "invalid",
+      }),
+    ]);
+    const { merges } = dedupeData(file);
+    expect(merges[0]?.keepId).toBe("A");
+  });
+});
+
+describe("dedupe file", () => {
+  test("missing files return an empty result", () => {
+    const fx = makeFixture();
+    try {
+      const result = dedupeFile({
+        filePath: fx.agentFile("builder"),
+        agent: "builder",
+        dryRun: true,
+      });
+      expect(result.totalLessons).toBe(0);
+      expect(result.merges).toEqual([]);
+      expect(result.wrote).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("apply mode writes merged content", () => {
+    const fx = makeFixture();
+    try {
+      const filePath = writeLessons(fx, "builder", {
+        version: 1,
+        lessons: [
+          makeLesson({ id: "A", title: "same title", tags: ["a"], category: "x" }),
+          makeLesson({ id: "B", title: "same title", tags: ["b"], category: "x" }),
+        ],
+      });
+      const result = dedupeFile({
+        filePath,
+        agent: "builder",
+        dryRun: false,
+        now: new Date("2026-04-13T00:00:00Z"),
+      });
+      expect(result.wrote).toBe(true);
+      const after = readJson<LessonsFile>(filePath);
+      expect(after.lessons.find((lesson) => lesson.id === "B")?.duplicateOf).toBe("A");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("apply mode does not rewrite when there are no merges", () => {
+    const fx = makeFixture();
+    try {
+      const filePath = writeLessons(fx, "builder", {
+        version: 1,
+        lessons: [
+          makeLesson({ id: "A", title: "database migrations", tags: ["db"], category: "db" }),
+          makeLesson({ id: "B", title: "css layout", tags: ["css"], category: "ui" }),
+        ],
+      });
+      const before = fs.readFileSync(filePath, "utf8");
+      const result = dedupeFile({
+        filePath,
+        agent: "builder",
+        dryRun: false,
+      });
+      expect(result.wrote).toBe(false);
+      expect(fs.readFileSync(filePath, "utf8")).toBe(before);
+    } finally {
+      fx.cleanup();
+    }
   });
 });

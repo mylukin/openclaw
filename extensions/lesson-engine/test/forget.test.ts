@@ -1,6 +1,8 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { DEFAULT_MAX_ACTIVE, forgetData, scoreLesson } from "../src/forget.js";
-import { makeFile, makeLesson } from "./helpers.js";
+import { DEFAULT_MAX_ACTIVE, forgetData, forgetFile, scoreLesson } from "../src/forget.js";
+import { makeFile, makeFixture, makeLesson, writeLessons } from "./helpers.js";
 
 const NOW = new Date("2026-04-13T00:00:00Z");
 
@@ -39,6 +41,11 @@ describe("forget scoring", () => {
     expect(scoreLesson(makeLesson({ ...base, severity: "high" }), NOW).severity).toBe(1.0);
     expect(scoreLesson(makeLesson({ ...base, severity: "medium" }), NOW).severity).toBe(0.5);
     expect(scoreLesson(makeLesson({ ...base, severity: "low" }), NOW).severity).toBe(0.2);
+  });
+
+  test("invalid timestamps fall back to a very old age", () => {
+    const s = scoreLesson(makeLesson({ id: "X", createdAt: "invalid-date" }), NOW);
+    expect(s.daysSinceLastHit).toBeGreaterThan(3000);
   });
 });
 
@@ -105,5 +112,62 @@ describe("forget lifecycle transitions", () => {
     const beforeCount = file.lessons.length;
     const { next } = forgetData(file, { now: NOW });
     expect(next.lessons).toHaveLength(beforeCount);
+  });
+
+  test("ties fall back to lesson id when scores and createdAt match", () => {
+    const { transitions } = forgetData(
+      makeFile([
+        makeLesson({ id: "b", title: "tie b", createdAt: "2026-04-01T00:00:00Z" }),
+        makeLesson({ id: "a", title: "tie a", createdAt: "2026-04-01T00:00:00Z" }),
+      ]),
+      { now: NOW, maxActive: 1 },
+    );
+    expect(transitions[0]?.id).toBe("a");
+  });
+});
+
+describe("forget file", () => {
+  test("missing files return defaults", () => {
+    const fx = makeFixture();
+    try {
+      const result = forgetFile({
+        filePath: path.join(fx.root, "builder", "memory", "lessons-learned.json"),
+        agent: "builder",
+        dryRun: true,
+        maxActive: 7,
+      });
+      expect(result.maxActive).toBe(7);
+      expect(result.totalLessons).toBe(0);
+      expect(result.transitions).toEqual([]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("dry-run does not write", () => {
+    const fx = makeFixture();
+    try {
+      const filePath = writeLessons(fx, "builder", {
+        version: 1,
+        lessons: [
+          makeLesson({
+            id: "old",
+            lifecycle: "stale",
+            createdAt: "2025-01-01T00:00:00Z",
+          }),
+        ],
+      });
+      const before = fs.readFileSync(filePath, "utf8");
+      const result = forgetFile({
+        filePath,
+        agent: "builder",
+        dryRun: true,
+        now: NOW,
+      });
+      expect(result.wrote).toBe(false);
+      expect(fs.readFileSync(filePath, "utf8")).toBe(before);
+    } finally {
+      fx.cleanup();
+    }
   });
 });
