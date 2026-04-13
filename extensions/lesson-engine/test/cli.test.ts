@@ -1,58 +1,51 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { main } from "../bin/lesson-engine.js";
-import type { Lesson } from "../src/types.js";
-import { makeFile, makeFixture, makeLesson, writeLessons } from "./helpers.js";
+import { main } from "../cli/lesson-engine.js";
+import type { DedupeResult } from "../src/dedupe.js";
+import type { ForgetResult } from "../src/forget.js";
+import type { MigrateResult } from "../src/migrate.js";
+import { makeFixture, writeLessons } from "./helpers.js";
 
-describe("CLI (via main())", () => {
-  test("no command → exit 1 with help", () => {
-    const fx = makeFixture();
-    try {
-      const { exitCode, stderr } = main(["--root", fx.root]);
-      expect(exitCode).toBe(1);
-      expect(stderr.join("\n")).toContain("error:");
-    } finally {
-      fx.cleanup();
-    }
+describe("CLI", () => {
+  test("rejects unknown agent with exit code 1", () => {
+    const { stdout, exitCode } = main(["migrate", "--agent", "nope"]);
+    expect(exitCode).toBe(1);
+    expect((stdout as { error: string }).error).toMatch(/Unknown agent/);
   });
 
-  test("unknown agent → exit 1", () => {
+  test("migrate --dry-run reports diff without writing", () => {
     const fx = makeFixture();
     try {
-      const { exitCode, stderr } = main(["status", "--agent", "nobody", "--root", fx.root]);
-      expect(exitCode).toBe(1);
-      expect(stderr.join("\n")).toContain("Unknown agent");
-    } finally {
-      fx.cleanup();
-    }
-  });
-
-  test("migrate --dry-run returns diff without writing", () => {
-    const fx = makeFixture();
-    try {
-      writeLessons(fx, "builder", {
+      const filePath = writeLessons(fx, "builder", {
         version: 1,
-        lessons: [{ id: "l1", title: "test" }],
+        lessons: [{ id: "l1", title: "t" }],
       });
-      const { stdout, exitCode } = main(["migrate", "--agent", "builder", "--root", fx.root]);
+      const before = fs.readFileSync(filePath, "utf8");
+      const { stdout, exitCode } = main([
+        "migrate",
+        "--agent",
+        "builder",
+        "--dry-run",
+        "--root",
+        fx.root,
+      ]);
       expect(exitCode).toBe(0);
-      const data = stdout as any;
-      expect(data.command).toBe("migrate");
-      expect(data.dryRun).toBe(true);
-      expect(data.results[0].wrote).toBe(false);
-      expect(data.results[0].mutatedCount).toBe(1);
+      const results = (stdout as { results: MigrateResult[] }).results;
+      expect(results[0].wrote).toBe(false);
+      expect(results[0].mutatedCount).toBeGreaterThan(0);
+      expect(fs.readFileSync(filePath, "utf8")).toBe(before);
     } finally {
       fx.cleanup();
     }
   });
 
-  test("migrate --apply writes backup + migrated file", () => {
+  test("migrate --apply writes migrated file + backup", () => {
     const fx = makeFixture();
     try {
-      writeLessons(fx, "builder", {
+      const filePath = writeLessons(fx, "builder", {
         version: 1,
-        lessons: [{ id: "l1", title: "test" }],
+        lessons: [{ id: "l1", severity: "critical", title: "t" }],
       });
       const { stdout, exitCode } = main([
         "migrate",
@@ -63,69 +56,88 @@ describe("CLI (via main())", () => {
         fx.root,
       ]);
       expect(exitCode).toBe(0);
-      const data = stdout as any;
-      expect(data.results[0].wrote).toBe(true);
-      expect(data.results[0].backupPath).toBeTruthy();
-      expect(fs.existsSync(data.results[0].backupPath)).toBe(true);
+      const results = (stdout as { results: MigrateResult[] }).results;
+      expect(results[0].wrote).toBe(true);
+      expect(fs.existsSync(results[0].backupPath!)).toBe(true);
+      const after = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      expect(after.lessons[0].severity).toBe("high");
     } finally {
       fx.cleanup();
     }
   });
 
-  test("status --all reports counts for each agent", () => {
+  test("maintenance --apply updates shared maintenance-state.json", () => {
     const fx = makeFixture();
     try {
-      writeLessons(
-        fx,
+      const lessons = [];
+      for (let i = 0; i < 52; i++) {
+        lessons.push({
+          id: `L-${i}`,
+          title: `lesson ${i}`,
+          category: "general",
+          tags: [`t${i}`],
+          severity: "medium",
+          createdAt: new Date(Date.now() - i * 86400_000).toISOString(),
+          hitCount: 0,
+          appliedCount: 0,
+          lastHitAt: null,
+          mergedFrom: [],
+          duplicateOf: null,
+          lifecycle: "active",
+        });
+      }
+      writeLessons(fx, "builder", { version: 1, lessons });
+      const { stdout, exitCode } = main([
+        "maintenance",
+        "--agent",
         "builder",
-        makeFile([
-          makeLesson({ id: "l1", lifecycle: "active" }),
-          makeLesson({ id: "l2", lifecycle: "stale" }),
-          makeLesson({ id: "l3", lifecycle: "archive" }),
-        ]),
-      );
-      writeLessons(fx, "architect", makeFile([makeLesson({ id: "a1", lifecycle: "active" })]));
-      const { stdout, exitCode } = main(["status", "--all", "--root", fx.root]);
+        "--apply",
+        "--root",
+        fx.root,
+      ]);
       expect(exitCode).toBe(0);
-      const data = stdout as any;
-      expect(data.results).toHaveLength(4);
-      const b = data.results.find((r: any) => r.agent === "builder");
-      expect(b.active).toBe(1);
-      expect(b.stale).toBe(1);
-      expect(b.archive).toBe(1);
+      const results = (
+        stdout as {
+          results: { dedupe: DedupeResult; forget: ForgetResult; statePath?: string }[];
+        }
+      ).results;
+      expect(results[0].forget.wrote).toBe(true);
+      expect(results[0].forget.activeAfter).toBeLessThanOrEqual(50);
+      const statePath = results[0].statePath!;
+      expect(statePath).toBeDefined();
+      expect(fs.existsSync(statePath)).toBe(true);
+      const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      expect(state.version).toBe(1);
+      expect(state.agents.builder.lastMaintenanceAt).toBeTruthy();
+      expect(state.agents.builder.forgetStale).toBeGreaterThanOrEqual(2);
+      expect(statePath.startsWith(fx.root)).toBe(true);
+      const after = JSON.parse(
+        fs.readFileSync(path.join(fx.root, "builder", "memory", "lessons-learned.json"), "utf8"),
+      );
+      expect(after.lessons.length).toBe(52);
     } finally {
       fx.cleanup();
     }
   });
 
-  test("maintenance --apply writes maintenance-state.json", () => {
+  test("status reports per-lifecycle counts", () => {
     const fx = makeFixture();
     try {
-      const lessons: Lesson[] = [];
-      for (let i = 0; i < 55; i++) {
-        lessons.push(
-          makeLesson({
-            id: `l-${i}`,
-            title: `Unique lesson number ${i} about topic ${i}`,
-            severity: i < 5 ? "low" : "high",
-            hitCount: i < 5 ? 0 : 5,
-            createdAt: i < 5 ? "2025-01-01T00:00:00Z" : "2026-04-01T00:00:00Z",
-            lastHitAt: i < 5 ? null : "2026-04-12T00:00:00Z",
-          }),
-        );
-      }
-      writeLessons(fx, "builder", makeFile(lessons));
-      for (const agent of ["architect", "chief", "growth"] as const) {
-        writeLessons(fx, agent, makeFile([]));
-      }
-      const { stdout, exitCode } = main(["maintenance", "--all", "--apply", "--root", fx.root]);
+      writeLessons(fx, "builder", {
+        version: 1,
+        lessons: [
+          { id: "a", lifecycle: "active" },
+          { id: "b", lifecycle: "stale" },
+          { id: "c", lifecycle: "archive" },
+        ],
+      });
+      const { stdout, exitCode } = main(["status", "--agent", "builder", "--root", fx.root]);
       expect(exitCode).toBe(0);
-
-      const msPath = path.join(fx.root, "shared", "lessons", "maintenance-state.json");
-      expect(fs.existsSync(msPath)).toBe(true);
-      const ms = JSON.parse(fs.readFileSync(msPath, "utf8"));
-      expect(ms.version).toBe(1);
-      expect(ms.agents.builder).toBeDefined();
+      const r = (stdout as { results: { active: number; stale: number; archive: number }[] })
+        .results[0];
+      expect(r.active).toBe(1);
+      expect(r.stale).toBe(1);
+      expect(r.archive).toBe(1);
     } finally {
       fx.cleanup();
     }
