@@ -14,14 +14,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { dedupeFile, type DedupeResult } from "../src/dedupe.js";
 import {
-  ClaudeCliProvider,
   DEFAULT_MIN_CLUSTER_SIZE,
   type DistillLLMProvider,
+  NativeProvider,
   distillAll,
   readCandidatesFile,
   writeCandidatesFile,
 } from "../src/distill.js";
 import {
+  readPersistedSeeds,
   readScannerState,
   scanAll,
   writeScannerState,
@@ -373,15 +374,10 @@ async function run(argv: string[], opts: MainOptions = {}): Promise<CliResult> {
       };
     }
     case "distill": {
-      // First gather seeds (in-memory; do not modify scanner state here).
+      // Read persisted seeds written by a prior `scan --apply` invocation.
       const agents = args.all ? [...VALID_AGENTS] : resolveAgents(args);
-      const { seeds } = scanAll({
-        agents,
-        root: args.root,
-        state: readScannerState(args.root),
-        now,
-      });
-      const llm = opts.llm ?? new ClaudeCliProvider();
+      const seeds = readPersistedSeeds(args.root);
+      const llm = opts.llm ?? new NativeProvider();
       const existing = readCandidatesFile(args.root);
       const { candidates, skipped } = await distillAll({
         seeds,
