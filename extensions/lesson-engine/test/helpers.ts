@@ -33,7 +33,7 @@ export function readJson<T>(filePath: string): T {
 
 /** Build a minimal post-migration lesson with overrides. */
 export function makeLesson(partial: Partial<Lesson> & { id: string }): Lesson {
-  return {
+  const defaults: Lesson = {
     id: partial.id,
     title: partial.title ?? `title-${partial.id}`,
     category: partial.category ?? "general",
@@ -46,8 +46,8 @@ export function makeLesson(partial: Partial<Lesson> & { id: string }): Lesson {
     mergedFrom: partial.mergedFrom ?? [],
     duplicateOf: partial.duplicateOf ?? null,
     lifecycle: partial.lifecycle ?? "active",
-    ...partial,
   };
+  return { ...defaults, ...partial };
 }
 
 export function makeFile(lessons: Lesson[], extras: Partial<LessonsFile> = {}): LessonsFile {
