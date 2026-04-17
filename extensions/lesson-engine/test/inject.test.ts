@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { main } from "../cli/lesson-engine.js";
 import { injectLessons } from "../src/inject.js";
 import { makeFile, makeFixture, makeLesson, writeLessons } from "./helpers.js";
@@ -260,6 +260,62 @@ describe("injectLessons", () => {
       const logPath = path.join(fx.root, "builder", "memory", "lesson-injection-log.jsonl");
       expect(fs.existsSync(logPath)).toBe(false);
     } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("renderMarkdown header reflects custom maxLessons (e.g. Top 5)", () => {
+    const fx = makeFixture();
+    try {
+      const lessons = [
+        makeLesson({ id: "L1", severity: "critical", hitCount: 5, lesson: "critical lesson" }),
+        makeLesson({ id: "L2", severity: "high", hitCount: 3, lesson: "high lesson" }),
+      ];
+      writeLessons(fx, "builder", makeFile(lessons));
+      const result = injectLessons({
+        agent: "builder",
+        root: fx.root,
+        maxLessons: 5,
+        dryRun: false,
+      });
+      expect(result.outputPath).not.toBeNull();
+      const content = fs.readFileSync(result.outputPath!, "utf8");
+      expect(content).toContain("Top 5");
+      expect(content).not.toContain("Top 10");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("jsonl injection-log write failure warns but does not throw", () => {
+    const fx = makeFixture();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const lessons = [
+        makeLesson({ id: "L1", severity: "critical", hitCount: 5, lesson: "critical lesson text" }),
+      ];
+      writeLessons(fx, "builder", makeFile(lessons));
+      // Force the jsonl append to fail by pre-creating the log path as a directory
+      // (EISDIR). Best-effort writes must warn and continue instead of throwing.
+      const memoryDir = path.join(fx.root, "builder", "memory");
+      fs.mkdirSync(memoryDir, { recursive: true });
+      fs.mkdirSync(path.join(memoryDir, "lesson-injection-log.jsonl"), { recursive: true });
+
+      let result: ReturnType<typeof injectLessons> | undefined;
+      expect(() => {
+        result = injectLessons({ agent: "builder", root: fx.root, dryRun: false });
+      }).not.toThrow();
+
+      // Main path still completed (markdown written).
+      expect(result).toBeDefined();
+      expect(result!.outputPath).not.toBeNull();
+
+      // console.warn must have surfaced the failure (match /injection log/i).
+      expect(warnSpy).toHaveBeenCalled();
+      const calls = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(calls.some((m) => /injection log/i.test(m))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
       fx.cleanup();
     }
   });
