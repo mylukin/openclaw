@@ -24,14 +24,12 @@ import {
 } from "./subagent-tool-persist.js";
 import { REDACT_TOKEN } from "./subagent-tool-redact.js";
 
-type Appended = Parameters<ReturnType<typeof makeManager>["appendMessage"]>[0];
-
 function makeManager() {
-  const calls: Appended[] = [];
+  const calls: unknown[] = [];
   return {
     calls,
     appendMessage(message: unknown) {
-      calls.push(message as Appended);
+      calls.push(message);
       return "entry-id";
     },
   };

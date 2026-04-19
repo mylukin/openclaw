@@ -97,3 +97,15 @@ export function persistSubagentToolResult(params: ToolResultPersistInput): boole
     ...(params.isError ? { isError: true } : {}),
   });
 }
+
+export function isPersistedSubagentToolFragment(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const meta = (message as { __openclaw?: unknown }).__openclaw;
+  if (!meta || typeof meta !== "object") {
+    return false;
+  }
+  const kind = (meta as { kind?: unknown }).kind;
+  return kind === TOOL_SUMMARY_KIND || kind === TOOL_RESULT_SUMMARY_KIND;
+}
