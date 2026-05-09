@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { CandidatesFile, ErrorSeed, EvidenceRef, LessonCandidate, Severity } from "./types.js";
 import { agentDataRoot, atomicWriteJson, ensureDir, nowIso, readJson } from "./utils.js";
@@ -41,6 +42,127 @@ export class ClaudeCliProvider implements DistillLLMProvider {
 }
 
 /** OpenClaw-native provider using the agent runtime. */
+export interface OpenAiResponsesProviderOptions {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  maxOutputTokens?: number;
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function readOpenClawConfig(configPath = process.env.OPENCLAW_CONFIG): unknown {
+  const resolved = configPath ?? path.join(os.homedir(), ".openclaw", "openclaw.json");
+  return JSON.parse(fs.readFileSync(resolved, "utf8"));
+}
+
+function getNestedRecord(value: unknown, keys: string[]): Record<string, unknown> | undefined {
+  let cur: unknown = value;
+  for (const key of keys) {
+    if (!cur || typeof cur !== "object" || !(key in cur)) return undefined;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur && typeof cur === "object" ? (cur as Record<string, unknown>) : undefined;
+}
+
+function extractOpenAiResponsesText(data: unknown): string {
+  if (!data || typeof data !== "object") return "";
+  const root = data as Record<string, unknown>;
+  if (typeof root.output_text === "string") return root.output_text;
+
+  const texts: string[] = [];
+  const output = Array.isArray(root.output) ? root.output : [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    const content = (item as Record<string, unknown>).content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const rec = part as Record<string, unknown>;
+      if (typeof rec.text === "string") texts.push(rec.text);
+      if (typeof rec.output_text === "string") texts.push(rec.output_text);
+    }
+  }
+  return texts.join("\n");
+}
+
+function extractOpenAiResponsesSseText(body: string): string {
+  const deltas: string[] = [];
+  let completedText = "";
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (typeof event.delta === "string") deltas.push(event.delta);
+    if (typeof event.output_text === "string") deltas.push(event.output_text);
+    const responseText = extractOpenAiResponsesText(event.response);
+    if (responseText) completedText = responseText;
+  }
+  return deltas.join("") || completedText;
+}
+
+export class OpenAiResponsesProvider implements DistillLLMProvider {
+  constructor(private readonly opts: OpenAiResponsesProviderOptions) {}
+
+  static fromOpenClawConfig(
+    params: {
+      providerId?: string;
+      model?: string;
+      configPath?: string;
+    } = {},
+  ): OpenAiResponsesProvider {
+    const providerId =
+      params.providerId ?? process.env.LESSON_ENGINE_MODEL_PROVIDER ?? "openai-crs";
+    const model = params.model ?? process.env.LESSON_ENGINE_LLM_MODEL ?? "gpt-5.5";
+    const cfg = readOpenClawConfig(params.configPath);
+    const provider = getNestedRecord(cfg, ["models", "providers", providerId]);
+    const baseUrl = process.env.LESSON_ENGINE_OPENAI_BASE_URL ?? provider?.baseUrl;
+    const apiKey =
+      process.env.LESSON_ENGINE_OPENAI_API_KEY ?? process.env.CRS_AUTH_TOKEN ?? provider?.apiKey;
+    if (typeof baseUrl !== "string" || baseUrl.length === 0) {
+      throw new Error(`OpenAiResponsesProvider: missing baseUrl for provider ${providerId}`);
+    }
+    if (typeof apiKey !== "string" || apiKey.length === 0) {
+      throw new Error(`OpenAiResponsesProvider: missing apiKey for provider ${providerId}`);
+    }
+    return new OpenAiResponsesProvider({ baseUrl, apiKey, model });
+  }
+
+  async complete(prompt: string): Promise<string> {
+    const res = await fetch(`${trimTrailingSlash(this.opts.baseUrl)}/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.opts.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.opts.model,
+        input: [{ role: "user", content: prompt }],
+        max_output_tokens: this.opts.maxOutputTokens ?? 4096,
+        stream: true,
+      }),
+    });
+    const body = await res.text();
+    if (!res.ok) {
+      throw new Error(`OpenAiResponsesProvider failed (${res.status}): ${body.slice(0, 500)}`);
+    }
+    const text = body.includes("data:")
+      ? extractOpenAiResponsesSseText(body)
+      : extractOpenAiResponsesText(JSON.parse(body));
+    if (!text.trim()) throw new Error("OpenAiResponsesProvider returned empty text");
+    return text;
+  }
+}
+
 export class NativeProvider implements DistillLLMProvider {
   constructor(private readonly agentId: string = "builder") {}
 

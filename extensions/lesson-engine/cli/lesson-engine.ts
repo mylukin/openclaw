@@ -18,6 +18,7 @@ import {
   DEFAULT_MIN_CLUSTER_SIZE,
   type DistillLLMProvider,
   NativeProvider,
+  OpenAiResponsesProvider,
   distillAll,
   readCandidatesFile,
   writeCandidatesFile,
@@ -73,6 +74,9 @@ interface ParsedArgs {
   maxTokens?: number;
   root?: string;
   lessonId?: string;
+  llmProvider?: string;
+  llmModel?: string;
+  llmModelProvider?: string;
   help: boolean;
 }
 
@@ -106,6 +110,9 @@ Options:
   --max-lessons <N>   Max lessons to inject (default 10).
   --max-tokens <N>    Token budget for inject (default 2000).
   --lesson-id <id>    Lesson ID for the hit command.
+  --llm-provider <p>  Distill provider: native|gpt5|openai-responses|claude-cli (env LESSON_ENGINE_LLM_PROVIDER).
+  --llm-model <id>    Distill model for openai-responses/gpt5 (default gpt-5.5).
+  --llm-model-provider <id>  OpenClaw model provider id for openai-responses (default openai-crs).
   --root <path>       Override AGENT_DATA_ROOT for this invocation.
   -h, --help          Print this help.
 `;
@@ -156,6 +163,15 @@ function parseArgs(argv: string[]): ParsedArgs {
       case "--lesson-id":
         out.lessonId = rest[++i];
         break;
+      case "--llm-provider":
+        out.llmProvider = rest[++i];
+        break;
+      case "--llm-model":
+        out.llmModel = rest[++i];
+        break;
+      case "--llm-model-provider":
+        out.llmModelProvider = rest[++i];
+        break;
       case "--root":
         out.root = rest[++i];
         break;
@@ -183,6 +199,34 @@ function resolveAgents(args: ParsedArgs): string[] {
     throw new UserError(`Unknown agent '${args.agent}'. Valid: ${VALID_AGENTS.join(", ")}.`);
   }
   return [args.agent];
+}
+
+function createDistillProvider(args: ParsedArgs, agent: string): DistillLLMProvider {
+  const provider = (
+    args.llmProvider ??
+    process.env.LESSON_ENGINE_LLM_PROVIDER ??
+    "native"
+  ).toLowerCase();
+  switch (provider) {
+    case "native":
+      return new NativeProvider(agent);
+    case "gpt5":
+    case "openai":
+    case "openai-responses":
+      return OpenAiResponsesProvider.fromOpenClawConfig({
+        providerId: args.llmModelProvider,
+        model: args.llmModel,
+      });
+    case "claude":
+    case "claude-cli":
+      throw new UserError(
+        "lesson-engine no longer uses claude-cli implicitly; use --llm-provider native or gpt5.",
+      );
+    default:
+      throw new UserError(
+        `Unknown --llm-provider '${provider}'. Valid: native, gpt5, openai-responses.`,
+      );
+  }
 }
 
 function summarizeMigrate(r: MigrateResult): string {
@@ -389,7 +433,7 @@ async function run(argv: string[], opts: MainOptions = {}): Promise<CliResult> {
           distillSummary.push({ agent, candidates: 0, skipped: 0 });
           continue;
         }
-        const llm = opts.llm ?? new NativeProvider(agent);
+        const llm = opts.llm ?? createDistillProvider(args, agent);
         const freshExisting = readCandidatesFile(args.root);
         const { candidates, skipped } = await distillAll({
           seeds: agentSeeds,
@@ -567,7 +611,7 @@ async function run(argv: string[], opts: MainOptions = {}): Promise<CliResult> {
       let totalSkipped = 0;
       for (const agent of agents) {
         const agentSeeds = allSeeds.filter((s) => s.agent === agent);
-        const llm = opts.llm ?? new NativeProvider(agent);
+        const llm = opts.llm ?? createDistillProvider(args, agent);
         const { candidates, skipped } = await distillAll({
           seeds: agentSeeds,
           llm,
