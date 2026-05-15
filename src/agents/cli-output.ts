@@ -384,6 +384,7 @@ export function createCliJsonlStreamingParser(params: {
   let sessionId: string | undefined;
   let usage: CliUsage | undefined;
   let sawThinkingStream = false;
+  let emittedEncryptedThinkingNotice = false;
   const seenRecordKeys = new Set<string>();
   const emittedToolUseKeys = new Set<string>();
   const emittedToolResultKeys = new Set<string>();
@@ -474,6 +475,25 @@ export function createCliJsonlStreamingParser(params: {
     });
   };
 
+  // Some upstreams (e.g. opus-4-7 behind certain proxies) strip thinking
+  // plaintext and only forward the integrity `signature`. The signature is
+  // not recoverable into reasoning text, so surface a one-time placeholder
+  // instead of leaving the thinking panel empty.
+  const emitEncryptedThinkingNotice = () => {
+    if (!params.onThinkingDelta || sawThinkingStream || emittedEncryptedThinkingNotice) {
+      return;
+    }
+    emittedEncryptedThinkingNotice = true;
+    const notice = "🔒 Reasoning hidden — model returned encrypted thinking only.";
+    thinkingText = `${thinkingText}${notice}`;
+    params.onThinkingDelta({
+      text: thinkingText,
+      delta: notice,
+      sessionId,
+      usage,
+    });
+  };
+
   const emitThinkingFromBlock = (block: Record<string, unknown>) => {
     if (!params.onThinkingDelta || sawThinkingStream || block.type !== "thinking") {
       return;
@@ -485,6 +505,9 @@ export function createCliJsonlStreamingParser(params: {
           ? block.text
           : "";
     if (!delta) {
+      if (typeof block.signature === "string" && block.signature) {
+        emitEncryptedThinkingNotice();
+      }
       return;
     }
     thinkingText = `${thinkingText}${delta}`;
@@ -587,6 +610,14 @@ export function createCliJsonlStreamingParser(params: {
         if (blockIndex !== undefined) {
           toolUseBlocksByIndex.delete(blockIndex);
         }
+      }
+
+      if (
+        event.type === "content_block_delta" &&
+        isRecord(event.delta) &&
+        event.delta.type === "signature_delta"
+      ) {
+        emitEncryptedThinkingNotice();
       }
 
       const message = isRecord(parsed.message) ? parsed.message : undefined;

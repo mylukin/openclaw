@@ -342,6 +342,97 @@ describe("createCliJsonlStreamingParser", () => {
     });
   });
 
+  it("surfaces a placeholder when thinking is signature-only (encrypted)", () => {
+    const onThinkingDelta = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: { command: "claude", output: "jsonl", sessionIdFields: ["session_id"] },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onThinkingDelta,
+    });
+
+    parser.push(
+      [
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "s-1",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "thinking", thinking: "", signature: "" },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "s-1",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "signature_delta", signature: "EuMCabc==" },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "s-1",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "signature_delta", signature: "more==" },
+          },
+        }),
+      ].join("\n"),
+    );
+    parser.finish();
+
+    expect(onThinkingDelta).toHaveBeenCalledTimes(1);
+    expect(onThinkingDelta).toHaveBeenCalledWith({
+      text: "🔒 Reasoning hidden — model returned encrypted thinking only.",
+      delta: "🔒 Reasoning hidden — model returned encrypted thinking only.",
+      sessionId: "s-1",
+      usage: undefined,
+    });
+  });
+
+  it("does not emit the encrypted placeholder when plaintext thinking streamed", () => {
+    const onThinkingDelta = vi.fn();
+    const parser = createCliJsonlStreamingParser({
+      backend: { command: "claude", output: "jsonl", sessionIdFields: ["session_id"] },
+      providerId: "claude-cli",
+      onAssistantDelta: vi.fn(),
+      onThinkingDelta,
+    });
+
+    parser.push(
+      [
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "s-2",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "thinking_delta", thinking: "Real reasoning" },
+          },
+        }),
+        JSON.stringify({
+          type: "stream_event",
+          session_id: "s-2",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "signature_delta", signature: "sig==" },
+          },
+        }),
+      ].join("\n"),
+    );
+    parser.finish();
+
+    expect(onThinkingDelta).toHaveBeenCalledTimes(1);
+    expect(onThinkingDelta).toHaveBeenCalledWith({
+      text: "Real reasoning",
+      delta: "Real reasoning",
+      sessionId: "s-2",
+      usage: undefined,
+    });
+  });
+
   it("emits Claude tool result line metadata when available", () => {
     const onToolResult = vi.fn();
     const parser = createCliJsonlStreamingParser({
