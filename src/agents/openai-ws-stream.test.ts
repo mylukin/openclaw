@@ -1743,6 +1743,41 @@ describe("createOpenAIWebSocketStreamFn", () => {
     expect(sent.store).toBe(false);
   });
 
+  it("preserves stored reasoning item ids while building WebSocket payloads", () => {
+    const sent = buildOpenAIWebSocketResponseCreatePayload({
+      model: modelStub as Parameters<typeof buildOpenAIWebSocketResponseCreatePayload>[0]["model"],
+      context: contextStub as Parameters<
+        typeof buildOpenAIWebSocketResponseCreatePayload
+      >[0]["context"],
+      turnInput: {
+        inputItems: [
+          {
+            type: "reasoning",
+            id: "rs_ws_stateless",
+            encrypted_content: "encrypted-reasoning",
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: "hello",
+          },
+        ],
+      },
+      tools: [],
+    }) as {
+      store?: boolean;
+      input?: Array<{ type?: string; id?: string; encrypted_content?: string }>;
+    };
+
+    const reasoningItem = sent.input?.find((item) => item.type === "reasoning");
+    expect(sent.store).toBe(false);
+    expect(reasoningItem).toMatchObject({
+      type: "reasoning",
+      id: "rs_ws_stateless",
+      encrypted_content: "encrypted-reasoning",
+    });
+  });
+
   it("emits an AssistantMessage on response.completed", async () => {
     const streamFn = createOpenAIWebSocketStreamFn("sk-test", "sess-2");
     const stream = streamFn(
@@ -2402,9 +2437,8 @@ describe("createOpenAIWebSocketStreamFn", () => {
       input: Array<{ type: string; id?: string; call_id?: string }>;
     };
     expect(sent2.previous_response_id).toBeUndefined();
-    expect(sent2.input.map((item) => item.type)).toEqual(["message", "reasoning", "function_call"]);
-    expect(sent2.input[1]).toMatchObject({ type: "reasoning", id: "rs_turn1" });
-    expect(sent2.input[2]).toMatchObject({
+    expect(sent2.input.map((item) => item.type)).toEqual(["message", "function_call"]);
+    expect(sent2.input[1]).toMatchObject({
       type: "function_call",
       call_id: "call_turn1",
       id: "fc_turn1",
@@ -2803,6 +2837,109 @@ describe("createOpenAIWebSocketStreamFn", () => {
     expect(sent.reasoning).toEqual({ effort: "none" });
     expect(sent.text).toEqual({ verbosity: "low" });
     expect(sent.service_tier).toBe("priority");
+  });
+
+  it("strips stored reasoning ids after onPayload when final WebSocket store is false", async () => {
+    const streamFn = createOpenAIWebSocketStreamFn("sk-test", "sess-onpayload-reasoning-strip");
+    const stream = streamFn(
+      modelStub as Parameters<typeof streamFn>[0],
+      contextStub as Parameters<typeof streamFn>[1],
+      {
+        onPayload: (payload: unknown) => {
+          const request = payload as Record<string, unknown>;
+          request.input = [
+            {
+              type: "reasoning",
+              id: "rs_ws_final_stateless",
+              encrypted_content: "encrypted-reasoning",
+            },
+            {
+              type: "message",
+              role: "assistant",
+              content: "hello",
+            },
+          ];
+          return undefined;
+        },
+      } as unknown as Parameters<typeof streamFn>[2],
+    );
+    await new Promise<void>((resolve, reject) => {
+      queueMicrotask(async () => {
+        try {
+          await new Promise((r) => setImmediate(r));
+          MockManager.lastInstance!.simulateEvent({
+            type: "response.completed",
+            response: makeResponseObject("resp-onpayload-reasoning-strip", "Done"),
+          });
+          for await (const _ of await resolveStream(stream)) {
+            /* consume */
+          }
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    const sent = MockManager.lastInstance!.sentEvents[0] as {
+      input?: Array<{ type?: string; id?: string; encrypted_content?: string }>;
+      store?: boolean;
+    };
+    const reasoningItem = sent.input?.find((item) => item.type === "reasoning");
+    expect(sent.store).toBe(false);
+    expect(reasoningItem).toMatchObject({
+      type: "reasoning",
+      encrypted_content: "encrypted-reasoning",
+    });
+    expect(reasoningItem).not.toHaveProperty("id");
+  });
+
+  it("keeps stored reasoning ids after onPayload when final WebSocket store is true", async () => {
+    const streamFn = createOpenAIWebSocketStreamFn("sk-test", "sess-onpayload-reasoning-store");
+    const stream = streamFn(
+      modelStub as Parameters<typeof streamFn>[0],
+      contextStub as Parameters<typeof streamFn>[1],
+      {
+        onPayload: (payload: unknown) => {
+          const request = payload as Record<string, unknown>;
+          request.store = true;
+          request.input = [
+            {
+              type: "reasoning",
+              id: "rs_ws_final_persisted",
+              encrypted_content: "encrypted-reasoning",
+            },
+          ];
+          return undefined;
+        },
+      } as unknown as Parameters<typeof streamFn>[2],
+    );
+    await new Promise<void>((resolve, reject) => {
+      queueMicrotask(async () => {
+        try {
+          await new Promise((r) => setImmediate(r));
+          MockManager.lastInstance!.simulateEvent({
+            type: "response.completed",
+            response: makeResponseObject("resp-onpayload-reasoning-store", "Done"),
+          });
+          for await (const _ of await resolveStream(stream)) {
+            /* consume */
+          }
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    const sent = MockManager.lastInstance!.sentEvents[0] as {
+      input?: Array<{ type?: string; id?: string; encrypted_content?: string }>;
+      store?: boolean;
+    };
+    expect(sent.store).toBe(true);
+    expect(sent.input?.[0]).toMatchObject({
+      type: "reasoning",
+      id: "rs_ws_final_persisted",
+      encrypted_content: "encrypted-reasoning",
+    });
   });
 
   it("awaits async onPayload mutations before sending response.create", async () => {

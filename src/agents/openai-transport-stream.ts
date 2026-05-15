@@ -23,6 +23,7 @@ import { resolveProviderTransportTurnStateWithPlugin } from "../plugins/provider
 import type { ProviderRuntimeModel } from "../plugins/types.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./copilot-dynamic-headers.js";
 import { detectOpenAICompletionsCompat } from "./openai-completions-compat.js";
+import { sanitizeStatelessReasoningReplayPayload } from "./openai-reasoning-replay.js";
 import {
   applyOpenAIResponsesPayloadPolicy,
   resolveOpenAIResponsesPayloadPolicy,
@@ -187,7 +188,10 @@ function convertResponsesMessages(
   model: Model<Api>,
   context: Context,
   allowedToolCallProviders: Set<string>,
-  options?: { includeSystemPrompt?: boolean; supportsDeveloperRole?: boolean },
+  options?: {
+    includeSystemPrompt?: boolean;
+    supportsDeveloperRole?: boolean;
+  },
 ): ResponseInput {
   const messages: ResponseInput = [];
   const normalizeIdPart = (part: string) => {
@@ -264,7 +268,8 @@ function convertResponsesMessages(
       for (const block of msg.content) {
         if (block.type === "thinking") {
           if (block.thinkingSignature) {
-            output.push(JSON.parse(block.thinkingSignature));
+            const reasoningItem = JSON.parse(block.thinkingSignature);
+            output.push(reasoningItem);
           }
         } else if (block.type === "text") {
           let msgId = parseTextSignature(block.textSignature)?.id ?? `msg_${msgIndex}`;
@@ -677,6 +682,7 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
           params = nextParams as typeof params;
         }
         params = mergeTransportMetadata(params, turnState?.metadata);
+        sanitizeStatelessReasoningReplayPayload(params as Record<string, unknown>);
         const responseStream = (await client.responses.create(
           params as never,
           options?.signal ? { signal: options.signal } : undefined,
@@ -734,6 +740,9 @@ export function buildOpenAIResponsesParams(
   const compat = getCompat(model as OpenAIModeModel);
   const supportsDeveloperRole =
     typeof compat.supportsDeveloperRole === "boolean" ? compat.supportsDeveloperRole : undefined;
+  const payloadPolicy = resolveOpenAIResponsesPayloadPolicy(model, {
+    storeMode: "disable",
+  });
   const messages = convertResponsesMessages(
     model,
     context,
@@ -741,9 +750,6 @@ export function buildOpenAIResponsesParams(
     { supportsDeveloperRole },
   );
   const cacheRetention = resolveCacheRetention(options?.cacheRetention);
-  const payloadPolicy = resolveOpenAIResponsesPayloadPolicy(model, {
-    storeMode: "disable",
-  });
   const params: OpenAIResponsesRequestParams = {
     model: model.id,
     input: messages,
@@ -833,6 +839,7 @@ export function createAzureOpenAIResponsesTransportStreamFn(): StreamFn {
           params = nextParams as typeof params;
         }
         params = mergeTransportMetadata(params, turnState?.metadata);
+        sanitizeStatelessReasoningReplayPayload(params as Record<string, unknown>);
         const responseStream = (await client.responses.create(
           params as never,
           options?.signal ? { signal: options.signal } : undefined,

@@ -1,5 +1,6 @@
 import type { Model } from "@mariozechner/pi-ai";
 import { describe, expect, it } from "vitest";
+import { sanitizeStatelessReasoningReplayPayload } from "./openai-reasoning-replay.js";
 import {
   buildOpenAIResponsesParams,
   buildOpenAICompletionsParams,
@@ -532,6 +533,131 @@ describe("openai transport stream", () => {
     ) as { input?: Array<{ role?: string }> };
 
     expect(params.input?.[0]).toMatchObject({ role: "developer" });
+  });
+
+  it("preserves stored reasoning item ids while building Responses params", () => {
+    const params = buildOpenAIResponsesParams(
+      {
+        id: "gpt-5.4",
+        name: "GPT-5.4",
+        api: "openai-responses",
+        provider: "openai",
+        baseUrl: "https://api.openai.com/v1",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 8192,
+      } satisfies Model<"openai-responses">,
+      {
+        systemPrompt: "system",
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "openai",
+            model: "gpt-5.4",
+            stopReason: "stop",
+            usage: {},
+            timestamp: 0,
+            content: [
+              {
+                type: "thinking",
+                thinking: "internal",
+                thinkingSignature: JSON.stringify({
+                  type: "reasoning",
+                  id: "rs_stateless",
+                  encrypted_content: "encrypted-reasoning",
+                }),
+              },
+              { type: "text", text: "hello", textSignature: "msg_1" },
+            ],
+          },
+        ],
+        tools: [],
+      } as never,
+      undefined,
+    ) as {
+      input?: Array<{ type?: string; id?: string; encrypted_content?: string }>;
+      store?: unknown;
+    };
+
+    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
+    expect(params.store).toBe(false);
+    expect(reasoningItem).toMatchObject({
+      type: "reasoning",
+      id: "rs_stateless",
+      encrypted_content: "encrypted-reasoning",
+    });
+  });
+
+  it("strips stored reasoning ids from final store:false Responses payloads", () => {
+    const payload = {
+      store: false,
+      input: [
+        {
+          type: "reasoning",
+          id: "rs_stateless",
+          encrypted_content: "encrypted-reasoning",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: "hello",
+        },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    const reasoningItem = payload.input.find((item) => item.type === "reasoning");
+    expect(reasoningItem).toMatchObject({
+      type: "reasoning",
+      encrypted_content: "encrypted-reasoning",
+    });
+    expect(reasoningItem).not.toHaveProperty("id");
+  });
+
+  it("keeps stored reasoning ids when final Responses payload enables store", () => {
+    const payload = {
+      store: true,
+      input: [
+        {
+          type: "reasoning",
+          id: "rs_persisted",
+          encrypted_content: "encrypted-reasoning",
+        },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    expect(payload.input[0]).toMatchObject({
+      type: "reasoning",
+      id: "rs_persisted",
+      encrypted_content: "encrypted-reasoning",
+    });
+  });
+
+  it("drops stored reasoning-only items from final store:false Responses payloads", () => {
+    const payload = {
+      store: false,
+      input: [
+        {
+          type: "reasoning",
+          id: "rs_missing_stateless",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: "hello",
+        },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    expect(payload.input.map((item) => item.type)).toEqual(["message"]);
   });
 
   it.each([

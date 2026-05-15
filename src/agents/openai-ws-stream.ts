@@ -39,6 +39,7 @@ import {
   encodeAssistantTextSignature,
   normalizeAssistantPhase,
 } from "../shared/chat-message-content.js";
+import { sanitizeStatelessReasoningReplayPayload } from "./openai-reasoning-replay.js";
 import { resolveOpenAIStrictToolSetting } from "./openai-tool-schema.js";
 import {
   getOpenAIWebSocketErrorDetails,
@@ -856,6 +857,7 @@ export function createOpenAIWebSocketStreamFn(
           (nextPayload ?? payload) as Record<string, unknown>,
           turnState?.metadata,
         );
+        sanitizeStatelessReasoningReplayPayload(payload);
         const requestPayload = payload as Parameters<OpenAIWebSocketManager["send"]>[0];
 
         try {

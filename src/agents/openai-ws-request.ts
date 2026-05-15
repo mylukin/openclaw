@@ -101,11 +101,12 @@ export function buildOpenAIWebSocketResponseCreatePayload(params: {
     capability: "llm",
     transport: "websocket",
   }).capabilities.supportsResponsesStoreField;
+  const store = supportsResponsesStoreField ? false : undefined;
 
   return {
     type: "response.create",
     model: params.model.id,
-    ...(supportsResponsesStoreField ? { store: false } : {}),
+    ...(store === undefined ? {} : { store }),
     input: params.turnInput.inputItems,
     instructions: params.context.systemPrompt
       ? stripSystemPromptCacheBoundary(params.context.systemPrompt)
