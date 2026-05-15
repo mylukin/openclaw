@@ -53,4 +53,41 @@ describe("buildClaudeTmuxArgs", () => {
       ]),
     );
   });
+
+  it("works with no baseArgs and omits model/session when unset", () => {
+    const args = buildClaudeTmuxArgs({
+      backend: { command: "claude" },
+      modelId: "",
+      settingsFile: "/tmp/s.json",
+      systemPromptFile: "/tmp/p.txt",
+    });
+
+    expect(args).toEqual([
+      "--settings",
+      "/tmp/s.json",
+      "--setting-sources",
+      "",
+      "--append-system-prompt-file",
+      "/tmp/p.txt",
+      "--permission-mode",
+      "bypassPermissions",
+    ]);
+    expect(args).not.toContain("--model");
+    expect(args).not.toContain("--managed-settings");
+  });
+
+  it("drops equals-form settings/model overrides from baseArgs", () => {
+    const args = buildClaudeTmuxArgs({
+      backend: { command: "claude", modelArg: "--model" },
+      baseArgs: ["--model=opus", "--settings=/x.json", "--permission-mode=plan", "--keep-me"],
+      modelId: "sonnet",
+      settingsFile: "/tmp/s.json",
+      systemPromptFile: "/tmp/p.txt",
+    });
+    expect(args).toContain("--keep-me");
+    expect(args).not.toContain("--model=opus");
+    expect(args).not.toContain("--settings=/x.json");
+    expect(args).not.toContain("--permission-mode=plan");
+    expect(args.slice(-2)).toEqual(["--model", "sonnet"]);
+  });
 });

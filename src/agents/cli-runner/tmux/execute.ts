@@ -18,6 +18,7 @@ import type {
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_TURN_IDLE_MS = 1_200;
+const DEFAULT_HOOK_STALL_MS = 8_000;
 const DEFAULT_CAPTURE_LINES = 160;
 const CLAUDE_READY_RE = /\bClaude Code v\d+\.\d+\.\d+\b/;
 
@@ -34,6 +35,7 @@ function normalizeTmuxConfig(input: TmuxExecutionInput): NormalizedTmuxConfig {
     startupTimeoutMs: config?.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
     turnTimeoutMs: config?.turnTimeoutMs ?? input.timeoutMs,
     turnIdleMs: config?.turnIdleMs ?? DEFAULT_TURN_IDLE_MS,
+    hookStallMs: config?.hookStallMs ?? DEFAULT_HOOK_STALL_MS,
     captureLines: config?.captureLines ?? DEFAULT_CAPTURE_LINES,
     stopOnAbort: config?.stopOnAbort ?? true,
     memoryMode: config?.memoryMode ?? "managed-disabled",
@@ -440,11 +442,14 @@ export async function executeTmuxCliRun(
         },
       );
     }
-    if (
-      (config.hookMode === "off" || !sawCurrentRunHook) &&
-      terminal.getText() &&
-      Date.now() - lastActivityAt >= config.turnIdleMs
-    ) {
+    const idleFor = Date.now() - lastActivityAt;
+    const noHookYet = config.hookMode === "off" || !sawCurrentRunHook;
+    // Fast path: no managed hooks (or none seen yet) — short idle ends the turn.
+    // Stall path: hooks were seen but the Stop hook never arrived (crashed/timed
+    // out hook script); fall back after a longer silence so the turn does not
+    // hang until the overall deadline.
+    const idleThreshold = noHookYet ? config.turnIdleMs : config.hookStallMs;
+    if (terminal.getText() && idleFor >= idleThreshold) {
       break;
     }
     await sleep(100);

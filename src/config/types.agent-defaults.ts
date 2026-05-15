@@ -57,6 +57,12 @@ export type CliTmuxExecutionConfig = {
   turnTimeoutMs?: number;
   /** Idle duration used by terminal-output fallback completion. */
   turnIdleMs?: number;
+  /**
+   * Silence window after which a hooked turn falls back to terminal-idle
+   * completion when the Stop hook never fires (e.g. hook script crashed).
+   * Prevents the turn from hanging until the overall timeout.
+   */
+  hookStallMs?: number;
   /** Number of pane lines to capture for diagnostics. */
   captureLines?: number;
   /** Send Ctrl-C/kill the tmux session when OpenClaw aborts the run. */

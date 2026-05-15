@@ -24,4 +24,18 @@ describe("buildTmuxSessionName", () => {
   it("sanitizes arbitrary prefix text", () => {
     expect(sanitizeTmuxNamePart(" hello/world:tmux ")).toBe("hello-world-tmux");
   });
+
+  it("falls back to the default prefix when the prefix sanitizes to empty", () => {
+    const name = buildTmuxSessionName({
+      prefix: "!!!",
+      backendId: "claude-cli",
+      workspaceDir: "/repo",
+      sessionKey: "chat-1",
+      modelId: "sonnet",
+      systemPromptHash: "sys",
+      memoryMode: "managed-disabled",
+      hookMode: "managed",
+    });
+    expect(name).toMatch(/^openclaw-claude-[0-9a-f]{12}$/);
+  });
 });

@@ -48,6 +48,29 @@ describe("parseHookEventLine", () => {
 
   it("ignores malformed or unknown event lines", () => {
     expect(parseHookEventLine("{")).toBeNull();
+    expect(parseHookEventLine("   ")).toBeNull();
     expect(parseHookEventLine(JSON.stringify({ event: "Unknown", timestamp: 1 }))).toBeNull();
+    expect(parseHookEventLine(JSON.stringify({ event: 123, timestamp: 1 }))).toBeNull();
+  });
+
+  it("defaults the timestamp and omits non-string/optional fields", () => {
+    const event = parseHookEventLine(
+      JSON.stringify({
+        event: "Stop",
+        timestamp: "not-a-number",
+        runId: 42,
+        openclawSessionId: null,
+        claudeSessionId: { x: 1 },
+        stdin: "not-an-object",
+      }),
+    );
+    expect(event).not.toBeNull();
+    expect(event?.event).toBe("Stop");
+    expect(typeof event?.timestamp).toBe("number");
+    expect(event?.timestamp).toBeGreaterThan(0);
+    expect(event?.runId).toBeUndefined();
+    expect(event?.openclawSessionId).toBeUndefined();
+    expect(event?.claudeSessionId).toBeUndefined();
+    expect(event?.stdin).toBeUndefined();
   });
 });

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TmuxSessionManager } from "./manager.js";
+import { defaultTmuxCommandRunner, TmuxSessionManager } from "./manager.js";
 import type { NormalizedTmuxConfig, TmuxRuntimePaths } from "./types.js";
 
 function buildPaths(rootDir: string): TmuxRuntimePaths {
@@ -26,6 +26,7 @@ const config: NormalizedTmuxConfig = {
   startupTimeoutMs: 1_000,
   turnTimeoutMs: 5_000,
   turnIdleMs: 100,
+  hookStallMs: 8_000,
   captureLines: 20,
   stopOnAbort: true,
   memoryMode: "managed-disabled",
@@ -181,5 +182,149 @@ describe("TmuxSessionManager", () => {
 
     await expect(fs.readFile(paths.paneLogFile, "utf8")).resolves.toBe("");
     await expect(fs.readFile(paths.eventsFile, "utf8")).resolves.toBe("");
+  });
+
+  it("reuses a live session when metadata matches and bumps lastUsedAt", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
+    tempDirs.push(rootDir);
+    const paths = buildPaths(rootDir);
+    const metadata = {
+      backendId: "claude-cli",
+      workspaceDir: rootDir,
+      sessionName: "openclaw-claude-test",
+      launchHash: "launch-hash",
+      model: "sonnet",
+      systemPromptHash: "hash",
+      memoryMode: "managed-disabled" as const,
+      hookMode: "managed" as const,
+      createdAt: 1,
+      lastUsedAt: 1,
+    };
+    await fs.writeFile(paths.metadataFile, `${JSON.stringify(metadata)}\n`);
+    const calls: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" }; // has-session succeeds → exists=true
+    });
+
+    const result = await manager.ensureSession({
+      paths,
+      metadata,
+      command: "claude",
+      args: ["--model", "sonnet"],
+      cwd: rootDir,
+      env: {},
+      config,
+    });
+
+    expect(result).toEqual({ created: false });
+    expect(calls).toEqual(["has-session"]);
+    expect(calls).not.toContain("new-session");
+    const persisted = JSON.parse(await fs.readFile(paths.metadataFile, "utf8"));
+    expect(persisted.lastUsedAt).toBeGreaterThan(1);
+  });
+
+  it("recreates when the session is live but metadata file is missing", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
+    tempDirs.push(rootDir);
+    const paths = buildPaths(rootDir);
+    const calls: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" }; // has-session ok, no metadata file → mismatch
+    });
+
+    const result = await manager.ensureSession({
+      paths,
+      metadata: {
+        backendId: "claude-cli",
+        workspaceDir: rootDir,
+        sessionName: "openclaw-claude-test",
+        launchHash: "h",
+        model: "sonnet",
+        systemPromptHash: "hash",
+        memoryMode: "managed-disabled",
+        hookMode: "managed",
+        createdAt: 1,
+        lastUsedAt: 1,
+      },
+      command: "claude",
+      args: [],
+      cwd: rootDir,
+      env: {},
+      config,
+    });
+
+    expect(result).toEqual({ created: true });
+    expect(calls).toContain("kill-session");
+    expect(calls).toContain("new-session");
+  });
+
+  it("pastes the prompt buffer and sends Enter", async () => {
+    const calls: string[][] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args);
+      return { stdout: "", stderr: "" };
+    });
+    await manager.pastePrompt({
+      sessionName: "s",
+      bufferName: "buf",
+      promptFile: "/tmp/p.txt",
+    });
+    expect(calls.map((a) => a[0])).toEqual(["load-buffer", "paste-buffer", "send-keys"]);
+    await manager.sendEnter("s");
+    expect(calls.at(-1)).toEqual(["send-keys", "-t", "s:0.0", "Enter"]);
+  });
+
+  it("captures pane tail and swallows capture failures", async () => {
+    let mode: "ok" | "fail" = "ok";
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      if (args[0] === "capture-pane" && mode === "fail") {
+        throw new Error("no pane");
+      }
+      return { stdout: "PANE TAIL", stderr: "" };
+    });
+    await expect(manager.captureTail("s", 10)).resolves.toBe("PANE TAIL");
+    mode = "fail";
+    await expect(manager.captureTail("s", 10)).resolves.toBe("");
+  });
+
+  it("interrupts with C-c and falls back to kill-session on failure", async () => {
+    const calls: string[] = [];
+    const okManager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" };
+    });
+    await okManager.interrupt("s");
+    expect(calls).toEqual(["send-keys"]);
+
+    const killCalls: string[] = [];
+    const failManager = new TmuxSessionManager(async (_c, args) => {
+      killCalls.push(args[0]);
+      if (args[0] === "send-keys") {
+        throw new Error("send failed");
+      }
+      return { stdout: "", stderr: "" };
+    });
+    await failManager.interrupt("s");
+    expect(killCalls).toEqual(["send-keys", "kill-session"]);
+  });
+
+  it("hasSession reflects the underlying tmux exit", async () => {
+    const present = new TmuxSessionManager(async () => ({ stdout: "", stderr: "" }));
+    await expect(present.hasSession("s")).resolves.toBe(true);
+    const absent = new TmuxSessionManager(async () => {
+      throw new Error("no session");
+    });
+    await expect(absent.hasSession("s")).resolves.toBe(false);
+  });
+
+  it("defaultTmuxCommandRunner executes a real process and returns stdout", async () => {
+    const result = await defaultTmuxCommandRunner("node", [
+      "-e",
+      "process.stdout.write('hi'); process.stderr.write('warn')",
+    ]);
+    expect(result.stdout).toBe("hi");
+    expect(result.stderr).toBe("warn");
   });
 });

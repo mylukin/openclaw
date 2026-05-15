@@ -6,6 +6,7 @@ export type NormalizedTmuxConfig = Required<
     | "sessionNamePrefix"
     | "startupTimeoutMs"
     | "turnIdleMs"
+    | "hookStallMs"
     | "captureLines"
     | "stopOnAbort"
     | "memoryMode"
