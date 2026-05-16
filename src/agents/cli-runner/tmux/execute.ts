@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { CliOutput } from "../../cli-output.js";
 import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
@@ -90,6 +91,48 @@ async function readFromOffset(
     }
   } catch {
     return { text: "", offset };
+  }
+}
+
+// User-level Claude assets to surface inside an isolated CLAUDE_CONFIG_DIR.
+// Auth/history (`.credentials.json`, `projects/`, `todos/`, etc.) are
+// deliberately excluded — those must stay isolated per tmux session.
+const USER_CLAUDE_LINKED_ASSETS = ["skills", "commands", "agents"] as const;
+
+export async function linkUserClaudeAssets(params: {
+  configDir: string;
+  /** Override the user ~/.claude root (tests). */
+  userClaudeDir?: string;
+  onDiagnostic?: (event: string, data?: Record<string, unknown>) => void;
+}): Promise<void> {
+  const userRoot = params.userClaudeDir ?? path.join(os.homedir(), ".claude");
+  for (const asset of USER_CLAUDE_LINKED_ASSETS) {
+    const source = path.join(userRoot, asset);
+    const dest = path.join(params.configDir, asset);
+    try {
+      const srcStat = await fs.stat(source).catch(() => null);
+      if (!srcStat || !srcStat.isDirectory()) {
+        continue; // user has no such asset dir — nothing to share
+      }
+      const destStat = await fs.lstat(dest).catch(() => null);
+      if (destStat) {
+        // Already present (prior run's symlink, or a real dir we must not
+        // clobber). Leave it; refresh only stale symlinks pointing nowhere.
+        if (destStat.isSymbolicLink()) {
+          const resolved = await fs.stat(dest).catch(() => null);
+          if (resolved) {
+            continue; // valid symlink, keep
+          }
+          await fs.rm(dest, { force: true }).catch(() => {});
+        } else {
+          continue; // real dir/file — never overwrite
+        }
+      }
+      await fs.symlink(source, dest, "dir");
+      params.onDiagnostic?.("tmux.assets.linked", { asset, source, dest });
+    } catch {
+      // Best-effort: a missing source or symlink race must never block launch.
+    }
   }
 }
 
@@ -476,6 +519,15 @@ export async function executeTmuxCliRun(
   };
   if (config.authMode === "openclaw" && env.CLAUDE_CONFIG_DIR) {
     await fs.mkdir(env.CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
+    // The isolated CLAUDE_CONFIG_DIR replaces ~/.claude wholesale, so
+    // user-level skills/commands/agents would be invisible. Symlink them in
+    // (best-effort) so the tmux Claude can still use them while keeping its
+    // auth/history isolated. Only links when the user source exists and the
+    // destination is absent — never clobbers a real dir.
+    await linkUserClaudeAssets({
+      configDir: env.CLAUDE_CONFIG_DIR,
+      ...(input.onDiagnostic ? { onDiagnostic: input.onDiagnostic } : {}),
+    });
   }
   // Launch signature must stay stable across turns of the same conversation.
   // Several values change every turn and would otherwise force a kill +

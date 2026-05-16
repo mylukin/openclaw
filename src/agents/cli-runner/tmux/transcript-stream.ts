@@ -138,6 +138,42 @@ function stringifyToolResultContent(content: unknown): string | undefined {
   }
 }
 
+// OpenClaw pastes the serialized conversation context (XML message
+// envelopes + Feishu "[Pasted text #N +M lines]" placeholders) into the
+// tmux Claude as its prompt. When that blob is large the model frequently
+// reproduces fragments of the envelope verbatim in its own reply, which
+// then leaks into the Feishu card and wrecks readability. These are
+// unambiguous machine tokens (never legitimate assistant prose), so strip
+// them from captured assistant text. Anchored patterns only — generic
+// markdown/XML the model writes intentionally is left untouched.
+const PROMPT_ENVELOPE_PATTERNS: RegExp[] = [
+  // Feishu paste placeholder: "[Pasted text #29 +35 lines]" and the
+  // space-collapsed "[Pastedtext#29+35lines]" variant.
+  /\[Pasted\s*text\s*#\d+\s*\+\s*\d+\s*lines?\]/gi,
+  // Conversation envelope open/close: <message ...>, <messageindex="2" ...>,
+  // <message dex="2" ...>, </message>, </messe> (truncated paste).
+  /<\/?messa?ge?(?:index)?\b[^>]*>/gi,
+  /<messageindex=[^>]*>/gi,
+  // Mention envelope: <atid=ou_xxx></at>, <at user_id="...">...</at> wrappers.
+  /<atid=[^>]*>/gi,
+  /<\/at>/gi,
+  /<at\s+user_id="[^"]*">/gi,
+  // Stray serialized metadata attribute runs left on their own lines.
+  /(?:^|\s)(?:sender_type|sender_name|sender_id|content_type|created_at|messageindex|message_id|id)="[^"]*"/gi,
+];
+
+export function stripPromptEnvelopeArtifacts(text: string): string {
+  let out = text;
+  for (const re of PROMPT_ENVELOPE_PATTERNS) {
+    out = out.replace(re, "");
+  }
+  // Collapse the blank-line debris left where envelopes were removed.
+  return out
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // Concatenate text records for the same message. Claude normally writes one
 // complete text block per message, but if a build streams partial then full
 // text records, treat a later record that extends an earlier one as the
@@ -398,7 +434,7 @@ export class TranscriptTailer {
     for (const thinking of pending.thinking) {
       out.push({ kind: "thinking", text: thinking });
     }
-    const text = joinMessageText(pending.text);
+    const text = stripPromptEnvelopeArtifacts(joinMessageText(pending.text));
     if (text.trim()) {
       this.accumulatedText = this.accumulatedText ? `${this.accumulatedText}\n\n${text}` : text;
       if (pending.finalText) {

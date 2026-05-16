@@ -2,7 +2,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveTranscriptPath, TranscriptTailer, workspaceSlug } from "./transcript-stream.js";
+import {
+  resolveTranscriptPath,
+  stripPromptEnvelopeArtifacts,
+  TranscriptTailer,
+  workspaceSlug,
+} from "./transcript-stream.js";
 
 describe("workspaceSlug", () => {
   it("replaces forward slashes with hyphens", () => {
@@ -432,5 +437,39 @@ describe("TranscriptTailer", () => {
     const tailer = new TranscriptTailer(file, 0);
     await tailer.poll();
     expect(tailer.getLastUsage()).toBeUndefined();
+  });
+
+  describe("stripPromptEnvelopeArtifacts", () => {
+    it("removes Feishu paste placeholders (spaced and collapsed)", () => {
+      expect(stripPromptEnvelopeArtifacts("a [Pasted text #29 +35 lines] b")).toBe("a  b");
+      expect(stripPromptEnvelopeArtifacts("x [Pastedtext#30+23lines] y")).toBe("x  y");
+    });
+
+    it("removes conversation envelope tags and mention wrappers", () => {
+      const raw =
+        'reply text </message><messageindex="2" id="om_x" sender_type="bot">more ' +
+        "<atid=ou_68d></at> tail";
+      expect(stripPromptEnvelopeArtifacts(raw)).toBe("reply text more  tail");
+    });
+
+    it("removes stray serialized metadata attribute runs", () => {
+      const raw =
+        'Trent结论\nsender_type="bot" sender_name="Ada" created_at="2026-05-15T23:47:58Z"\n实际内容';
+      const out = stripPromptEnvelopeArtifacts(raw);
+      expect(out).not.toContain("sender_type");
+      expect(out).not.toContain("created_at");
+      expect(out).toContain("Trent结论");
+      expect(out).toContain("实际内容");
+    });
+
+    it("leaves legitimate assistant prose untouched", () => {
+      const prose = "Here is a plan:\n\n1. do X\n2. do Y\n\n```ts\nconst a = 1;\n```";
+      expect(stripPromptEnvelopeArtifacts(prose)).toBe(prose);
+    });
+
+    it("collapses blank-line debris left by removed envelopes", () => {
+      const raw = 'para1\n\n</message>\n\n\n<messageindex="3" id="om_y">\n\npara2';
+      expect(stripPromptEnvelopeArtifacts(raw)).toBe("para1\n\npara2");
+    });
   });
 });

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { executeTmuxCliRun } from "./execute.js";
+import { executeTmuxCliRun, linkUserClaudeAssets } from "./execute.js";
 import { resolveTmuxRuntimePaths } from "./runtime-dir.js";
 import { buildTmuxSessionName } from "./session-name.js";
 import type { TmuxExecutionInput, TmuxRuntimePaths } from "./types.js";
@@ -1437,4 +1437,61 @@ describe("executeTmuxCliRun", () => {
     expect(ensureCalls).toBeLessThanOrEqual(4);
     expect(ensureCalls).toBeGreaterThanOrEqual(2);
   }, 20_000);
+
+  describe("linkUserClaudeAssets", () => {
+    it("symlinks existing user skills/commands/agents into the config dir", async () => {
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-assets-test-"));
+      tempDirs.push(base);
+      const userClaudeDir = path.join(base, "user-claude");
+      const configDir = path.join(base, "isolated-config");
+      await fs.mkdir(path.join(userClaudeDir, "skills", "demo"), { recursive: true });
+      await fs.writeFile(path.join(userClaudeDir, "skills", "demo", "SKILL.md"), "# demo skill");
+      await fs.mkdir(path.join(userClaudeDir, "commands"), { recursive: true });
+      // agents intentionally absent → must be skipped, not error.
+      await fs.mkdir(configDir, { recursive: true });
+
+      await linkUserClaudeAssets({ configDir, userClaudeDir });
+
+      const skillLink = path.join(configDir, "skills");
+      const lst = await fs.lstat(skillLink);
+      expect(lst.isSymbolicLink()).toBe(true);
+      // Resolves through the symlink to the real SKILL.md.
+      expect(await fs.readFile(path.join(skillLink, "demo", "SKILL.md"), "utf8")).toBe(
+        "# demo skill",
+      );
+      expect((await fs.lstat(path.join(configDir, "commands"))).isSymbolicLink()).toBe(true);
+      await expect(fs.lstat(path.join(configDir, "agents"))).rejects.toThrow();
+    });
+
+    it("never clobbers a real (non-symlink) dir already in the config dir", async () => {
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-assets-test-"));
+      tempDirs.push(base);
+      const userClaudeDir = path.join(base, "user-claude");
+      const configDir = path.join(base, "isolated-config");
+      await fs.mkdir(path.join(userClaudeDir, "skills", "u"), { recursive: true });
+      await fs.writeFile(path.join(userClaudeDir, "skills", "u", "SKILL.md"), "user");
+      // Pre-existing REAL skills dir in the isolated config — must survive.
+      await fs.mkdir(path.join(configDir, "skills", "local"), { recursive: true });
+      await fs.writeFile(path.join(configDir, "skills", "local", "SKILL.md"), "local");
+
+      await linkUserClaudeAssets({ configDir, userClaudeDir });
+
+      const st = await fs.lstat(path.join(configDir, "skills"));
+      expect(st.isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(configDir, "skills", "local", "SKILL.md"), "utf8")).toBe(
+        "local",
+      );
+    });
+
+    it("is a no-op when the user ~/.claude has none of the assets", async () => {
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-assets-test-"));
+      tempDirs.push(base);
+      const userClaudeDir = path.join(base, "empty-user");
+      const configDir = path.join(base, "cfg");
+      await fs.mkdir(userClaudeDir, { recursive: true });
+      await fs.mkdir(configDir, { recursive: true });
+      await linkUserClaudeAssets({ configDir, userClaudeDir });
+      await expect(fs.lstat(path.join(configDir, "skills"))).rejects.toThrow();
+    });
+  });
 });
