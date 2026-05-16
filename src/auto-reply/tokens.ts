@@ -41,6 +41,44 @@ export function isSilentReplyText(
   return getSilentExactRegex(token).test(text);
 }
 
+/**
+ * Autonomous-dispatch silent check. Unlike {@link isSilentReplyText} (kept
+ * strict for interactive chat per #19537), this also treats a message whose
+ * LAST non-empty line is exactly the token as silent — even when preceded by
+ * status narration. Autonomous finalize turns (cron isolated-agent, subagent
+ * announce) routinely emit a one-line status echo of an action already taken
+ * via tools, then `NO_REPLY` on its own line to signal "nothing to deliver".
+ * Interactive replies must NOT use this (a user answer ending in a stray
+ * NO_REPLY line would be wrongly suppressed).
+ */
+export function isAutonomousSilentReply(
+  text: string | undefined,
+  token: string = SILENT_REPLY_TOKEN,
+): boolean {
+  if (!text) {
+    return false;
+  }
+  if (isSilentReplyText(text, token)) {
+    return true;
+  }
+  const lines = text.split(/\r?\n/);
+  let lastNonEmpty = "";
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const candidate = (lines[i] ?? "").trim();
+    if (candidate) {
+      lastNonEmpty = candidate;
+      break;
+    }
+  }
+  if (!lastNonEmpty) {
+    return false;
+  }
+  // Allow surrounding markdown emphasis the model sometimes adds, e.g.
+  // "**NO_REPLY**" or "*NO_REPLY*".
+  const unwrapped = lastNonEmpty.replace(/^\*+/, "").replace(/\*+$/, "").trim();
+  return getSilentExactRegex(token).test(unwrapped);
+}
+
 type SilentReplyActionEnvelope = { action?: unknown };
 
 export function isSilentReplyEnvelopeText(

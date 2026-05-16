@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   couldBeSilentTokenStart,
+  isAutonomousSilentReply,
   isSilentReplyPrefixText,
   isSilentReplyTailFragmentText,
   isSilentReplyText,
@@ -30,6 +31,39 @@ describe("isSilentReplyText", () => {
   it("returns false for substantive text ending with token (#19537)", () => {
     const text = "Here is a helpful response.\n\nNO_REPLY";
     expect(isSilentReplyText(text)).toBe(false);
+  });
+
+  describe("isAutonomousSilentReply", () => {
+    it("matches exact token like isSilentReplyText", () => {
+      expect(isAutonomousSilentReply("NO_REPLY")).toBe(true);
+      expect(isAutonomousSilentReply("  no_reply  ")).toBe(true);
+      expect(isAutonomousSilentReply(undefined)).toBe(false);
+      expect(isAutonomousSilentReply("")).toBe(false);
+    });
+
+    it("treats a trailing standalone NO_REPLY line as silent (the repro)", () => {
+      const text =
+        "Final audit exit=0, cleanup completed without errors. Archive at\n" +
+        "/Users/lukin/AgentData/shared/archives/monitor-state-cleanup/20260516T090400Z.json\n" +
+        "(archived 2 tasks + 1 promise from chief).\n\nNO_REPLY";
+      expect(isAutonomousSilentReply(text)).toBe(true);
+      // Interactive path must still deliver this (#19537 preserved).
+      expect(isSilentReplyText(text)).toBe(false);
+    });
+
+    it("unwraps markdown emphasis around the trailing token", () => {
+      expect(isAutonomousSilentReply("done.\n\n**NO_REPLY**")).toBe(true);
+      expect(isAutonomousSilentReply("done.\n*NO_REPLY*")).toBe(true);
+    });
+
+    it("does NOT match when token is mid-text, not the last line", () => {
+      expect(isAutonomousSilentReply("NO_REPLY\nbut actually here is the answer")).toBe(false);
+      expect(isAutonomousSilentReply("see NO_REPLY in docs for details")).toBe(false);
+    });
+
+    it("does NOT match a last line that merely contains the token", () => {
+      expect(isAutonomousSilentReply("status\nthe result was NO_REPLY today")).toBe(false);
+    });
   });
 
   it("returns false for substantive text starting with token", () => {

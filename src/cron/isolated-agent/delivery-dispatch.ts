@@ -1,5 +1,9 @@
 import { countActiveDescendantRuns } from "../../agents/subagent-registry-read.js";
-import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+import {
+  isAutonomousSilentReply,
+  isSilentReplyText,
+  SILENT_REPLY_TOKEN,
+} from "../../auto-reply/tokens.js";
 import type { ReplyPayload } from "../../auto-reply/types.js";
 import type { CliDeps } from "../../cli/outbound-send-deps.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -425,8 +429,10 @@ export async function dispatchCronDelivery(
             ? [{ text: synthesizedText }]
             : [];
       // Suppress NO_REPLY sentinel so it never leaks to external channels.
+      // Autonomous variant: a status-echo line followed by a standalone
+      // NO_REPLY line is also silent (the action was already taken via tools).
       const payloadsForDelivery = rawPayloads.filter(
-        (p) => !isSilentReplyText(p.text, SILENT_REPLY_TOKEN),
+        (p) => !isAutonomousSilentReply(p.text, SILENT_REPLY_TOKEN),
       );
       if (payloadsForDelivery.length === 0) {
         return await finishSilentReplyDelivery();
@@ -646,7 +652,7 @@ export async function dispatchCronDelivery(
         ...params.telemetry,
       });
     }
-    if (isSilentReplyText(synthesizedText, SILENT_REPLY_TOKEN)) {
+    if (isAutonomousSilentReply(synthesizedText, SILENT_REPLY_TOKEN)) {
       return await finishSilentReplyDelivery();
     }
     if (params.isAborted()) {
