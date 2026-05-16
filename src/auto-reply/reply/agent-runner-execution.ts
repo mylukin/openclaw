@@ -885,60 +885,69 @@ export async function runAgentTurnWithFallback(params: {
                     });
                   },
                   onToolResult: onToolResult
-                    ? (() => {
-                        let toolResultChain: Promise<void> = Promise.resolve();
-                        return (payload) => {
-                          queueReasoningEndIfNeeded();
-                          const preview =
-                            typeof payload.text === "string" && payload.text.trim()
-                              ? payload.text.trim().slice(0, 1_200)
-                              : undefined;
-                          emitAgentEvent({
-                            runId,
-                            stream: "tool",
-                            data: {
-                              phase: "result",
-                              ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
-                              ...(preview ? { partialResult: preview, result: preview } : {}),
-                              ...(payload.isError ? { isError: true } : {}),
-                            },
-                          });
-                          toolResultChain = toolResultChain
-                            .then(async () => {
-                              await params.opts?.onAgentEvent?.({
-                                stream: "tool",
-                                data: {
-                                  phase: "result",
-                                  ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
-                                  ...(preview ? { partialResult: preview, result: preview } : {}),
-                                  ...(payload.isError ? { isError: true } : {}),
-                                },
-                              });
-                              const { text, skip } = normalizeStreamingText({
-                                text: payload.text,
+                    ? (payload) => {
+                        queueReasoningEndIfNeeded();
+                        const preview =
+                          typeof payload.text === "string" && payload.text.trim()
+                            ? payload.text.trim().slice(0, 1_200)
+                            : undefined;
+                        emitAgentEvent({
+                          runId,
+                          stream: "tool",
+                          data: {
+                            phase: "result",
+                            ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                            ...(preview ? { partialResult: preview, result: preview } : {}),
+                            ...(payload.isError ? { isError: true } : {}),
+                          },
+                        });
+                        // Funnel tool_result through the SAME streamingChain as
+                        // onToolUseEvent so downstream observers (Feishu inline
+                        // stats) always see tool-start before tool-result for
+                        // the same toolUseId. A separate chain raced here and
+                        // caused Feishu's handleToolResultLikeEvent to
+                        // synthesize a generic `Tool` entry when the result
+                        // landed before its matching start was dispatched.
+                        let resolveTask: (() => void) | undefined;
+                        const task = new Promise<void>((resolve) => {
+                          resolveTask = resolve;
+                        }).finally(() => {
+                          params.pendingToolTasks.delete(task);
+                        });
+                        params.pendingToolTasks.add(task);
+                        queueStreamingStep(async () => {
+                          try {
+                            await params.opts?.onAgentEvent?.({
+                              stream: "tool",
+                              data: {
+                                phase: "result",
+                                ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+                                ...(preview ? { partialResult: preview, result: preview } : {}),
                                 ...(payload.isError ? { isError: true } : {}),
-                              });
-                              if (skip) {
-                                return;
-                              }
-                              if (text !== undefined) {
-                                await params.typingSignals.signalTextDelta(text);
-                              }
-                              await onToolResult({
-                                ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
-                                ...(text !== undefined ? { text } : {}),
-                                ...(payload.isError ? { isError: true } : {}),
-                              });
-                            })
-                            .catch((err) => {
-                              logVerbose(`cli tool result delivery failed: ${String(err)}`);
+                              },
                             });
-                          const task = toolResultChain.finally(() => {
-                            params.pendingToolTasks.delete(task);
-                          });
-                          params.pendingToolTasks.add(task);
-                        };
-                      })()
+                            const { text, skip } = normalizeStreamingText({
+                              text: payload.text,
+                              ...(payload.isError ? { isError: true } : {}),
+                            });
+                            if (skip) {
+                              return;
+                            }
+                            if (text !== undefined) {
+                              await params.typingSignals.signalTextDelta(text);
+                            }
+                            await onToolResult({
+                              ...(payload.toolUseId ? { toolCallId: payload.toolUseId } : {}),
+                              ...(text !== undefined ? { text } : {}),
+                              ...(payload.isError ? { isError: true } : {}),
+                            });
+                          } catch (err) {
+                            logVerbose(`cli tool result delivery failed: ${String(err)}`);
+                          } finally {
+                            resolveTask?.();
+                          }
+                        });
+                      }
                     : undefined,
                 });
                 bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(

@@ -417,6 +417,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
+  // Card body is an ordered list of blocks instead of an accumulated string
+  // sliced by character offsets. Each block is either a text paragraph
+  // (assistant prose) or a tool-stats summary ("✓ Read 3 files"). New text
+  // from onPartialReply replaces/extends the last text block; tool
+  // completion increments counts on the trailing toolStats block (or appends
+  // a new one if the previous block is text). Rendering = join blocks. This
+  // eliminates the prior offset-slice fragility that split assistant text
+  // mid-word when interim narration and tool completions interleaved.
+  type CardBlock =
+    | { kind: "text"; text: string }
+    | { kind: "toolStats"; counts: Map<string, number> };
+  const blocks: CardBlock[] = [];
   let lastPartial = "";
   let reasoningText = "";
   const deliveredFinalTexts = new Set<string>();
@@ -467,6 +479,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     seenToolCallIds.clear();
     completedToolSummaries.length = 0;
     toolCallCount = 0;
+    blocks.length = 0;
     lastRenderedStreamContent = "";
     replaceNextPartialAfterTool = false;
     thinkingActivityTick = 0;
@@ -641,14 +654,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     streamingActivityTimer.unref?.();
   };
 
+  // Upper bound on tool summaries shown in the panel. Long turns may produce
+  // dozens of tool calls; keep all of them visible so the Feishu panel mirrors
+  // the tmux UI (which lists each tool inline). The cap prevents pathological
+  // runs from exploding the card height while still showing the full history
+  // for typical turns.
+  const COMPLETED_TOOL_SUMMARY_LIMIT = 100;
   const rememberCompletedToolSummary = (summary: string | undefined): void => {
     const trimmed = summary ? truncateFeishuToolSummary(summary) : undefined;
     if (!trimmed) {
       return;
     }
     completedToolSummaries.push(trimmed);
-    if (completedToolSummaries.length > 3) {
-      completedToolSummaries.splice(0, completedToolSummaries.length - 3);
+    if (completedToolSummaries.length > COMPLETED_TOOL_SUMMARY_LIMIT) {
+      completedToolSummaries.splice(
+        0,
+        completedToolSummaries.length - COMPLETED_TOOL_SUMMARY_LIMIT,
+      );
     }
   };
 
@@ -768,6 +790,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
     const removedTool = removeActiveTool(payload.toolCallId);
     rememberCompletedToolSummary(removedTool?.summary ?? removedTool?.name);
+    // Append/extend a toolStats block — never anchor anything to text length.
+    // Sits AFTER the current trailing text block, never inside it.
+    const inlineToolName = removedTool?.name?.trim();
+    if (inlineToolName) {
+      const last = blocks[blocks.length - 1];
+      if (last && last.kind === "toolStats") {
+        last.counts.set(inlineToolName, (last.counts.get(inlineToolName) ?? 0) + 1);
+      } else {
+        const counts = new Map<string, number>();
+        counts.set(inlineToolName, 1);
+        blocks.push({ kind: "toolStats", counts });
+      }
+      rebuildStreamTextFromBlocks();
+    }
     if (activeTools.length === 0 && streamPhase === "tool") {
       streamPhase = streamText ? "streaming" : "idle";
     }
@@ -776,9 +812,96 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       return;
     }
     queueThinkingPanelUpdate();
+    if (inlineToolName) {
+      queueStreamingRender();
+    }
   };
 
   const hasReasoningText = (): boolean => reasoningText.trim().length > 0;
+
+  const TOOL_INLINE_UNITS: Record<string, { singular: string; plural: string }> = {
+    Read: { singular: "file", plural: "files" },
+    Write: { singular: "file", plural: "files" },
+    Edit: { singular: "file", plural: "files" },
+    MultiEdit: { singular: "file", plural: "files" },
+    NotebookEdit: { singular: "cell", plural: "cells" },
+    Bash: { singular: "command", plural: "commands" },
+    Grep: { singular: "search", plural: "searches" },
+    Glob: { singular: "pattern", plural: "patterns" },
+    Find: { singular: "search", plural: "searches" },
+    WebFetch: { singular: "fetch", plural: "fetches" },
+    WebSearch: { singular: "search", plural: "searches" },
+    Task: { singular: "subagent", plural: "subagents" },
+    Agent: { singular: "subagent", plural: "subagents" },
+    TodoWrite: { singular: "update", plural: "updates" },
+    TaskCreate: { singular: "task", plural: "tasks" },
+    TaskUpdate: { singular: "task", plural: "tasks" },
+  };
+
+  const formatInlineToolStat = (toolName: string, count: number): string => {
+    const unit = TOOL_INLINE_UNITS[toolName];
+    if (!unit) {
+      return `${toolName} ${count} ${count === 1 ? "call" : "calls"}`;
+    }
+    return `${toolName} ${count} ${count === 1 ? unit.singular : unit.plural}`;
+  };
+
+  const renderToolStatsBlock = (block: { counts: Map<string, number> }): string => {
+    return Array.from(block.counts.entries())
+      .map(([name, count]) => `✓ ${formatInlineToolStat(name, count)}`)
+      .join("\n");
+  };
+
+  const renderBlocks = (): string => {
+    if (blocks.length === 0) {
+      return "";
+    }
+    return blocks
+      .map((block) =>
+        block.kind === "text" ? block.text.replace(/^\n+|\n+$/g, "") : renderToolStatsBlock(block),
+      )
+      .filter((part) => part.length > 0)
+      .join("\n\n");
+  };
+
+  // Set/extend the trailing text block from a partial-reply snapshot.
+  // Delegates merge semantics to `mergeStreamingText` so overlap, prefix and
+  // identical-snapshot cases collapse into a single text block; falls back
+  // to appending a new text block when the trailing block is toolStats.
+  // toolStats blocks are never sliced or rewritten by text.
+  const upsertTextBlock = (text: string): void => {
+    if (!text) {
+      return;
+    }
+    const last = blocks[blocks.length - 1];
+    if (last && last.kind === "text") {
+      last.text = mergeStreamingText(last.text, text);
+      return;
+    }
+    blocks.push({ kind: "text", text });
+  };
+
+  const rebuildStreamTextFromBlocks = (): void => {
+    streamText = renderBlocks();
+  };
+
+  // At final delivery, replace ONLY the trailing text block with the
+  // canonical final text (the partial may have been cut off / hook-rewritten).
+  // Earlier narration text blocks and interleaved toolStats stay in their
+  // original positions so the card preserves the tmux-style ordering.
+  const setFinalTextBlock = (finalText: string): void => {
+    const last = blocks[blocks.length - 1];
+    if (!finalText.trim()) {
+      if (last && last.kind === "text") {
+        blocks.pop();
+      }
+    } else if (last && last.kind === "text") {
+      last.text = finalText;
+    } else {
+      blocks.push({ kind: "text", text: finalText });
+    }
+    rebuildStreamTextFromBlocks();
+  };
 
   const normalizeReasoningDisplayText = (text: string | undefined): string => {
     const trimmed = text?.trim() ?? "";
@@ -882,20 +1005,25 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           ? `⏳ Running tool...${elapsedSuffix()}`
           : "";
       const completedSummaryLines = completedToolSummaries.map((summary) => `✓ ${summary}`);
+      const statusLine = toolStatus || genericActivityLine;
+      // Suppress the bouncing activity line when there is already at least one
+      // completed tool summary to show. Mid-run the running-tool status still
+      // surfaces, and an empty summaries list still falls back to the activity
+      // line so the panel never renders blank.
+      const showStatusLine =
+        Boolean(statusLine) && (activeTools.length > 0 || completedSummaryLines.length === 0);
       if (toolOnlyPanel) {
-        // Show a completed summary when no tool is actively running, instead
-        // of a zero-width space that renders as a blank panel.
+        // Mirror the tmux pane: list every completed tool summary inline
+        // (running status above the list), instead of collapsing to a count.
+        const toolOnlyLines = [...(showStatusLine ? [statusLine] : []), ...completedSummaryLines];
         sections.push(
-          toolStatus ||
-            genericActivityLine ||
-            completedSummaryLines.join("\n") ||
-            `✓ ${toolCallCount} completed`,
+          toolOnlyLines.length > 0 ? toolOnlyLines.join("\n") : `✓ ${toolCallCount} completed`,
         );
       } else {
         sections.push(
           [
             `🔧 Tool calls (${toolCallCount})`,
-            ...(toolStatus || genericActivityLine ? ["", toolStatus || genericActivityLine] : []),
+            ...(showStatusLine ? ["", statusLine] : []),
             ...(completedSummaryLines.length > 0 ? ["", ...completedSummaryLines] : []),
           ].join("\n"),
         );
@@ -1049,18 +1177,39 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (options?.dedupeWithLastPartial && nextText === lastPartial) {
       return;
     }
-    const shouldResetAfterTool =
-      replaceNextPartialAfterTool &&
-      options?.dedupeWithLastPartial === true &&
-      Boolean(streamText) &&
-      !nextText.startsWith(streamText);
-    if (shouldResetAfterTool) {
-      // Post-tool text doesn't continue from existing stream — replace entirely
-      streamText = nextText;
+    // Cumulative snapshot semantics from upstream: the partial text is the
+    // FULL assistant text-so-far for the current logical reply, not a delta.
+    // Drive the block model directly — never slice by character offset.
+    if (replaceNextPartialAfterTool) {
+      // The next snapshot after a tool can be either (a) a fresh paragraph
+      // from a per-message source (tmux transcript) or (b) a cumulative
+      // snapshot from a streaming provider that includes the pre-tool text
+      // as a prefix. In case (b) extend the pre-tool text block in place so
+      // the tool stays AFTER it; in case (a) start a new text block after
+      // the trailing toolStats.
+      let lastTextIdx = -1;
+      for (let i = blocks.length - 1; i >= 0; i -= 1) {
+        if (blocks[i]?.kind === "text") {
+          lastTextIdx = i;
+          break;
+        }
+      }
+      const lastTextBlock = lastTextIdx >= 0 ? blocks[lastTextIdx] : undefined;
+      if (
+        lastTextBlock &&
+        lastTextBlock.kind === "text" &&
+        lastTextBlock.text &&
+        nextText.startsWith(lastTextBlock.text)
+      ) {
+        lastTextBlock.text = nextText;
+      } else {
+        blocks.push({ kind: "text", text: nextText });
+      }
       replaceNextPartialAfterTool = false;
     } else {
-      streamText = mergeStreamingText(streamText, nextText);
+      upsertTextBlock(nextText);
     }
+    rebuildStreamTextFromBlocks();
     if (options?.dedupeWithLastPartial) {
       lastPartial = nextText;
     }
@@ -1247,6 +1396,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       streaming = null;
       streamingStartPromise = null;
       streamText = "";
+      blocks.length = 0;
       lastPartial = "";
       reasoningText = "";
       thinkingCollapsed = false;
@@ -1342,7 +1492,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               if (info?.kind === "final" && (streaming?.isActive() || streamingStartPromise)) {
                 // Show a brief note in the streaming card so the user sees
                 // feedback rather than a silently discarded empty card.
-                streamText = policyNote;
+                setFinalTextBlock(policyNote);
                 await closeStreaming({ emitFinalText: true, reason: "error" });
               } else if (info?.kind === "final") {
                 // No streaming session — send a plain text notification so the
@@ -1433,7 +1583,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 logDispatcher(
                   `deliver final -> streaming close streamMessageId=${streaming?.getMessageId() ?? "raced-null"} finalChars=${text.trim().length}`,
                 );
-                streamText = text;
+                // Replace only the trailing text block with the canonical
+                // final text (hooks may have rewritten it). Earlier text
+                // blocks + interleaved toolStats stay in their original
+                // positions so the card preserves tmux-style ordering.
+                setFinalTextBlock(text);
                 if (streaming?.isActive()) {
                   await closeStreaming({ emitFinalText: true, reason: "idle" });
                 } else {

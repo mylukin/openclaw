@@ -755,6 +755,49 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     });
   });
 
+  it("keeps inline tool stats anchored at end-of-text on cumulative-extending partial reply snapshots", async () => {
+    // Regression: when Claude emits text "No" as a partial snapshot, then a
+    // tool fires (recording an inline insertion at offset=2), then a later
+    // cumulative snapshot "Now reading the session…" extends the first, the
+    // composite must NOT slice the merged text mid-word ("No" + ✓ Read + "w
+    // reading…"). The insertion should travel forward to the new end-of-text.
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: { renderMode: "card", streaming: true },
+    });
+
+    const dispatcher = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn(), error: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    await dispatcher.replyOptions.onPartialReply?.({ text: "No" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolStart?.({
+      name: "Read",
+      phase: "start",
+      toolCallId: "tu-1",
+    });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onToolResult?.({ toolCallId: "tu-1", text: "" });
+    await flushAsyncTasks();
+    await dispatcher.replyOptions.onPartialReply?.({
+      text: "Now reading the session startup files in parallel.",
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    const lastUpdate = streamingInstances[0].update.mock.calls.at(-1);
+    expect(lastUpdate?.[0]).toBe(
+      "Now reading the session startup files in parallel.\n\n✓ Read 1 file",
+    );
+  });
+
   it("shows tool status even when the first visible event is a tool call", async () => {
     resolveFeishuAccountMock.mockReturnValue({
       accountId: "main",
