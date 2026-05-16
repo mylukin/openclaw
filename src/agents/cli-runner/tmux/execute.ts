@@ -30,6 +30,11 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_TURN_IDLE_MS = 1_200;
 const DEFAULT_HOOK_STALL_MS = 8_000;
 const DEFAULT_CAPTURE_LINES = 160;
+// Reap sibling tmux REPLs idle longer than this (ms). Bounds orphan
+// accumulation from openclaw session rotation, model swaps, mcpConfig
+// changes — each spawns a new sessionName digest and the old REPL would
+// otherwise linger until tmux server death.
+const DEFAULT_REAP_IDLE_AFTER_MS = 60 * 60 * 1_000;
 // Claude Code writes the final assistant message to the session JSONL right
 // before (or right after) the Stop hook fires. Give the writer a short window
 // to flush the final block so downstream surfaces (e.g. Feishu cards) get the
@@ -59,6 +64,10 @@ function normalizeTmuxConfig(input: TmuxExecutionInput): NormalizedTmuxConfig {
     memoryMode: config?.memoryMode ?? "managed-disabled",
     hookMode: config?.hookMode ?? "managed",
     authMode: config?.authMode ?? "openclaw",
+    reapIdleAfterMs:
+      typeof (config as { reapIdleAfterMs?: number } | undefined)?.reapIdleAfterMs === "number"
+        ? (config as { reapIdleAfterMs: number }).reapIdleAfterMs
+        : DEFAULT_REAP_IDLE_AFTER_MS,
   };
 }
 
@@ -370,6 +379,28 @@ export async function executeTmuxCliRun(
   });
   const paths = resolveTmuxRuntimePaths({ runtimeDir: config.runtimeDir, sessionName });
   await ensureTmuxRuntimeDir(paths);
+  // Opportunistic orphan reap. Sibling runtime dirs share the same
+  // rootBase = parentOf(paths.rootDir). Stale-by-TTL sibling REPLs are
+  // killed here so /new / model swap / mcp-config churn does not leave
+  // dead tmux servers around. Best-effort; never blocks the run.
+  try {
+    const reapResult = await manager.reapStaleSessions({
+      rootBase: path.dirname(paths.rootDir),
+      ttlMs: config.reapIdleAfterMs,
+      now: Date.now(),
+      except: sessionName,
+      ...(input.onDiagnostic ? { onDiagnostic: input.onDiagnostic } : {}),
+    });
+    if (reapResult.reaped.length > 0) {
+      input.onDiagnostic?.("tmux.reap.summary", {
+        scanned: reapResult.scanned,
+        reapedCount: reapResult.reaped.length,
+        reaped: reapResult.reaped.join(","),
+      });
+    }
+  } catch {
+    // Reaper failures must never block the actual run.
+  }
   await writeClaudeTmuxRuntimeFiles({
     paths,
     hookMode: config.hookMode,

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import type {
   NormalizedTmuxConfig,
@@ -146,6 +147,67 @@ export class TmuxSessionManager {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Kill sibling tmux REPLs whose metadata.lastUsedAt is older than the TTL,
+   * then remove their runtime dirs. Bounds orphan accumulation: every
+   * openclaw session rotation, model swap, or mcpConfigHash change spawns a
+   * new sessionName digest, so without reaping the old REPLs would linger
+   * indefinitely. Best-effort: any per-entry error skips that entry only.
+   * Returns the list of session names reaped (for diagnostics).
+   */
+  async reapStaleSessions(params: {
+    rootBase: string;
+    ttlMs: number;
+    now: number;
+    /** Session name to skip (the one this run is about to use). */
+    except?: string;
+    onDiagnostic?: (event: string, data?: Record<string, unknown>) => void;
+  }): Promise<{ reaped: string[]; scanned: number }> {
+    if (!Number.isFinite(params.ttlMs) || params.ttlMs <= 0) {
+      return { reaped: [], scanned: 0 };
+    }
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(params.rootBase, { withFileTypes: true });
+    } catch {
+      return { reaped: [], scanned: 0 };
+    }
+    const cutoff = params.now - params.ttlMs;
+    const reaped: string[] = [];
+    let scanned = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      if (params.except && entry.name === params.except) {
+        continue;
+      }
+      scanned += 1;
+      const dir = path.join(params.rootBase, entry.name);
+      const meta = await readJsonFile<TmuxMetadata>(path.join(dir, "metadata.json"));
+      if (!meta || typeof meta.lastUsedAt !== "number") {
+        // No usable metadata → leave it alone (could be in-flight create).
+        continue;
+      }
+      if (meta.lastUsedAt > cutoff) {
+        continue;
+      }
+      const sessionName = typeof meta.sessionName === "string" ? meta.sessionName : entry.name;
+      await this.killSession(sessionName);
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+      } catch {
+        // best-effort dir cleanup
+      }
+      reaped.push(sessionName);
+      params.onDiagnostic?.("tmux.reap.killed", {
+        sessionName,
+        idleForMs: params.now - meta.lastUsedAt,
+      });
+    }
+    return { reaped, scanned };
   }
 
   // `hasSession` only proves the tmux session object exists — the pane's

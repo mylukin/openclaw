@@ -16,6 +16,15 @@ export type NormalizedTmuxConfig = Required<
 > &
   Pick<CliTmuxExecutionConfig, "runtimeDir"> & {
     turnTimeoutMs: number;
+    /**
+     * Idle TTL (ms). Sibling tmux sessions in the same runtimeDir whose
+     * metadata.lastUsedAt is older than `now - reapIdleAfterMs` are killed
+     * and their runtime dirs removed on the next executeTmuxCliRun call.
+     * Bounds orphan accumulation from openclaw session rotation (every /new,
+     * model swap, mcpConfigHash change spawns a new sessionName digest;
+     * without this the old REPLs linger indefinitely). 0 disables.
+     */
+    reapIdleAfterMs: number;
   };
 
 export type TmuxRuntimePaths = {

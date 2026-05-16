@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { defaultTmuxCommandRunner, TmuxSessionManager } from "./manager.js";
 import type { NormalizedTmuxConfig, TmuxRuntimePaths } from "./types.js";
 
@@ -30,6 +30,7 @@ const config: NormalizedTmuxConfig = {
   memoryMode: "managed-disabled",
   hookMode: "managed",
   authMode: "openclaw",
+  reapIdleAfterMs: 0,
 };
 
 describe("TmuxSessionManager", () => {
@@ -449,6 +450,71 @@ describe("TmuxSessionManager", () => {
     expect(result.created).toBe(false);
     expect(result.persistedClaudeSessionId).toBe("claude-persisted");
     expect(calls).not.toContain("kill-session");
+  });
+
+  it("reapStaleSessions kills idle sibling REPLs and removes their dirs", async () => {
+    const rootBase = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-reap-test-"));
+    tempDirs.push(rootBase);
+    const now = 10_000_000;
+    const ttlMs = 60_000;
+    // fresh: lastUsedAt within TTL → keep
+    const freshDir = path.join(rootBase, "openclaw-claude-fresh");
+    // stale: lastUsedAt past TTL → reap
+    const staleDir = path.join(rootBase, "openclaw-claude-stale");
+    // current: matches `except` → skip even if stale
+    const currentDir = path.join(rootBase, "openclaw-claude-current");
+    for (const [dir, lastUsedAt, sessionName] of [
+      [freshDir, now - 1_000, "openclaw-claude-fresh"],
+      [staleDir, now - ttlMs - 5_000, "openclaw-claude-stale"],
+      [currentDir, now - ttlMs - 999_999, "openclaw-claude-current"],
+    ] as const) {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        path.join(dir, "metadata.json"),
+        `${JSON.stringify({ sessionName, lastUsedAt })}\n`,
+      );
+    }
+    const killed: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      if (args[0] === "kill-session") {
+        killed.push(args[2] ?? "");
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const onDiagnostic = vi.fn();
+    const result = await manager.reapStaleSessions({
+      rootBase,
+      ttlMs,
+      now,
+      except: "openclaw-claude-current",
+      onDiagnostic,
+    });
+    expect(result.reaped).toEqual(["openclaw-claude-stale"]);
+    expect(killed).toEqual(["openclaw-claude-stale"]);
+    // Fresh and current dirs survived.
+    await expect(fs.access(freshDir)).resolves.toBeUndefined();
+    await expect(fs.access(currentDir)).resolves.toBeUndefined();
+    // Stale dir was removed.
+    await expect(fs.access(staleDir)).rejects.toThrow();
+    expect(onDiagnostic).toHaveBeenCalledWith(
+      "tmux.reap.killed",
+      expect.objectContaining({ sessionName: "openclaw-claude-stale" }),
+    );
+  });
+
+  it("reapStaleSessions disabled when ttlMs <= 0", async () => {
+    const rootBase = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-reap-test-"));
+    tempDirs.push(rootBase);
+    const dir = path.join(rootBase, "openclaw-claude-x");
+    await fs.mkdir(dir);
+    await fs.writeFile(
+      path.join(dir, "metadata.json"),
+      `${JSON.stringify({ sessionName: "openclaw-claude-x", lastUsedAt: 0 })}\n`,
+    );
+    const manager = new TmuxSessionManager(async () => ({ stdout: "", stderr: "" }));
+    const result = await manager.reapStaleSessions({ rootBase, ttlMs: 0, now: 1e12 });
+    expect(result.reaped).toEqual([]);
+    await expect(fs.access(dir)).resolves.toBeUndefined();
   });
 
   it("defaultTmuxCommandRunner executes a real process and returns stdout", async () => {
