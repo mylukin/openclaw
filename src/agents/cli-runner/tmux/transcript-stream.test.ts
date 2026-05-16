@@ -366,4 +366,71 @@ describe("TranscriptTailer", () => {
     await tailer.poll();
     expect(tailer.flushPending()).toEqual([{ kind: "text", text: "buffered", final: true }]);
   });
+
+  it("captures latest message.usage so /status sees real Context numbers", async () => {
+    const file = await makeFile();
+    const startedAt = 1_000;
+    const lineWithUsage = (
+      uuid: string,
+      messageId: string,
+      ts: number,
+      usage: Record<string, number>,
+      text: string,
+    ): string =>
+      `${JSON.stringify({
+        type: "assistant",
+        uuid,
+        timestamp: new Date(ts).toISOString(),
+        message: {
+          id: messageId,
+          role: "assistant",
+          content: [{ type: "text", text }],
+          usage,
+        },
+      })}\n`;
+    await fs.writeFile(
+      file,
+      lineWithUsage(
+        "u1",
+        "m1",
+        startedAt + 1,
+        {
+          input_tokens: 100,
+          output_tokens: 20,
+          cache_read_input_tokens: 9_000,
+          cache_creation_input_tokens: 50,
+        },
+        "first",
+      ) +
+        lineWithUsage(
+          "u2",
+          "m2",
+          startedAt + 2,
+          {
+            input_tokens: 150,
+            output_tokens: 30,
+            cache_read_input_tokens: 9_500,
+            cache_creation_input_tokens: 0,
+          },
+          "second",
+        ),
+    );
+    const tailer = new TranscriptTailer(file, startedAt);
+    await tailer.poll();
+    tailer.flushPending();
+    // Latest message wins; cache_creation falling to 0 is preserved.
+    expect(tailer.getLastUsage()).toEqual({
+      input: 150,
+      output: 30,
+      cacheRead: 9_500,
+      cacheWrite: 0,
+    });
+  });
+
+  it("getLastUsage returns undefined when no usage present", async () => {
+    const file = await makeFile();
+    const tailer = new TranscriptTailer(file, 0);
+    await tailer.poll();
+    expect(tailer.getLastUsage()).toBeUndefined();
+  });
 });

@@ -37,6 +37,47 @@ export function resolveTranscriptPath(params: {
   );
 }
 
+/**
+ * Locate the most recent Claude session JSONL touched after `sinceMs` in the
+ * project dir for this workspace. Used as a post-run fallback when the
+ * SessionStart hook never delivered a session id but Claude still wrote a
+ * transcript on disk. Returns undefined if the project dir is missing, has
+ * no JSONL files, or none are fresh enough to belong to this run.
+ */
+export async function findLatestTranscriptFile(params: {
+  configDir?: string;
+  workspaceDir: string;
+  sinceMs: number;
+}): Promise<string | undefined> {
+  const baseDir = params.configDir ?? path.join(os.homedir(), ".claude");
+  const projectDir = path.join(baseDir, "projects", workspaceSlug(params.workspaceDir));
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(projectDir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  let best: { file: string; mtimeMs: number } | undefined;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+      continue;
+    }
+    const full = path.join(projectDir, entry.name);
+    try {
+      const stat = await fs.stat(full);
+      if (stat.mtimeMs < params.sinceMs) {
+        continue;
+      }
+      if (!best || stat.mtimeMs > best.mtimeMs) {
+        best = { file: full, mtimeMs: stat.mtimeMs };
+      }
+    } catch {
+      // skip races
+    }
+  }
+  return best?.file;
+}
+
 export type TranscriptSegment =
   | { kind: "text"; text: string; final: boolean }
   | { kind: "thinking"; text: string }
@@ -122,6 +163,13 @@ function joinMessageText(parts: string[]): string {
   return out;
 }
 
+export type TranscriptUsage = {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+};
+
 export class TranscriptTailer {
   private offset = 0;
   private buffer = "";
@@ -137,6 +185,10 @@ export class TranscriptTailer {
   private readonly emittedToolUseIds = new Set<string>();
   // tool_result blocks seen before their tool_use was emitted.
   private readonly orphanResults = new Map<string, TranscriptSegment>();
+  // Latest assistant `message.usage` seen on this run. Used to populate
+  // CliOutput.usage so /status (which reads usage from the openclaw session
+  // transcript) shows real Context numbers instead of 0/200k.
+  private lastUsage: TranscriptUsage | undefined;
 
   constructor(
     private readonly filePath: string,
@@ -201,6 +253,16 @@ export class TranscriptTailer {
     return this.finalReplyText.trim();
   }
 
+  /** Latest assistant message.usage seen on this run, or undefined if none. */
+  getLastUsage(): TranscriptUsage | undefined {
+    return this.lastUsage ? { ...this.lastUsage } : undefined;
+  }
+
+  /** Path of the transcript file this tailer is reading. */
+  getFilePath(): string {
+    return this.filePath;
+  }
+
   private consumeLine(line: string, out: TranscriptSegment[]): void {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -230,6 +292,33 @@ export class TranscriptTailer {
       if (this.pending && this.pending.messageId !== messageId) {
         // A new assistant message starts: the previous one is complete.
         this.sealPending(out);
+      }
+      const usage = message?.usage as Record<string, unknown> | undefined;
+      if (usage && typeof usage === "object") {
+        // Anthropic shape: input_tokens / output_tokens /
+        // cache_read_input_tokens / cache_creation_input_tokens. Take the
+        // latest non-zero values (later records on the same message carry
+        // updated counts).
+        const next: TranscriptUsage = { ...this.lastUsage };
+        const num = (v: unknown): number | undefined =>
+          typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+        const input = num(usage.input_tokens);
+        const output = num(usage.output_tokens);
+        const cacheRead = num(usage.cache_read_input_tokens);
+        const cacheWrite = num(usage.cache_creation_input_tokens);
+        if (input !== undefined) {
+          next.input = input;
+        }
+        if (output !== undefined) {
+          next.output = output;
+        }
+        if (cacheRead !== undefined) {
+          next.cacheRead = cacheRead;
+        }
+        if (cacheWrite !== undefined) {
+          next.cacheWrite = cacheWrite;
+        }
+        this.lastUsage = next;
       }
       const stopReason = typeof message?.stop_reason === "string" ? message.stop_reason : undefined;
       if (!this.pending) {

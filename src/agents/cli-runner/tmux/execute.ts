@@ -13,6 +13,7 @@ import { resolveTmuxRuntimePaths, ensureTmuxRuntimeDir } from "./runtime-dir.js"
 import { buildTmuxSessionName, sha256Hex } from "./session-name.js";
 import { TerminalDeltaTracker } from "./terminal-stream.js";
 import {
+  findLatestTranscriptFile,
   resolveTranscriptPath,
   TranscriptTailer,
   type TranscriptSegment,
@@ -965,6 +966,30 @@ export async function executeTmuxCliRun(
     await sleep(100);
   }
 
+  // Post-run transcript discovery fallback: SessionStart hook may not have
+  // delivered a claude session id, so `transcript` is undefined even though
+  // Claude wrote a JSONL on disk. Find the freshest project JSONL touched
+  // during this run and replay it; otherwise the only available output would
+  // be raw TUI noise (bracketed-paste placeholders + box-drawing tables).
+  if (!transcript && transcriptIsAuthoritative) {
+    const fallback = await findLatestTranscriptFile({
+      configDir: transcriptConfigDir,
+      workspaceDir: input.workspaceDir,
+      sinceMs: startedAt,
+    });
+    if (fallback) {
+      transcript = new TranscriptTailer(fallback, startedAt);
+      diag?.("tmux.transcript.fallback", { sessionName, transcriptFile: fallback });
+      // Bind the discovered session id (filename = `<id>.jsonl`) so it gets
+      // persisted into metadata for next-turn resume.
+      const discovered = path.basename(fallback, ".jsonl");
+      if (discovered && !cliSessionId) {
+        cliSessionId = discovered;
+        resumableClaudeId = discovered;
+      }
+    }
+  }
+
   if (transcript) {
     // Drain phase: Claude Code may flush the final assistant message to the
     // JSONL transcript right around the Stop hook. Keep polling until the
@@ -986,7 +1011,21 @@ export async function executeTmuxCliRun(
     dispatchTranscriptSegments(transcript.flushPending());
   }
 
-  if (!transcriptEmitted && bufferedPaneDeltas.length > 0) {
+  // Pane fallback rules:
+  //   - hookMode=off: pane IS canonical → flush.
+  //   - authoritative + a transcript file exists on disk (whether we read
+  //     anything from it or not): transcript is the source of truth →
+  //     suppress pane (TUI noise: bracketed-paste placeholders, box-drawing
+  //     tables, prompt echo). The on-disk presence is the signal; even if
+  //     parsing yielded nothing, falling back to pane garbage is worse.
+  //   - authoritative but NO transcript on disk (rare): pane is the only
+  //     signal → flush as last resort.
+  let transcriptOnDisk = false;
+  if (transcript) {
+    transcriptOnDisk = (await fileSize(transcript.getFilePath())) > 0;
+  }
+  const suppressPaneFallback = transcriptIsAuthoritative && transcriptOnDisk;
+  if (!transcriptEmitted && !suppressPaneFallback && bufferedPaneDeltas.length > 0) {
     for (const delta of bufferedPaneDeltas) {
       input.onAssistantTurn?.(delta);
     }
@@ -1031,10 +1070,22 @@ export async function executeTmuxCliRun(
   // run was cut off mid-narration), then the pane text.
   const finalReplyText = transcriptEmitted ? (transcript?.getFinalReplyText() ?? "") : "";
   const accumulatedText = transcriptEmitted ? (transcript?.getText() ?? "") : "";
+  // Lift the latest assistant message.usage off the Claude transcript so
+  // /status can render real Context numbers. Without this CliOutput.usage is
+  // undefined and the status renderer falls back to the openclaw session
+  // transcript, which shows 0/200k for the tmux flow.
+  const usage = transcript?.getLastUsage();
+  // When transcript is authoritative AND a transcript was found, the pane
+  // is TUI noise and must NEVER fall through as the reply body. If no
+  // transcript exists anywhere (rare), pane is the only available signal.
+  const paneFallback = suppressPaneFallback ? "" : terminal.getText();
   return {
-    text: finalReplyText || accumulatedText || terminal.getText(),
+    text: finalReplyText || accumulatedText || paneFallback,
     ...((cliSessionId ?? input.cliSessionId)
       ? { sessionId: cliSessionId ?? input.cliSessionId }
+      : {}),
+    ...(usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite)
+      ? { usage }
       : {}),
   };
 }
