@@ -16,6 +16,7 @@ import { TerminalDeltaTracker } from "./terminal-stream.js";
 import {
   findLatestTranscriptFile,
   resolveTranscriptPath,
+  stripPromptEnvelopeArtifacts,
   TranscriptTailer,
   type TranscriptSegment,
 } from "./transcript-stream.js";
@@ -1107,10 +1108,31 @@ export async function executeTmuxCliRun(
   if (transcript) {
     transcriptOnDisk = (await fileSize(transcript.getFilePath())) > 0;
   }
-  const suppressPaneFallback = transcriptIsAuthoritative && transcriptOnDisk;
+  // Defense in depth: even when neither the transcript handle nor on-disk
+  // discovery succeeded, if the pane content carries the OpenClaw conversation
+  // envelope (Feishu "[Pasted text #N +M lines]" placeholders, <message>,
+  // <messageindex=>, <atid=>, <at user_id=>) it is the pasted prompt being
+  // rendered back by the TUI — never user-deliverable content. Treat that as
+  // authoritative signal to suppress pane fallback regardless of transcript
+  // discovery state. This catches the race where SessionStart hook never
+  // delivered a session id and the project dir was empty at fallback time.
+  const ENVELOPE_RE =
+    // NOTE: `<at user_id="...">Name</at>` is a legitimate Feishu @mention
+    // and must NOT be stripped. The envelope-specific tag is `<atid=ou_...>`
+    // (no `user_id=`, no quotes) — that one is unambiguous noise.
+    /\[Pasted\s*text\s*#\d+\s*\+\s*\d+\s*lines?\]|<\/?messa?ge?\b|<messageindex=|<atid=/i;
+  const rawPaneText = terminal.getText();
+  const paneLooksLikeEnvelope = ENVELOPE_RE.test(rawPaneText);
+  const suppressPaneFallback =
+    transcriptIsAuthoritative && (transcriptOnDisk || paneLooksLikeEnvelope);
+  let paneActuallyFlushed = false;
   if (!transcriptEmitted && !suppressPaneFallback && bufferedPaneDeltas.length > 0) {
     for (const delta of bufferedPaneDeltas) {
-      input.onAssistantTurn?.(delta);
+      const cleaned = stripPromptEnvelopeArtifacts(delta);
+      if (cleaned) {
+        input.onAssistantTurn?.(cleaned);
+        paneActuallyFlushed = true;
+      }
     }
   }
 
@@ -1139,7 +1161,12 @@ export async function executeTmuxCliRun(
     aliveAtEnd,
     sawStop,
     transcriptEmitted,
-    bufferedPaneFlushed: !transcriptEmitted && bufferedPaneDeltas.length > 0,
+    // True only if pane deltas were actually emitted to the consumer
+    // (previously this lied — it reported buffer non-emptiness, not the
+    // suppression-gated flush). False here ≠ pane is in card.
+    bufferedPaneFlushed: paneActuallyFlushed,
+    suppressPaneFallback,
+    paneLooksLikeEnvelope,
     recoveryAttempts,
     launchMode,
     durationMs: Date.now() - startedAt,
@@ -1161,7 +1188,10 @@ export async function executeTmuxCliRun(
   // When transcript is authoritative AND a transcript was found, the pane
   // is TUI noise and must NEVER fall through as the reply body. If no
   // transcript exists anywhere (rare), pane is the only available signal.
-  const paneFallback = suppressPaneFallback ? "" : terminal.getText();
+  // Final-text pane fallback: same sanitize-or-suppress rule. Reuse the
+  // already-captured rawPaneText, run it through the envelope stripper so a
+  // mixed-content pane only contributes its real content.
+  const paneFallback = suppressPaneFallback ? "" : stripPromptEnvelopeArtifacts(rawPaneText);
   return {
     text: finalReplyText || accumulatedText || paneFallback,
     ...((cliSessionId ?? input.cliSessionId)

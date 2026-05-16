@@ -445,11 +445,22 @@ describe("TranscriptTailer", () => {
       expect(stripPromptEnvelopeArtifacts("x [Pastedtext#30+23lines] y")).toBe("x  y");
     });
 
-    it("removes conversation envelope tags and mention wrappers", () => {
+    it("removes conversation envelope tags but preserves real Feishu mentions", () => {
       const raw =
-        'reply text </message><messageindex="2" id="om_x" sender_type="bot">more ' +
+        'reply <at user_id="ou_x">Trent</at> text </message><messageindex="2" id="om_x" sender_type="bot">more ' +
         "<atid=ou_68d></at> tail";
-      expect(stripPromptEnvelopeArtifacts(raw)).toBe("reply text more  tail");
+      const out = stripPromptEnvelopeArtifacts(raw);
+      // <message>, <messageindex=>, <atid=...></at> envelope removed.
+      expect(out).not.toContain("</message>");
+      expect(out).not.toContain("<messageindex=");
+      expect(out).not.toContain("<atid=");
+      // Real @mention (<at user_id="...">Name</at>) preserved intact.
+      expect(out).toContain('<at user_id="ou_x">Trent</at>');
+    });
+
+    it("does not strip a standalone </at> closing tag (paired with a real mention)", () => {
+      const raw = 'hi <at user_id="ou_a">Ada</at> please review';
+      expect(stripPromptEnvelopeArtifacts(raw)).toBe(raw);
     });
 
     it("removes stray serialized metadata attribute runs", () => {

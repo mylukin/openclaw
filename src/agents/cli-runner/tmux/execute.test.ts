@@ -1494,4 +1494,78 @@ describe("executeTmuxCliRun", () => {
       await expect(fs.lstat(path.join(configDir, "skills"))).rejects.toThrow();
     });
   });
+
+  it("suppresses pane fallback when its content matches the prompt envelope", async () => {
+    // Regression for the Feishu-card leak: SessionStart hook never delivers a
+    // session id AND the project dir has no transcript JSONL yet — both
+    // discovery paths fail, transcript stays undefined. Without the envelope
+    // detector this would have flushed the pane (containing the pasted
+    // OpenClaw conversation envelope rendered as TUI placeholders) directly
+    // into the card. The detector forces suppression.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    class NoHookEnvelopeManager extends FakeTmuxManager {
+      override async pastePrompt(p: { promptFile: string }) {
+        // Pane stream contains the prompt envelope echoed by the TUI — no
+        // assistant text, no SessionStart hook event with a claude id.
+        await fs.appendFile(
+          this.paths!.paneLogFile,
+          "[Pastedtext#21+35lines] paste gain to expad\n" +
+            '</message><messageindex="4" id="om_xyz" sender_type="bot">extra prompt echo\n' +
+            "<atid=ou_abc></at>some interim noise",
+        );
+        // Stop hook fires without a claudeSessionId so transcript is never
+        // instantiated via the live path either.
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now(), stdin: {} })}\n`,
+        );
+      }
+    }
+    const onAssistantTurn = vi.fn();
+    const output = await executeTmuxCliRun(
+      // hookMode managed (default) → transcriptIsAuthoritative=true.
+      baseInput(runtimeDir, { onAssistantTurn }),
+      new NoHookEnvelopeManager() as never,
+    );
+
+    // Envelope detector must short-circuit pane fallback even without any
+    // transcript file → no envelope text reaches the card.
+    const emitted = onAssistantTurn.mock.calls.map((c) => String(c[0])).join("");
+    expect(emitted).not.toMatch(/Pasted\s*text\s*#/i);
+    expect(emitted).not.toContain("</message>");
+    expect(emitted).not.toContain("<atid=");
+    expect(output.text).not.toMatch(/Pasted\s*text\s*#/i);
+    expect(output.text).not.toContain("</message>");
+  });
+
+  it("preserves legit Feishu mentions even when other envelope tokens trigger suppression", async () => {
+    // Mixed pane: envelope tokens + a real <at user_id> mention. With pane
+    // fallback active (no transcript), the sanitizer must strip the envelope
+    // but keep the @mention as-is.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    class MixedManager extends FakeTmuxManager {
+      override async pastePrompt(p: { promptFile: string }) {
+        // hookMode=off makes pane the canonical reply path so the sanitizer
+        // runs through the flush+text-return logic (envelope detector still
+        // applies but pane is allowed when not authoritative).
+        await fs.appendFile(
+          this.paths!.paneLogFile,
+          'real reply <at user_id="ou_a">Ada</at> ok</message> trailing',
+        );
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now(), stdin: {} })}\n`,
+        );
+      }
+    }
+    const onAssistantTurn = vi.fn();
+    const output = await executeTmuxCliRun(
+      baseInput(runtimeDir, { onAssistantTurn }, { hookMode: "off" }),
+      new MixedManager() as never,
+    );
+    expect(output.text).toContain('<at user_id="ou_a">Ada</at>');
+    expect(output.text).not.toContain("</message>");
+  });
 });

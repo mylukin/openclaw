@@ -154,10 +154,12 @@ const PROMPT_ENVELOPE_PATTERNS: RegExp[] = [
   // <message dex="2" ...>, </message>, </messe> (truncated paste).
   /<\/?messa?ge?(?:index)?\b[^>]*>/gi,
   /<messageindex=[^>]*>/gi,
-  // Mention envelope: <atid=ou_xxx></at>, <at user_id="...">...</at> wrappers.
-  /<atid=[^>]*>/gi,
-  /<\/at>/gi,
-  /<at\s+user_id="[^"]*">/gi,
+  // Envelope-only mention placeholder `<atid=ou_xxx></at>` (no quotes, no
+  // user_id, no inner name). LEGIT Feishu @mentions look like
+  // `<at user_id="ou_xxx">Name</at>` — those carry useful semantic content
+  // and MUST be preserved. Match the envelope variant as a paired unit so a
+  // stray `</at>` from a real mention is never collaterally removed.
+  /<atid=[^>]*>\s*<\/at>/gi,
   // Stray serialized metadata attribute runs left on their own lines.
   /(?:^|\s)(?:sender_type|sender_name|sender_id|content_type|created_at|messageindex|message_id|id)="[^"]*"/gi,
 ];
