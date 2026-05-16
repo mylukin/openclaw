@@ -12,9 +12,7 @@ function buildPaths(rootDir: string): TmuxRuntimePaths {
     eventsFile: path.join(rootDir, "events.jsonl"),
     paneLogFile: path.join(rootDir, "pane.log"),
     launcherFile: path.join(rootDir, "launch-claude.mjs"),
-    managedSettingsFile: path.join(rootDir, "managed-settings.json"),
     settingsFile: path.join(rootDir, "settings.json"),
-    systemPromptFile: path.join(rootDir, "system-prompt.txt"),
     hookWriterFile: path.join(rootDir, "hook-writer.mjs"),
     promptBufferFile: path.join(rootDir, "prompt-buffer.txt"),
     metadataFile: path.join(rootDir, "metadata.json"),
@@ -224,6 +222,48 @@ describe("TmuxSessionManager", () => {
     expect(persisted.lastUsedAt).toBeGreaterThan(1);
   });
 
+  it("reuses a live session across turns even when only the systemPromptHash changed", async () => {
+    // The system prompt is rebuilt every turn (date + rotating context). A
+    // persistent tmux Claude REPL must NOT be killed + re-bootstrapped just
+    // because the prompt hash differs — follow-up DM turns paste the new
+    // user message into the running session instead.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
+    tempDirs.push(rootDir);
+    const paths = buildPaths(rootDir);
+    const persistedMetadata = {
+      backendId: "claude-cli",
+      workspaceDir: rootDir,
+      sessionName: "openclaw-claude-test",
+      launchHash: "launch-hash",
+      model: "sonnet",
+      systemPromptHash: "turn-1-hash",
+      memoryMode: "managed-disabled" as const,
+      hookMode: "managed" as const,
+      createdAt: 1,
+      lastUsedAt: 1,
+    };
+    await fs.writeFile(paths.metadataFile, `${JSON.stringify(persistedMetadata)}\n`);
+    const calls: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" };
+    });
+
+    const result = await manager.ensureSession({
+      paths,
+      metadata: { ...persistedMetadata, systemPromptHash: "turn-2-hash" },
+      command: "claude",
+      args: ["--model", "sonnet"],
+      cwd: rootDir,
+      env: {},
+      config,
+    });
+
+    expect(result).toEqual({ created: false });
+    expect(calls).not.toContain("kill-session");
+    expect(calls).not.toContain("new-session");
+  });
+
   it("recreates when the session is live but metadata file is missing", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
     tempDirs.push(rootDir);
@@ -317,6 +357,98 @@ describe("TmuxSessionManager", () => {
       throw new Error("no session");
     });
     await expect(absent.hasSession("s")).resolves.toBe(false);
+  });
+
+  it("isPaneAlive: alive only when pane not dead and has a live pid", async () => {
+    const alive = new TmuxSessionManager(async () => ({ stdout: "0 12345\n", stderr: "" }));
+    await expect(alive.isPaneAlive("s")).resolves.toBe(true);
+    const dead = new TmuxSessionManager(async () => ({ stdout: "1 12345\n", stderr: "" }));
+    await expect(dead.isPaneAlive("s")).resolves.toBe(false);
+    const noPid = new TmuxSessionManager(async () => ({ stdout: "0 0\n", stderr: "" }));
+    await expect(noPid.isPaneAlive("s")).resolves.toBe(false);
+    const empty = new TmuxSessionManager(async () => ({ stdout: "", stderr: "" }));
+    await expect(empty.isPaneAlive("s")).resolves.toBe(false);
+    const missing = new TmuxSessionManager(async () => {
+      throw new Error("no pane");
+    });
+    await expect(missing.isPaneAlive("s")).resolves.toBe(false);
+  });
+
+  it("recreates when launchMode flips fresh<->resume but reuses when it matches", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
+    tempDirs.push(rootDir);
+    const paths = buildPaths(rootDir);
+    const base = {
+      backendId: "claude-cli",
+      workspaceDir: rootDir,
+      sessionName: "openclaw-claude-test",
+      launchHash: "launch-hash",
+      model: "sonnet",
+      systemPromptHash: "hash",
+      memoryMode: "managed-disabled" as const,
+      hookMode: "managed" as const,
+      launchMode: "fresh" as const,
+      claudeSessionId: "claude-aaa",
+      createdAt: 1,
+      lastUsedAt: 1,
+    };
+    await fs.writeFile(paths.metadataFile, `${JSON.stringify(base)}\n`);
+    const calls: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" };
+    });
+    // launchMode changes fresh -> resume: must recreate.
+    const recreate = await manager.ensureSession({
+      paths,
+      metadata: { ...base, launchMode: "resume", claudeSessionId: "claude-bbb" },
+      command: "claude",
+      args: [],
+      cwd: rootDir,
+      env: {},
+      config,
+    });
+    expect(recreate.created).toBe(true);
+    expect(calls).toContain("kill-session");
+  });
+
+  it("reuse ignores claudeSessionId differences and returns the persisted id", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-manager-test-"));
+    tempDirs.push(rootDir);
+    const paths = buildPaths(rootDir);
+    const persisted = {
+      backendId: "claude-cli",
+      workspaceDir: rootDir,
+      sessionName: "openclaw-claude-test",
+      launchHash: "launch-hash",
+      model: "sonnet",
+      systemPromptHash: "turn-1",
+      memoryMode: "managed-disabled" as const,
+      hookMode: "managed" as const,
+      launchMode: "fresh" as const,
+      claudeSessionId: "claude-persisted",
+      createdAt: 1,
+      lastUsedAt: 1,
+    };
+    await fs.writeFile(paths.metadataFile, `${JSON.stringify(persisted)}\n`);
+    const calls: string[] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args[0]);
+      return { stdout: "", stderr: "" };
+    });
+    // Same identity, only volatile fields differ → reuse, no kill.
+    const result = await manager.ensureSession({
+      paths,
+      metadata: { ...persisted, systemPromptHash: "turn-2", claudeSessionId: undefined },
+      command: "claude",
+      args: [],
+      cwd: rootDir,
+      env: {},
+      config,
+    });
+    expect(result.created).toBe(false);
+    expect(result.persistedClaudeSessionId).toBe("claude-persisted");
+    expect(calls).not.toContain("kill-session");
   });
 
   it("defaultTmuxCommandRunner executes a real process and returns stdout", async () => {

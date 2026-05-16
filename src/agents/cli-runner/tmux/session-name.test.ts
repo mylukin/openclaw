@@ -9,16 +9,17 @@ describe("buildTmuxSessionName", () => {
       workspaceDir: "/repo",
       sessionKey: "chat-1",
       modelId: "sonnet",
-      systemPromptHash: "sys",
       memoryMode: "managed-disabled",
       hookMode: "managed",
     };
 
     expect(buildTmuxSessionName(base)).toBe(buildTmuxSessionName(base));
     expect(buildTmuxSessionName(base)).toMatch(/^openclaw-claude-[0-9a-f]{12}$/);
-    expect(buildTmuxSessionName({ ...base, systemPromptHash: "other" })).not.toBe(
-      buildTmuxSessionName(base),
-    );
+    // The conversation identity (model) changes the name. The volatile system
+    // prompt is intentionally not part of the signature any more, so follow-up
+    // turns of the same conversation map to the same persistent session (see
+    // manager.test.ts for the reuse regression).
+    expect(buildTmuxSessionName({ ...base, modelId: "opus" })).not.toBe(buildTmuxSessionName(base));
   });
 
   it("sanitizes arbitrary prefix text", () => {
@@ -32,7 +33,6 @@ describe("buildTmuxSessionName", () => {
       workspaceDir: "/repo",
       sessionKey: "chat-1",
       modelId: "sonnet",
-      systemPromptHash: "sys",
       memoryMode: "managed-disabled",
       hookMode: "managed",
     });

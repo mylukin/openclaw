@@ -14,7 +14,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-export function buildClaudeTmuxSettings(): Record<string, unknown> {
+function buildBaseClaudeTmuxSettings(): Record<string, unknown> {
   return {
     autoMemoryEnabled: false,
     autoDreamEnabled: false,
@@ -33,47 +33,40 @@ function buildCommandHook(paths: TmuxRuntimePaths, event: string) {
   };
 }
 
-export function buildClaudeTmuxManagedSettings(paths: TmuxRuntimePaths): Record<string, unknown> {
+function buildHooksBlock(paths: TmuxRuntimePaths): Record<string, unknown> {
   return {
-    autoMemoryEnabled: false,
-    autoDreamEnabled: false,
-    allowManagedHooksOnly: true,
-    disableBackgroundAgents: true,
-    disableRemoteControl: true,
-    hooks: {
-      SessionStart: [{ hooks: [buildCommandHook(paths, "SessionStart")] }],
-      UserPromptSubmit: [{ hooks: [buildCommandHook(paths, "UserPromptSubmit")] }],
-      PreToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PreToolUse")] }],
-      PostToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PostToolUse")] }],
-      PostToolUseFailure: [
-        { matcher: "*", hooks: [buildCommandHook(paths, "PostToolUseFailure")] },
-      ],
-      Stop: [{ hooks: [buildCommandHook(paths, "Stop")] }],
-    },
+    SessionStart: [{ hooks: [buildCommandHook(paths, "SessionStart")] }],
+    UserPromptSubmit: [{ hooks: [buildCommandHook(paths, "UserPromptSubmit")] }],
+    PreToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PreToolUse")] }],
+    PostToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PostToolUse")] }],
+    PostToolUseFailure: [{ matcher: "*", hooks: [buildCommandHook(paths, "PostToolUseFailure")] }],
+    Stop: [{ hooks: [buildCommandHook(paths, "Stop")] }],
   };
+}
+
+export function buildClaudeTmuxSettings(params: {
+  paths: TmuxRuntimePaths;
+  hookMode: "managed" | "off";
+}): Record<string, unknown> {
+  const base = buildBaseClaudeTmuxSettings();
+  if (params.hookMode === "off") {
+    return base;
+  }
+  return { ...base, hooks: buildHooksBlock(params.paths) };
 }
 
 export async function writeClaudeTmuxRuntimeFiles(params: {
   paths: TmuxRuntimePaths;
-  systemPrompt: string;
   hookMode: "managed" | "off";
-}): Promise<{ managedSettingsJson?: string }> {
-  await fs.writeFile(
-    params.paths.settingsFile,
-    `${JSON.stringify(buildClaudeTmuxSettings(), null, 2)}\n`,
-    { mode: 0o600 },
-  );
-  await fs.writeFile(params.paths.systemPromptFile, params.systemPrompt, { mode: 0o600 });
-  await writeHookWriter(params.paths);
-  if (params.hookMode === "off") {
-    return {};
-  }
-  const managed = buildClaudeTmuxManagedSettings(params.paths);
-  const managedSettingsJson = JSON.stringify(managed);
-  await fs.writeFile(params.paths.managedSettingsFile, `${JSON.stringify(managed, null, 2)}\n`, {
+}): Promise<void> {
+  const settings = buildClaudeTmuxSettings({
+    paths: params.paths,
+    hookMode: params.hookMode,
+  });
+  await fs.writeFile(params.paths.settingsFile, `${JSON.stringify(settings, null, 2)}\n`, {
     mode: 0o600,
   });
-  return { managedSettingsJson };
+  await writeHookWriter(params.paths);
 }
 
 export async function writeActiveRun(

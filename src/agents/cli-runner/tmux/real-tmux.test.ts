@@ -85,6 +85,7 @@ setInterval(() => {}, 1000);
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
         sessionId: "openclaw-session",
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         cliSessionId: "00000000-0000-4000-8000-000000000000",
         runId: "run-real",
         modelId: "sonnet",

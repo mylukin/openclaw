@@ -11,6 +11,17 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The Claude TUI ingests a bracketed paste asynchronously while it is still
+// rendering (most visible right after the startup banner on a fresh session).
+// Sending Enter immediately races that ingest and the submit is dropped, so
+// the prompt is left sitting in the input box. A short settle delay before
+// Enter makes submission reliable.
+const PASTE_SUBMIT_DELAY_MS = 200;
+
 export const defaultTmuxCommandRunner: TmuxCommandRunner = async (command, args, options) => {
   const result = await execFileAsync(command, args, {
     cwd: options?.cwd,
@@ -78,22 +89,51 @@ async function readJsonFile<T>(file: string): Promise<T | null> {
   }
 }
 
-function metadataMatches(existing: TmuxMetadata | null, expected: TmuxMetadata): boolean {
+function metadataMismatchReasons(existing: TmuxMetadata | null, expected: TmuxMetadata): string[] {
   if (!existing) {
-    return false;
+    return ["missing-existing-metadata"];
   }
-  return (
-    existing.backendId === expected.backendId &&
-    existing.workspaceDir === expected.workspaceDir &&
-    existing.sessionName === expected.sessionName &&
-    existing.launchHash === expected.launchHash &&
-    existing.model === expected.model &&
-    existing.systemPromptHash === expected.systemPromptHash &&
-    (existing.mcpConfigHash ?? "") === (expected.mcpConfigHash ?? "") &&
-    (existing.authProfileId ?? "") === (expected.authProfileId ?? "") &&
-    existing.memoryMode === expected.memoryMode &&
-    existing.hookMode === expected.hookMode
-  );
+  // NOTE: systemPromptHash is intentionally NOT compared. It changes every
+  // turn (date + rotating context), and a persistent tmux Claude REPL fixes
+  // its system prompt at launch — follow-up turns just paste the new user
+  // message. Comparing it would kill + re-bootstrap the session every turn.
+  const reasons: string[] = [];
+  if (existing.backendId !== expected.backendId) {
+    reasons.push("backendId");
+  }
+  if (existing.workspaceDir !== expected.workspaceDir) {
+    reasons.push("workspaceDir");
+  }
+  if (existing.sessionName !== expected.sessionName) {
+    reasons.push("sessionName");
+  }
+  if (existing.launchHash !== expected.launchHash) {
+    reasons.push("launchHash");
+  }
+  if (existing.model !== expected.model) {
+    reasons.push("model");
+  }
+  if ((existing.mcpConfigHash ?? "") !== (expected.mcpConfigHash ?? "")) {
+    reasons.push("mcpConfigHash");
+  }
+  if ((existing.authProfileId ?? "") !== (expected.authProfileId ?? "")) {
+    reasons.push("authProfileId");
+  }
+  if (existing.memoryMode !== expected.memoryMode) {
+    reasons.push("memoryMode");
+  }
+  if (existing.hookMode !== expected.hookMode) {
+    reasons.push("hookMode");
+  }
+  // launchMode IS identity for the running process: a fresh REPL owns its
+  // session id, a resumed REPL replayed history from disk. Switching between
+  // them must recreate exactly once. claudeSessionId is intentionally NOT
+  // compared — it is recovery data, not launch identity, and comparing it
+  // would kill+recreate every time the bound id is discovered/changes.
+  if (existing.launchMode !== expected.launchMode) {
+    reasons.push("launchMode");
+  }
+  return reasons;
 }
 
 export class TmuxSessionManager {
@@ -103,6 +143,34 @@ export class TmuxSessionManager {
     try {
       await this.runCommand("tmux", ["has-session", "-t", sessionName]);
       return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // `hasSession` only proves the tmux session object exists — the pane's
+  // child (the Claude REPL) may have already exited while tmux keeps a dead
+  // pane around. This checks the pane is genuinely alive: not flagged dead
+  // and carrying a live child pid. A dead/missing pane (or any tmux error)
+  // reports not-alive so callers can trigger resume-based recovery.
+  async isPaneAlive(sessionName: string): Promise<boolean> {
+    try {
+      const result = await this.runCommand("tmux", [
+        "list-panes",
+        "-t",
+        `${sessionName}:0.0`,
+        "-F",
+        "#{pane_dead} #{pane_pid}",
+      ]);
+      const line = result.stdout.split("\n").find((entry) => entry.trim().length > 0);
+      if (!line) {
+        return false;
+      }
+      const [dead, pid] = line.trim().split(/\s+/);
+      if (dead !== "0") {
+        return false;
+      }
+      return Boolean(pid && Number.parseInt(pid, 10) > 0);
     } catch {
       return false;
     }
@@ -124,17 +192,42 @@ export class TmuxSessionManager {
     cwd: string;
     env: Record<string, string>;
     config: NormalizedTmuxConfig;
+    onDiagnostic?: (event: string, data?: Record<string, unknown>) => void;
   }): Promise<TmuxEnsureSessionResult> {
     const exists = await this.hasSession(params.metadata.sessionName);
     const existingMetadata = await readJsonFile<TmuxMetadata>(params.paths.metadataFile);
-    if (exists && metadataMatches(existingMetadata, params.metadata)) {
+    const reasons = metadataMismatchReasons(existingMetadata, params.metadata);
+    params.onDiagnostic?.("tmux.ensureSession.start", {
+      sessionName: params.metadata.sessionName,
+      exists,
+      hasMetadata: existingMetadata !== null,
+      mismatchReasons: reasons,
+    });
+    if (exists && reasons.length === 0) {
       await fs.writeFile(
         params.paths.metadataFile,
         `${JSON.stringify({ ...existingMetadata, lastUsedAt: Date.now() }, null, 2)}\n`,
       );
-      return { created: false };
+      params.onDiagnostic?.("tmux.ensureSession.reuse", {
+        sessionName: params.metadata.sessionName,
+        persistedClaudeSessionId: existingMetadata?.claudeSessionId,
+      });
+      return {
+        created: false,
+        ...(existingMetadata?.claudeSessionId
+          ? { persistedClaudeSessionId: existingMetadata.claudeSessionId }
+          : {}),
+      };
     }
     if (exists) {
+      params.onDiagnostic?.("tmux.ensureSession.killing", {
+        sessionName: params.metadata.sessionName,
+        mismatchReasons: reasons,
+        existingLaunchHash: existingMetadata?.launchHash,
+        expectedLaunchHash: params.metadata.launchHash,
+        existingModel: existingMetadata?.model,
+        expectedModel: params.metadata.model,
+      });
       await this.killSession(params.metadata.sessionName);
     }
     const envEntries = Object.entries(params.env).filter(
@@ -177,6 +270,9 @@ export class TmuxSessionManager {
     await fs.writeFile(params.paths.metadataFile, `${JSON.stringify(params.metadata, null, 2)}\n`, {
       mode: 0o600,
     });
+    params.onDiagnostic?.("tmux.ensureSession.created", {
+      sessionName: params.metadata.sessionName,
+    });
     return { created: true };
   }
 
@@ -193,11 +289,16 @@ export class TmuxSessionManager {
       "-t",
       `${params.sessionName}:0.0`,
     ]);
+    await sleep(PASTE_SUBMIT_DELAY_MS);
     await this.runCommand("tmux", ["send-keys", "-t", `${params.sessionName}:0.0`, "Enter"]);
   }
 
   async sendEnter(sessionName: string): Promise<void> {
     await this.runCommand("tmux", ["send-keys", "-t", `${sessionName}:0.0`, "Enter"]);
+  }
+
+  async sendKey(sessionName: string, key: string): Promise<void> {
+    await this.runCommand("tmux", ["send-keys", "-t", `${sessionName}:0.0`, key]);
   }
 
   async captureTail(sessionName: string, lines: number): Promise<string> {

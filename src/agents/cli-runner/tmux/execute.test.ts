@@ -3,17 +3,23 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { executeTmuxCliRun } from "./execute.js";
+import { resolveTmuxRuntimePaths } from "./runtime-dir.js";
+import { buildTmuxSessionName } from "./session-name.js";
 import type { TmuxExecutionInput, TmuxRuntimePaths } from "./types.js";
 
 class FakeTmuxManager {
   paths?: TmuxRuntimePaths;
   sessionNames: string[] = [];
 
-  async ensureSession(params: { paths: TmuxRuntimePaths; metadata: { sessionName: string } }) {
+  async ensureSession(params: {
+    paths: TmuxRuntimePaths;
+    metadata: { sessionName: string };
+  }): Promise<{ created: boolean }> {
     this.paths = params.paths;
     this.sessionNames.push(params.metadata.sessionName);
     await fs.writeFile(params.paths.paneLogFile, "Claude Code v2.1.140\nprevious turn text");
     await fs.writeFile(params.paths.eventsFile, "");
+    return { created: true };
   }
 
   async pastePrompt(params: { promptFile: string }) {
@@ -48,6 +54,16 @@ class FakeTmuxManager {
     return "tail";
   }
 
+  async hasSession(): Promise<boolean> {
+    return true;
+  }
+
+  async isPaneAlive(): Promise<boolean> {
+    return true;
+  }
+
+  async killSession(): Promise<void> {}
+
   async interrupt() {}
 }
 
@@ -75,6 +91,7 @@ describe("executeTmuxCliRun", () => {
         },
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         sessionId: "openclaw-session",
         runId: "run-1",
         modelId: "sonnet",
@@ -93,9 +110,16 @@ describe("executeTmuxCliRun", () => {
     expect(onAssistantTurn).not.toHaveBeenCalledWith(expect.stringContaining("hello"));
   });
 
-  it("fans hook events out to tool/system callbacks", async () => {
+  it("drives tool callbacks from the JSONL transcript in canonical order", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-9";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
 
     class HookManager extends FakeTmuxManager {
       async pastePrompt(params: { promptFile: string }) {
@@ -105,28 +129,60 @@ describe("executeTmuxCliRun", () => {
         const promptEcho = await fs.readFile(params.promptFile, "utf8");
         await fs.appendFile(this.paths.paneLogFile, `> ${promptEcho}Done`);
         const now = Date.now();
-        const lines = [
-          { event: "SessionStart", claudeSessionId: "cs-9", stdin: { session_id: "cs-9" } },
-          {
-            event: "PreToolUse",
-            stdin: { tool_name: "Read", tool_use_id: "tu-1", tool_input: { file: "a.ts" } },
-          },
-          {
-            event: "PostToolUse",
-            stdin: { tool_use_id: "tu-1", tool_response: { ok: true } },
-          },
-          {
-            event: "PostToolUseFailure",
-            stdin: { tool_use_id: "tu-2", tool_response: "boom" },
-          },
-          { event: "Stop", stdin: { session_id: "cs-9" } },
-        ];
-        for (const line of lines) {
-          await fs.appendFile(
-            this.paths.eventsFile,
-            `${JSON.stringify({ runId: "run-1", timestamp: now, ...line })}\n`,
-          );
-        }
+        // SessionStart hook gives us the Claude session id so the runner can
+        // locate the JSONL transcript.
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            runId: "run-1",
+            timestamp: now,
+            event: "SessionStart",
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+        // Tool events are emitted by the transcript in canonical order
+        // (assistant tool_use blocks, then user tool_result blocks).
+        await fs.writeFile(
+          transcriptFile,
+          `${JSON.stringify({
+            type: "assistant",
+            uuid: "a-1",
+            timestamp: new Date(now + 1).toISOString(),
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Done" },
+                { type: "tool_use", id: "tu-1", name: "Read", input: { file: "a.ts" } },
+                { type: "tool_use", id: "tu-2", name: "Read", input: { file: "b.ts" } },
+              ],
+            },
+          })}\n`,
+        );
+        await fs.appendFile(
+          transcriptFile,
+          `${JSON.stringify({
+            type: "user",
+            uuid: "u-1",
+            timestamp: new Date(now + 2).toISOString(),
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "tu-1", content: { ok: true } },
+                { type: "tool_result", tool_use_id: "tu-2", content: "boom", is_error: true },
+              ],
+            },
+          })}\n`,
+        );
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            runId: "run-1",
+            timestamp: now + 3,
+            event: "Stop",
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
       }
     }
 
@@ -140,17 +196,18 @@ describe("executeTmuxCliRun", () => {
           command: "claude",
           args: ["-p"],
           modelArg: "--model",
-          execution: { mode: "tmux", tmux: { runtimeDir } },
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
         },
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         sessionId: "openclaw-session",
         runId: "run-1",
         modelId: "sonnet",
         systemPrompt: "system",
         prompt: "go",
         timeoutMs: 5_000,
-        env: {},
+        env: { CLAUDE_CONFIG_DIR: configDir },
         onSystemInit,
         onToolUseEvent,
         onToolResult,
@@ -159,22 +216,164 @@ describe("executeTmuxCliRun", () => {
     );
 
     expect(output.text).toBe("Done");
-    expect(onSystemInit).toHaveBeenCalledWith({ subtype: "init", sessionId: "cs-9" });
+    expect(onSystemInit).toHaveBeenCalledWith({ subtype: "init", sessionId });
     expect(onToolUseEvent).toHaveBeenCalledWith({
       name: "Read",
       toolUseId: "tu-1",
       input: { file: "a.ts" },
     });
+    expect(onToolUseEvent).toHaveBeenCalledWith({
+      name: "Read",
+      toolUseId: "tu-2",
+      input: { file: "b.ts" },
+    });
     expect(onToolResult).toHaveBeenCalledWith({
       toolUseId: "tu-1",
       text: JSON.stringify({ ok: true }),
-      isError: false,
     });
     expect(onToolResult).toHaveBeenCalledWith({
       toolUseId: "tu-2",
       text: "boom",
       isError: true,
     });
+  });
+
+  it("anchors transcript tool segments after the preceding text (no race with hook events)", async () => {
+    // Regression for the inline-tool ordering race: when hook PostToolUse
+    // fires in the same poll iteration as a fresh assistant text block, the
+    // transcript poll runs first and the resulting callbacks fire in
+    // text-then-tool order so downstream inline rendering anchors the tool
+    // stats at end-of-text, not end-of-previous-turn.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-race";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
+
+    class RaceManager extends FakeTmuxManager {
+      async pastePrompt(params: { promptFile: string }) {
+        if (!this.paths) {
+          throw new Error("missing paths");
+        }
+        const promptEcho = await fs.readFile(params.promptFile, "utf8");
+        await fs.appendFile(this.paths.paneLogFile, `> ${promptEcho}`);
+        const now = Date.now();
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            runId: "run-1",
+            timestamp: now,
+            event: "SessionStart",
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+        await fs.writeFile(
+          transcriptFile,
+          `${JSON.stringify({
+            type: "assistant",
+            uuid: "a-1",
+            timestamp: new Date(now + 1).toISOString(),
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Now reading workspace." },
+                { type: "tool_use", id: "tu-1", name: "Read" },
+                { type: "tool_use", id: "tu-2", name: "Read" },
+              ],
+            },
+          })}\n` +
+            `${JSON.stringify({
+              type: "user",
+              uuid: "u-1",
+              timestamp: new Date(now + 2).toISOString(),
+              message: {
+                role: "user",
+                content: [
+                  { type: "tool_result", tool_use_id: "tu-1", content: "" },
+                  { type: "tool_result", tool_use_id: "tu-2", content: "" },
+                ],
+              },
+            })}\n` +
+            `${JSON.stringify({
+              type: "assistant",
+              uuid: "a-2",
+              timestamp: new Date(now + 3).toISOString(),
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Finished." }],
+              },
+            })}\n`,
+        );
+        // Hooks deliberately fire AFTER the transcript already has the full
+        // turn — the bug we're guarding against would dispatch tool events
+        // before the second text segment lands.
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            runId: "run-1",
+            timestamp: now + 4,
+            event: "PostToolUse",
+            stdin: { tool_use_id: "tu-1", tool_response: "" },
+          })}\n${JSON.stringify({
+            runId: "run-1",
+            timestamp: now + 5,
+            event: "PostToolUse",
+            stdin: { tool_use_id: "tu-2", tool_response: "" },
+          })}\n${JSON.stringify({
+            runId: "run-1",
+            timestamp: now + 6,
+            event: "Stop",
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+      }
+    }
+
+    const events: string[] = [];
+    await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        sessionId: "openclaw-session",
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "go",
+        timeoutMs: 5_000,
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        onAssistantTurn: (text) => {
+          events.push(`text:${text}`);
+        },
+        onToolUseEvent: (payload) => {
+          events.push(`use:${payload.toolUseId ?? payload.name}`);
+        },
+        onToolResult: (payload) => {
+          events.push(`result:${payload.toolUseId ?? "?"}`);
+        },
+      },
+      new RaceManager() as never,
+    );
+
+    expect(events).toEqual([
+      "text:Now reading workspace.",
+      "use:tu-1",
+      "use:tu-2",
+      "result:tu-1",
+      "result:tu-2",
+      "text:Finished.",
+    ]);
   });
 
   it("ignores hook events from other runs", async () => {
@@ -211,6 +410,7 @@ describe("executeTmuxCliRun", () => {
         },
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         sessionId: "openclaw-session",
         runId: "run-1",
         modelId: "sonnet",
@@ -251,6 +451,7 @@ describe("executeTmuxCliRun", () => {
         },
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         sessionId: "openclaw-session",
         runId: "run-1",
         modelId: "sonnet",
@@ -303,6 +504,7 @@ describe("executeTmuxCliRun", () => {
         },
         backendId: "claude-cli",
         workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
         sessionId: "openclaw-session",
         runId: "run-1",
         modelId: "sonnet",
@@ -334,6 +536,7 @@ describe("executeTmuxCliRun", () => {
           },
           backendId: "claude-cli",
           workspaceDir: runtimeDir,
+          sessionFile: path.join(runtimeDir, "session.jsonl"),
           sessionId: "openclaw-session",
           runId: "run-1",
           modelId: "sonnet",
@@ -371,6 +574,7 @@ describe("executeTmuxCliRun", () => {
           },
           backendId: "claude-cli",
           workspaceDir: runtimeDir,
+          sessionFile: path.join(runtimeDir, "session.jsonl"),
           sessionId: "openclaw-session",
           runId: "run-1",
           modelId: "sonnet",
@@ -400,6 +604,7 @@ describe("executeTmuxCliRun", () => {
       },
       backendId: "claude-cli",
       workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
       sessionId: "openclaw-session",
       runId: "run-1",
       modelId: "sonnet",
@@ -437,11 +642,136 @@ describe("executeTmuxCliRun", () => {
       async captureTail() {
         return "";
       }
+      async hasSession() {
+        return true;
+      }
+      async isPaneAlive() {
+        return true;
+      }
+      async killSession() {}
       async interrupt() {}
     }
 
     const output = await executeTmuxCliRun(baseInput(runtimeDir), new EventReadyManager() as never);
     expect(output.text).toBe("Ready answer");
+  });
+
+  it("propagates sessionId from a SessionStart hook seen during startup", async () => {
+    // Regression: in fresh sessions the SessionStart hook fires during
+    // waitForStartup and the event is consumed before the main loop's event
+    // reader starts (initialEventOffset is captured after startup). The
+    // discovered claudeSessionId must still be carried into the main loop so
+    // the JSONL transcript tailer is instantiated before any tool events.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-startup-discovery";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
+
+    class StartupSessionManager {
+      paths?: TmuxRuntimePaths;
+      async ensureSession(p: { paths: TmuxRuntimePaths; metadata: { sessionName: string } }) {
+        this.paths = p.paths;
+        await fs.writeFile(p.paths.paneLogFile, "Claude Code v2.1.140\n");
+        // SessionStart event lands BEFORE the main loop opens its event
+        // window — this is the fresh-session path the bug fix targets.
+        await fs.writeFile(
+          p.paths.eventsFile,
+          `${JSON.stringify({
+            event: "SessionStart",
+            timestamp: Date.now() - 100,
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+      }
+      async pastePrompt(p: { promptFile: string }) {
+        const echo = await fs.readFile(p.promptFile, "utf8");
+        await fs.appendFile(this.paths!.paneLogFile, `> ${echo}`);
+        const now = Date.now();
+        // The assistant immediately uses a tool, then replies. Tool events
+        // come only from the JSONL transcript — if the bug fix regresses,
+        // the runner would fall back to hook-driven tool events and break
+        // ordering / naming.
+        await fs.writeFile(
+          transcriptFile,
+          `${JSON.stringify({
+            type: "assistant",
+            uuid: "a-1",
+            timestamp: new Date(now + 1).toISOString(),
+            message: {
+              role: "assistant",
+              content: [{ type: "tool_use", id: "tu-1", name: "Read" }],
+            },
+          })}\n${JSON.stringify({
+            type: "user",
+            uuid: "u-1",
+            timestamp: new Date(now + 2).toISOString(),
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "tu-1", content: "" }],
+            },
+          })}\n${JSON.stringify({
+            type: "assistant",
+            uuid: "a-2",
+            timestamp: new Date(now + 3).toISOString(),
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Ready answer" }],
+            },
+          })}\n`,
+        );
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({
+            event: "Stop",
+            runId: "run-1",
+            timestamp: now + 4,
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+      }
+      async captureTail() {
+        return "";
+      }
+      async hasSession() {
+        return true;
+      }
+      async isPaneAlive() {
+        return true;
+      }
+      async killSession() {}
+      async interrupt() {}
+    }
+
+    const onToolUseEvent = vi.fn();
+    const onToolResult = vi.fn();
+    const output = await executeTmuxCliRun(
+      {
+        ...baseInput(runtimeDir, {
+          env: { CLAUDE_CONFIG_DIR: configDir },
+          onToolUseEvent,
+          onToolResult,
+        }),
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
+        },
+      },
+      new StartupSessionManager() as never,
+    );
+
+    expect(output.text).toBe("Ready answer");
+    expect(output.sessionId).toBe(sessionId);
+    expect(onToolUseEvent).toHaveBeenCalledWith({ name: "Read", toolUseId: "tu-1" });
+    expect(onToolResult).toHaveBeenCalledWith({ toolUseId: "tu-1", text: "" });
   });
 
   it("confirms the workspace trust prompt during startup", async () => {
@@ -475,6 +805,13 @@ describe("executeTmuxCliRun", () => {
       async captureTail() {
         return "";
       }
+      async hasSession() {
+        return true;
+      }
+      async isPaneAlive() {
+        return true;
+      }
+      async killSession() {}
       async interrupt() {}
     }
 
@@ -497,6 +834,13 @@ describe("executeTmuxCliRun", () => {
       async captureTail() {
         return "pane diagnostic tail";
       }
+      async hasSession() {
+        return true;
+      }
+      async isPaneAlive() {
+        return true;
+      }
+      async killSession() {}
       async interrupt() {}
     }
 
@@ -603,6 +947,95 @@ describe("executeTmuxCliRun", () => {
     expect(output.text).not.toContain("ping");
   });
 
+  it("streams clean text from the Claude session JSONL transcript when available", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-transcript";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
+
+    class TranscriptManager extends FakeTmuxManager {
+      async pastePrompt(params: { promptFile: string }) {
+        if (!this.paths) {
+          throw new Error("missing paths");
+        }
+        const promptEcho = await fs.readFile(params.promptFile, "utf8");
+        await fs.appendFile(
+          this.paths.paneLogFile,
+          `╭────────╮\n│ Thinking… │\n╰────────╯\n> ${promptEcho}╭─ Assistant ─╮\n│ noisy TUI text │\n╰──────────────╯\n`,
+        );
+        const now = Date.now();
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            event: "SessionStart",
+            runId: "run-1",
+            timestamp: now,
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+        await fs.writeFile(
+          transcriptFile,
+          `${JSON.stringify({
+            type: "assistant",
+            uuid: "msg-1",
+            timestamp: new Date(now + 5).toISOString(),
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Clean transcript answer" }],
+            },
+          })}\n`,
+        );
+        await fs.appendFile(
+          this.paths.eventsFile,
+          `${JSON.stringify({
+            event: "Stop",
+            runId: "run-1",
+            timestamp: now + 10,
+            claudeSessionId: sessionId,
+            stdin: { session_id: sessionId },
+          })}\n`,
+        );
+      }
+    }
+
+    const onAssistantTurn = vi.fn();
+    const output = await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionId: "openclaw-session",
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "go",
+        timeoutMs: 5_000,
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        onAssistantTurn,
+      },
+      new TranscriptManager() as never,
+    );
+
+    expect(output.text).toBe("Clean transcript answer");
+    expect(onAssistantTurn).toHaveBeenCalledWith("Clean transcript answer");
+    for (const call of onAssistantTurn.mock.calls) {
+      expect(call[0]).not.toContain("noisy TUI text");
+      expect(call[0]).not.toContain("╭");
+    }
+  });
+
   it("keeps the tmux session name stable when Claude reports a session id", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);
@@ -617,6 +1050,7 @@ describe("executeTmuxCliRun", () => {
       },
       backendId: "claude-cli",
       workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
       sessionId: "openclaw-session",
       modelId: "sonnet",
       systemPrompt: "system",
@@ -636,4 +1070,371 @@ describe("executeTmuxCliRun", () => {
     expect(manager.sessionNames).toHaveLength(2);
     expect(manager.sessionNames[0]).toBe(manager.sessionNames[1]);
   });
+
+  it("keeps launchHash stable when the only arg change between turns is the --session-id value", async () => {
+    // Regression: turn 1 (fresh /new) had no cliSessionId so the args lacked
+    // `--session-id`; turn 2 (hello) inherited the Claude session id and the
+    // args carried `--session-id <uuid>`. The launchHash difference triggered
+    // killSession + recreate, which collapsed the tmux pane and surfaced as
+    // "tmux 直接退出了" with the user-visible reply lost.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const launchHashes: string[] = [];
+    class CapturingManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string; launchHash: string };
+      }) {
+        launchHashes.push(p.metadata.launchHash);
+        return super.ensureSession(p as never);
+      }
+    }
+    const manager = new CapturingManager();
+    const baseInput: Omit<TmuxExecutionInput, "runId" | "prompt" | "cliSessionId"> = {
+      backend: {
+        command: "claude",
+        args: ["-p", "--bare"],
+        modelArg: "--model",
+        sessionArg: "--session-id",
+        execution: { mode: "tmux", tmux: { runtimeDir } },
+      },
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
+      sessionId: "openclaw-session",
+      modelId: "sonnet",
+      systemPrompt: "system",
+      timeoutMs: 5_000,
+      env: {},
+    };
+    await executeTmuxCliRun({ ...baseInput, runId: "run-1", prompt: "hello" }, manager as never);
+    await executeTmuxCliRun(
+      { ...baseInput, runId: "run-2", prompt: "again", cliSessionId: "claude-session-uuid" },
+      manager as never,
+    );
+    expect(launchHashes).toHaveLength(2);
+    expect(launchHashes[0]).toBe(launchHashes[1]);
+  });
+
+  it("keeps launchHash stable when only volatile per-run env keys differ", async () => {
+    // Regression: prepare.ts injects OPENCLAW_MCP_RUN_ID into the child env on
+    // every turn. It is baked into the initial tmux child process and can't be
+    // updated for a reused session, so including it in the launch signature
+    // would force kill+recreate on every follow-up turn. The first repro:
+    // turn 1 launchHash=bf464f..., turn 2 launchHash=e1f95f... with
+    // mismatchReasons=["launchHash"] → tmux pane collapsed mid-paste.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const launchHashes: string[] = [];
+    class CapturingManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string; launchHash: string };
+      }) {
+        launchHashes.push(p.metadata.launchHash);
+        return super.ensureSession(p as never);
+      }
+    }
+    const manager = new CapturingManager();
+    const baseInput: Omit<TmuxExecutionInput, "runId" | "prompt" | "env"> = {
+      backend: {
+        command: "claude",
+        args: ["-p", "--bare"],
+        modelArg: "--model",
+        sessionArg: "--session-id",
+        execution: { mode: "tmux", tmux: { runtimeDir } },
+      },
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
+      sessionId: "openclaw-session",
+      modelId: "sonnet",
+      systemPrompt: "system",
+      timeoutMs: 5_000,
+    };
+    await executeTmuxCliRun(
+      { ...baseInput, runId: "run-1", prompt: "hello", env: { OPENCLAW_MCP_RUN_ID: "run-1" } },
+      manager as never,
+    );
+    await executeTmuxCliRun(
+      { ...baseInput, runId: "run-2", prompt: "again", env: { OPENCLAW_MCP_RUN_ID: "run-2" } },
+      manager as never,
+    );
+    expect(launchHashes).toHaveLength(2);
+    expect(launchHashes[0]).toBe(launchHashes[1]);
+  });
+
+  it("keeps launchHash stable when only the --mcp-config temp path differs", async () => {
+    // Real-world repro (the one that kept killing tmux on "hello"):
+    // prepareCliBundleMcpConfig writes the bundled MCP config to a fresh
+    // mkdtemp dir every turn, so backend.args carried
+    //   --mcp-config /var/folders/.../openclaw-cli-mcp-FJs13w/mcp.json
+    // with a different random segment each turn. That shifted stableArgs →
+    // launchHash → mismatchReasons=["launchHash"] → kill+recreate mid-paste,
+    // surfacing as "发了 hello，tmux 就被关闭了". The path is per-turn noise;
+    // content is guarded separately via metadata.mcpConfigHash.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const launchHashes: string[] = [];
+    class CapturingManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string; launchHash: string };
+      }) {
+        launchHashes.push(p.metadata.launchHash);
+        return super.ensureSession(p as never);
+      }
+    }
+    const manager = new CapturingManager();
+    const baseInput: Omit<TmuxExecutionInput, "runId" | "prompt" | "backend"> = {
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
+      sessionId: "openclaw-session",
+      modelId: "sonnet",
+      systemPrompt: "system",
+      timeoutMs: 5_000,
+      env: {},
+      mcpConfigHash: "stable-mcp-content-hash",
+    };
+    const backendWith = (mcpPath: string): TmuxExecutionInput["backend"] => ({
+      command: "claude",
+      args: ["--strict-mcp-config", "--mcp-config", mcpPath, "-p", "--bare"],
+      modelArg: "--model",
+      sessionArg: "--session-id",
+      execution: { mode: "tmux", tmux: { runtimeDir } },
+    });
+    await executeTmuxCliRun(
+      {
+        ...baseInput,
+        backend: backendWith("/var/folders/aa/openclaw-cli-mcp-FJs13w/mcp.json"),
+        runId: "run-1",
+        prompt: "hello",
+      },
+      manager as never,
+    );
+    await executeTmuxCliRun(
+      {
+        ...baseInput,
+        backend: backendWith("/var/folders/bb/openclaw-cli-mcp-ZZ99kq/mcp.json"),
+        runId: "run-2",
+        prompt: "again",
+      },
+      manager as never,
+    );
+    expect(launchHashes).toHaveLength(2);
+    expect(launchHashes[0]).toBe(launchHashes[1]);
+  });
+
+  const resumeBackend = (runtimeDir: string, tmux: Record<string, unknown> = {}) => ({
+    command: "claude",
+    args: ["-p", "--bare"],
+    resumeArgs: ["-p", "--bare", "--resume", "{sessionId}"],
+    modelArg: "--model",
+    sessionArg: "--session-id",
+    systemPromptArg: "--append-system-prompt",
+    execution: { mode: "tmux" as const, tmux: { runtimeDir, ...tmux } },
+  });
+
+  function seedMetadata(
+    runtimeDir: string,
+    extra: Record<string, unknown>,
+  ): Promise<{ sessionName: string; paths: TmuxRuntimePaths }> {
+    const sessionName = buildTmuxSessionName({
+      prefix: "openclaw-claude",
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionKey: "openclaw-session",
+      modelId: "sonnet",
+      memoryMode: "managed-disabled",
+      hookMode: "managed",
+    });
+    const paths = resolveTmuxRuntimePaths({ runtimeDir, sessionName });
+    return fs
+      .mkdir(paths.rootDir, { recursive: true })
+      .then(() =>
+        fs.writeFile(
+          paths.metadataFile,
+          `${JSON.stringify({
+            backendId: "claude-cli",
+            workspaceDir: runtimeDir,
+            sessionName,
+            launchHash: "x",
+            model: "sonnet",
+            systemPromptHash: "old",
+            memoryMode: "managed-disabled",
+            hookMode: "managed",
+            ...extra,
+          })}\n`,
+        ),
+      )
+      .then(() => ({ sessionName, paths }));
+  }
+
+  it("pre-paste dead pane with a prior-bound id: resume-relaunches", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // A prior turn bound a Claude id to THIS tmux identity → resume evidence.
+    await seedMetadata(runtimeDir, { launchMode: "resume", claudeSessionId: "claude-x" });
+    const ensureArgs: string[][] = [];
+    let aliveCalls = 0;
+    class DeadThenHealedManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgs.push(p.args ?? []);
+        await super.ensureSession(p as never);
+        return { created: true };
+      }
+      // sessionAliveAtStart probe reports dead; everything after heal alive.
+      async isPaneAlive() {
+        aliveCalls += 1;
+        return aliveCalls > 1;
+      }
+    }
+    const onAssistantTurn = vi.fn();
+    const output = await executeTmuxCliRun(
+      { ...baseInput(runtimeDir, { onAssistantTurn }), backend: resumeBackend(runtimeDir) },
+      new DeadThenHealedManager() as never,
+    );
+
+    const resumeCall = ensureArgs.find((a) => a.includes("--resume"));
+    expect(resumeCall).toBeDefined();
+    expect(resumeCall).toContain("claude-x");
+    expect(resumeCall).not.toContain("--append-system-prompt");
+    // Loader text rode in front of the prompt but never surfaced as output.
+    const emitted = onAssistantTurn.mock.calls.map((c) => String(c[0])).join("");
+    expect(emitted).not.toContain("MANDATORY FIRST STEP");
+    expect(output.text).toContain("Hello from Claude");
+  });
+
+  it("no prior-bound id: heals via FRESH relaunch, not a resume failure", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const ensureArgs: string[][] = [];
+    let aliveCalls = 0;
+    class DeadThenHealedManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgs.push(p.args ?? []);
+        return super.ensureSession(p as never);
+      }
+      async isPaneAlive() {
+        aliveCalls += 1;
+        return aliveCalls > 1;
+      }
+    }
+    // resumeBackend has a resume template, but there is NO prior-bound id
+    // (fresh /new). Must NOT try `--resume`; FRESH relaunch instead.
+    const output = await executeTmuxCliRun(
+      {
+        ...baseInput(runtimeDir),
+        backend: resumeBackend(runtimeDir),
+        cliSessionId: "stale-foreign-id",
+      },
+      new DeadThenHealedManager() as never,
+    );
+    expect(ensureArgs.some((a) => a.includes("--resume"))).toBe(false);
+    expect(ensureArgs.length).toBeLessThanOrEqual(4);
+    expect(output.text).toContain("Hello from Claude");
+  });
+
+  it("cold restart: resumes from claudeSessionId persisted in metadata.json", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // Recreate the exact runtime path the runner will resolve, then pre-seed
+    // metadata.json as if a prior gateway process had bound a Claude id.
+    const sessionName = buildTmuxSessionName({
+      prefix: "openclaw-claude",
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionKey: "openclaw-session",
+      modelId: "sonnet",
+      memoryMode: "managed-disabled",
+      hookMode: "managed",
+    });
+    const paths = resolveTmuxRuntimePaths({ runtimeDir, sessionName });
+    await fs.mkdir(paths.rootDir, { recursive: true });
+    await fs.writeFile(
+      paths.metadataFile,
+      `${JSON.stringify({
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionName,
+        launchHash: "x",
+        model: "sonnet",
+        systemPromptHash: "old",
+        memoryMode: "managed-disabled",
+        hookMode: "managed",
+        launchMode: "resume",
+        claudeSessionId: "cold-id",
+        createdAt: 1,
+        lastUsedAt: 1,
+      })}\n`,
+    );
+    const ensureArgs: string[][] = [];
+    class ColdManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgs.push(p.args ?? []);
+        return super.ensureSession(p as never);
+      }
+      async hasSession() {
+        return false;
+      }
+      async isPaneAlive() {
+        return false;
+      }
+    }
+    await executeTmuxCliRun(
+      // No cliSessionId → must fall back to the persisted claudeSessionId.
+      { ...baseInput(runtimeDir), backend: resumeBackend(runtimeDir) },
+      new ColdManager() as never,
+    ).catch(() => {});
+    const resumeCall = ensureArgs.find((a) => a.includes("--resume"));
+    expect(resumeCall).toBeDefined();
+    expect(resumeCall).toContain("cold-id");
+  });
+
+  it("mid-turn death is bounded: exhausts resume attempts then FailoverError", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    let ensureCalls = 0;
+    class AlwaysDeadManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+      }) {
+        ensureCalls += 1;
+        return super.ensureSession(p as never);
+      }
+      async isPaneAlive() {
+        return false;
+      }
+      // Never emit Stop so the turn cannot complete normally.
+      override async pastePrompt() {}
+    }
+    await expect(
+      executeTmuxCliRun(
+        {
+          ...baseInput(runtimeDir, {}, { startupTimeoutMs: 200 }),
+          backend: resumeBackend(runtimeDir, { startupTimeoutMs: 200 }),
+          cliSessionId: "claude-x",
+          timeoutMs: 30_000,
+        },
+        new AlwaysDeadManager() as never,
+      ),
+    ).rejects.toThrow(/(exhausted|resume-recovery)/);
+    // 1 initial + at most MAX_RECOVERY_ATTEMPTS(3) relaunches.
+    expect(ensureCalls).toBeLessThanOrEqual(4);
+    expect(ensureCalls).toBeGreaterThanOrEqual(2);
+  }, 20_000);
 });

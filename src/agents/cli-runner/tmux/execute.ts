@@ -2,12 +2,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { CliOutput } from "../../cli-output.js";
 import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
+import {
+  buildClaudeSystemPromptLoaderPrompt,
+  writeClaudeSystemPromptFile,
+} from "../system-prompt-file.js";
 import { buildClaudeTmuxArgs } from "./args.js";
 import { parseHookEventLine, writeActiveRun, writeClaudeTmuxRuntimeFiles } from "./hooks.js";
 import { TmuxSessionManager } from "./manager.js";
 import { resolveTmuxRuntimePaths, ensureTmuxRuntimeDir } from "./runtime-dir.js";
 import { buildTmuxSessionName, sha256Hex } from "./session-name.js";
 import { TerminalDeltaTracker } from "./terminal-stream.js";
+import {
+  resolveTranscriptPath,
+  TranscriptTailer,
+  type TranscriptSegment,
+} from "./transcript-stream.js";
 import type {
   NormalizedTmuxConfig,
   TmuxActiveRun,
@@ -20,7 +29,15 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_TURN_IDLE_MS = 1_200;
 const DEFAULT_HOOK_STALL_MS = 8_000;
 const DEFAULT_CAPTURE_LINES = 160;
+// Claude Code writes the final assistant message to the session JSONL right
+// before (or right after) the Stop hook fires. Give the writer a short window
+// to flush the final block so downstream surfaces (e.g. Feishu cards) get the
+// complete reply instead of only the interim turns.
+const TRANSCRIPT_DRAIN_TOTAL_MS = 3_000;
+const TRANSCRIPT_DRAIN_QUIET_MS = 500;
 const CLAUDE_READY_RE = /\bClaude Code v\d+\.\d+\.\d+\b/;
+const PRESS_ENTER_RE = /Press Enter to continue\s*(?:…|\.{2,})/i;
+const PRESS_ENTER_DEBOUNCE_MS = 500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,6 +83,14 @@ async function readFromOffset(
   }
 }
 
+async function readJsonFile<T>(filePath: string): Promise<T | null> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function fileSize(filePath: string): Promise<number> {
   try {
     return (await fs.stat(filePath)).size;
@@ -94,10 +119,19 @@ async function readTextTail(filePath: string, maxBytes = 32_768): Promise<string
   }
 }
 
+// Env keys that change every turn (run id, etc.). They get baked into the
+// initial child env at session creation, so they cannot be updated for a
+// reused session anyway — including them in the launch signature would force
+// a kill + recreate on every follow-up turn even though the running Claude
+// is perfectly usable.
+const VOLATILE_ENV_KEYS_RE = /^(OPENCLAW_MCP_RUN_ID)$/;
+
 function stableJson(value: Record<string, string>): string {
   return JSON.stringify(
     Object.fromEntries(
-      Object.entries(value).toSorted(([left], [right]) => left.localeCompare(right)),
+      Object.entries(value)
+        .filter(([key]) => !VOLATILE_ENV_KEYS_RE.test(key))
+        .toSorted(([left], [right]) => left.localeCompare(right)),
     ),
   );
 }
@@ -114,6 +148,22 @@ function looksReadyForPrompt(text: string): boolean {
   return CLAUDE_READY_RE.test(text);
 }
 
+function looksLikePressEnterToContinue(text: string): boolean {
+  return PRESS_ENTER_RE.test(text);
+}
+
+function looksLikeThemePrompt(text: string): boolean {
+  return text.includes("Choose the text style") && text.includes("Dark mode");
+}
+
+function looksLikeBypassPermissionsWarning(text: string): boolean {
+  return (
+    text.includes("Bypass Permissions mode") &&
+    text.includes("Yes, I accept") &&
+    text.includes("No, exit")
+  );
+}
+
 async function waitForStartup(params: {
   manager: TmuxSessionManager;
   sessionName: string;
@@ -121,9 +171,12 @@ async function waitForStartup(params: {
   config: NormalizedTmuxConfig;
   startedAt: number;
   input: TmuxExecutionInput;
-}): Promise<void> {
+}): Promise<{ claudeSessionId?: string }> {
   const deadline = params.startedAt + params.config.startupTimeoutMs;
   let confirmedTrustPrompt = false;
+  let confirmedThemePrompt = false;
+  let confirmedBypassWarning = false;
+  let lastPressEnterAt = 0;
   while (Date.now() <= deadline) {
     if (params.input.abortSignal?.aborted) {
       if (params.config.stopOnAbort) {
@@ -137,21 +190,50 @@ async function waitForStartup(params: {
       params.config.captureLines,
     );
     const combinedTail = `${logTail}\n${captureTail}`;
+    if (looksLikeThemePrompt(combinedTail) && !confirmedThemePrompt) {
+      await params.manager.sendEnter(params.sessionName);
+      confirmedThemePrompt = true;
+      await sleep(150);
+      continue;
+    }
+    if (looksLikeBypassPermissionsWarning(combinedTail) && !confirmedBypassWarning) {
+      await params.manager.sendKey(params.sessionName, "Down");
+      await sleep(80);
+      await params.manager.sendEnter(params.sessionName);
+      confirmedBypassWarning = true;
+      await sleep(150);
+      continue;
+    }
     if (looksLikeTrustPrompt(combinedTail) && !confirmedTrustPrompt) {
       await params.manager.sendEnter(params.sessionName);
       confirmedTrustPrompt = true;
       await sleep(100);
       continue;
     }
-    if (looksReadyForPrompt(combinedTail)) {
-      return;
+    if (
+      looksLikePressEnterToContinue(combinedTail) &&
+      Date.now() - lastPressEnterAt > PRESS_ENTER_DEBOUNCE_MS
+    ) {
+      await params.manager.sendEnter(params.sessionName);
+      lastPressEnterAt = Date.now();
+      await sleep(100);
+      continue;
     }
     const eventTail = await readTextTail(params.paths.eventsFile);
+    let discoveredSessionId: string | undefined;
     for (const line of eventTail.split("\n")) {
       const event = parseHookEventLine(line);
       if (event?.event === "SessionStart" && event.timestamp >= params.startedAt) {
-        return;
+        if (event.claudeSessionId) {
+          discoveredSessionId = event.claudeSessionId;
+        }
+        if (!looksReadyForPrompt(combinedTail)) {
+          return discoveredSessionId ? { claudeSessionId: discoveredSessionId } : {};
+        }
       }
+    }
+    if (looksReadyForPrompt(combinedTail)) {
+      return discoveredSessionId ? { claudeSessionId: discoveredSessionId } : {};
     }
     await sleep(100);
   }
@@ -196,10 +278,20 @@ function stringifyHookPayload(value: unknown): string | undefined {
   }
 }
 
-function dispatchHookEvent(input: TmuxExecutionInput, event: TmuxHookEvent): void {
+function dispatchHookEvent(
+  input: TmuxExecutionInput,
+  event: TmuxHookEvent,
+  options: { suppressToolEvents: boolean },
+): void {
   const stdin = event.stdin;
   if (event.event === "SessionStart") {
     input.onSystemInit?.({ subtype: "init", sessionId: event.claudeSessionId });
+    return;
+  }
+  if (options.suppressToolEvents) {
+    // Transcript JSONL is the canonical source for tool events when it is
+    // active; emitting them again from the hook stream would duplicate
+    // (and mis-order) inline rendering downstream.
     return;
   }
   if (event.event === "PreToolUse") {
@@ -225,6 +317,8 @@ function buildMetadata(params: {
   sessionName: string;
   systemPromptHash: string;
   launchHash: string;
+  launchMode: TmuxMetadata["launchMode"];
+  claudeSessionId?: string;
 }): TmuxMetadata {
   const now = Date.now();
   return {
@@ -238,6 +332,8 @@ function buildMetadata(params: {
     ...(params.input.authProfileId ? { authProfileId: params.input.authProfileId } : {}),
     memoryMode: params.config.memoryMode,
     hookMode: params.config.hookMode,
+    launchMode: params.launchMode,
+    ...(params.claudeSessionId ? { claudeSessionId: params.claudeSessionId } : {}),
     createdAt: now,
     lastUsedAt: now,
   };
@@ -266,7 +362,6 @@ export async function executeTmuxCliRun(
     workspaceDir: input.workspaceDir,
     sessionKey: input.sessionId,
     modelId: input.modelId,
-    systemPromptHash,
     mcpConfigHash: input.mcpConfigHash,
     authProfileId: input.authProfileId,
     memoryMode: config.memoryMode,
@@ -274,21 +369,72 @@ export async function executeTmuxCliRun(
   });
   const paths = resolveTmuxRuntimePaths({ runtimeDir: config.runtimeDir, sessionName });
   await ensureTmuxRuntimeDir(paths);
-  const { managedSettingsJson } = await writeClaudeTmuxRuntimeFiles({
+  await writeClaudeTmuxRuntimeFiles({
     paths,
-    systemPrompt: input.systemPrompt,
     hookMode: config.hookMode,
   });
 
-  const args = buildClaudeTmuxArgs({
-    backend: input.backend,
-    baseArgs: input.backend.args,
-    modelId: input.modelId,
-    settingsFile: paths.settingsFile,
-    managedSettingsJson,
-    systemPromptFile: paths.systemPromptFile,
-    sessionId: input.cliSessionId,
+  const cliSystemPromptFile = await writeClaudeSystemPromptFile({
+    sessionFile: input.sessionFile,
+    systemPrompt: input.systemPrompt,
   });
+  // Cold-restart durability: a prior turn may have persisted the Claude
+  // session id in metadata even though this gateway process lost its
+  // in-memory binding. Read it so recovery can resume the right conversation
+  // instead of starting blank.
+  const persistedMeta = await readJsonFile<TmuxMetadata>(paths.metadataFile);
+  const resumeTemplateAvailable = (input.backend.resumeArgs?.length ?? 0) > 0;
+  // Resume is ONLY valid against a Claude session that actually exists on
+  // disk under THIS tmux identity. The only launch-time evidence of that is
+  // a prior-bound id persisted in this session's metadata.json. NOTE:
+  // input.cliSessionId is deliberately NOT treated as resume evidence here —
+  // on a fresh `/new` conversation upstream still passes a (stale/foreign)
+  // cliSessionId, and `claude --resume <nonexistent-id>` exits immediately,
+  // which previously made every fresh session fail to start. A first launch
+  // must be FRESH; input.cliSessionId is still used as the fresh
+  // `--session-id` value below.
+  const priorBoundClaudeId = persistedMeta?.claudeSessionId?.trim() || undefined;
+  // Mutable: updated to the live Claude id once discovered this run, so a
+  // mid-turn death can resume the session we just created.
+  let resumableClaudeId = priorBoundClaudeId;
+  const canResumeAtLaunch = Boolean(priorBoundClaudeId) && resumeTemplateAvailable;
+  // Liveness governs launch mode. A warm, alive REPL is reused as-is (the
+  // fast path — the entire point of tmux mode). Only when the pane is dead
+  // or missing AND we have a prior-bound id do we RESUME from disk so
+  // conversation context survives. Otherwise FRESH. A reused alive session
+  // keeps whatever launchMode it was created with so metadataMismatchReasons
+  // does not spuriously kill it.
+  const sessionAliveAtStart =
+    (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
+  const launchMode: TmuxMetadata["launchMode"] = sessionAliveAtStart
+    ? (persistedMeta?.launchMode ?? "fresh")
+    : canResumeAtLaunch
+      ? "resume"
+      : "fresh";
+  const loaderPrompt = buildClaudeSystemPromptLoaderPrompt({
+    chunks: cliSystemPromptFile.chunks,
+    // A resumed REPL is a fresh process replaying disk history but WITHOUT
+    // the --append-system-prompt (Claude CLI rejects it on resume), so the
+    // authoritative system prompt files must be re-read — same need as after
+    // a compaction.
+    reason: launchMode === "resume" ? "compaction" : "new-session",
+  });
+  const buildArgsForMode = (mode: TmuxMetadata["launchMode"]): string[] =>
+    buildClaudeTmuxArgs({
+      backend: input.backend,
+      baseArgs: input.backend.args,
+      modelId: input.modelId,
+      settingsFile: paths.settingsFile,
+      systemPrompt: loaderPrompt,
+      launch:
+        mode === "resume" && resumableClaudeId
+          ? { mode: "resume", claudeSessionId: resumableClaudeId }
+          : {
+              mode: "fresh",
+              ...(input.cliSessionId ? { sessionId: input.cliSessionId } : {}),
+            },
+    });
+  const args = buildArgsForMode(launchMode);
   const env = {
     ...input.env,
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
@@ -299,14 +445,117 @@ export async function executeTmuxCliRun(
   if (config.authMode === "openclaw" && env.CLAUDE_CONFIG_DIR) {
     await fs.mkdir(env.CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
-  const launchHash = sha256Hex(
-    input.backend.command,
-    JSON.stringify(args),
-    stableJson(env),
-    managedSettingsJson,
-    input.systemPrompt,
-  );
-  const metadata = buildMetadata({ input, config, sessionName, systemPromptHash, launchHash });
+  // Launch signature must stay stable across turns of the same conversation.
+  // Several values change every turn and would otherwise force a kill +
+  // recreate even though the running Claude is perfectly usable:
+  //   1. The system prompt (rebuilt with date/context each turn).
+  //   2. `--session-id <uuid>` — turn 1 has no Claude session id yet, turn 2
+  //      onward carries the id Claude itself produced; only meaningful at
+  //      first launch anyway because we paste follow-ups into the running
+  //      REPL via tmux.
+  //   3. `--mcp-config <path>` — prepareCliBundleMcpConfig writes the bundled
+  //      MCP config to a fresh mkdtemp path every turn. The *path* is pure
+  //      per-turn noise; the *content* is already guarded separately via
+  //      metadata.mcpConfigHash (compared in metadataMismatchReasons), so a
+  //      genuine MCP change still recreates.
+  // Strip those values from the hash. Model / settings args still
+  // participate, so a genuine launch-affecting change still recreates.
+  const systemPromptFlag = input.backend.systemPromptArg?.trim() || "--append-system-prompt";
+  const sessionIdFlag = input.backend.sessionArg?.trim();
+  const VOLATILE_PATH_FLAGS = new Set(["--mcp-config", "--settings"]);
+  const stableArgs: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === systemPromptFlag) {
+      stableArgs.push(arg, "<system-prompt>");
+      i += 1;
+      continue;
+    }
+    if (sessionIdFlag && arg === sessionIdFlag) {
+      // Drop the flag AND its value entirely. Turn 1 (fresh) emits no
+      // --session-id arg at all; turn 2 onward emits one. Including either
+      // form (with or without a placeholder) would still differ across
+      // turns. The flag is meaningful only at first launch — once the
+      // tmux Claude is running we paste follow-ups, never relaunch.
+      i += 1;
+      continue;
+    }
+    if (VOLATILE_PATH_FLAGS.has(arg) && i + 1 < args.length) {
+      // Keep the flag (a genuine add/remove of MCP/settings still shifts the
+      // hash) but replace its per-turn temp path with a stable placeholder.
+      stableArgs.push(arg, `<${arg.replace(/^-+/, "")}>`);
+      i += 1;
+      continue;
+    }
+    if (arg === "--resume" && i + 1 < args.length) {
+      // Keep the `--resume` flag (fresh vs resume IS a real launch
+      // difference and must shift the hash) but mask the volatile session id
+      // value so steady-state resume turns reuse the warm REPL instead of
+      // churn-recreating. Mode stability is separately guaranteed by
+      // launchMode in metadataMismatchReasons.
+      stableArgs.push(arg, "<resume-session-id>");
+      i += 1;
+      continue;
+    }
+    stableArgs.push(arg);
+  }
+  const stableEnvJson = stableJson(env);
+  const launchHash = sha256Hex(input.backend.command, JSON.stringify(stableArgs), stableEnvJson);
+  const metadata = buildMetadata({
+    input,
+    config,
+    sessionName,
+    systemPromptHash,
+    launchHash,
+    launchMode,
+    // Only carry a prior-bound id forward. The real discovered id is
+    // persisted at run end; persisting input.cliSessionId here would make
+    // the next run falsely believe a resumable session exists.
+    ...(resumableClaudeId ? { claudeSessionId: resumableClaudeId } : {}),
+  });
+  const diag = input.onDiagnostic;
+  // Persist signature inputs alongside metadata so a future launchHash
+  // mismatch is diffable from the file system without rerunning under a
+  // debugger. File is small (args + filtered env) and overwritten each turn.
+  const signatureFile = path.join(paths.rootDir, "launch-signature.json");
+  const prevSignatureFile = path.join(paths.rootDir, "launch-signature.prev.json");
+  try {
+    await fs.rename(signatureFile, prevSignatureFile);
+  } catch {
+    // no prior turn signature yet
+  }
+  try {
+    await fs.writeFile(
+      signatureFile,
+      `${JSON.stringify(
+        {
+          command: input.backend.command,
+          stableArgs,
+          stableEnv: JSON.parse(stableEnvJson),
+          launchHash,
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // best-effort diagnostic only
+  }
+  diag?.("tmux.run.start", {
+    runId: input.runId,
+    sessionName,
+    backendId: input.backendId,
+    model: input.modelId,
+    promptChars: input.prompt.length,
+    cliSessionIdProvided: Boolean(input.cliSessionId),
+    launchHash,
+    systemPromptHash,
+    stableArgsHash: sha256Hex(JSON.stringify(stableArgs)),
+    stableEnvHash: sha256Hex(stableEnvJson),
+    stableEnvKeys: Object.keys(JSON.parse(stableEnvJson) as Record<string, string>).join(","),
+    signatureFile,
+  });
   const sessionState = await manager.ensureSession({
     paths,
     metadata,
@@ -315,9 +564,12 @@ export async function executeTmuxCliRun(
     cwd: input.workspaceDir,
     env,
     config,
+    ...(diag ? { onDiagnostic: diag } : {}),
   });
+  let startupSessionId: string | undefined;
   if (!sessionState || sessionState.created) {
-    await waitForStartup({
+    diag?.("tmux.run.waitForStartup", { sessionName });
+    const startupResult = await waitForStartup({
       manager,
       sessionName,
       paths,
@@ -325,6 +577,17 @@ export async function executeTmuxCliRun(
       startedAt: Date.now(),
       input,
     });
+    startupSessionId = startupResult.claudeSessionId;
+    if (startupSessionId) {
+      // Now resumable: a mid-turn death can replay the session we just made.
+      resumableClaudeId = startupSessionId;
+    }
+    diag?.("tmux.run.waitForStartup.done", {
+      sessionName,
+      claudeSessionId: startupSessionId,
+    });
+  } else {
+    diag?.("tmux.run.reusedSession", { sessionName });
   }
 
   const startedAt = Date.now();
@@ -336,31 +599,202 @@ export async function executeTmuxCliRun(
     promptHash: sha256Hex(input.prompt),
     turnIndex: startedAt,
   };
-  const initialPaneOffset = await fileSize(paths.paneLogFile);
-  const initialEventOffset = await fileSize(paths.eventsFile);
   await writeActiveRun(paths, activeRun);
-  await fs.writeFile(
-    paths.promptBufferFile,
-    input.prompt.endsWith("\n") ? input.prompt : `${input.prompt}\n`,
-    {
-      mode: 0o600,
-    },
-  );
+
+  const MAX_RECOVERY_ATTEMPTS = 3;
+  let recoveryAttempts = 0;
+  // True on a turn where the REPL was (re)launched in resume mode: the
+  // resumed process never received --append-system-prompt (Claude CLI
+  // rejects it on resume), so the loader must ride in front of this turn's
+  // user prompt to restore the authoritative system prompt. Steady-state
+  // warm turns keep this false — that is the whole fast-path benefit.
+  let loaderInjectionPending = launchMode === "resume" && Boolean(sessionState?.created);
+
+  // Bytes actually pasted into the REPL this turn. pendingPromptEcho must
+  // mirror these (NOT input.prompt) so the echoed prompt — loader prefix
+  // included on a recovered turn — is stripped from the pane stream.
+  // Trailing newline stripped: the TUI ingests via bracketed paste, so a
+  // trailing "\n" would sit as a literal newline; submission is the explicit
+  // Enter in pastePrompt.
+  const composePasteBuffer = (): string => {
+    const body = loaderInjectionPending ? `${loaderPrompt}\n${input.prompt}` : input.prompt;
+    return body.replace(/\n+$/, "");
+  };
+
+  // Self-heal a dead REPL. If a resumable Claude id is known (prior-bound or
+  // discovered live this run) and the backend has a resume template, RESUME
+  // from disk so conversation context survives; otherwise FRESH relaunch so
+  // tmux at least restarts (a brand-new session has no history to lose).
+  // Bounded; only attempt exhaustion escalates to FailoverError so upstream
+  // failover / profile-downgrade still engages.
+  const healViaResume = async (phase: string): Promise<void> => {
+    if (input.abortSignal?.aborted) {
+      if (config.stopOnAbort) {
+        await manager.interrupt(sessionName);
+      }
+      throw Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+    }
+    if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+      diag?.("tmux.recovery.exhausted", { sessionName, phase, attempts: recoveryAttempts });
+      throw new FailoverError(
+        `CLI tmux session died (${phase}); exhausted ${MAX_RECOVERY_ATTEMPTS} recovery attempts.`,
+        {
+          reason: "unknown",
+          provider: input.backendId,
+          model: input.modelId,
+          status: resolveFailoverStatus("unknown"),
+        },
+      );
+    }
+    recoveryAttempts += 1;
+    const healMode: TmuxMetadata["launchMode"] =
+      resumableClaudeId && resumeTemplateAvailable ? "resume" : "fresh";
+    diag?.("tmux.recovery.detected", {
+      sessionName,
+      phase,
+      attempt: recoveryAttempts,
+      healMode,
+      claudeSessionId: resumableClaudeId,
+    });
+    await manager.killSession(sessionName);
+    const healMeta = buildMetadata({
+      input,
+      config,
+      sessionName,
+      systemPromptHash,
+      launchHash,
+      launchMode: healMode,
+      ...(healMode === "resume" && resumableClaudeId ? { claudeSessionId: resumableClaudeId } : {}),
+    });
+    diag?.("tmux.recovery.relaunch", { sessionName, attempt: recoveryAttempts, healMode });
+    await manager.ensureSession({
+      paths,
+      metadata: healMeta,
+      command: input.backend.command,
+      args: buildArgsForMode(healMode),
+      cwd: input.workspaceDir,
+      env,
+      config,
+      ...(diag ? { onDiagnostic: diag } : {}),
+    });
+    await waitForStartup({
+      manager,
+      sessionName,
+      paths,
+      config,
+      startedAt: Date.now(),
+      input,
+    });
+    // Only a resumed REPL lacks the system prompt (no --append-system-prompt
+    // on resume); a fresh relaunch already carries it via args.
+    loaderInjectionPending = healMode === "resume";
+    diag?.("tmux.recovery.healed", {
+      sessionName,
+      attempt: recoveryAttempts,
+      healMode,
+      claudeSessionId: resumableClaudeId,
+    });
+  };
+
+  // Pre-paste liveness: a dead/missing pane here means the warm REPL we
+  // expected to reuse is gone. Heal before pasting instead of pasting into
+  // the void (the old code only logged this).
+  const alivePrePaste =
+    (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
+  diag?.("tmux.run.pastePrompt", {
+    sessionName,
+    promptChars: input.prompt.length,
+    aliveBeforePaste: alivePrePaste,
+  });
+  if (!alivePrePaste) {
+    diag?.("tmux.run.pastePrompt.sessionMissing", { sessionName });
+    await healViaResume("pre-paste");
+  }
+
+  // Sample offsets AFTER any heal: ensureSession truncates the pane log +
+  // events file and re-runs pipe-pane, so pre-heal sizes would skip the
+  // relaunched session's output (or replay stale bytes).
+  let paneOffset = await fileSize(paths.paneLogFile);
+  let eventOffset = await fileSize(paths.eventsFile);
+  let pastedBuffer = composePasteBuffer();
+  await fs.writeFile(paths.promptBufferFile, pastedBuffer, { mode: 0o600 });
   await manager.pastePrompt({
     sessionName,
     bufferName: `openclaw-${input.runId.slice(0, 12)}`,
     promptFile: paths.promptBufferFile,
   });
 
-  const terminal = new TerminalDeltaTracker();
-  let paneOffset = initialPaneOffset;
-  let eventOffset = initialEventOffset;
-  let pendingPromptEcho = input.prompt.endsWith("\n") ? input.prompt : `${input.prompt}\n`;
+  let terminal = new TerminalDeltaTracker();
+  let pendingPromptEcho = pastedBuffer;
   let sawStop = false;
   let sawCurrentRunHook = false;
-  let cliSessionId = input.cliSessionId;
+  // Fresh sessions: SessionStart hook fires during waitForStartup and gets
+  // consumed there, so the main loop's event reader (starting at
+  // initialEventOffset) never sees it. Carry the discovered sessionId
+  // forward so the transcript tailer can be instantiated before any tool
+  // events arrive — otherwise we fall back to hook-driven tool dispatch
+  // and lose canonical ordering.
+  let cliSessionId = input.cliSessionId ?? startupSessionId;
   let lastActivityAt = Date.now();
+  let lastPressEnterAt = 0;
+  // Rolling tail so a "Press Enter to continue…" prompt split across two
+  // pane reads is still detected. 256 chars >> marker length.
+  let pressEnterScanBuffer = "";
+  // Throttle mid-turn liveness probes (tmux list-panes is cheap but not
+  // free, and the loop ticks every 100ms).
+  let lastLivenessProbeAt = Date.now();
+  const LIVENESS_PROBE_INTERVAL_MS = 1_500;
   const deadline = Date.now() + Math.min(input.timeoutMs, config.turnTimeoutMs);
+  // Claude Code session JSONL transcript carries structured assistant text
+  // blocks. Prefer it over the noisy TUI pane log so downstream surfaces
+  // (e.g. Feishu cards) get clean output. Pane log still drives startup
+  // detection, press-enter handling, and acts as a fallback when no
+  // transcript file is available (older Claude versions / non-managed auth).
+  const transcriptConfigDir = env.CLAUDE_CONFIG_DIR;
+  // When managed hooks are active, SessionStart will deliver a sessionId and
+  // the JSONL transcript becomes the canonical source for assistant text.
+  // We buffer pane deltas until either the transcript produces anything
+  // (then we drop the buffer as duplicate TUI noise) or the run ends without
+  // a transcript (then we flush the buffer as a best-effort fallback). With
+  // hookMode=off, hooks never fire so the pane is canonical from the start.
+  const transcriptIsAuthoritative = config.hookMode !== "off";
+  const bufferedPaneDeltas: string[] = [];
+  let transcriptEmitted = false;
+  let transcript: TranscriptTailer | undefined = cliSessionId
+    ? new TranscriptTailer(
+        resolveTranscriptPath({
+          configDir: transcriptConfigDir,
+          workspaceDir: input.workspaceDir,
+          sessionId: cliSessionId,
+        }),
+        startedAt,
+      )
+    : undefined;
+
+  const dispatchTranscriptSegments = (segments: readonly TranscriptSegment[]): void => {
+    for (const segment of segments) {
+      if (segment.kind === "text") {
+        if (!transcriptEmitted) {
+          transcriptEmitted = true;
+          bufferedPaneDeltas.length = 0;
+        }
+        input.onAssistantTurn?.(segment.text);
+      } else if (segment.kind === "tool_use") {
+        input.onToolUseEvent?.({
+          name: segment.name,
+          ...(segment.toolUseId ? { toolUseId: segment.toolUseId } : {}),
+          ...(segment.input !== undefined ? { input: segment.input } : {}),
+        });
+      } else if (segment.kind === "tool_result") {
+        input.onToolResult?.({
+          ...(segment.toolUseId ? { toolUseId: segment.toolUseId } : {}),
+          ...(segment.text !== undefined ? { text: segment.text } : {}),
+          ...(segment.isError ? { isError: true } : {}),
+        });
+      }
+      // thinking segments not surfaced through the tmux callbacks today.
+    }
+  };
 
   while (!sawStop) {
     if (input.abortSignal?.aborted) {
@@ -374,8 +808,17 @@ export async function executeTmuxCliRun(
     paneOffset = pane.offset;
     if (pane.text) {
       lastActivityAt = Date.now();
+      const rawText = pane.text.replaceAll("\r", "");
+      pressEnterScanBuffer = (pressEnterScanBuffer + rawText).slice(-256);
+      if (
+        looksLikePressEnterToContinue(pressEnterScanBuffer) &&
+        Date.now() - lastPressEnterAt > PRESS_ENTER_DEBOUNCE_MS
+      ) {
+        await manager.sendEnter(sessionName);
+        lastPressEnterAt = Date.now();
+        pressEnterScanBuffer = "";
+      }
       const paneText = (() => {
-        const rawText = pane.text.replaceAll("\r", "");
         if (!pendingPromptEcho) {
           return rawText;
         }
@@ -403,7 +846,21 @@ export async function executeTmuxCliRun(
       })();
       const delta = terminal.push(paneText);
       if (delta) {
-        input.onAssistantTurn?.(delta);
+        if (transcriptEmitted) {
+          // Transcript is canonical; drop the pane copy.
+        } else if (transcriptIsAuthoritative) {
+          bufferedPaneDeltas.push(delta);
+        } else {
+          input.onAssistantTurn?.(delta);
+        }
+      }
+    }
+
+    if (transcript) {
+      const segments = await transcript.poll();
+      if (segments.length > 0) {
+        lastActivityAt = Date.now();
+        dispatchTranscriptSegments(segments);
       }
     }
 
@@ -417,10 +874,29 @@ export async function executeTmuxCliRun(
           continue;
         }
         sawCurrentRunHook = true;
-        if (event.claudeSessionId) {
+        if (event.claudeSessionId && event.claudeSessionId !== cliSessionId) {
           cliSessionId = event.claudeSessionId;
+          // Keep the recoverable id current so a mid-turn death resumes the
+          // session in flight rather than starting blank.
+          resumableClaudeId = event.claudeSessionId;
         }
-        dispatchHookEvent(input, event);
+        if (!transcript && cliSessionId) {
+          transcript = new TranscriptTailer(
+            resolveTranscriptPath({
+              configDir: transcriptConfigDir,
+              workspaceDir: input.workspaceDir,
+              sessionId: cliSessionId,
+            }),
+            startedAt,
+          );
+        }
+        dispatchHookEvent(input, event, {
+          // After SessionStart establishes the JSONL transcript as the source
+          // of truth, all subsequent tool events flow from there in the
+          // correct order. Dropping the hook copy avoids duplicate /
+          // misordered inline tool stats downstream.
+          suppressToolEvents: Boolean(transcript),
+        });
         if (event.event === "Stop") {
           sawStop = true;
         }
@@ -442,6 +918,40 @@ export async function executeTmuxCliRun(
         },
       );
     }
+    // Mid-turn death: the REPL exited before emitting Stop. Detect via a
+    // throttled pane-liveness probe and resume-relaunch + re-paste the same
+    // turn so the user still gets a reply with full context. Bounded inside
+    // healViaResume; exhaustion throws FailoverError.
+    if (
+      !sawStop &&
+      Date.now() - lastLivenessProbeAt >= LIVENESS_PROBE_INTERVAL_MS &&
+      Date.now() - lastActivityAt >= LIVENESS_PROBE_INTERVAL_MS
+    ) {
+      lastLivenessProbeAt = Date.now();
+      const aliveMidTurn =
+        (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
+      if (!aliveMidTurn) {
+        await healViaResume("mid-turn");
+        // Fresh pane log / events file after relaunch — reset trackers so we
+        // do not replay stale bytes or mis-diff against the dead session.
+        paneOffset = await fileSize(paths.paneLogFile);
+        eventOffset = await fileSize(paths.eventsFile);
+        terminal = new TerminalDeltaTracker();
+        bufferedPaneDeltas.length = 0;
+        pressEnterScanBuffer = "";
+        pastedBuffer = composePasteBuffer();
+        pendingPromptEcho = pastedBuffer;
+        await fs.writeFile(paths.promptBufferFile, pastedBuffer, { mode: 0o600 });
+        await manager.pastePrompt({
+          sessionName,
+          bufferName: `openclaw-${input.runId.slice(0, 12)}`,
+          promptFile: paths.promptBufferFile,
+        });
+        lastActivityAt = Date.now();
+        await sleep(100);
+        continue;
+      }
+    }
     const idleFor = Date.now() - lastActivityAt;
     const noHookYet = config.hookMode === "off" || !sawCurrentRunHook;
     // Fast path: no managed hooks (or none seen yet) — short idle ends the turn.
@@ -455,8 +965,74 @@ export async function executeTmuxCliRun(
     await sleep(100);
   }
 
+  if (transcript) {
+    // Drain phase: Claude Code may flush the final assistant message to the
+    // JSONL transcript right around the Stop hook. Keep polling until the
+    // transcript goes quiet or the total budget elapses.
+    const drainStart = Date.now();
+    let lastDeltaAt = drainStart;
+    while (Date.now() - drainStart < TRANSCRIPT_DRAIN_TOTAL_MS) {
+      const segments = await transcript.poll();
+      if (segments.length > 0) {
+        dispatchTranscriptSegments(segments);
+        lastDeltaAt = Date.now();
+      } else if (Date.now() - lastDeltaAt >= TRANSCRIPT_DRAIN_QUIET_MS) {
+        break;
+      }
+      await sleep(100);
+    }
+    // The final assistant message has no successor record to seal it, so
+    // flush whatever blocks are still buffered (canonical order preserved).
+    dispatchTranscriptSegments(transcript.flushPending());
+  }
+
+  if (!transcriptEmitted && bufferedPaneDeltas.length > 0) {
+    for (const delta of bufferedPaneDeltas) {
+      input.onAssistantTurn?.(delta);
+    }
+  }
+
+  const aliveAtEnd = await manager.hasSession(sessionName);
+  // Persist the bound Claude session id so a cold gateway restart (which
+  // loses the in-memory binding) can still resume this conversation. Best
+  // effort: merge into the on-disk metadata without disturbing identity
+  // fields. Only write when we actually know the id.
+  const finalClaudeSessionId = cliSessionId ?? resumableClaudeId;
+  if (finalClaudeSessionId) {
+    const onDisk = await readJsonFile<TmuxMetadata>(paths.metadataFile);
+    if (onDisk && onDisk.claudeSessionId !== finalClaudeSessionId) {
+      try {
+        await fs.writeFile(
+          paths.metadataFile,
+          `${JSON.stringify({ ...onDisk, claudeSessionId: finalClaudeSessionId, lastUsedAt: Date.now() }, null, 2)}\n`,
+          { mode: 0o600 },
+        );
+      } catch {
+        // best-effort durability only
+      }
+    }
+  }
+  diag?.("tmux.run.complete", {
+    sessionName,
+    aliveAtEnd,
+    sawStop,
+    transcriptEmitted,
+    bufferedPaneFlushed: !transcriptEmitted && bufferedPaneDeltas.length > 0,
+    recoveryAttempts,
+    launchMode,
+    durationMs: Date.now() - startedAt,
+  });
+
+  // The returned text is the turn's deliverable: prefer the final (end_turn)
+  // assistant message. Interim narration ("Now I'll read…") was streamed live
+  // via onAssistantTurn for progress, but it must NOT become the reply body —
+  // otherwise a NO_REPLY final disposition can't suppress the card. Fall back
+  // to all accumulated text only when no final message was produced (e.g. the
+  // run was cut off mid-narration), then the pane text.
+  const finalReplyText = transcriptEmitted ? (transcript?.getFinalReplyText() ?? "") : "";
+  const accumulatedText = transcriptEmitted ? (transcript?.getText() ?? "") : "";
   return {
-    text: terminal.getText(),
+    text: finalReplyText || accumulatedText || terminal.getText(),
     ...((cliSessionId ?? input.cliSessionId)
       ? { sessionId: cliSessionId ?? input.cliSessionId }
       : {}),

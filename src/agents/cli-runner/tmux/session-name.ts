@@ -24,19 +24,21 @@ export function buildTmuxSessionName(params: {
   workspaceDir: string;
   sessionKey: string;
   modelId: string;
-  systemPromptHash: string;
   mcpConfigHash?: string;
   authProfileId?: string;
   memoryMode: string;
   hookMode: string;
 }): string {
   const prefix = sanitizeTmuxNamePart(params.prefix) || "openclaw-claude";
+  // The session name keys on the *stable* conversation identity only. The
+  // system prompt is rebuilt every turn (it embeds the date and rotating
+  // context), so including it would make every follow-up DM turn spin up a
+  // fresh Claude process instead of pasting into the persistent tmux REPL.
   const digest = sha256Hex(
     params.backendId,
     params.workspaceDir,
     params.sessionKey,
     params.modelId,
-    params.systemPromptHash,
     params.mcpConfigHash,
     params.authProfileId,
     params.memoryMode,

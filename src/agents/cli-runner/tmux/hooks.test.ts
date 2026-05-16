@@ -1,29 +1,41 @@
 import { describe, expect, it } from "vitest";
-import { buildClaudeTmuxManagedSettings, parseHookEventLine } from "./hooks.js";
+import { buildClaudeTmuxSettings, parseHookEventLine } from "./hooks.js";
 
-describe("buildClaudeTmuxManagedSettings", () => {
-  it("enables managed-only hooks and memory disable settings", () => {
-    const settings = buildClaudeTmuxManagedSettings({
-      rootDir: "/tmp/root",
-      activeRunFile: "/tmp/root/active-run.json",
-      eventsFile: "/tmp/root/events.jsonl",
-      paneLogFile: "/tmp/root/pane.log",
-      launcherFile: "/tmp/root/launch-claude.mjs",
-      managedSettingsFile: "/tmp/root/managed-settings.json",
-      settingsFile: "/tmp/root/settings.json",
-      systemPromptFile: "/tmp/root/system.txt",
-      hookWriterFile: "/tmp/root/hook-writer.mjs",
-      promptBufferFile: "/tmp/root/prompt.txt",
-      metadataFile: "/tmp/root/metadata.json",
-    });
+const TEST_PATHS = {
+  rootDir: "/tmp/root",
+  activeRunFile: "/tmp/root/active-run.json",
+  eventsFile: "/tmp/root/events.jsonl",
+  paneLogFile: "/tmp/root/pane.log",
+  launcherFile: "/tmp/root/launch-claude.mjs",
+  settingsFile: "/tmp/root/settings.json",
+  hookWriterFile: "/tmp/root/hook-writer.mjs",
+  promptBufferFile: "/tmp/root/prompt.txt",
+  metadataFile: "/tmp/root/metadata.json",
+};
+
+describe("buildClaudeTmuxSettings", () => {
+  it("embeds hooks block into settings when hookMode is managed", () => {
+    const settings = buildClaudeTmuxSettings({ paths: TEST_PATHS, hookMode: "managed" });
 
     expect(settings).toMatchObject({
       autoMemoryEnabled: false,
       autoDreamEnabled: false,
-      allowManagedHooksOnly: true,
+      disableBackgroundAgents: true,
+      disableRemoteControl: true,
     });
+    expect(settings).toHaveProperty("hooks");
     expect(JSON.stringify(settings)).toContain("Stop");
     expect(JSON.stringify(settings)).toContain("hook-writer.mjs");
+  });
+
+  it("omits hooks block when hookMode is off", () => {
+    const settings = buildClaudeTmuxSettings({ paths: TEST_PATHS, hookMode: "off" });
+
+    expect(settings).toMatchObject({
+      autoMemoryEnabled: false,
+      autoDreamEnabled: false,
+    });
+    expect(settings).not.toHaveProperty("hooks");
   });
 });
 

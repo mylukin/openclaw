@@ -771,6 +771,7 @@ export async function executeWithOverflowProtection(
             backendId: context.backendResolved.id,
             workspaceDir: context.workspaceDir,
             sessionId: params.sessionId,
+            sessionFile: params.sessionFile,
             ...(resolvedSessionId ? { cliSessionId: resolvedSessionId } : {}),
             runId: params.runId,
             modelId: context.normalizedModel,
@@ -787,6 +788,24 @@ export async function executeWithOverflowProtection(
             ...(params.onAssistantTurn ? { onAssistantTurn: params.onAssistantTurn } : {}),
             ...(params.onToolUseEvent ? { onToolUseEvent: params.onToolUseEvent } : {}),
             ...(params.onToolResult ? { onToolResult: params.onToolResult } : {}),
+            onDiagnostic: (event, data) => {
+              const detail = data
+                ? Object.entries(data)
+                    .map(([k, v]) => {
+                      const rendered =
+                        v === null || v === undefined
+                          ? ""
+                          : typeof v === "string"
+                            ? v
+                            : typeof v === "number" || typeof v === "boolean"
+                              ? String(v)
+                              : JSON.stringify(v);
+                      return `${k}=${rendered}`;
+                    })
+                    .join(" ")
+                : "";
+              cliBackendLog.info(`${event}${detail ? ` ${detail}` : ""}`);
+            },
           });
           latestCliSessionBinding =
             !isSystemCall && (cliOutput.sessionId || resolvedSessionId)

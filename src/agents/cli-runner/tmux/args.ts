@@ -45,17 +45,12 @@ function shouldDropEqualsArg(arg: string): boolean {
   );
 }
 
-export function buildClaudeTmuxArgs(params: {
-  backend: CliBackendConfig;
-  baseArgs?: string[];
-  modelId: string;
-  settingsFile: string;
-  managedSettingsJson?: string;
-  systemPromptFile: string;
-  sessionId?: string;
-}): string[] {
+export type TmuxLaunchSpec =
+  | { mode: "fresh"; sessionId?: string }
+  | { mode: "resume"; claudeSessionId: string };
+
+function filterBaseArgs(source: readonly string[]): string[] {
   const args: string[] = [];
-  const source = params.baseArgs ?? [];
   for (let i = 0; i < source.length; i += 1) {
     const arg = source[i] ?? "";
     if (DROP_FLAGS.has(arg) || shouldDropEqualsArg(arg)) {
@@ -67,19 +62,55 @@ export function buildClaudeTmuxArgs(params: {
     }
     args.push(arg);
   }
+  return args;
+}
 
-  args.push("--settings", params.settingsFile);
-  if (params.managedSettingsJson) {
-    args.push("--managed-settings", params.managedSettingsJson);
+export function buildClaudeTmuxArgs(params: {
+  backend: CliBackendConfig;
+  baseArgs?: string[];
+  modelId: string;
+  settingsFile: string;
+  systemPrompt: string;
+  launch: TmuxLaunchSpec;
+}): string[] {
+  if (params.launch.mode === "resume") {
+    // Resume an existing Claude session from disk. The base comes from the
+    // backend resume template so `--resume <id>` is carried through; the
+    // shared filter drops `-p`/`--bare`/stream-json/etc. just like fresh.
+    // Claude CLI rejects `--append-system-prompt` on resume (see non-tmux
+    // cli-runner/execute.ts), so it is intentionally NOT added here — the
+    // caller re-injects the loader as the first pasted message on the
+    // recovered turn instead.
+    const claudeSessionId = params.launch.claudeSessionId;
+    const resumeTemplate = params.backend.resumeArgs ?? params.backend.args ?? [];
+    const substituted = resumeTemplate.map((entry) =>
+      entry.replaceAll("{sessionId}", claudeSessionId),
+    );
+    const args = filterBaseArgs(substituted);
+    // Defensive: if the template lacked an explicit resume flag, add one.
+    if (!args.includes("--resume")) {
+      args.push("--resume", claudeSessionId);
+    }
+    args.push("--settings", params.settingsFile);
+    args.push("--setting-sources", "");
+    args.push("--permission-mode", "bypassPermissions");
+    if (params.backend.modelArg && params.modelId) {
+      args.push(params.backend.modelArg, params.modelId);
+    }
+    return args;
   }
+
+  const args = filterBaseArgs(params.baseArgs ?? []);
+  args.push("--settings", params.settingsFile);
   args.push("--setting-sources", "");
-  args.push("--append-system-prompt-file", params.systemPromptFile);
+  const systemPromptArg = params.backend.systemPromptArg?.trim() || "--append-system-prompt";
+  args.push(systemPromptArg, params.systemPrompt);
   args.push("--permission-mode", "bypassPermissions");
   if (params.backend.modelArg && params.modelId) {
     args.push(params.backend.modelArg, params.modelId);
   }
-  if (params.backend.sessionArg && params.sessionId) {
-    args.push(params.backend.sessionArg, params.sessionId);
+  if (params.backend.sessionArg && params.launch.sessionId) {
+    args.push(params.backend.sessionArg, params.launch.sessionId);
   }
   return args;
 }
