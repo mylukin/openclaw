@@ -22,6 +22,7 @@ import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { runPreflightCompactionIfNeeded } from "./agent-runner-memory.js";
 import { resolveRunAuthProfile } from "./agent-runner-utils.js";
+import { buildFollowupStablePromptParams } from "./followup-runner-run-params.js";
 import {
   resolveOriginAccountId,
   resolveOriginMessageProvider,
@@ -257,7 +258,7 @@ export function createFollowupRunner(params: {
                 config: queued.run.config,
                 skillsSnapshot: queued.run.skillsSnapshot,
                 prompt: queued.prompt,
-                extraSystemPrompt: queued.run.extraSystemPrompt,
+                ...buildFollowupStablePromptParams(queued.run),
                 ownerNumbers: queued.run.ownerNumbers,
                 enforceFinalTag: queued.run.enforceFinalTag,
                 provider,

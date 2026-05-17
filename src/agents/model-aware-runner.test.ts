@@ -146,6 +146,37 @@ describe("runModelAwareAgent", () => {
     expect(result).toEqual({ payloads: [{ text: "cli-ok" }] });
   });
 
+  it("passes stable extra system prompt to CLI session identity", async () => {
+    runCliAgentMock.mockResolvedValue({ payloads: [{ text: "cli-ok" }] });
+
+    await runModelAwareAgent({
+      ...baseParams,
+      provider: "claude-cli",
+      model: "opus",
+      config: {
+        agents: {
+          defaults: {
+            cliBackends: {
+              "claude-cli": { command: "claude" },
+            },
+          },
+        },
+      } as OpenClawConfig,
+      disableTools: true,
+      extraSystemPrompt: "DYNAMIC_TURN_CONTEXT",
+      stableExtraSystemPrompt: "STABLE_CONTEXT",
+    });
+
+    const cliCallArg = runCliAgentMock.mock.calls[0]?.[0] as
+      | { extraSystemPrompt?: string; stableExtraSystemPrompt?: string }
+      | undefined;
+    expect(cliCallArg?.extraSystemPrompt).toContain("DYNAMIC_TURN_CONTEXT");
+    expect(cliCallArg?.extraSystemPrompt).toContain("Tools are disabled in this session.");
+    expect(cliCallArg?.stableExtraSystemPrompt).toContain("STABLE_CONTEXT");
+    expect(cliCallArg?.stableExtraSystemPrompt).toContain("Tools are disabled in this session.");
+    expect(cliCallArg?.stableExtraSystemPrompt).not.toContain("DYNAMIC_TURN_CONTEXT");
+  });
+
   it("suppresses split NO_REPLY fragments from CLI partial output", async () => {
     runCliAgentMock.mockImplementation(async (params: Record<string, unknown>) => {
       const onAssistantTurn = params.onAssistantTurn as ((text: string) => void) | undefined;

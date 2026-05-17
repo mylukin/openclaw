@@ -42,6 +42,10 @@ export async function runModelAwareAgent(
     extraSystemPrompt: params.extraSystemPrompt,
     disableTools: params.disableTools,
   });
+  const stableExtraSystemPrompt = resolveDecisionLikeSystemPrompt({
+    extraSystemPrompt: params.stableExtraSystemPrompt,
+    disableTools: params.disableTools,
+  });
   const visibleTextAccumulator = createAcpVisibleTextAccumulator();
 
   return runCliAgent({
@@ -58,6 +62,7 @@ export async function runModelAwareAgent(
     timeoutMs: params.timeoutMs,
     runId: params.runId,
     extraSystemPrompt,
+    stableExtraSystemPrompt,
     skillsSnapshot: params.skillsSnapshot,
     disableTools: params.disableTools,
     ownerNumbers: params.ownerNumbers,
