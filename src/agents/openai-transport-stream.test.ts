@@ -660,6 +660,56 @@ describe("openai transport stream", () => {
     expect(payload.input.map((item) => item.type)).toEqual(["message"]);
   });
 
+  it("drops all item_reference items when store=false regardless of id prefix", () => {
+    const payload = {
+      store: false,
+      input: [
+        { type: "item_reference", id: "rs_persisted_id" },
+        { type: "item_reference", id: "resp_persisted" },
+        { type: "item_reference", id: "fcr_unknown_prefix" },
+        { type: "item_reference", id: "call_tool_id" },
+        { type: "item_reference", id: "local_anything" },
+        { type: "message", role: "user", content: "hi" },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    expect(payload.input).toEqual([{ type: "message", role: "user", content: "hi" }]);
+  });
+
+  it("drops item_reference items when store field is absent (Azure path)", () => {
+    const payload: Record<string, unknown> = {
+      // No `store` key — Azure transport deletes it before sending. Sanitizer
+      // must treat this as stateless because Azure Responses does not persist.
+      input: [
+        { type: "item_reference", id: "rs_x" },
+        { type: "message", role: "user", content: "hi" },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    expect(payload.input).toEqual([{ type: "message", role: "user", content: "hi" }]);
+  });
+
+  it("keeps item_reference items when store=true", () => {
+    const payload = {
+      store: true,
+      input: [
+        { type: "item_reference", id: "rs_persisted" },
+        { type: "message", role: "user", content: "hi" },
+      ],
+    };
+
+    sanitizeStatelessReasoningReplayPayload(payload);
+
+    expect(payload.input).toEqual([
+      { type: "item_reference", id: "rs_persisted" },
+      { type: "message", role: "user", content: "hi" },
+    ]);
+  });
+
   it.each([
     {
       label: "openai",

@@ -11,6 +11,10 @@ function isStoredReasoningId(value: unknown): value is string {
   return typeof value === "string" && value.trim().startsWith("rs_");
 }
 
+function isItemReferenceType(value: unknown): value is "item_reference" {
+  return value === "item_reference";
+}
+
 function hasStatelessReasoningPayload(record: ReasoningReplayItem): boolean {
   return (
     (typeof record.encrypted_content === "string" && record.encrypted_content.length > 0) ||
@@ -30,6 +34,12 @@ export function stripStoredReasoningIdForStatelessReplay<T>(item: T): T | undefi
     return item;
   }
   const record = item as ReasoningReplayItem;
+  // item_reference always points at server-persisted state, which doesn't exist
+  // when store !== true. Drop unconditionally; partial whitelists miss prefixes
+  // (call_, fcr_, ig_, ...) and still 404 on replay.
+  if (isItemReferenceType(record.type)) {
+    return undefined;
+  }
   if (!isReasoningType(record.type)) {
     return item;
   }

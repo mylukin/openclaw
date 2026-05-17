@@ -3,8 +3,16 @@ export function isModelNotFoundErrorMessage(raw: string): boolean {
   if (!msg) {
     return false;
   }
+  // Responses API "Item with id 'rs_...' not found" / "Items are not persisted" are
+  // stateless-reasoning replay errors, not missing-model errors. Don't trigger fallback.
+  if (/\bItem with id\b/i.test(msg) || /items? (?:are|is) not persisted/i.test(msg)) {
+    return false;
+  }
   if (/\b404\b/.test(msg) && /not(?:[_\-\s])?found/i.test(msg)) {
-    return true;
+    if (/\b(model|engine)\b/i.test(msg) || /model:\s*[a-z0-9._-]+/i.test(msg)) {
+      return true;
+    }
+    return false;
   }
   if (/not_found_error/i.test(msg)) {
     return true;
