@@ -302,6 +302,9 @@ describe("FeishuStreamingSession.update", () => {
       thinkingExpanded: true,
       thinkingPanelRendered: false,
     };
+    // Disable the reasoning throttle: this test asserts the rollback +
+    // synchronous-retry contract, not the coalescing window.
+    (session as any).thinkingThrottleMs = 0;
     const updateCardFullSpy = vi
       .spyOn(session as any, "updateCardFull")
       .mockResolvedValueOnce(false)
@@ -335,6 +338,9 @@ describe("FeishuStreamingSession.update", () => {
       thinkingExpanded: true,
       thinkingPanelRendered: true,
     };
+    // Disable the reasoning throttle: this test asserts the rollback +
+    // synchronous-retry contract, not the coalescing window.
+    (session as any).thinkingThrottleMs = 0;
     const updateElementSpy = vi
       .spyOn(session as any, "updateElementContent")
       .mockResolvedValueOnce(false)
@@ -346,6 +352,134 @@ describe("FeishuStreamingSession.update", () => {
     await session.updateThinking("new", { title: "💭 Thinking" });
     expect(updateElementSpy).toHaveBeenCalledTimes(2);
     expect((session as any).state.thinkingText).toBe("new");
+  });
+
+  it("coalesces rapid reasoning chunks within the throttle window", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "old",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    (session as any).thinkingThrottleMs = 600;
+    const updateElementSpy = vi
+      .spyOn(session as any, "updateElementContent")
+      .mockResolvedValue(true);
+
+    // First chunk fires immediately.
+    await session.updateThinking("chunk-1", { title: "💭 Thinking" });
+    expect(updateElementSpy).toHaveBeenCalledTimes(1);
+
+    // Rapid follow-ups within the window are coalesced, not sent.
+    await session.updateThinking("chunk-2", { title: "💭 Thinking" });
+    await session.updateThinking("chunk-3", { title: "💭 Thinking" });
+    expect(updateElementSpy).toHaveBeenCalledTimes(1);
+    expect((session as any).pendingThinking).toEqual({
+      text: "chunk-3",
+      title: "💭 Thinking",
+    });
+
+    // After the window elapses the latest pending chunk flushes once.
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    await (session as any).queue;
+    expect(updateElementSpy).toHaveBeenCalledTimes(2);
+    expect(updateElementSpy).toHaveBeenLastCalledWith(
+      "thinking_content",
+      "chunk-3",
+      expect.any(Function),
+    );
+    expect((session as any).state.thinkingText).toBe("chunk-3");
+  });
+
+  it("folds the last throttled reasoning frame into the terminal card on close", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "old",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    (session as any).thinkingThrottleMs = 600;
+    vi.spyOn(session as any, "updateElementContent").mockResolvedValue(true);
+    let thinkingAtFinalRender: string | undefined;
+    vi.spyOn(session as any, "updateCardFull").mockImplementation(async () => {
+      thinkingAtFinalRender = (session as any).state?.thinkingText;
+      return true;
+    });
+
+    await session.updateThinking("chunk-1", { title: "💭 Thinking" });
+    // chunk-2 stays pending in the throttle window and is never flushed
+    // by a timer because close() happens first.
+    await session.updateThinking("chunk-2", { title: "💭 Thinking" });
+    expect((session as any).pendingThinking).toEqual({
+      text: "chunk-2",
+      title: "💭 Thinking",
+    });
+
+    await session.close();
+
+    // Pending frame folded into state, so the final full-card render shows
+    // it instead of the stale "chunk-1".
+    expect(thinkingAtFinalRender).toBe("chunk-2");
+    expect((session as any).pendingThinking).toBeNull();
+    expect((session as any).thinkingFlushTimer).toBeNull();
+  });
+
+  it("folds the last throttled reasoning frame into the adoption resume token", async () => {
+    const { client } = createClientMock();
+    const session = new FeishuStreamingSession(client, {
+      appId: "app",
+      appSecret: "secret",
+    });
+    (session as any).state = {
+      cardId: "card-id",
+      messageId: "message-id",
+      sequence: 1,
+      currentText: "answer",
+      hasNote: false,
+      noteText: "",
+      thinkingTitle: "💭 Thinking",
+      thinkingText: "old",
+      thinkingExpanded: true,
+      thinkingPanelRendered: true,
+    };
+    (session as any).thinkingThrottleMs = 600;
+    vi.spyOn(session as any, "updateElementContent").mockResolvedValue(true);
+
+    await session.updateThinking("chunk-1", { title: "💭 Thinking" });
+    await session.updateThinking("chunk-2", { title: "🔧 Tool calls (1)" });
+    expect((session as any).pendingThinking).toEqual({
+      text: "chunk-2",
+      title: "🔧 Tool calls (1)",
+    });
+
+    const token = await session.releaseForAdoption();
+
+    expect(token?.thinkingText).toBe("chunk-2");
+    expect(token?.thinkingTitle).toBe("🔧 Tool calls (1)");
+    expect((session as any).pendingThinking).toBeNull();
+    expect((session as any).thinkingFlushTimer).toBeNull();
   });
 
   it("reopens streaming mode and retries once when text streaming times out", async () => {

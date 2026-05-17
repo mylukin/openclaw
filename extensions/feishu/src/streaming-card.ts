@@ -188,6 +188,12 @@ export class FeishuStreamingSession {
   private pendingText: string | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
+  private lastThinkingUpdateTime = 0;
+  private pendingThinking: { text: string; title: string } | null = null;
+  private thinkingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  // Reasoning panel does not need 10/sec; coarser throttle keeps the shared
+  // Feishu cardkit QPS budget for the visible-answer stream.
+  private thinkingThrottleMs = 600;
   private lastStreamingModeRenewAt = 0;
   private renewTimer: ReturnType<typeof setInterval> | null = null;
   private renewRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -636,12 +642,47 @@ export class FeishuStreamingSession {
       return;
     }
     const normalized = (text ?? "").trim();
-    const previousText = this.state.thinkingText;
-    const previousTitle = this.state.thinkingTitle;
     const nextTitle = options?.title?.trim() || this.state.thinkingTitle || "💭 Thinking";
-    if (!normalized || (normalized === previousText && nextTitle === previousTitle)) {
+    if (
+      !normalized ||
+      (normalized === this.state.thinkingText && nextTitle === this.state.thinkingTitle)
+    ) {
       return;
     }
+
+    // Throttle: reasoning chunks arrive far faster than the Feishu cardkit
+    // API round-trip. Without coalescing, every chunk fires its own
+    // card.update, hammering the shared QPS budget and visibly re-rendering
+    // the thinking panel several times per second for the whole run. Mirror
+    // the visible-answer `update()` throttle: keep only the latest pending
+    // text and flush once the window elapses.
+    const now = Date.now();
+    if (now - this.lastThinkingUpdateTime < this.thinkingThrottleMs) {
+      this.pendingThinking = { text: normalized, title: nextTitle };
+      if (!this.thinkingFlushTimer) {
+        this.thinkingFlushTimer = setTimeout(() => {
+          this.thinkingFlushTimer = null;
+          const pending = this.pendingThinking;
+          this.pendingThinking = null;
+          if (pending && this.state && !this.closed) {
+            this.lastThinkingUpdateTime = Date.now();
+            this.enqueueThinkingUpdate(pending.text, pending.title);
+          }
+        }, this.thinkingThrottleMs);
+      }
+      return;
+    }
+    this.pendingThinking = null;
+    this.lastThinkingUpdateTime = now;
+    if (this.thinkingFlushTimer) {
+      clearTimeout(this.thinkingFlushTimer);
+      this.thinkingFlushTimer = null;
+    }
+    this.enqueueThinkingUpdate(normalized, nextTitle);
+    await this.queue;
+  }
+
+  private enqueueThinkingUpdate(normalized: string, nextTitle: string): void {
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) return;
       // Capture rollback values inside the queue to avoid races with
@@ -650,10 +691,13 @@ export class FeishuStreamingSession {
       const rollbackTitle = this.state.thinkingTitle;
       const rollbackText = this.state.thinkingText;
       const rollbackPanelRendered = this.state.thinkingPanelRendered;
+      if (normalized === rollbackText && nextTitle === rollbackTitle) {
+        return;
+      }
+      const requiresFullCardUpdate =
+        !this.state.thinkingPanelRendered || nextTitle !== rollbackTitle;
       this.state.thinkingTitle = nextTitle;
       this.state.thinkingText = normalized;
-      const requiresFullCardUpdate =
-        !this.state.thinkingPanelRendered || nextTitle !== previousTitle;
       if (requiresFullCardUpdate) {
         const fullCardUpdated = await this.updateCardFull(this.state.currentText, {
           keepStreaming: true,
@@ -682,7 +726,6 @@ export class FeishuStreamingSession {
         this.state.thinkingPanelRendered = rollbackPanelRendered;
       }
     });
-    await this.queue;
   }
 
   private async updateNoteContent(note: string): Promise<void> {
@@ -731,8 +774,24 @@ export class FeishuStreamingSession {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    if (this.thinkingFlushTimer) {
+      clearTimeout(this.thinkingFlushTimer);
+      this.thinkingFlushTimer = null;
+    }
+    // Capture the last throttled reasoning frame, but apply it only after
+    // the queue drains: an in-flight thinking lambda could otherwise
+    // overwrite (success with an older frame) or roll back (failure) the
+    // folded value during `await this.queue`.
+    const foldThinking = this.pendingThinking;
+    this.pendingThinking = null;
     this.stopRenewTimer();
     await this.queue;
+    // `dropThinkingPanel`/`finalThinking` below still override this
+    // (authoritative final snapshot) when supplied.
+    if (foldThinking && this.state) {
+      this.state.thinkingTitle = foldThinking.title;
+      this.state.thinkingText = foldThinking.text;
+    }
 
     const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
     // `finalText` is a full final snapshot from the caller, not a delta. When
@@ -824,6 +883,11 @@ export class FeishuStreamingSession {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    if (this.thinkingFlushTimer) {
+      clearTimeout(this.thinkingFlushTimer);
+      this.thinkingFlushTimer = null;
+    }
+    this.pendingThinking = null;
     this.stopRenewTimer();
     await this.queue;
 
@@ -857,7 +921,20 @@ export class FeishuStreamingSession {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    if (this.thinkingFlushTimer) {
+      clearTimeout(this.thinkingFlushTimer);
+      this.thinkingFlushTimer = null;
+    }
+    // Capture the last throttled reasoning frame, but apply it only after
+    // the queue drains so an in-flight thinking lambda cannot overwrite or
+    // roll back the folded value before the resume token is snapshotted.
+    const foldThinking = this.pendingThinking;
+    this.pendingThinking = null;
     await this.queue;
+    if (foldThinking && this.state) {
+      this.state.thinkingTitle = foldThinking.title;
+      this.state.thinkingText = foldThinking.text;
+    }
     const token = { ...this.state };
     this.stopRenewTimer();
     this.state = null;
