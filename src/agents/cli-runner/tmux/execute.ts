@@ -1292,7 +1292,11 @@ export async function executeTmuxCliRun(
         fs.writeFile(paths.eventsFile, ""),
         fs.writeFile(paths.promptBufferFile, ""),
       ]).catch(() => {});
-      return executeTmuxCliRun(input, manager, emptyOutputRetryAttempt + 1);
+      return executeTmuxCliRun(
+        { ...input, cliSessionId: undefined },
+        manager,
+        emptyOutputRetryAttempt + 1,
+      );
     }
     diag?.("tmux.empty-output.failure", diagnostic);
     throw new FailoverError(
