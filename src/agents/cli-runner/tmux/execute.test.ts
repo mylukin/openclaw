@@ -1404,6 +1404,53 @@ describe("executeTmuxCliRun", () => {
     expect(resumeCall).toContain("cold-id");
   });
 
+  it("alive pane + launchHash mismatch escalates to resume instead of fresh", async () => {
+    // Regression: when the tmux pane is alive at probe time but the persisted
+    // launchHash differs from the one this turn would compute (e.g. routing
+    // env shifted: OPENCLAW_MCP_ACCOUNT_ID / _CURRENT_CHANNEL /
+    // _MESSAGE_CHANNEL drift between followups), ensureSession kills the
+    // pane and relaunches. Pre-fix, the relaunch used fresh args → a new
+    // Claude --session-id with no memory of prior turns → Ada created
+    // duplicate issue #324 right after #323. Post-fix, the launchMode is
+    // escalated to resume so `claude --resume <priorBoundClaudeId>` replays
+    // the disk transcript and the conversation survives the recreate.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // Seed metadata as if a prior turn ran successfully (fresh launchMode,
+    // a bound Claude id, and a launchHash that will NOT match this turn's
+    // computed hash — "x" is a sentinel value that no real hash equals).
+    await seedMetadata(runtimeDir, { launchMode: "fresh", claudeSessionId: "prior-bound-id" });
+    const ensureArgs: string[][] = [];
+    class AlivePaneManager extends FakeTmuxManager {
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgs.push(p.args ?? []);
+        return super.ensureSession(p as never);
+      }
+      // Pane probed alive at the launchMode-decision point.
+      override async hasSession() {
+        return true;
+      }
+      override async isPaneAlive() {
+        return true;
+      }
+    }
+    await executeTmuxCliRun(
+      { ...baseInput(runtimeDir), backend: resumeBackend(runtimeDir) },
+      new AlivePaneManager() as never,
+    );
+    // The launch must use --resume with the prior-bound id, NOT a fresh
+    // --session-id with a brand-new uuid.
+    const launchArgs = ensureArgs[0];
+    expect(launchArgs).toBeDefined();
+    expect(launchArgs).toContain("--resume");
+    expect(launchArgs).toContain("prior-bound-id");
+    expect(launchArgs).not.toContain("--session-id");
+  });
+
   it("mid-turn death is bounded: exhausts resume attempts then FailoverError", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);

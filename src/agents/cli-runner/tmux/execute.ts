@@ -178,6 +178,13 @@ async function readTextTail(filePath: string, maxBytes = 32_768): Promise<string
 // reused session anyway — including them in the launch signature would force
 // a kill + recreate on every follow-up turn even though the running Claude
 // is perfectly usable.
+//
+// Routing metadata (OPENCLAW_MCP_ACCOUNT_ID / _CURRENT_CHANNEL /
+// _MESSAGE_CHANNEL) is intentionally NOT filtered: when those drift the
+// MCP server would otherwise read stale frozen-env headers for routing,
+// dedup, and tool-cache scoping. The launchHash mismatch correctly triggers
+// a recreate; conversation context is preserved by the resume-on-mismatch
+// escalation in the launchMode decision below, not by hash filtering.
 const VOLATILE_ENV_KEYS_RE = /^(OPENCLAW_MCP_RUN_ID)$/;
 
 function stableJson(value: Record<string, string>): string {
@@ -483,26 +490,31 @@ export async function executeTmuxCliRun(
   // does not spuriously kill it.
   const sessionAliveAtStart =
     (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
-  const launchMode: TmuxMetadata["launchMode"] = sessionAliveAtStart
+  // Initial mode pick. An alive REPL prefers reuse-as-fresh (the persisted
+  // launchMode); a dead/missing pane prefers resume when we have a prior id.
+  // The "alive but launchHash mismatch" case escalates to resume below so a
+  // routing/env change does not silently restart Claude blank.
+  let launchMode: TmuxMetadata["launchMode"] = sessionAliveAtStart
     ? (persistedMeta?.launchMode ?? "fresh")
     : canResumeAtLaunch
       ? "resume"
       : "fresh";
-  const loaderPrompt = buildClaudeSystemPromptLoaderPrompt({
-    chunks: cliSystemPromptFile.chunks,
-    // A resumed REPL is a fresh process replaying disk history but WITHOUT
-    // the --append-system-prompt (Claude CLI rejects it on resume), so the
-    // authoritative system prompt files must be re-read — same need as after
-    // a compaction.
-    reason: launchMode === "resume" ? "compaction" : "new-session",
-  });
+  const buildLoaderPrompt = (mode: TmuxMetadata["launchMode"]): string =>
+    buildClaudeSystemPromptLoaderPrompt({
+      chunks: cliSystemPromptFile.chunks,
+      // A resumed REPL is a fresh process replaying disk history but WITHOUT
+      // the --append-system-prompt (Claude CLI rejects it on resume), so the
+      // authoritative system prompt files must be re-read — same need as after
+      // a compaction.
+      reason: mode === "resume" ? "compaction" : "new-session",
+    });
   const buildArgsForMode = (mode: TmuxMetadata["launchMode"]): string[] =>
     buildClaudeTmuxArgs({
       backend: input.backend,
       baseArgs: input.backend.args,
       modelId: input.modelId,
       settingsFile: paths.settingsFile,
-      systemPrompt: loaderPrompt,
+      systemPrompt: buildLoaderPrompt(mode),
       launch:
         mode === "resume" && resumableClaudeId
           ? { mode: "resume", claudeSessionId: resumableClaudeId }
@@ -511,7 +523,7 @@ export async function executeTmuxCliRun(
               ...(input.cliSessionId ? { sessionId: input.cliSessionId } : {}),
             },
     });
-  const args = buildArgsForMode(launchMode);
+  let args = buildArgsForMode(launchMode);
   const env = {
     ...input.env,
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
@@ -549,44 +561,78 @@ export async function executeTmuxCliRun(
   const systemPromptFlag = input.backend.systemPromptArg?.trim() || "--append-system-prompt";
   const sessionIdFlag = input.backend.sessionArg?.trim();
   const VOLATILE_PATH_FLAGS = new Set(["--mcp-config", "--settings"]);
-  const stableArgs: string[] = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i] ?? "";
-    if (arg === systemPromptFlag) {
-      stableArgs.push(arg, "<system-prompt>");
-      i += 1;
-      continue;
+  const maskStableArgs = (rawArgs: string[]): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < rawArgs.length; i += 1) {
+      const arg = rawArgs[i] ?? "";
+      if (arg === systemPromptFlag) {
+        out.push(arg, "<system-prompt>");
+        i += 1;
+        continue;
+      }
+      if (sessionIdFlag && arg === sessionIdFlag) {
+        // Drop the flag AND its value entirely. Turn 1 (fresh) emits no
+        // --session-id arg at all; turn 2 onward emits one. Including either
+        // form (with or without a placeholder) would still differ across
+        // turns. The flag is meaningful only at first launch — once the
+        // tmux Claude is running we paste follow-ups, never relaunch.
+        i += 1;
+        continue;
+      }
+      if (VOLATILE_PATH_FLAGS.has(arg) && i + 1 < rawArgs.length) {
+        // Keep the flag (a genuine add/remove of MCP/settings still shifts
+        // the hash) but replace its per-turn temp path with a stable
+        // placeholder.
+        out.push(arg, `<${arg.replace(/^-+/, "")}>`);
+        i += 1;
+        continue;
+      }
+      if (arg === "--resume" && i + 1 < rawArgs.length) {
+        // Keep the `--resume` flag (fresh vs resume IS a real launch
+        // difference and must shift the hash) but mask the volatile session
+        // id value so steady-state resume turns reuse the warm REPL instead
+        // of churn-recreating. Mode stability is separately guaranteed by
+        // launchMode in metadataMismatchReasons.
+        out.push(arg, "<resume-session-id>");
+        i += 1;
+        continue;
+      }
+      out.push(arg);
     }
-    if (sessionIdFlag && arg === sessionIdFlag) {
-      // Drop the flag AND its value entirely. Turn 1 (fresh) emits no
-      // --session-id arg at all; turn 2 onward emits one. Including either
-      // form (with or without a placeholder) would still differ across
-      // turns. The flag is meaningful only at first launch — once the
-      // tmux Claude is running we paste follow-ups, never relaunch.
-      i += 1;
-      continue;
-    }
-    if (VOLATILE_PATH_FLAGS.has(arg) && i + 1 < args.length) {
-      // Keep the flag (a genuine add/remove of MCP/settings still shifts the
-      // hash) but replace its per-turn temp path with a stable placeholder.
-      stableArgs.push(arg, `<${arg.replace(/^-+/, "")}>`);
-      i += 1;
-      continue;
-    }
-    if (arg === "--resume" && i + 1 < args.length) {
-      // Keep the `--resume` flag (fresh vs resume IS a real launch
-      // difference and must shift the hash) but mask the volatile session id
-      // value so steady-state resume turns reuse the warm REPL instead of
-      // churn-recreating. Mode stability is separately guaranteed by
-      // launchMode in metadataMismatchReasons.
-      stableArgs.push(arg, "<resume-session-id>");
-      i += 1;
-      continue;
-    }
-    stableArgs.push(arg);
-  }
+    return out;
+  };
   const stableEnvJson = stableJson(env);
-  const launchHash = sha256Hex(input.backend.command, JSON.stringify(stableArgs), stableEnvJson);
+  const computeLaunchHash = (rawArgs: string[]): string =>
+    sha256Hex(input.backend.command, JSON.stringify(maskStableArgs(rawArgs)), stableEnvJson);
+  let stableArgs = maskStableArgs(args);
+  let launchHash = sha256Hex(input.backend.command, JSON.stringify(stableArgs), stableEnvJson);
+  // Resume-on-mismatch escalation: a routing-context env change (e.g.
+  // OPENCLAW_MCP_ACCOUNT_ID / _CURRENT_CHANNEL / _MESSAGE_CHANNEL) shifts
+  // launchHash, which makes ensureSession kill the live tmux pane. If we
+  // relaunched fresh, Claude would start with no memory of prior turns
+  // (root cause of the duplicate-issue bug: Ada created #323, env shifted,
+  // tmux killed, fresh Claude re-created the same task as #324). When a
+  // prior-bound Claude session id exists, prefer relaunching with
+  // `claude --resume <id>` so the disk transcript is replayed and
+  // conversation context survives the recreate.
+  if (
+    sessionAliveAtStart &&
+    canResumeAtLaunch &&
+    launchMode === "fresh" &&
+    persistedMeta &&
+    persistedMeta.launchHash !== launchHash
+  ) {
+    input.onDiagnostic?.("tmux.launchMode.escalateToResume", {
+      sessionName,
+      priorBoundClaudeId,
+      persistedLaunchHash: persistedMeta.launchHash,
+      freshLaunchHash: launchHash,
+    });
+    launchMode = "resume";
+    args = buildArgsForMode(launchMode);
+    stableArgs = maskStableArgs(args);
+    launchHash = computeLaunchHash(args);
+  }
   const metadata = buildMetadata({
     input,
     config,
@@ -703,7 +749,9 @@ export async function executeTmuxCliRun(
   // trailing "\n" would sit as a literal newline; submission is the explicit
   // Enter in pastePrompt.
   const composePasteBuffer = (): string => {
-    const body = loaderInjectionPending ? `${loaderPrompt}\n${input.prompt}` : input.prompt;
+    const body = loaderInjectionPending
+      ? `${buildLoaderPrompt(launchMode)}\n${input.prompt}`
+      : input.prompt;
     return body.replace(/\n+$/, "");
   };
 
