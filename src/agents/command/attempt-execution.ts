@@ -358,6 +358,7 @@ export function runAgentAttempt(params: {
       timeoutMs: params.timeoutMs,
       runId: params.runId,
       extraSystemPrompt: params.opts.extraSystemPrompt,
+      stableExtraSystemPrompt: params.opts.stableExtraSystemPrompt,
       skillsSnapshot: params.skillsSnapshot,
       authProfileId,
       bootstrapPromptWarningSignaturesSeen,

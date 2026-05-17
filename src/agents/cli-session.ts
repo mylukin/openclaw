@@ -71,6 +71,17 @@ export function hashCliSessionText(value: string | undefined): string | undefine
   return crypto.createHash("sha256").update(trimmed).digest("hex");
 }
 
+export function hashCliSessionStablePrompt(params: {
+  extraSystemPrompt?: string;
+  extraSystemPromptStatic?: string;
+}): string | undefined {
+  return hashCliSessionText(
+    params.extraSystemPromptStatic !== undefined
+      ? params.extraSystemPromptStatic
+      : params.extraSystemPrompt,
+  );
+}
+
 export function getCliSessionBinding(
   entry: SessionEntry | undefined,
   provider: string,
@@ -252,7 +263,11 @@ export function resolveCliSessionReuse(params: {
     return { invalidatedReason: "auth-epoch" };
   }
   const storedExtraSystemPromptHash = trimOptional(binding?.extraSystemPromptHash);
-  if (storedExtraSystemPromptHash !== currentExtraSystemPromptHash) {
+  if (storedExtraSystemPromptHash && currentExtraSystemPromptHash) {
+    if (storedExtraSystemPromptHash !== currentExtraSystemPromptHash) {
+      return { invalidatedReason: "system-prompt" };
+    }
+  } else if (storedExtraSystemPromptHash && !currentExtraSystemPromptHash) {
     return { invalidatedReason: "system-prompt" };
   }
   const storedMcpConfigHash = trimOptional(binding?.mcpConfigHash);

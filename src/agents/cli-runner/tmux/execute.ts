@@ -396,6 +396,7 @@ function buildMetadata(params: {
 export async function executeTmuxCliRun(
   input: TmuxExecutionInput,
   manager = new TmuxSessionManager(),
+  emptyOutputRetryAttempt = 0,
 ): Promise<CliOutput> {
   const config = normalizeTmuxConfig(input);
   if (config.memoryMode === "bare") {
@@ -1192,8 +1193,43 @@ export async function executeTmuxCliRun(
   // already-captured rawPaneText, run it through the envelope stripper so a
   // mixed-content pane only contributes its real content.
   const paneFallback = suppressPaneFallback ? "" : stripPromptEnvelopeArtifacts(rawPaneText);
+  const outputText = finalReplyText || accumulatedText || paneFallback;
+  if (!outputText && !transcriptEmitted) {
+    const emptyReason = paneLooksLikeEnvelope
+      ? "envelope-without-transcript"
+      : "transcript-and-pane-empty";
+    const diagnostic = {
+      runId: input.runId,
+      sessionName,
+      launchMode,
+      reason: emptyReason,
+      transcriptPath: transcript?.getFilePath() ?? "(not-discovered)",
+      paneTailSize: rawPaneText.length,
+      retryAttempt: emptyOutputRetryAttempt,
+    };
+    if (emptyOutputRetryAttempt < 1) {
+      diag?.("tmux.empty-output.retry", diagnostic);
+      await manager.killSession(sessionName).catch(() => {});
+      await Promise.all([
+        fs.writeFile(paths.paneLogFile, ""),
+        fs.writeFile(paths.eventsFile, ""),
+        fs.writeFile(paths.promptBufferFile, ""),
+      ]).catch(() => {});
+      return executeTmuxCliRun(input, manager, emptyOutputRetryAttempt + 1);
+    }
+    diag?.("tmux.empty-output.failure", diagnostic);
+    throw new FailoverError(
+      `CLI tmux run produced empty output (transcriptEmitted=false, chars=0, reason=${emptyReason})`,
+      {
+        reason: "unknown",
+        provider: input.backendId,
+        model: input.modelId,
+        status: resolveFailoverStatus("unknown"),
+      },
+    );
+  }
   return {
-    text: finalReplyText || accumulatedText || paneFallback,
+    text: outputText,
     ...((cliSessionId ?? input.cliSessionId)
       ? { sessionId: cliSessionId ?? input.cliSessionId }
       : {}),

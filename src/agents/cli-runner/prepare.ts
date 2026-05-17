@@ -26,7 +26,11 @@ import {
 } from "../bootstrap-files.js";
 import { resolveCliAuthEpoch } from "../cli-auth-epoch.js";
 import { resolveCliBackendConfig } from "../cli-backends.js";
-import { hashCliSessionText, resolveCliSessionReuse } from "../cli-session.js";
+import {
+  hashCliSessionStablePrompt,
+  hashCliSessionText,
+  resolveCliSessionReuse,
+} from "../cli-session.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { resolveOpenClawDocsPath } from "../docs-path.js";
 import {
@@ -300,7 +304,11 @@ export async function prepareCliRunContext(
     authProfileId: params.authProfileId,
   });
   const extraSystemPrompt = params.extraSystemPrompt?.trim() ?? "";
-  const extraSystemPromptHash = hashCliSessionText(extraSystemPrompt);
+  const extraSystemPromptHash = hashCliSessionStablePrompt({
+    extraSystemPrompt,
+    extraSystemPromptStatic: params.stableExtraSystemPrompt,
+  });
+  const fullExtraSystemPromptHash = hashCliSessionText(extraSystemPrompt);
   const modelId = (params.model ?? "default").trim() || "default";
   const normalizedModel = normalizeCliModel(modelId, backendResolved.config);
   const modelDisplay = `${params.provider}/${modelId}`;
@@ -402,8 +410,19 @@ export async function prepareCliRunContext(
     mcpConfigHash: preparedBackend.mcpConfigHash,
   });
   if (reusableCliSession.invalidatedReason) {
+    const resetReason =
+      reusableCliSession.invalidatedReason === "system-prompt"
+        ? "stable-system-change"
+        : reusableCliSession.invalidatedReason === "mcp"
+          ? "mcp-change"
+          : "auth-change";
+    cliBackendLog.info(`cli session reset: provider=${params.provider} reason=${resetReason}`);
+  } else if (
+    params.stableExtraSystemPrompt !== undefined &&
+    fullExtraSystemPromptHash !== extraSystemPromptHash
+  ) {
     cliBackendLog.info(
-      `cli session reset: provider=${params.provider} reason=${reusableCliSession.invalidatedReason}`,
+      `cli session reuse: provider=${params.provider} reason=turn-context-change-ignored`,
     );
   }
   const heartbeatPrompt =

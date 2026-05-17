@@ -85,6 +85,8 @@ export type AgentCommandOpts = {
   lane?: string;
   runId?: string;
   extraSystemPrompt?: string;
+  /** Stable portion of extraSystemPrompt used only for CLI session reuse identity. */
+  stableExtraSystemPrompt?: string;
   internalEvents?: AgentInternalEvent[];
   inputProvenance?: InputProvenance;
   /** Per-call stream param overrides (best-effort). */

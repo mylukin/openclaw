@@ -1523,20 +1523,71 @@ describe("executeTmuxCliRun", () => {
       }
     }
     const onAssistantTurn = vi.fn();
-    const output = await executeTmuxCliRun(
-      // hookMode managed (default) → transcriptIsAuthoritative=true.
-      baseInput(runtimeDir, { onAssistantTurn }),
-      new NoHookEnvelopeManager() as never,
-    );
+    const diagnostics: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    await expect(
+      executeTmuxCliRun(
+        // hookMode managed (default) -> transcriptIsAuthoritative=true.
+        baseInput(runtimeDir, {
+          onAssistantTurn,
+          onDiagnostic: (event, data) => diagnostics.push({ event, data }),
+        }),
+        new NoHookEnvelopeManager() as never,
+      ),
+    ).rejects.toThrow(/empty output/i);
 
     // Envelope detector must short-circuit pane fallback even without any
-    // transcript file → no envelope text reaches the card.
+    // transcript file -> no envelope text reaches the card; after one clean
+    // retry, a second empty result fails closed instead of returning "".
     const emitted = onAssistantTurn.mock.calls.map((c) => String(c[0])).join("");
     expect(emitted).not.toMatch(/Pasted\s*text\s*#/i);
     expect(emitted).not.toContain("</message>");
     expect(emitted).not.toContain("<atid=");
-    expect(output.text).not.toMatch(/Pasted\s*text\s*#/i);
-    expect(output.text).not.toContain("</message>");
+    expect(diagnostics.some((entry) => entry.event === "tmux.empty-output.retry")).toBe(true);
+    expect(diagnostics.some((entry) => entry.event === "tmux.empty-output.failure")).toBe(true);
+  });
+
+  it("retries once with a clean boundary instead of returning empty output from envelope-only pane residue", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    class RetryAfterEnvelopeManager extends FakeTmuxManager {
+      pasteCount = 0;
+      killCount = 0;
+      override async pastePrompt() {
+        this.pasteCount += 1;
+        if (this.pasteCount === 1) {
+          await fs.appendFile(
+            this.paths!.paneLogFile,
+            '[Pasted text #21 +35 lines]</message><messageindex="4">prompt echo only',
+          );
+        } else {
+          await fs.appendFile(this.paths!.paneLogFile, "Clean retry answer");
+        }
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now(), stdin: {} })}\n`,
+        );
+      }
+      override async killSession() {
+        this.killCount += 1;
+      }
+    }
+    const manager = new RetryAfterEnvelopeManager();
+    const onAssistantTurn = vi.fn();
+    const diagnostics: Array<{ event: string; data?: Record<string, unknown> }> = [];
+
+    const output = await executeTmuxCliRun(
+      baseInput(runtimeDir, {
+        onAssistantTurn,
+        onDiagnostic: (event, data) => diagnostics.push({ event, data }),
+      }),
+      manager as never,
+    );
+
+    expect(manager.killCount).toBe(1);
+    expect(manager.pasteCount).toBe(2);
+    expect(output.text).toBe("Clean retry answer");
+    expect(onAssistantTurn.mock.calls.flat().join("")).not.toContain("Pasted text");
+    expect(diagnostics.some((entry) => entry.event === "tmux.empty-output.retry")).toBe(true);
   });
 
   it("preserves legit Feishu mentions even when other envelope tokens trigger suppression", async () => {

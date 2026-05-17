@@ -80,6 +80,8 @@ export type FollowupRun = {
     ownerNumbers?: string[];
     inputProvenance?: InputProvenance;
     extraSystemPrompt?: string;
+    /** Stable portion of extraSystemPrompt used only for CLI session reuse identity. */
+    stableExtraSystemPrompt?: string;
     enforceFinalTag?: boolean;
     silentExpected?: boolean;
   };

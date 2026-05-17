@@ -27,6 +27,8 @@ export type RunCliAgentParams = {
   timeoutMs: number;
   runId: string;
   extraSystemPrompt?: string;
+  /** Stable portion of extraSystemPrompt used only for CLI session reuse identity. */
+  stableExtraSystemPrompt?: string;
   streamParams?: import("../command/types.js").AgentStreamParams;
   ownerNumbers?: string[];
   cliSessionId?: string;

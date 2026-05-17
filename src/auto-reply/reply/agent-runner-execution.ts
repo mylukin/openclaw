@@ -786,6 +786,7 @@ export async function runAgentTurnWithFallback(params: {
                   timeoutMs: params.followupRun.run.timeoutMs,
                   runId,
                   extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                  stableExtraSystemPrompt: params.followupRun.run.stableExtraSystemPrompt,
                   skillsSnapshot: params.followupRun.run.skillsSnapshot,
                   ownerNumbers: params.followupRun.run.ownerNumbers,
                   abortSignal: params.replyOperation?.abortSignal ?? params.opts?.abortSignal,

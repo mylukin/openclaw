@@ -6,6 +6,7 @@ import {
   getCliSessionBinding,
   getCliSessionId,
   hashCliSessionText,
+  hashCliSessionStablePrompt,
   resolveCliSessionReuse,
   setCliSessionBinding,
 } from "./cli-session.js";
@@ -92,7 +93,7 @@ describe("cli-session helpers", () => {
     expect(entry.claudeCliSessionId).toBeUndefined();
   });
 
-  it("invalidates legacy bindings when auth, prompt, or MCP state changes", () => {
+  it("invalidates legacy bindings when auth or MCP state changes, but not on first hash establishment", () => {
     const entry: SessionEntry = {
       sessionId: "openclaw-session",
       updatedAt: Date.now(),
@@ -110,15 +111,15 @@ describe("cli-session helpers", () => {
     expect(
       resolveCliSessionReuse({
         binding,
-        extraSystemPromptHash: "prompt-hash",
-      }),
-    ).toEqual({ invalidatedReason: "system-prompt" });
-    expect(
-      resolveCliSessionReuse({
-        binding,
         mcpConfigHash: "mcp-hash",
       }),
     ).toEqual({ invalidatedReason: "mcp" });
+    expect(
+      resolveCliSessionReuse({
+        binding,
+        extraSystemPromptHash: "prompt-hash",
+      }),
+    ).toEqual({ sessionId: "legacy-session" });
   });
 
   it("invalidates reuse when stored auth profile or prompt shape changes", () => {
@@ -166,6 +167,36 @@ describe("cli-session helpers", () => {
         mcpConfigHash: "mcp-b",
       }),
     ).toEqual({ invalidatedReason: "mcp" });
+  });
+
+  it("keeps dynamic turn context out of the stable CLI session prompt hash", () => {
+    const stablePrompt = "Group rules: reply only when addressed.";
+
+    const first = hashCliSessionStablePrompt({
+      extraSystemPrompt: `${stablePrompt}\n\nrecent_group_context: hello`,
+      extraSystemPromptStatic: stablePrompt,
+    });
+    const second = hashCliSessionStablePrompt({
+      extraSystemPrompt: `${stablePrompt}\n\nrecent_group_context: new message`,
+      extraSystemPromptStatic: stablePrompt,
+    });
+
+    expect(first).toBe(second);
+    expect(first).toBe(hashCliSessionText(stablePrompt));
+  });
+
+  it("changes the stable CLI session prompt hash when stable system context changes", () => {
+    expect(
+      hashCliSessionStablePrompt({
+        extraSystemPrompt: "stable system prompt A\n\nrecent_group_context: hello",
+        extraSystemPromptStatic: "stable system prompt A",
+      }),
+    ).not.toBe(
+      hashCliSessionStablePrompt({
+        extraSystemPrompt: "stable system prompt B\n\nrecent_group_context: hello",
+        extraSystemPromptStatic: "stable system prompt B",
+      }),
+    );
   });
 
   it("does not treat model changes as a session mismatch", () => {
