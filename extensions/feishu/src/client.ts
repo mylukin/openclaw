@@ -191,7 +191,7 @@ export function createFeishuWSClient(account: ResolvedFeishuAccount): Lark.WSCli
     appId,
     appSecret,
     domain: resolveDomain(domain),
-    loggerLevel: feishuClientSdk.LoggerLevel.info,
+    loggerLevel: feishuClientSdk.LoggerLevel.warn,
     ...(agent ? { agent } : {}),
   });
 }
