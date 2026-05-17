@@ -251,6 +251,17 @@ async function waitForStartup(params: {
       params.config.captureLines,
     );
     const combinedTail = `${logTail}\n${captureTail}`;
+    if (/Session ID .+ is already in use/i.test(combinedTail)) {
+      throw new FailoverError(
+        `CLI tmux session reported session-id conflict; not waiting for timeout.${combinedTail ? `\n\nPane tail:\n${combinedTail}` : ""}`,
+        {
+          reason: "session_expired",
+          provider: params.input.backendId,
+          model: params.input.modelId,
+          status: resolveFailoverStatus("session_expired"),
+        },
+      );
+    }
     if (looksLikeThemePrompt(combinedTail) && !confirmedThemePrompt) {
       await params.manager.sendEnter(params.sessionName);
       confirmedThemePrompt = true;
