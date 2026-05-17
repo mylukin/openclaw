@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FailoverError } from "../../failover-error.js";
 import { executeTmuxCliRun, linkUserClaudeAssets } from "./execute.js";
 import { resolveTmuxRuntimePaths } from "./runtime-dir.js";
 import { buildTmuxSessionName } from "./session-name.js";
@@ -852,6 +853,42 @@ describe("executeTmuxCliRun", () => {
     ).rejects.toThrow(/did not become ready/);
   });
 
+  it("raises session_expired failover immediately when pane reports session-id conflict", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+
+    class SessionIdConflictManager {
+      async ensureSession(p: { paths: TmuxRuntimePaths }) {
+        await fs.writeFile(
+          p.paths.paneLogFile,
+          "Error: Session ID abc123-dead-beef-0000 is already in use.\n",
+        );
+        await fs.writeFile(p.paths.eventsFile, "");
+      }
+      async pastePrompt() {}
+      async captureTail() {
+        return "";
+      }
+      async hasSession() {
+        return true;
+      }
+      async isPaneAlive() {
+        return true;
+      }
+      async killSession() {}
+      async interrupt() {}
+    }
+
+    const err = await executeTmuxCliRun(
+      // Use a generous startupTimeoutMs to prove we don't wait it out
+      baseInput(runtimeDir, {}, { startupTimeoutMs: 10_000 }),
+      new SessionIdConflictManager() as never,
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(FailoverError);
+    expect((err as FailoverError).reason).toBe("session_expired");
+  });
+
   it("raises a failover error when the turn exceeds the deadline", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);
@@ -1695,6 +1732,69 @@ describe("executeTmuxCliRun", () => {
     expect(retryArgs).toBeDefined();
     expect(retryArgs).not.toContain("--resume");
     expect(retryArgs).not.toContain("prior-bound-id");
+  });
+
+  it("empty-output retry strips cliSessionId from input so buildArgsForMode('fresh') never carries a stale --session-id", async () => {
+    // Regression: the recursive retry call passed the original `input` unchanged,
+    // so buildArgsForMode("fresh") still read input.cliSessionId and forwarded it
+    // as --session-id. Both metadata AND input could carry a stale id; the retry
+    // must clear both to guarantee a truly fresh launch.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // Seed metadata with a prior bound id so both stale-id paths are exercised.
+    await seedMetadata(runtimeDir, { launchMode: "fresh", claudeSessionId: "stale-meta-id" });
+
+    const ensureArgsList: string[][] = [];
+    class EnvelopeThenAnswerWithCliId extends FakeTmuxManager {
+      pasteCount = 0;
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgsList.push(p.args ?? []);
+        this.paths = p.paths;
+        await fs.writeFile(p.paths.paneLogFile, "Claude Code v2.1.140\n");
+        await fs.writeFile(p.paths.eventsFile, "");
+        return { created: true };
+      }
+      override async pastePrompt() {
+        this.pasteCount += 1;
+        if (this.pasteCount === 1) {
+          // First attempt: envelope-only pane → triggers empty-output retry.
+          await fs.appendFile(
+            this.paths!.paneLogFile,
+            '[Pasted text #3 +10 lines]</message><messageindex="1">echo noise',
+          );
+        } else {
+          await fs.appendFile(this.paths!.paneLogFile, "Clean retry answer");
+        }
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now(), stdin: {} })}\n`,
+        );
+      }
+      override async killSession() {}
+    }
+
+    const manager = new EnvelopeThenAnswerWithCliId();
+    const output = await executeTmuxCliRun(
+      {
+        ...baseInput(runtimeDir),
+        cliSessionId: "stale-input-id",
+        backend: resumeBackend(runtimeDir),
+      },
+      manager as never,
+    );
+
+    expect(output.text).toBe("Clean retry answer");
+    expect(ensureArgsList).toHaveLength(2);
+    const retryArgs = ensureArgsList[1];
+    // Retry must be a truly fresh launch: no --resume and no --session-id.
+    expect(retryArgs).not.toContain("--resume");
+    expect(retryArgs).not.toContain("--session-id");
+    expect(retryArgs).not.toContain("stale-input-id");
+    expect(retryArgs).not.toContain("stale-meta-id");
   });
 
   it("preserves legit Feishu mentions even when other envelope tokens trigger suppression", async () => {
