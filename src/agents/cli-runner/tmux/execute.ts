@@ -1210,6 +1210,24 @@ export async function executeTmuxCliRun(
     if (emptyOutputRetryAttempt < 1) {
       diag?.("tmux.empty-output.retry", diagnostic);
       await manager.killSession(sessionName).catch(() => {});
+      // Strip the persisted claudeSessionId so the retry launches fresh rather
+      // than --resume into the same (possibly corrupt) session that produced
+      // empty output. Without this the next call reads the old id from
+      // metadata.json and canResumeAtLaunch becomes true, re-binding the bad
+      // session and potentially replaying the same prompt against stale history.
+      try {
+        const onDisk = await readJsonFile<TmuxMetadata>(paths.metadataFile);
+        if (onDisk?.claudeSessionId) {
+          const { claudeSessionId: _dropped, ...rest } = onDisk;
+          await fs.writeFile(
+            paths.metadataFile,
+            `${JSON.stringify({ ...rest, lastUsedAt: Date.now() }, null, 2)}\n`,
+            { mode: 0o600 },
+          );
+        }
+      } catch {
+        // best-effort; the next run will overwrite on success
+      }
       await Promise.all([
         fs.writeFile(paths.paneLogFile, ""),
         fs.writeFile(paths.eventsFile, ""),

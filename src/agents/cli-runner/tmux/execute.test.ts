@@ -1590,6 +1590,66 @@ describe("executeTmuxCliRun", () => {
     expect(diagnostics.some((entry) => entry.event === "tmux.empty-output.retry")).toBe(true);
   });
 
+  it("empty-output retry ignores persisted claudeSessionId: must not --resume into prior session", async () => {
+    // Regression guard: if metadata.json already has a claudeSessionId from a
+    // prior turn, the empty-output retry must clear it before recursing so the
+    // fresh launch does NOT become a --resume that reattaches the same session
+    // that produced empty output.
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // Seed metadata with a prior bound Claude session id (simulates a warm session).
+    await seedMetadata(runtimeDir, { launchMode: "fresh", claudeSessionId: "prior-bound-id" });
+
+    const ensureArgsList: string[][] = [];
+    class EnvelopeThenAnswerManager extends FakeTmuxManager {
+      pasteCount = 0;
+      override async ensureSession(p: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+        args?: string[];
+      }) {
+        ensureArgsList.push(p.args ?? []);
+        this.paths = p.paths;
+        // Write the startup banner so waitForStartup can exit promptly.
+        await fs.writeFile(p.paths.paneLogFile, "Claude Code v2.1.140\n");
+        await fs.writeFile(p.paths.eventsFile, "");
+        return { created: true };
+      }
+      override async pastePrompt() {
+        this.pasteCount += 1;
+        if (this.pasteCount === 1) {
+          // First attempt: envelope-only pane → triggers empty-output retry.
+          await fs.appendFile(
+            this.paths!.paneLogFile,
+            '[Pasted text #3 +10 lines]</message><messageindex="1">echo noise',
+          );
+        } else {
+          // Retry attempt: real answer.
+          await fs.appendFile(this.paths!.paneLogFile, "Retry clean answer");
+        }
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now(), stdin: {} })}\n`,
+        );
+      }
+      override async killSession() {}
+    }
+    const manager = new EnvelopeThenAnswerManager();
+    const output = await executeTmuxCliRun(
+      { ...baseInput(runtimeDir), backend: resumeBackend(runtimeDir) },
+      manager as never,
+    );
+
+    expect(output.text).toBe("Retry clean answer");
+    // First ensureSession (initial attempt) may use any mode.
+    // Second ensureSession (the retry) must NOT use --resume — it must be fresh.
+    expect(ensureArgsList).toHaveLength(2);
+    const retryArgs = ensureArgsList[1];
+    expect(retryArgs).toBeDefined();
+    expect(retryArgs).not.toContain("--resume");
+    expect(retryArgs).not.toContain("prior-bound-id");
+  });
+
   it("preserves legit Feishu mentions even when other envelope tokens trigger suppression", async () => {
     // Mixed pane: envelope tokens + a real <at user_id> mention. With pane
     // fallback active (no transcript), the sanitizer must strip the envelope
