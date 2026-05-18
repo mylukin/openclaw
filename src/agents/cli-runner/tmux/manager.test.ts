@@ -1,8 +1,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { defaultTmuxCommandRunner, TmuxSessionManager } from "./manager.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  __resetPasteLocksForTest,
+  __resetTmuxCapabilityProbeForTest,
+  defaultTmuxCommandRunner,
+  TmuxSessionManager,
+} from "./manager.js";
 import type { NormalizedTmuxConfig, TmuxRuntimePaths } from "./types.js";
 
 function buildPaths(rootDir: string): TmuxRuntimePaths {
@@ -35,6 +40,11 @@ const config: NormalizedTmuxConfig = {
 
 describe("TmuxSessionManager", () => {
   const tempDirs: string[] = [];
+
+  beforeEach(() => {
+    __resetPasteLocksForTest();
+    __resetTmuxCapabilityProbeForTest();
+  });
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
@@ -301,10 +311,13 @@ describe("TmuxSessionManager", () => {
     expect(calls).toContain("new-session");
   });
 
-  it("pastes the prompt buffer and sends Enter", async () => {
+  it("pastes the prompt buffer and sends Enter (tmux 3.2+ uses -p)", async () => {
     const calls: string[][] = [];
     const manager = new TmuxSessionManager(async (_c, args) => {
       calls.push(args);
+      if (args[0] === "-V") {
+        return { stdout: "tmux 3.4\n", stderr: "" };
+      }
       return { stdout: "", stderr: "" };
     });
     await manager.pastePrompt({
@@ -312,9 +325,167 @@ describe("TmuxSessionManager", () => {
       bufferName: "buf",
       promptFile: "/tmp/p.txt",
     });
-    expect(calls.map((a) => a[0])).toEqual(["load-buffer", "paste-buffer", "send-keys"]);
+    expect(calls.map((a) => a[0])).toEqual(["load-buffer", "-V", "paste-buffer", "send-keys"]);
+    const pasteCall = calls.find((c) => c[0] === "paste-buffer");
+    // `-p` forces atomic bracketed-paste so the Claude TUI receives the whole
+    // buffer as one paste event (no fragmentation into multiple [Pasted text]
+    // placeholders).
+    expect(pasteCall).toEqual(["paste-buffer", "-p", "-b", "buf", "-t", "s:0.0"]);
     await manager.sendEnter("s");
     expect(calls.at(-1)).toEqual(["send-keys", "-t", "s:0.0", "Enter"]);
+  });
+
+  it("falls back to plain paste-buffer on tmux < 3.2", async () => {
+    const calls: string[][] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args);
+      if (args[0] === "-V") {
+        return { stdout: "tmux 2.8\n", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+    await manager.pastePrompt({
+      sessionName: "s",
+      bufferName: "buf",
+      promptFile: "/tmp/p.txt",
+    });
+    const pasteCall = calls.find((c) => c[0] === "paste-buffer");
+    expect(pasteCall).toEqual(["paste-buffer", "-b", "buf", "-t", "s:0.0"]);
+    expect(pasteCall).not.toContain("-p");
+  });
+
+  it("falls back to plain paste-buffer when tmux -V fails", async () => {
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      if (args[0] === "-V") {
+        throw new Error("tmux not installed");
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const calls: string[][] = [];
+    const recorder = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args);
+      if (args[0] === "-V") {
+        throw new Error("tmux not installed");
+      }
+      return { stdout: "", stderr: "" };
+    });
+    await recorder.pastePrompt({
+      sessionName: "s",
+      bufferName: "buf",
+      promptFile: "/tmp/p.txt",
+    });
+    expect(manager).toBeDefined();
+    const pasteCall = calls.find((c) => c[0] === "paste-buffer");
+    expect(pasteCall).toEqual(["paste-buffer", "-b", "buf", "-t", "s:0.0"]);
+  });
+
+  it("caches the tmux -V probe across pastePrompt calls", async () => {
+    let probeCount = 0;
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      if (args[0] === "-V") {
+        probeCount += 1;
+        return { stdout: "tmux 3.4\n", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+    await manager.pastePrompt({ sessionName: "s", bufferName: "b1", promptFile: "/tmp/a" });
+    await manager.pastePrompt({ sessionName: "s", bufferName: "b2", promptFile: "/tmp/b" });
+    await manager.pastePrompt({ sessionName: "s2", bufferName: "b3", promptFile: "/tmp/c" });
+    expect(probeCount).toBe(1);
+  });
+
+  it("serializes concurrent pastePrompt calls for the same session", async () => {
+    // Two concurrent pastePrompt invocations must not interleave their
+    // load-buffer / paste-buffer / send-keys triples — otherwise tmux would
+    // ship overlapping bracketed-paste sequences to the pty and the Claude
+    // TUI would see fragmented / out-of-order pastes.
+    const order: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const tag = args.includes("buf-a") ? "a" : args.includes("buf-b") ? "b" : "?";
+      order.push(`${args[0]}:${tag}`);
+      // Yield to the event loop so a racing caller would have a chance to
+      // interleave if the lock weren't holding.
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      if (args[0] === "-V") {
+        return { stdout: "tmux 3.4\n", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+    await Promise.all([
+      manager.pastePrompt({ sessionName: "s", bufferName: "buf-a", promptFile: "/tmp/a.txt" }),
+      manager.pastePrompt({ sessionName: "s", bufferName: "buf-b", promptFile: "/tmp/b.txt" }),
+    ]);
+    expect(maxInFlight).toBe(1);
+    // Filter out the once-per-process `-V` probe; what matters is the paste
+    // triple ordering, not the probe call.
+    const tagged = order.filter((entry) => !entry.startsWith("-V:"));
+    const aIdx = tagged.indexOf("load-buffer:a");
+    const bIdx = tagged.indexOf("load-buffer:b");
+    expect(aIdx).toBeGreaterThanOrEqual(0);
+    expect(bIdx).toBeGreaterThan(aIdx);
+    expect(tagged.slice(aIdx, aIdx + 3)).toEqual([
+      "load-buffer:a",
+      "paste-buffer:a",
+      "send-keys:?",
+    ]);
+    expect(tagged.slice(bIdx, bIdx + 3)).toEqual([
+      "load-buffer:b",
+      "paste-buffer:b",
+      "send-keys:?",
+    ]);
+  });
+
+  it("keeps serializing after a failed pastePrompt without leaking the lock", async () => {
+    // Verifies both lock release on rejection AND that a follow-on caller
+    // queued behind the failing paste actually waits for the failure before
+    // running (not just that the lock is gone post-hoc).
+    let firstLoadBufferCall = true;
+    let releaseFirstLoad!: (action: "fail" | "ok") => void;
+    const firstLoadGate = new Promise<"fail" | "ok">((resolve) => {
+      releaseFirstLoad = resolve;
+    });
+    const calls: string[][] = [];
+    const manager = new TmuxSessionManager(async (_c, args) => {
+      calls.push(args);
+      if (firstLoadBufferCall && args[0] === "load-buffer") {
+        firstLoadBufferCall = false;
+        const action = await firstLoadGate;
+        if (action === "fail") {
+          throw new Error("disk full");
+        }
+        return { stdout: "", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const first = manager.pastePrompt({
+      sessionName: "s",
+      bufferName: "buf-a",
+      promptFile: "/tmp/a.txt",
+    });
+    // Let the first invocation reach the suspended load-buffer.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls.map((c) => c[0])).toEqual(["load-buffer"]);
+    const second = manager.pastePrompt({
+      sessionName: "s",
+      bufferName: "buf-b",
+      promptFile: "/tmp/b.txt",
+    });
+    // Second invocation must NOT have started any tmux commands yet; the lock
+    // is still held by the in-flight first paste.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls.map((c) => c[0])).toEqual(["load-buffer"]);
+    // Release the first load-buffer with a failure.
+    releaseFirstLoad("fail");
+    await expect(first).rejects.toThrow("disk full");
+    // Now the second invocation runs to completion.
+    await expect(second).resolves.toBeUndefined();
+    const secondLoadIdx = calls.findIndex((c) => c[0] === "load-buffer" && c.includes("buf-b"));
+    expect(secondLoadIdx).toBeGreaterThan(0);
   });
 
   it("captures pane tail and swallows capture failures", async () => {

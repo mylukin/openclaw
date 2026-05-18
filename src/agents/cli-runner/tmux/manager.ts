@@ -23,6 +23,80 @@ function sleep(ms: number): Promise<void> {
 // Enter makes submission reliable.
 const PASTE_SUBMIT_DELAY_MS = 200;
 
+// Per-sessionName paste serializer. tmux paste-buffer + send-keys must run
+// strictly in order for a given pane; if two callers race the buffer (e.g.
+// rapid back-to-back turns or a recovery re-paste arriving while a previous
+// paste is mid-flight), tmux can interleave the write(2)s into the pty and
+// the Claude TUI sees fragmented bracketed-paste sequences — which surface as
+// multiple "[Pasted text #N +M lines]" placeholders for what should be one
+// atomic paste. Outer KeyedAsyncQueue already serializes turns per session,
+// but this defense lives at the tmux boundary so direct callers (tests,
+// recovery paths, future callers) cannot regress the invariant.
+const pasteLocks = new Map<string, Promise<unknown>>();
+
+function withPasteLock<T>(sessionName: string, task: () => Promise<T>): Promise<T> {
+  // `prior` is always a fulfilled promise (we store the `.catch`-flattened
+  // tracker, not the user-visible result), so we only need the onFulfilled
+  // branch of `.then`.
+  const prior = pasteLocks.get(sessionName) ?? Promise.resolve();
+  const next = prior.then(task);
+  // Keep the chain alive even on rejection so the next caller still queues
+  // behind the failed paste rather than racing in parallel.
+  const tracked = next.catch(() => {});
+  pasteLocks.set(sessionName, tracked);
+  void tracked.finally(() => {
+    if (pasteLocks.get(sessionName) === tracked) {
+      pasteLocks.delete(sessionName);
+    }
+  });
+  return next;
+}
+
+/** Test-only: drain the in-memory paste lock map between cases. */
+export function __resetPasteLocksForTest(): void {
+  pasteLocks.clear();
+}
+
+// tmux >= 3.2 supports `paste-buffer -p`, which forces a bracketed-paste wrap
+// around the buffer regardless of the target's mode-2004 state. Older tmux
+// (CentOS 7, Ubuntu 18.04, some long-LTS hosts) errors with "unknown option
+// -p", so we probe once per process and fall back to a plain paste-buffer.
+// The fallback still relies on Claude's mode-2004 to wrap, which is the
+// pre-fix behavior — degraded ordering guarantee, but functional.
+let pasteBufferForceBpProbe: Promise<boolean> | null = null;
+
+function parseTmuxMajorMinor(versionOutput: string): { major: number; minor: number } | null {
+  const match = versionOutput.match(/tmux\s+(\d+)\.(\d+)/i);
+  if (!match) {
+    return null;
+  }
+  return { major: Number.parseInt(match[1], 10), minor: Number.parseInt(match[2], 10) };
+}
+
+async function probePasteBufferForceBp(runCommand: TmuxCommandRunner): Promise<boolean> {
+  if (pasteBufferForceBpProbe === null) {
+    pasteBufferForceBpProbe = (async () => {
+      try {
+        const result = await runCommand("tmux", ["-V"]);
+        const parsed = parseTmuxMajorMinor(result.stdout);
+        if (!parsed) {
+          return false;
+        }
+        // 3.2+ ships `-p`. Treat 3.2 as the floor.
+        return parsed.major > 3 || (parsed.major === 3 && parsed.minor >= 2);
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return pasteBufferForceBpProbe;
+}
+
+/** Test-only: reset the cached `paste-buffer -p` capability probe. */
+export function __resetTmuxCapabilityProbeForTest(): void {
+  pasteBufferForceBpProbe = null;
+}
+
 export const defaultTmuxCommandRunner: TmuxCommandRunner = async (command, args, options) => {
   const result = await execFileAsync(command, args, {
     cwd: options?.cwd,
@@ -343,16 +417,28 @@ export class TmuxSessionManager {
     bufferName: string;
     promptFile: string;
   }): Promise<void> {
-    await this.runCommand("tmux", ["load-buffer", "-b", params.bufferName, params.promptFile]);
-    await this.runCommand("tmux", [
-      "paste-buffer",
-      "-b",
-      params.bufferName,
-      "-t",
-      `${params.sessionName}:0.0`,
-    ]);
-    await sleep(PASTE_SUBMIT_DELAY_MS);
-    await this.runCommand("tmux", ["send-keys", "-t", `${params.sessionName}:0.0`, "Enter"]);
+    return withPasteLock(params.sessionName, async () => {
+      await this.runCommand("tmux", ["load-buffer", "-b", params.bufferName, params.promptFile]);
+      // `-p` forces tmux to wrap the buffer in a single bracketed-paste
+      // sequence (\x1b[200~ ... \x1b[201~) regardless of whether the target
+      // application has signalled bracketed-paste support. Without this, large
+      // buffers can be delivered as raw keystrokes and the Claude TUI's
+      // paste-detection heuristic groups them into multiple `[Pasted text #N
+      // +M lines]` placeholders by chunk size, which looks like (and risks
+      // becoming) out-of-order delivery. The forced wrap pins the entire
+      // buffer to one paste event, ordered by the single load-buffer write.
+      //
+      // `-p` requires tmux 3.2+; on older tmux the probe returns false and we
+      // fall back to a plain paste-buffer (Claude still enables mode-2004 so
+      // pastes are usually wrapped, just without the forced guarantee).
+      const supportsForceBp = await probePasteBufferForceBp(this.runCommand);
+      const pasteArgs = supportsForceBp
+        ? ["paste-buffer", "-p", "-b", params.bufferName, "-t", `${params.sessionName}:0.0`]
+        : ["paste-buffer", "-b", params.bufferName, "-t", `${params.sessionName}:0.0`];
+      await this.runCommand("tmux", pasteArgs);
+      await sleep(PASTE_SUBMIT_DELAY_MS);
+      await this.runCommand("tmux", ["send-keys", "-t", `${params.sessionName}:0.0`, "Enter"]);
+    });
   }
 
   async sendEnter(sessionName: string): Promise<void> {
