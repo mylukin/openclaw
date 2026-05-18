@@ -1205,6 +1205,13 @@ export async function executeTmuxCliRun(
       if (!extendedDrain || elapsed < TRANSCRIPT_DRAIN_TOTAL_MS) {
         break;
       }
+      // Stop already fired: the turn is genuinely over. The long extension
+      // only exists to wait for a STILL-MISSING Stop while compaction runs;
+      // once Stop is seen there is no further output coming, so do not keep
+      // probing the (persistent) REPL pane for up to drainHardCapMs.
+      if (sawStop) {
+        break;
+      }
       if (transcript.getFinalReplyText().length > 0) {
         break;
       }
