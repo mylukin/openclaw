@@ -1,4 +1,9 @@
-import { loadSessionStore, resolveStorePath, type SessionEntry } from "../config/sessions.js";
+import {
+  loadSessionStore,
+  resolveSessionStoreEntry,
+  resolveStorePath,
+  type SessionEntry,
+} from "../config/sessions.js";
 import { CLAUDE_CLI_PROVIDER_ID, getCliSessionId } from "./cli-session.js";
 
 export type PhysicalContextLogger = {
@@ -72,7 +77,10 @@ export function resolvePhysicalContextId(
     );
     return undefined;
   }
-  const entry = store?.[sessionKey];
+  const entry = store
+    ? resolveSessionStoreEntry({ store: store as Record<string, SessionEntry>, sessionKey })
+        .existing
+    : undefined;
   if (!entry) {
     return undefined;
   }

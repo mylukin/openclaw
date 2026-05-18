@@ -78,6 +78,45 @@ describe("resolvePhysicalContextId", () => {
     expect(resolvePhysicalContextId({ storePath: "/dev/null", sessionKey: "  " })).toBeUndefined();
   });
 
+  it("resolves entry when store key is lowercase and sessionKey has different casing", async () => {
+    const storePath = await writeStore("normalized-hit", {
+      "agent:chat:norm": {
+        sessionId: "s",
+        updatedAt: 1,
+        cliSessionBindings: { "claude-cli": { sessionId: "phys-norm" } },
+      },
+    });
+    expect(resolvePhysicalContextId({ storePath, sessionKey: "AGENT:CHAT:NORM" })).toBe(
+      "phys-norm",
+    );
+  });
+
+  it("resolves entry when store key is mixed-case (legacy) and sessionKey is normalized", async () => {
+    const storePath = await writeStore("legacy-mixed", {
+      "Agent:Chat:Legacy": {
+        sessionId: "s",
+        updatedAt: 2,
+        cliSessionBindings: { "claude-cli": { sessionId: "phys-legacy" } },
+      },
+    });
+    expect(resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:legacy" })).toBe(
+      "phys-legacy",
+    );
+  });
+
+  it("returns undefined when no case-insensitive match exists", async () => {
+    const storePath = await writeStore("no-ci-match", {
+      "totally:different": {
+        sessionId: "s",
+        updatedAt: 1,
+        cliSessionBindings: { "claude-cli": { sessionId: "phys-other" } },
+      },
+    });
+    expect(
+      resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:nothere" }),
+    ).toBeUndefined();
+  });
+
   it("honors a custom provider id", async () => {
     const storePath = await writeStore("provider", {
       "agent:chat:3": {
