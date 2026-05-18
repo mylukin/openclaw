@@ -1,8 +1,15 @@
 import crypto from "node:crypto";
-import type { CliSessionBinding, SessionEntry } from "../config/sessions.js";
+import {
+  loadSessionStore,
+  resolveStorePath,
+  type CliSessionBinding,
+  type SessionEntry,
+} from "../config/sessions.js";
 import { normalizeProviderId } from "./model-selection.js";
 
 const CLAUDE_CLI_BACKEND_ID = "claude-cli";
+
+export { CLAUDE_CLI_BACKEND_ID as CLAUDE_CLI_PROVIDER_ID };
 
 function trimOptional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -275,4 +282,60 @@ export function resolveCliSessionReuse(params: {
     return { invalidatedReason: "mcp" };
   }
   return { sessionId };
+}
+
+export type ResolvePhysicalContextIdParams = {
+  /** Session-store key (e.g. dispatch key built from agent/account/chat). */
+  sessionKey: string;
+  /** Optional agent id used to resolve a per-agent store path. */
+  agentId?: string;
+  /** Pre-resolved path to a sessions.json file. Takes priority over `store`. */
+  storePath?: string;
+  /** Raw config value (e.g. `~/.openclaw/sessions/{agentId}.json`). */
+  store?: string;
+  /** CLI provider id. Defaults to `claude-cli`. */
+  provider?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+/**
+ * Resolve the physical CLI session id for a given session-store key.
+ *
+ * Reads the persisted CLI session binding (e.g. `claude-cli` session id) so a
+ * caller can pass it as `physicalContextId` when invoking downstream dispatch
+ * paths. Returns `undefined` when the store/entry/binding is missing — callers
+ * are expected to fall back to their existing `sessionKey`-based behavior.
+ */
+export function resolvePhysicalContextId(
+  params: ResolvePhysicalContextIdParams,
+): string | undefined {
+  const sessionKey = params.sessionKey?.trim();
+  if (!sessionKey) {
+    return undefined;
+  }
+  let storePath: string;
+  try {
+    storePath =
+      params.storePath ??
+      resolveStorePath(params.store, {
+        agentId: params.agentId,
+        env: params.env,
+      });
+  } catch {
+    return undefined;
+  }
+  let store: Record<string, SessionEntry | undefined> | undefined;
+  try {
+    store = loadSessionStore(storePath, { skipCache: true }) as Record<
+      string,
+      SessionEntry | undefined
+    >;
+  } catch {
+    return undefined;
+  }
+  const entry = store?.[sessionKey];
+  if (!entry) {
+    return undefined;
+  }
+  return getCliSessionId(entry, params.provider ?? CLAUDE_CLI_BACKEND_ID);
 }
