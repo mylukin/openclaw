@@ -37,6 +37,10 @@ export type TmuxRuntimePaths = {
   hookWriterFile: string;
   promptBufferFile: string;
   metadataFile: string;
+  // Sentinel written when a PreCompact hook fires inside the long-lived REPL.
+  // Presence at turn start tells the next turn to prepend the system-prompt
+  // loader so post-compaction history regains the original rules.
+  precompactFlagFile: string;
 };
 
 export type TmuxMetadata = {

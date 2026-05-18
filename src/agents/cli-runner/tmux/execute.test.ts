@@ -597,6 +597,107 @@ describe("executeTmuxCliRun", () => {
     expect(elapsed).toBeLessThan(8_000);
   });
 
+  it("re-injects system-prompt loader on the turn after a PreCompact hook", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+
+    // Turn 1: paste, then emit PreCompact + Stop. Sentinel must be written
+    // before the runner returns so turn 2 can consume it.
+    // Turn 2: warm REPL reuse (ensureSession returns created=false). We
+    // capture the bytes pasted into the REPL and expect the loader prelude
+    // to ride in front of the user prompt.
+    class PreCompactAndReusedManager extends FakeTmuxManager {
+      pastedBuffers: string[] = [];
+      private callIndex = 0;
+      override async ensureSession(params: {
+        paths: TmuxRuntimePaths;
+        metadata: { sessionName: string };
+      }): Promise<{ created: boolean }> {
+        this.paths = params.paths;
+        this.sessionNames.push(params.metadata.sessionName);
+        if (this.callIndex === 0) {
+          await fs.writeFile(params.paths.paneLogFile, "Claude Code v2.1.140\n");
+          await fs.writeFile(params.paths.eventsFile, "");
+          this.callIndex += 1;
+          return { created: true };
+        }
+        // Turn 2: pretend the REPL is still alive — do not clobber files,
+        // do not signal a fresh launch.
+        this.callIndex += 1;
+        return { created: false };
+      }
+      override async pastePrompt(params: { promptFile: string }) {
+        if (!this.paths) {
+          throw new Error("missing paths");
+        }
+        const paths = this.paths;
+        const body = await fs.readFile(params.promptFile, "utf8");
+        this.pastedBuffers.push(body);
+        const runId = this.pastedBuffers.length === 1 ? "run-1" : "run-2";
+        await fs.appendFile(paths.paneLogFile, `> ${body}reply`);
+        const now = Date.now();
+        await fs.appendFile(
+          paths.eventsFile,
+          `${JSON.stringify({ event: "SessionStart", runId, timestamp: now, claudeSessionId: "cs", stdin: { session_id: "cs" } })}\n`,
+        );
+        if (this.pastedBuffers.length === 1) {
+          // First turn fires PreCompact mid-paste so the sentinel exists.
+          await fs.appendFile(
+            paths.eventsFile,
+            `${JSON.stringify({ event: "PreCompact", runId, timestamp: now, stdin: { trigger: "auto" } })}\n`,
+          );
+        }
+        await fs.appendFile(
+          paths.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId, timestamp: Date.now() })}\n`,
+        );
+      }
+    }
+
+    const manager = new PreCompactAndReusedManager();
+    const base = {
+      backend: {
+        command: "claude",
+        args: ["-p"],
+        modelArg: "--model",
+        execution: {
+          mode: "tmux" as const,
+          tmux: { runtimeDir, turnIdleMs: 50, hookStallMs: 5_000 },
+        },
+      },
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionFile: path.join(runtimeDir, "session.jsonl"),
+      sessionId: "openclaw-session",
+      modelId: "sonnet",
+      systemPrompt: "AUTHORITATIVE RULES",
+      timeoutMs: 10_000,
+      env: {},
+    };
+
+    await executeTmuxCliRun({ ...base, runId: "run-1", prompt: "first" }, manager as never);
+    // Sentinel must exist immediately after turn 1.
+    expect(manager.paths).toBeDefined();
+    const flag = manager.paths!.precompactFlagFile;
+    await expect(fs.stat(flag)).resolves.toBeDefined();
+
+    await executeTmuxCliRun({ ...base, runId: "run-2", prompt: "second" }, manager as never);
+
+    expect(manager.pastedBuffers).toHaveLength(2);
+    const turn1 = manager.pastedBuffers[0];
+    const turn2 = manager.pastedBuffers[1];
+    // Turn 1: fresh launch — loader rides in args, NOT in the paste body.
+    expect(turn1).not.toContain("MANDATORY FIRST STEP");
+    expect(turn1).toContain("first");
+    // Turn 2: post-compaction re-injection — loader prepended and uses the
+    // compaction-flavored prelude.
+    expect(turn2).toContain("MANDATORY FIRST STEP");
+    expect(turn2).toContain("Session context may have been compacted");
+    expect(turn2).toContain("second");
+    // Sentinel cleared so turn 3 (if any) would not re-inject again.
+    await expect(fs.stat(flag)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects bare memory mode", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);

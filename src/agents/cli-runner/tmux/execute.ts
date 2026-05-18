@@ -757,6 +757,27 @@ export async function executeTmuxCliRun(
   // warm turns keep this false — that is the whole fast-path benefit.
   let loaderInjectionPending = launchMode === "resume" && Boolean(sessionState?.created);
 
+  // Cross-turn carry: if the previous turn observed a PreCompact hook inside
+  // the long-lived REPL, the in-process Claude summarised its history and
+  // very likely dropped the original --append-system-prompt rules. The hook
+  // writer drops a sentinel; consume it here so the next turn prepends the
+  // loader, then unlink so we don't keep re-injecting on every subsequent
+  // turn. We unlink up front (not after a successful paste) because the
+  // alternative — losing the rules permanently if paste fails — is worse
+  // than re-injecting once more after a transient failure.
+  let loaderReasonOverride: "compaction" | undefined;
+  try {
+    await fs.unlink(paths.precompactFlagFile);
+    loaderInjectionPending = true;
+    loaderReasonOverride = "compaction";
+    diag?.("tmux.precompact.consumeFlag", { sessionName });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    if (code && code !== "ENOENT") {
+      diag?.("tmux.precompact.consumeFlag.error", { sessionName, code });
+    }
+  }
+
   // Bytes actually pasted into the REPL this turn. pendingPromptEcho must
   // mirror these (NOT input.prompt) so the echoed prompt — loader prefix
   // included on a recovered turn — is stripped from the pane stream.
@@ -764,10 +785,20 @@ export async function executeTmuxCliRun(
   // trailing "\n" would sit as a literal newline; submission is the explicit
   // Enter in pastePrompt.
   const composePasteBuffer = (): string => {
-    const body = loaderInjectionPending
-      ? `${buildLoaderPrompt(launchMode)}\n${input.prompt}`
-      : input.prompt;
-    return body.replace(/\n+$/, "");
+    if (!loaderInjectionPending) {
+      return input.prompt.replace(/\n+$/, "");
+    }
+    // Reason picks the loader prelude. A warm REPL surviving an in-session
+    // /compact needs the explicit "context was summarised, re-read now"
+    // prelude even though launchMode is still "fresh" from this gateway's
+    // point of view.
+    const loader = loaderReasonOverride
+      ? buildClaudeSystemPromptLoaderPrompt({
+          chunks: cliSystemPromptFile.chunks,
+          reason: loaderReasonOverride,
+        })
+      : buildLoaderPrompt(launchMode);
+    return `${loader}\n${input.prompt}`.replace(/\n+$/, "");
   };
 
   // Self-heal a dead REPL. If a resumable Claude id is known (prior-bound or
@@ -1057,6 +1088,17 @@ export async function executeTmuxCliRun(
         });
         if (event.event === "PreCompact") {
           compactionInProgress = true;
+          // Persist a cross-turn sentinel so the NEXT turn knows to prepend
+          // the system-prompt loader. Compaction summarises the running
+          // REPL's history and tends to lose the original
+          // --append-system-prompt rules; without this re-injection, every
+          // subsequent turn would run un-ruled until the REPL restarts.
+          fs.writeFile(paths.precompactFlagFile, `${event.timestamp}\n`).catch((err) => {
+            diag?.("tmux.precompact.writeFlag.error", {
+              sessionName,
+              code: (err as NodeJS.ErrnoException | null)?.code,
+            });
+          });
         } else {
           // Any other hook (SessionStart source=compact, Pre/PostToolUse,
           // UserPromptSubmit, Stop) means Claude has resumed after the

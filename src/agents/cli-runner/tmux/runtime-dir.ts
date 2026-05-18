@@ -20,6 +20,7 @@ export function resolveTmuxRuntimePaths(params: {
     hookWriterFile: path.join(rootDir, "hook-writer.mjs"),
     promptBufferFile: path.join(rootDir, "prompt-buffer.txt"),
     metadataFile: path.join(rootDir, "metadata.json"),
+    precompactFlagFile: path.join(rootDir, "precompact.flag"),
   };
 }
 

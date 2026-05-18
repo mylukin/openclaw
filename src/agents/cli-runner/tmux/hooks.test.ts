@@ -11,6 +11,7 @@ const TEST_PATHS = {
   hookWriterFile: "/tmp/root/hook-writer.mjs",
   promptBufferFile: "/tmp/root/prompt.txt",
   metadataFile: "/tmp/root/metadata.json",
+  precompactFlagFile: "/tmp/root/precompact.flag",
 };
 
 describe("buildClaudeTmuxSettings", () => {
