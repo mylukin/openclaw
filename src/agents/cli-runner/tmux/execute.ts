@@ -1014,6 +1014,10 @@ export async function executeTmuxCliRun(
       const segments = await transcript.poll();
       if (segments.length > 0) {
         lastActivityAt = Date.now();
+        // Transcript producing again = Claude resumed post-compaction, even
+        // if no hook landed yet. Clear so a later unrelated stall is not
+        // granted the compaction-length tolerance.
+        compactionInProgress = false;
         dispatchTranscriptSegments(segments);
       }
     }
@@ -1053,10 +1057,16 @@ export async function executeTmuxCliRun(
         });
         if (event.event === "PreCompact") {
           compactionInProgress = true;
+        } else {
+          // Any other hook (SessionStart source=compact, Pre/PostToolUse,
+          // UserPromptSubmit, Stop) means Claude has resumed after the
+          // compaction silence. Clear the flag so a LATER unrelated stall in
+          // the same turn (e.g. a crashed hook script) still falls back fast
+          // instead of inheriting the earlier compaction's long tolerance.
+          compactionInProgress = false;
         }
         if (event.event === "Stop") {
           sawStop = true;
-          compactionInProgress = false;
         }
       }
     }
