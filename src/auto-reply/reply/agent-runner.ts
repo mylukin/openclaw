@@ -1,10 +1,11 @@
 import fs from "node:fs";
+import { getCliSessionId } from "../../agents/cli-session.js";
 import { lookupContextTokens, resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { queueEmbeddedPiMessage } from "../../agents/pi-embedded.js";
-import { hasNonzeroUsage } from "../../agents/usage.js";
+import { deriveSessionTotalTokens, hasNonzeroUsage } from "../../agents/usage.js";
 import {
   resolveAgentIdFromSessionKey,
   resolveSessionFilePath,
@@ -31,7 +32,10 @@ import type { OriginatingChannelType, TemplateContext } from "../templating.js";
 import { resolveResponseUsageMode, type VerboseLevel } from "../thinking.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
-import { runAgentTurnWithFallback } from "./agent-runner-execution.js";
+import {
+  inferCompactionFromTokenDrop,
+  runAgentTurnWithFallback,
+} from "./agent-runner-execution.js";
 import {
   createShouldEmitToolOutput,
   createShouldEmitToolResult,
@@ -602,6 +606,13 @@ export async function runReplyAgent(params: {
       activeSessionEntry?.contextTokens ??
       DEFAULT_CONTEXT_TOKENS;
 
+    // Capture previous token count and cli session id before updating the store.
+    // These are used below to infer compaction from a token drop on the cli-runner path.
+    const previousTotalTokens = activeSessionEntry?.totalTokens;
+    const previousCliSessionId = isCliProvider(providerUsed, cfg)
+      ? getCliSessionId(activeSessionEntry, providerUsed)
+      : undefined;
+
     await persistRunSessionUsage({
       storePath,
       sessionKey,
@@ -618,6 +629,30 @@ export async function runReplyAgent(params: {
       cliPromptLoad: runResult.meta?.agentMeta?.cliPromptLoad,
       usageIsContextSnapshot: isCliProvider(providerUsed, cfg),
     });
+
+    // For the cli-runner path, auto-compaction events are internal to Claude Code
+    // and are not surfaced as SDK events.  Detect them heuristically: if the
+    // token count dropped significantly in a single turn (same session id),
+    // treat it as a compaction so the /status counter stays accurate.
+    if (autoCompactionCount === 0 && isCliProvider(providerUsed, cfg)) {
+      const lastCallUsage = runResult.meta?.agentMeta?.lastCallUsage;
+      const newTotalTokens = deriveSessionTotalTokens({
+        usage: lastCallUsage ?? (usage as Parameters<typeof deriveSessionTotalTokens>[0]["usage"]),
+        contextTokens: contextTokensUsed,
+        promptTokens,
+      });
+      if (
+        newTotalTokens !== undefined &&
+        inferCompactionFromTokenDrop({
+          previousTotalTokens,
+          newTotalTokens,
+          previousSessionId: previousCliSessionId,
+          newSessionId: cliSessionId,
+        })
+      ) {
+        autoCompactionCount = 1;
+      }
+    }
 
     // Drain any late tool/block deliveries before deciding there's "nothing to send".
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
