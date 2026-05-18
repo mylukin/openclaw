@@ -133,4 +133,16 @@ export type PreparedCliRunContext = {
   docsPath?: string;
   /** Extra system prompt used in the build. */
   extraSystemPrompt?: string;
+  /**
+   * Stable identifier for the physical CLI session this run will resume.
+   * Equals `reusableCliSession.sessionId` when a prior session exists, or the
+   * value stored in the session store under `physicalContextId` when present.
+   * Undefined on the very first run for a new agent+chat pair.
+   *
+   * Exposed here so dispatch-layer callers can pass it as the authoritative
+   * physicalContextId to group-context injection callbacks without re-reading
+   * the session store after the CLI run (which would see the newly-created
+   * session ID rather than the pre-run value).
+   */
+  physicalContextId?: string;
 };

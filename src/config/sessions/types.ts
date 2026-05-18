@@ -218,6 +218,13 @@ export type SessionEntry = {
   cliSessionBindings?: Record<string, CliSessionBinding>;
   cliSessionIds?: Record<string, string>;
   claudeCliSessionId?: string;
+  /**
+   * Stable physical-context identifier for the current tmux pane / CLI session
+   * lifetime. Survives OpenClaw session-key resets and is used to dedup
+   * group-chat context injections across turns. Cleared on explicit session
+   * reset (`/reset`) so the next turn generates a fresh value.
+   */
+  physicalContextId?: string;
   cliPromptLoad?: CliPromptLoadStatus;
   label?: string;
   displayName?: string;

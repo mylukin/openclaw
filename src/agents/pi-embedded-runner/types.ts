@@ -11,6 +11,14 @@ export type EmbeddedPiAgentMeta = {
   model: string;
   cliSessionBinding?: CliSessionBinding;
   cliPromptLoad?: CliPromptLoadStatus;
+  /**
+   * Stable physical-context ID for the CLI session that was active at the
+   * START of this run (before the CLI ran). Equals the session ID resolved by
+   * `prepareCliRunContext` from the session store, so it is consistent with
+   * the physicalContextId used in pre-run group-context injection callbacks.
+   * Undefined when no prior CLI session existed (first run for this agent+chat).
+   */
+  physicalContextId?: string;
   compactionCount?: number;
   promptTokens?: number;
   usage?: {
