@@ -200,6 +200,15 @@ export class FeishuStreamingSession {
   // Feishu auto-closes streaming_mode 10 min after last open; renew at 8 min to stay ahead.
   private static readonly STREAMING_MODE_RENEW_INTERVAL_MS = 8 * 60 * 1000;
   private static readonly STREAMING_MODE_RETRY_MS = 30_000;
+  // Heartbeat: when the upstream agent goes silent for a long stretch (e.g.
+  // claude-cli running in tmux during /compact, or a long tool call), no
+  // content flows and the card looks frozen. A periodic timer renders a
+  // "still running" line below the body so the user knows it is alive.
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private lastContentActivityAt = 0;
+  private statusText = "";
+  private static readonly HEARTBEAT_CHECK_MS = 5_000;
+  private static readonly HEARTBEAT_IDLE_THRESHOLD_MS = 10_000;
 
   constructor(client: Client, _creds: Credentials, log?: (msg: string) => void) {
     this.client = client;
@@ -217,6 +226,7 @@ export class FeishuStreamingSession {
 
     const elements: Record<string, unknown>[] = [
       { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
+      { tag: "markdown", content: "", element_id: "status" },
     ];
     if (options?.note) {
       elements.push({ tag: "hr" });
@@ -310,6 +320,8 @@ export class FeishuStreamingSession {
     this.requiresFullCardSync = false;
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
+    this.lastContentActivityAt = Date.now();
+    this.startHeartbeatTimer();
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
   }
 
@@ -323,8 +335,22 @@ export class FeishuStreamingSession {
     this.requiresFullCardSync = false;
     this.lastStreamingModeRenewAt = Date.now();
     this.startRenewTimer();
+    this.lastContentActivityAt = Date.now();
+    this.statusText = "";
+    this.startHeartbeatTimer();
     await this.setStreamingModeEnabled({ force: true, reason: "reopen" }).catch((error) => {
       this.log?.(`Adopt existing streaming card reopen failed: ${String(error)}`);
+    });
+    // The adopted card may still display a "still running" line pushed by the
+    // releasing session (statusText is not carried in the resume token). Clear
+    // it once so it does not linger next to the new session's real output.
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) {
+        return;
+      }
+      await this.updateElementContent("status", "", (e) =>
+        this.log?.(`Status clear on adopt failed: ${String(e)}`),
+      );
     });
     this.log?.(`Adopted streaming: cardId=${token.cardId}, messageId=${token.messageId}`);
   }
@@ -421,6 +447,62 @@ export class FeishuStreamingSession {
     }
   }
 
+  private startHeartbeatTimer(): void {
+    this.stopHeartbeatTimer();
+    this.heartbeatTimer = setInterval(() => {
+      this.tickHeartbeat();
+    }, FeishuStreamingSession.HEARTBEAT_CHECK_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  private stopHeartbeatTimer(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /** Real content/thinking flowed: refresh the activity clock and clear any
+   *  "still running" line that was shown during the silent stretch. */
+  private markContentActivity(): void {
+    this.lastContentActivityAt = Date.now();
+    if (this.statusText) {
+      this.statusText = "";
+      this.queue = this.queue.then(async () => {
+        if (!this.state || this.closed) {
+          return;
+        }
+        await this.updateElementContent("status", "", (e) =>
+          this.log?.(`Status clear failed: ${String(e)}`),
+        );
+      });
+    }
+  }
+
+  private tickHeartbeat(): void {
+    if (!this.state || this.closed) {
+      return;
+    }
+    const idleMs = Date.now() - this.lastContentActivityAt;
+    if (idleMs < FeishuStreamingSession.HEARTBEAT_IDLE_THRESHOLD_MS) {
+      return;
+    }
+    const waitedSec = Math.round(idleMs / 1000);
+    const next = `<font color='grey'>⏳ 仍在处理中，请稍候…（已等待 ${waitedSec}s）</font>`;
+    if (next === this.statusText) {
+      return;
+    }
+    this.statusText = next;
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) {
+        return;
+      }
+      await this.updateElementContent("status", next, (e) =>
+        this.log?.(`Status update failed: ${String(e)}`),
+      );
+    });
+  }
+
   private async pushElementContent(elementId: string, text: string): Promise<void> {
     if (!this.state) {
       throw new Error("streaming session is inactive");
@@ -511,6 +593,7 @@ export class FeishuStreamingSession {
       });
     }
     elements.push({ tag: "markdown", content: text || "", element_id: "content" });
+    elements.push({ tag: "markdown", content: this.statusText || "", element_id: "status" });
     if (this.state?.hasNote) {
       elements.push({ tag: "hr" });
       const noteSource = options?.note ?? this.state.noteText;
@@ -583,6 +666,7 @@ export class FeishuStreamingSession {
     if (!resolvedInput || resolvedInput === this.state.currentText) {
       return;
     }
+    this.markContentActivity();
 
     // Throttle: skip if updated recently, but remember pending text
     const now = Date.now();
@@ -649,6 +733,7 @@ export class FeishuStreamingSession {
     ) {
       return;
     }
+    this.markContentActivity();
 
     // Throttle: reasoning chunks arrive far faster than the Feishu cardkit
     // API round-trip. Without coalescing, every chunk fires its own
@@ -785,6 +870,9 @@ export class FeishuStreamingSession {
     const foldThinking = this.pendingThinking;
     this.pendingThinking = null;
     this.stopRenewTimer();
+    this.stopHeartbeatTimer();
+    const hadStatusLine = this.statusText !== "";
+    this.statusText = "";
     await this.queue;
     // `dropThinkingPanel`/`finalThinking` below still override this
     // (authoritative final snapshot) when supplied.
@@ -835,6 +923,11 @@ export class FeishuStreamingSession {
       });
     } else {
       // No thinking panel — use element API for content, then note.
+      if (hadStatusLine) {
+        await this.updateElementContent("status", "", (e) =>
+          this.log?.(`Status clear on close failed: ${String(e)}`),
+        );
+      }
       if (resolvedText !== previousText) {
         const streamOk = await this.updateCardContent(resolvedText);
         if (!streamOk) {
@@ -889,6 +982,7 @@ export class FeishuStreamingSession {
     }
     this.pendingThinking = null;
     this.stopRenewTimer();
+    this.stopHeartbeatTimer();
     await this.queue;
 
     const messageId = this.state.messageId;
@@ -937,6 +1031,7 @@ export class FeishuStreamingSession {
     }
     const token = { ...this.state };
     this.stopRenewTimer();
+    this.stopHeartbeatTimer();
     this.state = null;
     this.pendingText = null;
     this.closed = true;
