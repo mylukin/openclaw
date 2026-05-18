@@ -698,6 +698,61 @@ describe("executeTmuxCliRun", () => {
     await expect(fs.stat(flag)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("drops a stale precompact sentinel on fresh recreate without arming the loader", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    // Pre-seed a sentinel as if a prior REPL incarnation had compacted, then
+    // died. This turn starts FRESH (default FakeTmuxManager.ensureSession
+    // returns created=true), so the new REPL already carries the system
+    // prompt via args — the sentinel is stale and must be cleared silently.
+    const sessionName = buildTmuxSessionName({
+      prefix: "openclaw-claude",
+      backendId: "claude-cli",
+      workspaceDir: runtimeDir,
+      sessionKey: "openclaw-session",
+      modelId: "sonnet",
+      memoryMode: "managed-disabled",
+      hookMode: "managed",
+    });
+    const seededPaths = resolveTmuxRuntimePaths({ runtimeDir, sessionName });
+    await fs.mkdir(seededPaths.rootDir, { recursive: true });
+    await fs.writeFile(seededPaths.precompactFlagFile, "stale\n");
+
+    class CapturingManager extends FakeTmuxManager {
+      pastedBuffer = "";
+      override async pastePrompt(params: { promptFile: string }) {
+        this.pastedBuffer = await fs.readFile(params.promptFile, "utf8");
+        await super.pastePrompt(params);
+      }
+    }
+    const manager = new CapturingManager();
+    await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir } },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        sessionId: "openclaw-session",
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "hello",
+        timeoutMs: 5_000,
+        env: {},
+      },
+      manager as never,
+    );
+
+    expect(manager.pastedBuffer).not.toContain("MANDATORY FIRST STEP");
+    expect(manager.pastedBuffer).toContain("hello");
+    await expect(fs.stat(seededPaths.precompactFlagFile)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects bare memory mode", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);
