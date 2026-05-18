@@ -157,6 +157,7 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
             provider: params.provider,
             model: context.modelId,
             usage: result.output.usage,
+            ...(context.physicalContextId ? { physicalContextId: context.physicalContextId } : {}),
             ...(result.compactionsThisRun > 0
               ? { compactionCount: result.compactionsThisRun }
               : {}),

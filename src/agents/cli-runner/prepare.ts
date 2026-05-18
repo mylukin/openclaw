@@ -788,5 +788,6 @@ export async function prepareCliRunContext(
     effectiveSkillsSnapshot,
     docsPath: docsPath ?? undefined,
     extraSystemPrompt,
+    physicalContextId: reusableCliSession.sessionId || undefined,
   };
 }

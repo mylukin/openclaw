@@ -133,4 +133,10 @@ export type PreparedCliRunContext = {
   docsPath?: string;
   /** Extra system prompt used in the build. */
   extraSystemPrompt?: string;
+  /**
+   * Physical CLI session ID that was active at the START of this run, taken
+   * directly from `reusableCliSession.sessionId` in prepareCliRunContext.
+   * Undefined on the very first run for this agent+chat pair (no prior session).
+   */
+  physicalContextId?: string;
 };

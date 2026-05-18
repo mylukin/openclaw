@@ -9,6 +9,12 @@ export type EmbeddedPiAgentMeta = {
   sessionId: string;
   provider: string;
   model: string;
+  /**
+   * Physical CLI session ID that was active at the START of this run.
+   * Equals PreparedCliRunContext.physicalContextId (= reusableCliSession.sessionId
+   * before the run executed). Undefined when no prior CLI session existed.
+   */
+  physicalContextId?: string;
   cliSessionBinding?: CliSessionBinding;
   cliPromptLoad?: CliPromptLoadStatus;
   compactionCount?: number;
