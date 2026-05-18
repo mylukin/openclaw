@@ -31,6 +31,10 @@ import type {
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_TURN_IDLE_MS = 1_200;
 const DEFAULT_HOOK_STALL_MS = 8_000;
+// During Claude Code context compaction, all hooks go silent for 30–120 s
+// while Claude summarises the session history. Each extension allows one
+// extra hookStallMs idle window; cap to avoid looping until the deadline.
+const DEFAULT_COMPACTION_STALL_EXTENSIONS = 20;
 const DEFAULT_CAPTURE_LINES = 160;
 // Reap sibling tmux REPLs idle longer than this (ms). Bounds orphan
 // accumulation from openclaw session rotation, model swaps, mcpConfig
@@ -873,6 +877,11 @@ export async function executeTmuxCliRun(
   let pendingPromptEcho = pastedBuffer;
   let sawStop = false;
   let sawCurrentRunHook = false;
+  let compactionStallExtensions = 0;
+  // Set by the PreCompact hook, cleared by Stop. While true, an all-channel
+  // silence is Claude busy compacting context (30–120 s) — NOT a crashed hook
+  // script — so the hook-stall fallback is allowed to wait it out.
+  let compactionInProgress = false;
   // Fresh sessions: SessionStart hook fires during waitForStartup and gets
   // consumed there, so the main loop's event reader (starting at
   // initialEventOffset) never sees it. Carry the discovered sessionId
@@ -1042,8 +1051,12 @@ export async function executeTmuxCliRun(
           // misordered inline tool stats downstream.
           suppressToolEvents: Boolean(transcript),
         });
+        if (event.event === "PreCompact") {
+          compactionInProgress = true;
+        }
         if (event.event === "Stop") {
           sawStop = true;
+          compactionInProgress = false;
         }
       }
     }
@@ -1105,6 +1118,25 @@ export async function executeTmuxCliRun(
     // hang until the overall deadline.
     const idleThreshold = noHookYet ? config.turnIdleMs : config.hookStallMs;
     if (terminal.getText() && idleFor >= idleThreshold) {
+      // Context compaction silences ALL channels for 30–120 s while Claude
+      // summarises history. Only extend the stall when the PreCompact hook
+      // told us compaction is actually running — otherwise an all-channel
+      // silence with an alive pane is a crashed hook script / idle Claude and
+      // must fall back fast (the hook-stall completion path). Cap extensions
+      // so a process that hangs without ever emitting Stop still terminates.
+      if (
+        !noHookYet &&
+        compactionInProgress &&
+        compactionStallExtensions < DEFAULT_COMPACTION_STALL_EXTENSIONS
+      ) {
+        const paneAlive =
+          (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
+        if (paneAlive) {
+          compactionStallExtensions++;
+          lastActivityAt = Date.now();
+          continue;
+        }
+      }
       break;
     }
     await sleep(100);
@@ -1138,14 +1170,47 @@ export async function executeTmuxCliRun(
     // Drain phase: Claude Code may flush the final assistant message to the
     // JSONL transcript right around the Stop hook. Keep polling until the
     // transcript goes quiet or the total budget elapses.
+    //
+    // Compaction / long generation tolerance: the 3s short cap is enough for
+    // the normal "Stop hook arrives, final block lands within a beat" path.
+    // But when the main loop already had to extend past a hook stall
+    // (compactionStallExtensions > 0) and the final reply has STILL not
+    // landed, Claude is likely mid-compaction or mid-generation — truncating
+    // here drops the real deliverable from the Feishu card. In that case keep
+    // polling while the pane stays alive, capped to the same window the main
+    // loop tolerates so total runner-side patience is consistent.
+    const extendedDrain = compactionStallExtensions > 0;
+    const drainHardCapMs = extendedDrain
+      ? DEFAULT_COMPACTION_STALL_EXTENSIONS * config.hookStallMs
+      : TRANSCRIPT_DRAIN_TOTAL_MS;
     const drainStart = Date.now();
     let lastDeltaAt = drainStart;
-    while (Date.now() - drainStart < TRANSCRIPT_DRAIN_TOTAL_MS) {
+    while (Date.now() - drainStart < drainHardCapMs) {
       const segments = await transcript.poll();
       if (segments.length > 0) {
         dispatchTranscriptSegments(segments);
         lastDeltaAt = Date.now();
-      } else if (Date.now() - lastDeltaAt >= TRANSCRIPT_DRAIN_QUIET_MS) {
+        await sleep(100);
+        continue;
+      }
+      const elapsed = Date.now() - drainStart;
+      const quietFor = Date.now() - lastDeltaAt;
+      if (quietFor < TRANSCRIPT_DRAIN_QUIET_MS) {
+        await sleep(100);
+        continue;
+      }
+      // Quiet long enough. Default behavior: exit (original short-cap path).
+      // Only the extended-drain case keeps waiting, and only while there is
+      // no final reply yet AND the pane is still alive (compaction running).
+      if (!extendedDrain || elapsed < TRANSCRIPT_DRAIN_TOTAL_MS) {
+        break;
+      }
+      if (transcript.getFinalReplyText().length > 0) {
+        break;
+      }
+      const paneAlive =
+        (await manager.hasSession(sessionName)) && (await manager.isPaneAlive(sessionName));
+      if (!paneAlive) {
         break;
       }
       await sleep(100);

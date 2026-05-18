@@ -7,6 +7,7 @@ const HOOK_EVENTS = [
   "PreToolUse",
   "PostToolUse",
   "PostToolUseFailure",
+  "PreCompact",
   "Stop",
 ] as const;
 
@@ -40,6 +41,12 @@ function buildHooksBlock(paths: TmuxRuntimePaths): Record<string, unknown> {
     PreToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PreToolUse")] }],
     PostToolUse: [{ matcher: "*", hooks: [buildCommandHook(paths, "PostToolUse")] }],
     PostToolUseFailure: [{ matcher: "*", hooks: [buildCommandHook(paths, "PostToolUseFailure")] }],
+    // PreCompact fires when Claude Code starts (auto or manual) context
+    // compaction. It is the only reliable signal that an upcoming multi-second
+    // all-channel silence is compaction (Claude is busy) rather than a crashed
+    // hook script (Claude is idle). The run loop uses it to decide whether a
+    // hook stall is worth waiting through.
+    PreCompact: [{ matcher: "*", hooks: [buildCommandHook(paths, "PreCompact")] }],
     Stop: [{ hooks: [buildCommandHook(paths, "Stop")] }],
   };
 }
