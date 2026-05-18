@@ -1,4 +1,5 @@
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
+import { resolvePhysicalContextId } from "../../agents/cli-session.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../agents/defaults.js";
 import { resolveAgentIdentity } from "../../agents/identity.js";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
@@ -37,6 +38,7 @@ export function createRuntimeAgent(): PluginRuntime["agent"] {
     loadSessionStore,
     saveSessionStore,
     resolveSessionFilePath,
+    resolvePhysicalContextId,
   }));
 
   return agentRuntime as PluginRuntime["agent"];

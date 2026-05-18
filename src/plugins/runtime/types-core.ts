@@ -47,6 +47,13 @@ export type PluginRuntimeCore = {
       loadSessionStore: typeof import("../../config/sessions.js").loadSessionStore;
       saveSessionStore: typeof import("../../config/sessions.js").saveSessionStore;
       resolveSessionFilePath: typeof import("../../config/sessions.js").resolveSessionFilePath;
+      /**
+       * Resolve the physical CLI session id for a given session-store key.
+       * Plugins (e.g. bot-company) pass the returned id as `physicalContextId`
+       * on dispatch to bind dedup state to the real CLI pane lifetime rather
+       * than the host sessionKey.
+       */
+      resolvePhysicalContextId: typeof import("../../agents/cli-session.js").resolvePhysicalContextId;
     };
   };
   system: {
