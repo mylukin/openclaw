@@ -1,7 +1,4 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { SessionEntry } from "../config/sessions.js";
 import {
   clearAllCliSessions,
@@ -11,7 +8,6 @@ import {
   hashCliSessionText,
   hashCliSessionStablePrompt,
   resolveCliSessionReuse,
-  resolvePhysicalContextId,
   setCliSessionBinding,
 } from "./cli-session.js";
 
@@ -244,97 +240,5 @@ describe("cli-session helpers", () => {
   it("hashes trimmed extra system prompts consistently", () => {
     expect(hashCliSessionText("  keep this  ")).toBe(hashCliSessionText("keep this"));
     expect(hashCliSessionText("")).toBeUndefined();
-  });
-});
-
-describe("resolvePhysicalContextId", () => {
-  let fixtureRoot = "";
-
-  beforeAll(async () => {
-    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-physical-ctx-"));
-  });
-
-  afterAll(async () => {
-    await fs.rm(fixtureRoot, { recursive: true, force: true });
-  });
-
-  async function writeStore(
-    label: string,
-    entries: Record<string, Partial<SessionEntry>>,
-  ): Promise<string> {
-    const storePath = path.join(fixtureRoot, `${label}.json`);
-    await fs.writeFile(storePath, JSON.stringify(entries), "utf-8");
-    return storePath;
-  }
-
-  it("returns the persisted claude-cli session id for the requested session key", async () => {
-    const storePath = await writeStore("hit", {
-      "agent:chat:1": {
-        sessionId: "openclaw-session",
-        updatedAt: 1,
-        cliSessionBindings: { "claude-cli": { sessionId: "phys-claude-1" } },
-        cliSessionIds: { "claude-cli": "phys-claude-1" },
-        claudeCliSessionId: "phys-claude-1",
-      },
-    });
-    expect(resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:1" })).toBe(
-      "phys-claude-1",
-    );
-  });
-
-  it("returns undefined when no binding exists, so callers fall back to sessionKey", async () => {
-    const storePath = await writeStore("miss-no-binding", {
-      "agent:chat:2": { sessionId: "openclaw-session", updatedAt: 1 },
-    });
-    expect(resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:2" })).toBeUndefined();
-  });
-
-  it("returns undefined for unknown session keys", async () => {
-    const storePath = await writeStore("miss-no-entry", {
-      "other:key": {
-        sessionId: "x",
-        updatedAt: 1,
-        cliSessionBindings: { "claude-cli": { sessionId: "phys" } },
-      },
-    });
-    expect(
-      resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:missing" }),
-    ).toBeUndefined();
-  });
-
-  it("returns undefined when the store file is missing", () => {
-    expect(
-      resolvePhysicalContextId({
-        storePath: path.join(fixtureRoot, "does-not-exist.json"),
-        sessionKey: "agent:chat:any",
-      }),
-    ).toBeUndefined();
-  });
-
-  it("returns undefined when sessionKey is empty", () => {
-    expect(resolvePhysicalContextId({ storePath: "/dev/null", sessionKey: "  " })).toBeUndefined();
-  });
-
-  it("honors a custom provider id", async () => {
-    const storePath = await writeStore("provider", {
-      "agent:chat:3": {
-        sessionId: "x",
-        updatedAt: 1,
-        cliSessionBindings: {
-          "claude-cli": { sessionId: "phys-claude-3" },
-          "codex-cli": { sessionId: "phys-codex-3" },
-        },
-      },
-    });
-    expect(
-      resolvePhysicalContextId({
-        storePath,
-        sessionKey: "agent:chat:3",
-        provider: "codex-cli",
-      }),
-    ).toBe("phys-codex-3");
-    expect(resolvePhysicalContextId({ storePath, sessionKey: "agent:chat:3" })).toBe(
-      "phys-claude-3",
-    );
   });
 });

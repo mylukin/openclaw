@@ -53,7 +53,7 @@ export type PluginRuntimeCore = {
        * on dispatch to bind dedup state to the real CLI pane lifetime rather
        * than the host sessionKey.
        */
-      resolvePhysicalContextId: typeof import("../../agents/cli-session.js").resolvePhysicalContextId;
+      resolvePhysicalContextId: typeof import("../../agents/physical-context.js").resolvePhysicalContextId;
     };
   };
   system: {
