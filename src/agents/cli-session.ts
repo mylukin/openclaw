@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
 import type { CliSessionBinding, SessionEntry } from "../config/sessions.js";
+import { resolveStorePath } from "../config/sessions/paths.js";
+import { updateSessionStoreEntry } from "../config/sessions/store.js";
+import { logVerbose } from "../globals.js";
 import { normalizeProviderId } from "./model-selection.js";
 
 const CLAUDE_CLI_BACKEND_ID = "claude-cli";
@@ -233,6 +236,116 @@ export function clearAllCliSessions(entry: SessionEntry): void {
   delete entry.cliSessionBindings;
   delete entry.cliSessionIds;
   delete entry.claudeCliSessionId;
+}
+
+/**
+ * Eagerly persist `cliSessionBindings[provider]` to the on-disk session store
+ * as soon as the cli-runner has discovered the physical session id, independent
+ * of the end-of-run usage persistence path. The bot-company Feishu plugin reads
+ * `entry.cliSessionBindings["claude-cli"].sessionId` via its
+ * `resolvePhysicalContextIdFromRuntime` to drive snapshot/delta dedup, so a
+ * reliable, early write here completes the physical-context-dedup feature.
+ *
+ * Best-effort: returns `false` when storePath/sessionKey cannot be resolved,
+ * the binding has no sessionId, or the session-store entry does not yet exist.
+ * Callers must not depend on a `true` return for correctness; they should also
+ * surface the binding through the usual agentMeta/usage persistence path.
+ */
+export async function persistCliSessionBindingToStore(params: {
+  storePath?: string;
+  sessionKey?: string;
+  agentId?: string;
+  storeConfig?: string;
+  provider: string;
+  binding: CliSessionBinding;
+}): Promise<boolean> {
+  const sessionKey = params.sessionKey?.trim();
+  const sessionId = params.binding.sessionId?.trim();
+  if (!sessionKey || !sessionId) {
+    return false;
+  }
+  let storePath = params.storePath?.trim();
+  if (!storePath) {
+    try {
+      storePath = resolveStorePath(params.storeConfig, { agentId: params.agentId });
+    } catch (err) {
+      logVerbose(`persistCliSessionBindingToStore: failed to resolve storePath: ${String(err)}`);
+      return false;
+    }
+  }
+  if (!storePath) {
+    return false;
+  }
+  try {
+    const updated = await updateSessionStoreEntry({
+      storePath,
+      sessionKey,
+      update: async (entry) => {
+        const next: SessionEntry = { ...entry };
+        setCliSessionBinding(next, params.provider, params.binding);
+        return {
+          cliSessionBindings: next.cliSessionBindings,
+          cliSessionIds: next.cliSessionIds,
+          claudeCliSessionId: next.claudeCliSessionId,
+        };
+      },
+    });
+    return updated !== null;
+  } catch (err) {
+    logVerbose(`persistCliSessionBindingToStore failed: ${String(err)}`);
+    return false;
+  }
+}
+
+/**
+ * Remove `cliSessionBindings[provider]` from the on-disk session store.
+ * Called when a session is explicitly invalidated (auth change, system-prompt
+ * change) so that the next `resolvePhysicalContextIdFromRuntime` call returns
+ * `undefined` and bot-company triggers a fresh snapshot injection rather than
+ * a stale delta.
+ *
+ * Best-effort: silently returns `false` on any error.
+ */
+export async function clearCliSessionFromStore(params: {
+  storePath?: string;
+  sessionKey?: string;
+  agentId?: string;
+  storeConfig?: string;
+  provider: string;
+}): Promise<boolean> {
+  const sessionKey = params.sessionKey?.trim();
+  if (!sessionKey) {
+    return false;
+  }
+  let storePath = params.storePath?.trim();
+  if (!storePath) {
+    try {
+      storePath = resolveStorePath(params.storeConfig, { agentId: params.agentId });
+    } catch {
+      return false;
+    }
+  }
+  if (!storePath) {
+    return false;
+  }
+  try {
+    const updated = await updateSessionStoreEntry({
+      storePath,
+      sessionKey,
+      update: async (entry) => {
+        const next: SessionEntry = { ...entry };
+        clearCliSession(next, params.provider);
+        return {
+          cliSessionBindings: next.cliSessionBindings,
+          cliSessionIds: next.cliSessionIds,
+          claudeCliSessionId: next.claudeCliSessionId,
+        };
+      },
+    });
+    return updated !== null;
+  } catch {
+    return false;
+  }
 }
 
 export function resolveCliSessionReuse(params: {

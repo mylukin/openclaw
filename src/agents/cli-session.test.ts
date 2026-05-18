@@ -1,12 +1,17 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import type { SessionEntry } from "../config/sessions.js";
 import {
   clearAllCliSessions,
   clearCliSession,
+  clearCliSessionFromStore,
   getCliSessionBinding,
   getCliSessionId,
   hashCliSessionText,
   hashCliSessionStablePrompt,
+  persistCliSessionBindingToStore,
   resolveCliSessionReuse,
   setCliSessionBinding,
 } from "./cli-session.js";
@@ -240,5 +245,185 @@ describe("cli-session helpers", () => {
   it("hashes trimmed extra system prompts consistently", () => {
     expect(hashCliSessionText("  keep this  ")).toBe(hashCliSessionText("keep this"));
     expect(hashCliSessionText("")).toBeUndefined();
+  });
+});
+
+describe("persistCliSessionBindingToStore", () => {
+  const cleanupPaths: string[] = [];
+  afterEach(async () => {
+    while (cleanupPaths.length > 0) {
+      const target = cleanupPaths.pop();
+      if (target) {
+        await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  });
+
+  async function createSeededStore(seed: Record<string, unknown>): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-session-store-"));
+    cleanupPaths.push(dir);
+    const storePath = path.join(dir, "sessions.json");
+    await fs.writeFile(storePath, JSON.stringify(seed, null, 2), "utf-8");
+    return storePath;
+  }
+
+  it("writes cliSessionBindings[claude-cli].sessionId so resolvePhysicalContextIdFromRuntime can read it", async () => {
+    const sessionKey = "agent:main:feishu:chat:abc";
+    const storePath = await createSeededStore({
+      [sessionKey]: { sessionId: "s1", updatedAt: Date.now() },
+    });
+
+    const wrote = await persistCliSessionBindingToStore({
+      storePath,
+      sessionKey,
+      provider: "claude-cli",
+      binding: {
+        sessionId: "claude-physical-1",
+        systemPromptFile: "/tmp/session.claude-system-prompt.txt",
+        systemPromptHash: "hash-1",
+      },
+    });
+
+    expect(wrote).toBe(true);
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].cliSessionBindings).toEqual({
+      "claude-cli": {
+        sessionId: "claude-physical-1",
+        systemPromptFile: "/tmp/session.claude-system-prompt.txt",
+        systemPromptHash: "hash-1",
+      },
+    });
+    expect(stored[sessionKey].cliSessionIds).toEqual({ "claude-cli": "claude-physical-1" });
+    expect(stored[sessionKey].claudeCliSessionId).toBe("claude-physical-1");
+  });
+
+  it("returns false (no-op) when sessionKey is missing — fallback behavior unchanged", async () => {
+    const storePath = await createSeededStore({});
+    const wrote = await persistCliSessionBindingToStore({
+      storePath,
+      provider: "claude-cli",
+      binding: { sessionId: "claude-physical-1" },
+    });
+    expect(wrote).toBe(false);
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored).toEqual({});
+  });
+
+  it("returns false when the binding has no sessionId", async () => {
+    const sessionKey = "agent:main:feishu:chat:abc";
+    const storePath = await createSeededStore({
+      [sessionKey]: { sessionId: "s1", updatedAt: Date.now() },
+    });
+    const wrote = await persistCliSessionBindingToStore({
+      storePath,
+      sessionKey,
+      provider: "claude-cli",
+      binding: { sessionId: "   " },
+    });
+    expect(wrote).toBe(false);
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].cliSessionBindings).toBeUndefined();
+  });
+
+  it("returns false when the entry does not yet exist (best-effort write)", async () => {
+    const storePath = await createSeededStore({});
+    const wrote = await persistCliSessionBindingToStore({
+      storePath,
+      sessionKey: "unknown-key",
+      provider: "claude-cli",
+      binding: { sessionId: "claude-physical-1" },
+    });
+    expect(wrote).toBe(false);
+  });
+
+  it("overwrites the binding when a new physical session id supersedes the old one", async () => {
+    const sessionKey = "agent:main:feishu:chat:abc";
+    const storePath = await createSeededStore({
+      [sessionKey]: {
+        sessionId: "s1",
+        updatedAt: Date.now(),
+        cliSessionBindings: { "claude-cli": { sessionId: "previous-id" } },
+      },
+    });
+
+    await persistCliSessionBindingToStore({
+      storePath,
+      sessionKey,
+      provider: "claude-cli",
+      binding: { sessionId: "claude-physical-2" },
+    });
+
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].cliSessionBindings["claude-cli"].sessionId).toBe("claude-physical-2");
+  });
+
+  it("does not write a binding when the sessionId is empty even for non-claude-cli providers", async () => {
+    const sessionKey = "agent:main:feishu:chat:abc";
+    const storePath = await createSeededStore({
+      [sessionKey]: { sessionId: "s1", updatedAt: Date.now() },
+    });
+    const wrote = await persistCliSessionBindingToStore({
+      storePath,
+      sessionKey,
+      provider: "codex-cli",
+      binding: { sessionId: "" },
+    });
+    expect(wrote).toBe(false);
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].cliSessionBindings).toBeUndefined();
+  });
+});
+
+describe("clearCliSessionFromStore", () => {
+  const cleanupPaths: string[] = [];
+  afterEach(async () => {
+    while (cleanupPaths.length > 0) {
+      const target = cleanupPaths.pop();
+      if (target) {
+        await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  });
+
+  async function createSeededStore(seed: Record<string, unknown>): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-session-store-"));
+    cleanupPaths.push(dir);
+    const storePath = path.join(dir, "sessions.json");
+    await fs.writeFile(storePath, JSON.stringify(seed, null, 2), "utf-8");
+    return storePath;
+  }
+
+  it("clears the stored binding so resolvePhysicalContextIdFromRuntime falls back to sessionKey", async () => {
+    const sessionKey = "agent:main:feishu:chat:abc";
+    const storePath = await createSeededStore({
+      [sessionKey]: {
+        sessionId: "s1",
+        updatedAt: Date.now(),
+        cliSessionBindings: { "claude-cli": { sessionId: "stale-physical-id" } },
+        cliSessionIds: { "claude-cli": "stale-physical-id" },
+        claudeCliSessionId: "stale-physical-id",
+      },
+    });
+
+    const cleared = await clearCliSessionFromStore({
+      storePath,
+      sessionKey,
+      provider: "claude-cli",
+    });
+
+    expect(cleared).toBe(true);
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].cliSessionBindings).toBeUndefined();
+    expect(stored[sessionKey].cliSessionIds).toBeUndefined();
+    expect(stored[sessionKey].claudeCliSessionId).toBeUndefined();
+  });
+
+  it("returns false when sessionKey is missing", async () => {
+    const storePath = await createSeededStore({});
+    const cleared = await clearCliSessionFromStore({
+      storePath,
+      provider: "claude-cli",
+    });
+    expect(cleared).toBe(false);
   });
 });

@@ -1,10 +1,12 @@
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/config.js";
+import type { CliSessionBinding } from "../config/sessions.js";
 import { drainCliRunSends } from "../gateway/cli-run-sends.js";
 import { executeWithOverflowProtection } from "./cli-runner/execute.js";
 import { prepareCliRunContext } from "./cli-runner/prepare.js";
-import type { RunCliAgentParams } from "./cli-runner/types.js";
+import type { PreparedCliRunContext, RunCliAgentParams } from "./cli-runner/types.js";
+import { clearCliSessionFromStore, persistCliSessionBindingToStore } from "./cli-session.js";
 import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import { classifyFailoverReason, isFailoverErrorMessage } from "./pi-embedded-helpers.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner.js";
@@ -23,8 +25,86 @@ function didSendToCurrentChannelViaCliRun(params: RunCliAgentParams): boolean {
   return sends.includes(params.currentChannelId);
 }
 
+function buildCliSessionBinding(params: {
+  effectiveCliSessionId: string;
+  runParams: RunCliAgentParams;
+  context: PreparedCliRunContext;
+  resultBinding?: {
+    systemPromptFile?: string;
+    systemPromptHash?: string;
+    systemPromptCompactionCount?: number;
+    semanticContextFiles?: string[];
+    semanticSessionFile?: string;
+    semanticSessionHash?: string;
+    semanticCompactionCount?: number;
+  };
+}): CliSessionBinding {
+  const { effectiveCliSessionId, runParams, context, resultBinding } = params;
+  return {
+    sessionId: effectiveCliSessionId,
+    ...(runParams.authProfileId ? { authProfileId: runParams.authProfileId } : {}),
+    ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
+    ...(context.extraSystemPromptHash
+      ? { extraSystemPromptHash: context.extraSystemPromptHash }
+      : {}),
+    ...(context.preparedBackend.mcpConfigHash
+      ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
+      : {}),
+    ...(resultBinding?.systemPromptFile
+      ? {
+          systemPromptFile: resultBinding.systemPromptFile,
+          systemPromptHash: resultBinding.systemPromptHash,
+          systemPromptCompactionCount: resultBinding.systemPromptCompactionCount,
+        }
+      : {}),
+    ...(resultBinding?.semanticSessionFile
+      ? {
+          semanticContextFiles: resultBinding.semanticContextFiles,
+          semanticSessionFile: resultBinding.semanticSessionFile,
+          semanticSessionHash: resultBinding.semanticSessionHash,
+          semanticCompactionCount: resultBinding.semanticCompactionCount,
+        }
+      : {}),
+  };
+}
+
+/**
+ * Persist `cliSessionBindings[provider]` to the on-disk session store as soon
+ * as the cli-runner has discovered the physical session id. This makes
+ * `entry.cliSessionBindings["claude-cli"].sessionId` available to downstream
+ * consumers (e.g. the bot-company Feishu plugin's
+ * `resolvePhysicalContextIdFromRuntime`) without depending on the end-of-run
+ * usage persistence path firing.
+ */
+async function persistCliRunSessionBinding(params: {
+  runParams: RunCliAgentParams;
+  binding: CliSessionBinding;
+}): Promise<void> {
+  await persistCliSessionBindingToStore({
+    sessionKey: params.runParams.sessionKey,
+    agentId: params.runParams.agentId,
+    storeConfig: params.runParams.config?.session?.store,
+    provider: params.runParams.provider,
+    binding: params.binding,
+  });
+}
+
 export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPiRunResult> {
   const context = await prepareCliRunContext(params);
+
+  // When the session is explicitly invalidated (auth/system-prompt/MCP change),
+  // clear the old binding from the store immediately so the next
+  // resolvePhysicalContextIdFromRuntime call returns undefined and bot-company
+  // triggers a fresh snapshot injection rather than a stale delta.
+  if (context.reusableCliSession.invalidatedReason && params.sessionKey) {
+    void clearCliSessionFromStore({
+      sessionKey: params.sessionKey,
+      agentId: params.agentId,
+      storeConfig: params.config?.session?.store,
+      provider: params.provider,
+    });
+  }
+
   const restoreSkillEnv =
     params.disableTools !== true
       ? applySkillEnvOverridesFromSnapshot({
@@ -51,6 +131,22 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
       // the channel.
       const payloads = text && !didSendToCurrentChannelViaCliRun(params) ? [{ text }] : undefined;
 
+      const cliSessionBinding = effectiveCliSessionId
+        ? buildCliSessionBinding({
+            effectiveCliSessionId,
+            runParams: params,
+            context,
+            resultBinding: result.cliSessionBinding,
+          })
+        : undefined;
+
+      // Eagerly persist the binding so the next dispatch (e.g. bot-company's
+      // resolvePhysicalContextIdFromRuntime) can resolve the physicalContextId
+      // without waiting for the end-of-run usage persistence path.
+      if (cliSessionBinding) {
+        await persistCliRunSessionBinding({ runParams: params, binding: cliSessionBinding });
+      }
+
       return {
         payloads,
         meta: {
@@ -64,37 +160,7 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
             ...(result.compactionsThisRun > 0
               ? { compactionCount: result.compactionsThisRun }
               : {}),
-            ...(effectiveCliSessionId
-              ? {
-                  cliSessionBinding: {
-                    sessionId: effectiveCliSessionId,
-                    ...(params.authProfileId ? { authProfileId: params.authProfileId } : {}),
-                    ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
-                    ...(context.extraSystemPromptHash
-                      ? { extraSystemPromptHash: context.extraSystemPromptHash }
-                      : {}),
-                    ...(context.preparedBackend.mcpConfigHash
-                      ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
-                      : {}),
-                    ...(result.cliSessionBinding?.systemPromptFile
-                      ? {
-                          systemPromptFile: result.cliSessionBinding.systemPromptFile,
-                          systemPromptHash: result.cliSessionBinding.systemPromptHash,
-                          systemPromptCompactionCount:
-                            result.cliSessionBinding.systemPromptCompactionCount,
-                        }
-                      : {}),
-                    ...(result.cliSessionBinding?.semanticSessionFile
-                      ? {
-                          semanticContextFiles: result.cliSessionBinding.semanticContextFiles,
-                          semanticSessionFile: result.cliSessionBinding.semanticSessionFile,
-                          semanticSessionHash: result.cliSessionBinding.semanticSessionHash,
-                          semanticCompactionCount: result.cliSessionBinding.semanticCompactionCount,
-                        }
-                      : {}),
-                  },
-                }
-              : {}),
+            ...(cliSessionBinding ? { cliSessionBinding } : {}),
             ...(result.cliPromptLoad ? { cliPromptLoad: result.cliPromptLoad } : {}),
           },
         },
@@ -115,6 +181,19 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
           const payloads =
             text && !didSendToCurrentChannelViaCliRun(params) ? [{ text }] : undefined;
 
+          const cliSessionBinding = effectiveCliSessionId
+            ? buildCliSessionBinding({
+                effectiveCliSessionId,
+                runParams: params,
+                context,
+                resultBinding: result.cliSessionBinding,
+              })
+            : undefined;
+
+          if (cliSessionBinding) {
+            await persistCliRunSessionBinding({ runParams: params, binding: cliSessionBinding });
+          }
+
           return {
             payloads,
             meta: {
@@ -125,41 +204,13 @@ export async function runCliAgent(params: RunCliAgentParams): Promise<EmbeddedPi
                 provider: params.provider,
                 model: context.modelId,
                 usage: result.output.usage,
+                ...(context.physicalContextId
+                  ? { physicalContextId: context.physicalContextId }
+                  : {}),
                 ...(result.compactionsThisRun > 0
                   ? { compactionCount: result.compactionsThisRun }
                   : {}),
-                ...(effectiveCliSessionId
-                  ? {
-                      cliSessionBinding: {
-                        sessionId: effectiveCliSessionId,
-                        ...(params.authProfileId ? { authProfileId: params.authProfileId } : {}),
-                        ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
-                        ...(context.extraSystemPromptHash
-                          ? { extraSystemPromptHash: context.extraSystemPromptHash }
-                          : {}),
-                        ...(context.preparedBackend.mcpConfigHash
-                          ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
-                          : {}),
-                        ...(result.cliSessionBinding?.systemPromptFile
-                          ? {
-                              systemPromptFile: result.cliSessionBinding.systemPromptFile,
-                              systemPromptHash: result.cliSessionBinding.systemPromptHash,
-                              systemPromptCompactionCount:
-                                result.cliSessionBinding.systemPromptCompactionCount,
-                            }
-                          : {}),
-                        ...(result.cliSessionBinding?.semanticSessionFile
-                          ? {
-                              semanticContextFiles: result.cliSessionBinding.semanticContextFiles,
-                              semanticSessionFile: result.cliSessionBinding.semanticSessionFile,
-                              semanticSessionHash: result.cliSessionBinding.semanticSessionHash,
-                              semanticCompactionCount:
-                                result.cliSessionBinding.semanticCompactionCount,
-                            }
-                          : {}),
-                      },
-                    }
-                  : {}),
+                ...(cliSessionBinding ? { cliSessionBinding } : {}),
                 ...(result.cliPromptLoad ? { cliPromptLoad: result.cliPromptLoad } : {}),
               },
             },
