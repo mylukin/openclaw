@@ -522,6 +522,81 @@ describe("executeTmuxCliRun", () => {
     expect(Date.now() - start).toBeLessThan(5_000);
   });
 
+  it("waits through a PreCompact-signaled stall and delivers post-compaction output", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+
+    // Hooks fire (SessionStart + PreCompact) then ALL channels go silent far
+    // longer than hookStallMs while "compaction" runs. The final answer +
+    // Stop only arrive ~1.2s later — well past the 300ms stall threshold.
+    // Without the PreCompact extension this is truncated to "Partial answer"
+    // (see the no-PreCompact test above); with it the late output survives.
+    class CompactingManager extends FakeTmuxManager {
+      async pastePrompt(params: { promptFile: string }) {
+        if (!this.paths) {
+          throw new Error("missing paths");
+        }
+        const paths = this.paths;
+        const promptEcho = await fs.readFile(params.promptFile, "utf8");
+        await fs.appendFile(paths.paneLogFile, `> ${promptEcho}Partial answer`);
+        const now = Date.now();
+        await fs.appendFile(
+          paths.eventsFile,
+          `${JSON.stringify({ event: "SessionStart", runId: "run-1", timestamp: now, claudeSessionId: "cs", stdin: { session_id: "cs" } })}\n`,
+        );
+        await fs.appendFile(
+          paths.eventsFile,
+          `${JSON.stringify({ event: "PreCompact", runId: "run-1", timestamp: now, stdin: { trigger: "auto" } })}\n`,
+        );
+        // Compaction silence, then the real deliverable + Stop, ~1.2s later.
+        setTimeout(() => {
+          void (async () => {
+            await fs.appendFile(paths.paneLogFile, " DONE-after-compaction");
+            await fs.appendFile(
+              paths.eventsFile,
+              `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: Date.now() })}\n`,
+            );
+          })();
+        }, 1_200);
+      }
+    }
+
+    const start = Date.now();
+    const output = await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: {
+            mode: "tmux",
+            tmux: { runtimeDir, turnIdleMs: 50, hookStallMs: 300 },
+          },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        sessionId: "openclaw-session",
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "go",
+        timeoutMs: 10_000,
+        env: {},
+      },
+      new CompactingManager() as never,
+    );
+
+    // Post-compaction output survived (would be absent if the 300ms stall
+    // had broken the loop early).
+    expect(output.text).toContain("DONE-after-compaction");
+    const elapsed = Date.now() - start;
+    // Proves the loop actually waited through the >300ms silence...
+    expect(elapsed).toBeGreaterThanOrEqual(1_000);
+    // ...but still completed promptly via Stop, not the 10s deadline.
+    expect(elapsed).toBeLessThan(8_000);
+  });
+
   it("rejects bare memory mode", async () => {
     const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
     tempDirs.push(runtimeDir);
