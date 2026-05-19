@@ -70,6 +70,44 @@ import type { TypingSignaler } from "./typing-mode.js";
 // selection keeps conflicting with fallback model choices.
 // See: https://github.com/openclaw/openclaw/issues/58348
 export const MAX_LIVE_SWITCH_RETRIES = 2;
+
+/**
+ * Infer whether a compaction happened in the cli-runner path by detecting a
+ * significant token count drop between turns.  Claude Code's auto-compact fires
+ * internally without emitting an SDK event that OpenClaw can observe, so we
+ * use this heuristic as a proxy.
+ *
+ * A drop is treated as a compaction when ALL of the following hold:
+ * - We have a previous token count to compare against.
+ * - Both the previous and new session ids are present and identical (guards
+ *   against false positives from first-binding, /reset, or provider switches
+ *   where one or both ids may be absent or different).
+ * - The drop is more than 40% of the previous total AND more than 20 000 tokens
+ *   in absolute terms (avoids false positives from small/noisy fluctuations).
+ */
+export function inferCompactionFromTokenDrop(params: {
+  previousTotalTokens: number | undefined;
+  newTotalTokens: number;
+  previousSessionId: string | undefined;
+  newSessionId: string | undefined;
+}): boolean {
+  if (!params.previousTotalTokens) {
+    return false;
+  }
+  if (
+    !params.previousSessionId ||
+    !params.newSessionId ||
+    params.previousSessionId !== params.newSessionId
+  ) {
+    return false;
+  }
+
+  const drop = params.previousTotalTokens - params.newTotalTokens;
+  const dropRatio = drop / params.previousTotalTokens;
+
+  // drop > 40% AND absolute drop > 20k tokens
+  return dropRatio > 0.4 && drop > 20_000;
+}
 const GPT_CHAT_BREVITY_ACK_MAX_CHARS = 420;
 const GPT_CHAT_BREVITY_ACK_MAX_SENTENCES = 3;
 const GPT_CHAT_BREVITY_SOFT_MAX_CHARS = 900;

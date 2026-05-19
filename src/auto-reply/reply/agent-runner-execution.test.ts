@@ -4,7 +4,7 @@ import type { SessionEntry } from "../../config/sessions.js";
 import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions } from "../types.js";
-import { MAX_LIVE_SWITCH_RETRIES } from "./agent-runner-execution.js";
+import { inferCompactionFromTokenDrop, MAX_LIVE_SWITCH_RETRIES } from "./agent-runner-execution.js";
 import type { FollowupRun } from "./queue.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
 import type { TypingSignaler } from "./typing-mode.js";
@@ -1342,5 +1342,101 @@ describe("runAgentTurnWithFallback", () => {
     expect(sessionEntry.authProfileOverrideSource).toBe("user");
     expect(sessionStore.main.providerOverride).toBe("zai");
     expect(sessionStore.main.modelOverride).toBe("glm-5");
+  });
+});
+
+describe("inferCompactionFromTokenDrop", () => {
+  it("returns true when tokens drop by more than 40% and more than 20k absolute", () => {
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 80_000,
+        newTotalTokens: 30_000,
+        previousSessionId: "session-a",
+        newSessionId: "session-a",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false when both session ids are undefined (no session binding yet)", () => {
+    // Without confirmed session identity we cannot safely distinguish compaction from
+    // first-binding or a provider switch; require both ids to be present and equal.
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 80_000,
+        newTotalTokens: 30_000,
+        previousSessionId: undefined,
+        newSessionId: undefined,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when token drop is more than 40% but less than 20k absolute", () => {
+    // 60% drop but only 12k tokens absolute
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 20_000,
+        newTotalTokens: 8_000,
+        previousSessionId: "session-a",
+        newSessionId: "session-a",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when token drop is more than 20k absolute but less than 40% ratio", () => {
+    // 30k absolute drop but only 30% ratio
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 100_000,
+        newTotalTokens: 70_000,
+        previousSessionId: "session-a",
+        newSessionId: "session-a",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when the session id changed (reset or new session, not compaction)", () => {
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 80_000,
+        newTotalTokens: 30_000,
+        previousSessionId: "session-a",
+        newSessionId: "session-b",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when there are no previous tokens", () => {
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: undefined,
+        newTotalTokens: 30_000,
+        previousSessionId: "session-a",
+        newSessionId: "session-a",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when previous tokens is zero", () => {
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 0,
+        newTotalTokens: 0,
+        previousSessionId: "session-a",
+        newSessionId: "session-a",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when only one session id is defined (first-binding / reset ambiguity)", () => {
+    // One undefined id could mean first-binding, /reset, or provider switch — cannot
+    // safely infer compaction without both ids confirming the same session.
+    expect(
+      inferCompactionFromTokenDrop({
+        previousTotalTokens: 80_000,
+        newTotalTokens: 30_000,
+        previousSessionId: undefined,
+        newSessionId: "session-new",
+      }),
+    ).toBe(false);
   });
 });

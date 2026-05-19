@@ -5,11 +5,13 @@ import {
 } from "openclaw/plugin-sdk/reply-payload";
 import { resolveRunModelFallbacksOverride } from "../../agents/agent-scope.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
+import { getCliSessionId } from "../../agents/cli-session.js";
 import { lookupContextTokens, resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { runModelAwareAgent } from "../../agents/model-aware-runner.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { isCliProvider } from "../../agents/model-selection.js";
+import { deriveSessionTotalTokens } from "../../agents/usage.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
@@ -20,6 +22,7 @@ import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType } from "../templating.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import { inferCompactionFromTokenDrop } from "./agent-runner-execution.js";
 import { runPreflightCompactionIfNeeded } from "./agent-runner-memory.js";
 import { resolveRunAuthProfile } from "./agent-runner-utils.js";
 import { buildFollowupStablePromptParams } from "./followup-runner-run-params.js";
@@ -334,6 +337,11 @@ export function createFollowupRunner(params: {
         sessionEntry?.contextTokens ??
         DEFAULT_CONTEXT_TOKENS;
 
+      const previousTotalTokens = activeSessionEntry?.totalTokens;
+      const previousCliSessionId = isCliProvider(providerUsed, queued.run.config)
+        ? getCliSessionId(activeSessionEntry, providerUsed)
+        : undefined;
+
       if (storePath && sessionKey) {
         await persistRunSessionUsage({
           storePath,
@@ -355,6 +363,57 @@ export function createFollowupRunner(params: {
           ),
           logLabel: "followup",
         });
+      }
+
+      if (autoCompactionCount === 0 && isCliProvider(providerUsed, queued.run.config)) {
+        const lastCallUsage = runResult.meta?.agentMeta?.lastCallUsage;
+        const newTotalTokens = deriveSessionTotalTokens({
+          usage: lastCallUsage,
+          contextTokens: contextTokensUsed,
+          promptTokens,
+        });
+        if (
+          newTotalTokens !== undefined &&
+          inferCompactionFromTokenDrop({
+            previousTotalTokens,
+            newTotalTokens,
+            previousSessionId: previousCliSessionId,
+            newSessionId: cliSessionId,
+          })
+        ) {
+          autoCompactionCount = 1;
+        }
+      }
+
+      // Persist compaction state before any payload early-exits so that
+      // NO_REPLY / empty-payload / suppressed turns still update the counter.
+      let compactionCount: number | undefined;
+      if (autoCompactionCount > 0) {
+        const previousSessionId = queued.run.sessionId;
+        compactionCount = await incrementRunCompactionCount({
+          cfg: queued.run.config,
+          sessionEntry,
+          sessionStore,
+          sessionKey,
+          storePath,
+          amount: autoCompactionCount,
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          contextTokensUsed,
+          newSessionId: runResult.meta?.agentMeta?.sessionId,
+        });
+        const refreshedSessionEntry =
+          sessionKey && sessionStore ? sessionStore[sessionKey] : undefined;
+        if (refreshedSessionEntry) {
+          const queueKey = queued.run.sessionKey ?? sessionKey;
+          if (queueKey) {
+            refreshQueuedFollowupSession({
+              key: queueKey,
+              previousSessionId,
+              nextSessionId: refreshedSessionEntry.sessionId,
+              nextSessionFile: refreshedSessionEntry.sessionFile,
+            });
+          }
+        }
       }
 
       const payloadArray = runResult.payloads ?? [];
@@ -418,38 +477,11 @@ export function createFollowupRunner(params: {
         return;
       }
 
-      if (autoCompactionCount > 0) {
-        const previousSessionId = queued.run.sessionId;
-        const count = await incrementRunCompactionCount({
-          cfg: queued.run.config,
-          sessionEntry,
-          sessionStore,
-          sessionKey,
-          storePath,
-          amount: autoCompactionCount,
-          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-          contextTokensUsed,
-          newSessionId: runResult.meta?.agentMeta?.sessionId,
+      if (autoCompactionCount > 0 && queued.run.verboseLevel && queued.run.verboseLevel !== "off") {
+        const suffix = typeof compactionCount === "number" ? ` (count ${compactionCount})` : "";
+        finalPayloads.unshift({
+          text: `🧹 Auto-compaction complete${suffix}.`,
         });
-        const refreshedSessionEntry =
-          sessionKey && sessionStore ? sessionStore[sessionKey] : undefined;
-        if (refreshedSessionEntry) {
-          const queueKey = queued.run.sessionKey ?? sessionKey;
-          if (queueKey) {
-            refreshQueuedFollowupSession({
-              key: queueKey,
-              previousSessionId,
-              nextSessionId: refreshedSessionEntry.sessionId,
-              nextSessionFile: refreshedSessionEntry.sessionFile,
-            });
-          }
-        }
-        if (queued.run.verboseLevel && queued.run.verboseLevel !== "off") {
-          const suffix = typeof count === "number" ? ` (count ${count})` : "";
-          finalPayloads.unshift({
-            text: `🧹 Auto-compaction complete${suffix}.`,
-          });
-        }
       }
 
       await sendFollowupPayloads(finalPayloads, queued);
