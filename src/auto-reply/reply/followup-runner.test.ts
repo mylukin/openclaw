@@ -241,6 +241,11 @@ async function loadFreshFollowupRunnerModuleForTest() {
     runEmbeddedPiAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
     waitForEmbeddedPiRunEnd: vi.fn(async () => undefined),
   }));
+  // Route all providers through runEmbeddedPiAgentMock so CLI-provider tests
+  // don't hit the real runCliAgent which is unavailable in the test environment.
+  vi.doMock("../../agents/model-aware-runner.js", () => ({
+    runModelAwareAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
+  }));
   vi.doMock("./queue.js", () => ({
     clearFollowupQueue: clearFollowupQueueForFollowupTest,
     enqueueFollowupRun: enqueueFollowupRunForFollowupTest,
@@ -649,6 +654,54 @@ describe("createFollowupRunner compaction", () => {
 
     const store = loadSessionStore(storePath, { skipCache: true });
     expect(store.main?.compactionCount).toBe(2);
+  });
+
+  it("persists compaction count from token-drop inference even when followup has no payloads", async () => {
+    // Regression: before the fix, payloads:[] caused an early return that skipped
+    // incrementRunCompactionCount, so the inferred compaction was silently lost.
+    const storePath = path.join(
+      await fs.mkdtemp(path.join(tmpdir(), "openclaw-compaction-token-drop-")),
+      "sessions.json",
+    );
+    const sessionEntry: SessionEntry = {
+      sessionId: "session",
+      totalTokens: 80_000,
+      cliSessionBindings: { "claude-cli": { sessionId: "cli-session-abc" } },
+      updatedAt: Date.now(),
+    };
+    const sessionStore: Record<string, SessionEntry> = { main: sessionEntry };
+    await saveSessionStore(storePath, sessionStore);
+
+    const onBlockReply = vi.fn(async () => {});
+
+    // Same cli session id, token count drops from 80k → 30k (62.5% drop, 50k absolute).
+    // The agent returns no payloads (NO_REPLY), triggering the early-return path.
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [],
+      meta: {
+        agentMeta: {
+          provider: "claude-cli",
+          sessionId: "cli-session-abc",
+          lastCallUsage: { input: 30_000 },
+        },
+      },
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply },
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      sessionEntry,
+      sessionStore,
+      sessionKey: "main",
+      storePath,
+      defaultModel: "claude-cli/sonnet",
+    });
+
+    await runner(createQueuedRun({ run: { provider: "claude-cli" } }));
+
+    expect(onBlockReply).not.toHaveBeenCalled();
+    expect(sessionStore.main.compactionCount).toBe(1);
   });
 });
 

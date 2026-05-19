@@ -385,6 +385,37 @@ export function createFollowupRunner(params: {
         }
       }
 
+      // Persist compaction state before any payload early-exits so that
+      // NO_REPLY / empty-payload / suppressed turns still update the counter.
+      let compactionCount: number | undefined;
+      if (autoCompactionCount > 0) {
+        const previousSessionId = queued.run.sessionId;
+        compactionCount = await incrementRunCompactionCount({
+          cfg: queued.run.config,
+          sessionEntry,
+          sessionStore,
+          sessionKey,
+          storePath,
+          amount: autoCompactionCount,
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          contextTokensUsed,
+          newSessionId: runResult.meta?.agentMeta?.sessionId,
+        });
+        const refreshedSessionEntry =
+          sessionKey && sessionStore ? sessionStore[sessionKey] : undefined;
+        if (refreshedSessionEntry) {
+          const queueKey = queued.run.sessionKey ?? sessionKey;
+          if (queueKey) {
+            refreshQueuedFollowupSession({
+              key: queueKey,
+              previousSessionId,
+              nextSessionId: refreshedSessionEntry.sessionId,
+              nextSessionFile: refreshedSessionEntry.sessionFile,
+            });
+          }
+        }
+      }
+
       const payloadArray = runResult.payloads ?? [];
       if (payloadArray.length === 0) {
         return;
@@ -446,38 +477,11 @@ export function createFollowupRunner(params: {
         return;
       }
 
-      if (autoCompactionCount > 0) {
-        const previousSessionId = queued.run.sessionId;
-        const count = await incrementRunCompactionCount({
-          cfg: queued.run.config,
-          sessionEntry,
-          sessionStore,
-          sessionKey,
-          storePath,
-          amount: autoCompactionCount,
-          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-          contextTokensUsed,
-          newSessionId: runResult.meta?.agentMeta?.sessionId,
+      if (autoCompactionCount > 0 && queued.run.verboseLevel && queued.run.verboseLevel !== "off") {
+        const suffix = typeof compactionCount === "number" ? ` (count ${compactionCount})` : "";
+        finalPayloads.unshift({
+          text: `🧹 Auto-compaction complete${suffix}.`,
         });
-        const refreshedSessionEntry =
-          sessionKey && sessionStore ? sessionStore[sessionKey] : undefined;
-        if (refreshedSessionEntry) {
-          const queueKey = queued.run.sessionKey ?? sessionKey;
-          if (queueKey) {
-            refreshQueuedFollowupSession({
-              key: queueKey,
-              previousSessionId,
-              nextSessionId: refreshedSessionEntry.sessionId,
-              nextSessionFile: refreshedSessionEntry.sessionFile,
-            });
-          }
-        }
-        if (queued.run.verboseLevel && queued.run.verboseLevel !== "off") {
-          const suffix = typeof count === "number" ? ` (count ${count})` : "";
-          finalPayloads.unshift({
-            text: `🧹 Auto-compaction complete${suffix}.`,
-          });
-        }
       }
 
       await sendFollowupPayloads(finalPayloads, queued);
