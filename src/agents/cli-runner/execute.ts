@@ -786,6 +786,7 @@ export async function executeWithOverflowProtection(
             ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
             ...(params.onSystemInit ? { onSystemInit: params.onSystemInit } : {}),
             ...(params.onAssistantTurn ? { onAssistantTurn: params.onAssistantTurn } : {}),
+            ...(params.onThinkingTurn ? { onThinkingTurn: params.onThinkingTurn } : {}),
             ...(params.onToolUseEvent ? { onToolUseEvent: params.onToolUseEvent } : {}),
             ...(params.onToolResult ? { onToolResult: params.onToolResult } : {}),
             onDiagnostic: (event, data) => {
