@@ -2057,4 +2057,184 @@ describe("executeTmuxCliRun", () => {
     expect(output.text).toContain('<at user_id="ou_a">Ada</at>');
     expect(output.text).not.toContain("</message>");
   });
+
+  it("routes interim text (stop_reason=tool_use) to onThinkingTurn, not onAssistantTurn", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-thinking-route";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
+
+    class InterimTranscriptManager extends FakeTmuxManager {
+      override async pastePrompt(params: { promptFile: string }) {
+        const echo = await fs.readFile(params.promptFile, "utf8");
+        await fs.appendFile(this.paths!.paneLogFile, `> ${echo}thinking…`);
+        const now = Date.now();
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "SessionStart", runId: "run-1", timestamp: now, claudeSessionId: sessionId, stdin: { session_id: sessionId } })}\n`,
+        );
+        // JSONL: interim turn (stop_reason=tool_use) followed by a final turn
+        await fs.writeFile(
+          transcriptFile,
+          [
+            JSON.stringify({
+              type: "assistant",
+              uuid: "msg-1",
+              timestamp: new Date(now + 5).toISOString(),
+              message: {
+                role: "assistant",
+                content: [
+                  { type: "text", text: "Interim narration while using a tool" },
+                  { type: "tool_use", id: "tu-1", name: "Read", input: {} },
+                ],
+                stop_reason: "tool_use",
+              },
+            }),
+            JSON.stringify({
+              type: "user",
+              uuid: "usr-1",
+              timestamp: new Date(now + 10).toISOString(),
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tu-1", content: "file data" }],
+              },
+            }),
+            JSON.stringify({
+              type: "assistant",
+              uuid: "msg-2",
+              timestamp: new Date(now + 15).toISOString(),
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Final reply text" }],
+                stop_reason: "end_turn",
+              },
+            }),
+          ].join("\n") + "\n",
+        );
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: now + 20, claudeSessionId: sessionId, stdin: { session_id: sessionId } })}\n`,
+        );
+      }
+    }
+
+    const onAssistantTurn = vi.fn();
+    const onThinkingTurn = vi.fn();
+    const output = await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionId: "openclaw-session",
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "go",
+        timeoutMs: 5_000,
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        onAssistantTurn,
+        onThinkingTurn,
+      },
+      new InterimTranscriptManager() as never,
+    );
+
+    expect(output.text).toBe("Final reply text");
+    // Interim (stop_reason=tool_use) text must go to thinking panel only
+    expect(onThinkingTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("Interim narration") }),
+    );
+    expect(onAssistantTurn).not.toHaveBeenCalledWith(expect.stringContaining("Interim narration"));
+    // Final text must go to the main card only
+    expect(onAssistantTurn).toHaveBeenCalledWith("Final reply text");
+    expect(onThinkingTurn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: "Final reply text" }),
+    );
+  });
+
+  it("routes thinking blocks to onThinkingTurn and final text to onAssistantTurn", async () => {
+    const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tmux-test-"));
+    tempDirs.push(runtimeDir);
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-claude-config-"));
+    tempDirs.push(configDir);
+    const sessionId = "cs-thinking-block";
+    const slug = runtimeDir.replaceAll(/[/\\]/g, "-");
+    const transcriptDir = path.join(configDir, "projects", slug);
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, `${sessionId}.jsonl`);
+
+    class ThinkingBlockManager extends FakeTmuxManager {
+      override async pastePrompt(params: { promptFile: string }) {
+        const echo = await fs.readFile(params.promptFile, "utf8");
+        await fs.appendFile(this.paths!.paneLogFile, `> ${echo}answer`);
+        const now = Date.now();
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "SessionStart", runId: "run-1", timestamp: now, claudeSessionId: sessionId, stdin: { session_id: sessionId } })}\n`,
+        );
+        await fs.writeFile(
+          transcriptFile,
+          JSON.stringify({
+            type: "assistant",
+            uuid: "msg-1",
+            timestamp: new Date(now + 5).toISOString(),
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "Let me reason about this" },
+                { type: "text", text: "The answer is 42" },
+              ],
+              stop_reason: "end_turn",
+            },
+          }) + "\n",
+        );
+        await fs.appendFile(
+          this.paths!.eventsFile,
+          `${JSON.stringify({ event: "Stop", runId: "run-1", timestamp: now + 10, claudeSessionId: sessionId, stdin: { session_id: sessionId } })}\n`,
+        );
+      }
+    }
+
+    const onAssistantTurn = vi.fn();
+    const onThinkingTurn = vi.fn();
+    await executeTmuxCliRun(
+      {
+        backend: {
+          command: "claude",
+          args: ["-p"],
+          modelArg: "--model",
+          execution: { mode: "tmux", tmux: { runtimeDir, authMode: "user-claude" } },
+        },
+        backendId: "claude-cli",
+        workspaceDir: runtimeDir,
+        sessionId: "openclaw-session",
+        sessionFile: path.join(runtimeDir, "session.jsonl"),
+        runId: "run-1",
+        modelId: "sonnet",
+        systemPrompt: "system",
+        prompt: "go",
+        timeoutMs: 5_000,
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        onAssistantTurn,
+        onThinkingTurn,
+      },
+      new ThinkingBlockManager() as never,
+    );
+
+    expect(onThinkingTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("Let me reason") }),
+    );
+    expect(onAssistantTurn).toHaveBeenCalledWith("The answer is 42");
+    expect(onAssistantTurn).not.toHaveBeenCalledWith(expect.stringContaining("Let me reason"));
+  });
 });

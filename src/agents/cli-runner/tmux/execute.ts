@@ -986,7 +986,16 @@ export async function executeTmuxCliRun(
           transcriptEmitted = true;
           bufferedPaneDeltas.length = 0;
         }
-        input.onAssistantTurn?.(segment.text);
+        if (segment.final) {
+          input.onAssistantTurn?.(segment.text);
+        } else {
+          // Interim narration (stop_reason=tool_use) is not the user-facing
+          // reply; route it to the thinking panel so it stays out of the main
+          // card body while still being visible during processing.
+          input.onThinkingTurn?.({ text: segment.text });
+        }
+      } else if (segment.kind === "thinking") {
+        input.onThinkingTurn?.({ text: segment.text });
       } else if (segment.kind === "tool_use") {
         input.onToolUseEvent?.({
           name: segment.name,
@@ -1000,7 +1009,6 @@ export async function executeTmuxCliRun(
           ...(segment.isError ? { isError: true } : {}),
         });
       }
-      // thinking segments not surfaced through the tmux callbacks today.
     }
   };
 

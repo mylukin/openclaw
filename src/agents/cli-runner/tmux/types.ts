@@ -121,6 +121,7 @@ export type TmuxExecutionInput = {
   abortSignal?: AbortSignal;
   onSystemInit?: (payload: { subtype: string; sessionId?: string }) => void;
   onAssistantTurn?: (text: string) => void;
+  onThinkingTurn?: (payload: { text: string; delta?: string }) => void;
   onToolUseEvent?: (payload: { name: string; toolUseId?: string; input?: unknown }) => void;
   onToolResult?: (payload: { toolUseId?: string; text?: string; isError?: boolean }) => void;
   /** Lifecycle diagnostics for tmux session reuse/recreate, startup, drain. */
