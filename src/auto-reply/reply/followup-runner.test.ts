@@ -241,10 +241,10 @@ async function loadFreshFollowupRunnerModuleForTest() {
     runEmbeddedPiAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
     waitForEmbeddedPiRunEnd: vi.fn(async () => undefined),
   }));
-  // Route all providers through runEmbeddedPiAgentMock so CLI-provider tests
-  // don't hit the real runCliAgent which is unavailable in the test environment.
-  vi.doMock("../../agents/model-aware-runner.js", () => ({
-    runModelAwareAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
+  // Redirect runCliAgent through runEmbeddedPiAgentMock so CLI-provider tests
+  // can return pre-canned results without spawning a real CLI process.
+  vi.doMock("../../agents/cli-runner.js", () => ({
+    runCliAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
   }));
   vi.doMock("./queue.js", () => ({
     clearFollowupQueue: clearFollowupQueueForFollowupTest,
