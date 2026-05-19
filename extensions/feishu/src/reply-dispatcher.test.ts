@@ -952,6 +952,58 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("thinking panel visible"));
   });
 
+  it("keeps tool stats panel-only for claude-cli; final reply stays in the card body", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: { renderMode: "card", streaming: true },
+    });
+
+    const { result, options } = createDispatcherHarness();
+
+    await options.onReplyStart?.();
+    result.replyOptions.onModelSelected?.({
+      provider: "claude-cli",
+      model: "opus-4.5",
+      thinkLevel: "off",
+    });
+    await flushAsyncTasks();
+
+    await result.replyOptions.onToolStart?.({
+      name: "Read",
+      phase: "start",
+      toolCallId: "tu-1",
+    });
+    await flushAsyncTasks();
+    await result.replyOptions.onToolResult?.({ toolCallId: "tu-1", text: "" });
+    await flushAsyncTasks();
+    await result.replyOptions.onPartialReply?.({ text: "最终答案" });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    // Body carries ONLY the final reply — no orphan "✓ Read" toolStats block
+    // duplicating the panel outside it.
+    const bodyUpdates = streamingInstances[0].update.mock.calls.map((c) => c[0]);
+    expect(bodyUpdates.at(-1)).toBe("最终答案");
+    expect(bodyUpdates.join("\n")).not.toContain("✓ Read");
+
+    // Tool activity is represented in the thinking panel instead.
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("✓ Read"),
+      { title: "🔧 Tool calls (1)" },
+    );
+
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "最终答案",
+      expect.objectContaining({
+        finalThinking: expect.objectContaining({ title: "🔧 Tool calls (1)" }),
+      }),
+    );
+  });
+
   it("logs pending thinking-card lifecycle when a queued followup preview is shown", async () => {
     const runtime = { log: vi.fn(), error: vi.fn() };
     const { result } = createDispatcherHarness({

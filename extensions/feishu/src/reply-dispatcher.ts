@@ -792,7 +792,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     rememberCompletedToolSummary(removedTool?.summary ?? removedTool?.name);
     // Append/extend a toolStats block — never anchor anything to text length.
     // Sits AFTER the current trailing text block, never inside it.
-    const inlineToolName = removedTool?.name?.trim();
+    //
+    // claude-cli (tmux) routes interim narration to the thinking panel
+    // (onReasoningStream), so the body only receives the FINAL reply. A body
+    // toolStats block would then render as an orphan aggregated summary
+    // sitting between the panel and the final reply — duplicating the panel's
+    // own ordered "🔧 Tool calls (N)" + per-call list. Keep tool activity
+    // panel-only for claude-cli; other streaming providers still interleave
+    // tool stats with body-streamed narration in canonical order.
+    const inlineToolName = claudeCliInitThinkingPanelEnabled
+      ? undefined
+      : removedTool?.name?.trim();
     if (inlineToolName) {
       const last = blocks[blocks.length - 1];
       if (last && last.kind === "toolStats") {
