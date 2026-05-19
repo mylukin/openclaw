@@ -77,10 +77,11 @@ export const MAX_LIVE_SWITCH_RETRIES = 2;
  * internally without emitting an SDK event that OpenClaw can observe, so we
  * use this heuristic as a proxy.
  *
- * A drop is treated as a compaction when:
+ * A drop is treated as a compaction when ALL of the following hold:
  * - We have a previous token count to compare against.
- * - The session id did not change between turns (a changed id means /reset or
- *   a new session, not a compaction).
+ * - Both the previous and new session ids are present and identical (guards
+ *   against false positives from first-binding, /reset, or provider switches
+ *   where one or both ids may be absent or different).
  * - The drop is more than 40% of the previous total AND more than 20 000 tokens
  *   in absolute terms (avoids false positives from small/noisy fluctuations).
  */
@@ -94,8 +95,8 @@ export function inferCompactionFromTokenDrop(params: {
     return false;
   }
   if (
-    params.previousSessionId &&
-    params.newSessionId &&
+    !params.previousSessionId ||
+    !params.newSessionId ||
     params.previousSessionId !== params.newSessionId
   ) {
     return false;

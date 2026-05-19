@@ -1357,7 +1357,9 @@ describe("inferCompactionFromTokenDrop", () => {
     ).toBe(true);
   });
 
-  it("returns true when session ids are both undefined (no session binding yet)", () => {
+  it("returns false when both session ids are undefined (no session binding yet)", () => {
+    // Without confirmed session identity we cannot safely distinguish compaction from
+    // first-binding or a provider switch; require both ids to be present and equal.
     expect(
       inferCompactionFromTokenDrop({
         previousTotalTokens: 80_000,
@@ -1365,7 +1367,7 @@ describe("inferCompactionFromTokenDrop", () => {
         previousSessionId: undefined,
         newSessionId: undefined,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("returns false when token drop is more than 40% but less than 20k absolute", () => {
@@ -1425,8 +1427,9 @@ describe("inferCompactionFromTokenDrop", () => {
     ).toBe(false);
   });
 
-  it("returns true when only one session id is defined (new session id from compaction)", () => {
-    // Previous session id was undefined (no binding yet), new id was assigned after compaction
+  it("returns false when only one session id is defined (first-binding / reset ambiguity)", () => {
+    // One undefined id could mean first-binding, /reset, or provider switch — cannot
+    // safely infer compaction without both ids confirming the same session.
     expect(
       inferCompactionFromTokenDrop({
         previousTotalTokens: 80_000,
@@ -1434,6 +1437,6 @@ describe("inferCompactionFromTokenDrop", () => {
         previousSessionId: undefined,
         newSessionId: "session-new",
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
