@@ -1064,6 +1064,70 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("strips tool-call summary lines from Feishu group reply streaming partials", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: { renderMode: "card", streaming: true },
+    });
+
+    const { result, options } = createDispatcherHarness({
+      isGroup: true,
+      replyToMessageId: "om_parent",
+      replyInThread: true,
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onModelSelected?.({
+      provider: "claude-cli",
+      model: "opus-4.5",
+      thinkLevel: "off",
+    });
+    await flushAsyncTasks();
+
+    await result.replyOptions.onToolStart?.({
+      name: "Read",
+      phase: "start",
+      toolCallId: "tu-read",
+    });
+    await result.replyOptions.onToolResult?.({ toolCallId: "tu-read", text: "" });
+    await flushAsyncTasks();
+
+    await result.replyOptions.onPartialReply?.({
+      text: "最终答案\n\n✓ read 1 call\n✓ exec 7 calls",
+    });
+    await flushAsyncTasks();
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].start).toHaveBeenCalledWith(
+      "oc_chat",
+      "chat_id",
+      expect.objectContaining({
+        replyToMessageId: "om_parent",
+        replyInThread: true,
+      }),
+    );
+    expect(streamingInstances[0].update).toHaveBeenLastCalledWith("最终答案", {
+      replace: true,
+    });
+    expect(streamingInstances[0].update.mock.calls.at(-1)?.[0]).not.toContain("✓ read 1 call");
+    expect(streamingInstances[0].update.mock.calls.at(-1)?.[0]).not.toContain("✓ exec 7 calls");
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("✓ Read"),
+      { title: "🔧 Tool calls (1)" },
+    );
+
+    await options.onIdle?.();
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "最终答案",
+      expect.objectContaining({
+        finalThinking: expect.objectContaining({ text: expect.stringContaining("✓ Read") }),
+      }),
+    );
+  });
+
   it("keeps ordinary checkmark lines in Feishu reply bodies", async () => {
     const { options } = createDispatcherHarness({
       isGroup: true,
