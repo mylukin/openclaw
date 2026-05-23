@@ -105,6 +105,25 @@ function truncateFeishuToolSummary(
   return `${truncated}…`;
 }
 
+const FEISHU_TOOL_CALL_SUMMARY_LINE_RE =
+  /^\s*✓\s+`?[A-Za-z][A-Za-z0-9_.:/-]*`?\s+\d+\s+calls?\s*$/i;
+
+function stripFeishuToolCallSummaryLines(text: string): string {
+  if (!text.includes("✓")) {
+    return text;
+  }
+  const lines = text.split(/\r?\n/);
+  const kept = lines.filter((line) => !FEISHU_TOOL_CALL_SUMMARY_LINE_RE.test(line));
+  if (kept.length === lines.length) {
+    return text;
+  }
+  return kept
+    .join("\n")
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function resolveMediaFileName(mediaUrl: string): string {
   const trimmed = mediaUrl.trim();
   if (!trimmed) return "media";
@@ -1524,7 +1543,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 ? hookResult.metadata
                 : undefined;
           }
-          text = stripInlineDirectiveTagsForDelivery(text).text;
+          text = stripFeishuToolCallSummaryLines(stripInlineDirectiveTagsForDelivery(text).text);
           const hasText = text.trim().length > 0;
           const hasMedia = originalReply.hasMedia;
           const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
@@ -1877,7 +1896,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             // render time by queueStreamingRender (via the Display-variant strip,
             // which preserves newlines/tables) and again at final delivery (L959 /
             // L1169) via the Delivery variant.
-            const cleanedText = payload.text ?? "";
+            const cleanedText = stripFeishuToolCallSummaryLines(payload.text ?? "");
             if (!cleanedText) {
               return;
             }

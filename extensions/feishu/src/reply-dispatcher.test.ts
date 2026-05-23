@@ -1004,6 +1004,89 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     );
   });
 
+  it("strips tool-call summary lines from Feishu group reply body while keeping thinking panel history", async () => {
+    resolveFeishuAccountMock.mockReturnValue({
+      accountId: "main",
+      appId: "app_id",
+      appSecret: "app_secret",
+      domain: "feishu",
+      config: { renderMode: "card", streaming: true },
+    });
+
+    const { result, options } = createDispatcherHarness({
+      isGroup: true,
+      replyToMessageId: "om_parent",
+      replyInThread: true,
+    });
+
+    await options.onReplyStart?.();
+    result.replyOptions.onModelSelected?.({
+      provider: "claude-cli",
+      model: "opus-4.5",
+      thinkLevel: "off",
+    });
+    await flushAsyncTasks();
+
+    await result.replyOptions.onToolStart?.({
+      name: "Read",
+      phase: "start",
+      toolCallId: "tu-read",
+    });
+    await result.replyOptions.onToolResult?.({ toolCallId: "tu-read", text: "" });
+    await flushAsyncTasks();
+
+    await options.deliver(
+      {
+        text: "最终答案\n\n✓ read 1 call\n✓ exec 7 calls\n✓ process 1 call",
+      },
+      { kind: "final" },
+    );
+
+    expect(streamingInstances).toHaveLength(1);
+    expect(streamingInstances[0].start).toHaveBeenCalledWith(
+      "oc_chat",
+      "chat_id",
+      expect.objectContaining({
+        replyToMessageId: "om_parent",
+        replyInThread: true,
+      }),
+    );
+    expect(streamingInstances[0].close).toHaveBeenCalledWith(
+      "最终答案",
+      expect.objectContaining({
+        finalThinking: expect.objectContaining({ text: expect.stringContaining("✓ Read") }),
+      }),
+    );
+    expect(streamingInstances[0].close.mock.calls[0]?.[0]).not.toContain("✓ read 1 call");
+    expect(streamingInstances[0].updateThinking).toHaveBeenLastCalledWith(
+      expect.stringContaining("✓ Read"),
+      { title: "🔧 Tool calls (1)" },
+    );
+  });
+
+  it("keeps ordinary checkmark lines in Feishu reply bodies", async () => {
+    const { options } = createDispatcherHarness({
+      isGroup: true,
+      replyToMessageId: "om_parent",
+      replyInThread: true,
+    });
+
+    await options.deliver(
+      {
+        text: "发布检查\n✓ call customer after deploy\n✓ 通过基础回归",
+      },
+      { kind: "final" },
+    );
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "发布检查\n✓ call customer after deploy\n✓ 通过基础回归",
+        replyToMessageId: "om_parent",
+        replyInThread: true,
+      }),
+    );
+  });
+
   it("logs pending thinking-card lifecycle when a queued followup preview is shown", async () => {
     const runtime = { log: vi.fn(), error: vi.fn() };
     const { result } = createDispatcherHarness({
