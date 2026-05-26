@@ -597,13 +597,18 @@ export function resolveProviderRequestCapabilities(
     // transports, not just a statement about vendor support in the abstract.
     supportsResponsesStoreField:
       input.compat?.supportsStore !== false && api !== undefined && OPENAI_RESPONSES_APIS.has(api),
+    // `compat.supportsStore === true` is an explicit per-model opt-in that
+    // bypasses the provider-name and native-endpoint checks, so relays/proxies
+    // can enable Responses-API `store=true` when the operator knows the
+    // upstream supports it (e.g. CRS pinned to a single OpenAI account).
     allowsResponsesStore:
-      input.compat?.supportsStore !== false &&
-      provider !== undefined &&
       api !== undefined &&
       OPENAI_RESPONSES_APIS.has(api) &&
-      OPENAI_RESPONSES_PROVIDERS.has(provider) &&
-      policy.usesKnownNativeOpenAIEndpoint,
+      (input.compat?.supportsStore === true ||
+        (input.compat?.supportsStore !== false &&
+          provider !== undefined &&
+          OPENAI_RESPONSES_PROVIDERS.has(provider) &&
+          policy.usesKnownNativeOpenAIEndpoint)),
     shouldStripResponsesPromptCache:
       api !== undefined && OPENAI_RESPONSES_APIS.has(api) && policy.usesExplicitProxyLikeEndpoint,
     // Native endpoint class is the real signal here. Users can point a generic
